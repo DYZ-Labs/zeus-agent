@@ -6,7 +6,7 @@ import {
   setStewardshipModeAction,
 } from "@/app/actions";
 import { DeleteAllConversations } from "@/components/delete-all-conversations";
-import { PageHeader } from "@/components/page-header";
+import { SettingsModal } from "@/components/settings-modal";
 import { listConversations } from "@/core/conversations";
 import { conversationDependencies } from "@/core/retention";
 import type {
@@ -30,14 +30,12 @@ export default function SettingsPage() {
   const conversations = listConversations(db, 500);
 
   return (
-    <div className="flex h-full flex-col lg:min-h-0">
-      <PageHeader title="Settings" meta="control and privacy" />
-
-      <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
-        <section className="max-w-[54rem]">
-          <SectionTitle>Follow-through</SectionTitle>
-          <h2 className="mt-3 text-[1rem] font-medium">When Zeus should speak up</h2>
-          <p className="mt-2 max-w-[65ch] text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+    <SettingsModal>
+      <div className="mx-auto w-full max-w-[48rem] px-5 py-6 sm:px-8 sm:py-7">
+        <section id="follow-through" className="scroll-mt-6">
+          <h2 className="text-lg font-semibold leading-6">Follow-through</h2>
+          <h3 className="mt-6 text-sm font-medium leading-5">When Zeus should speak up</h3>
+          <p className="mt-2 max-w-[65ch] text-sm leading-6" style={{ color: "var(--shell-muted)" }}>
             This controls when Zeus may surface a plan. Snoozes and dismissals always take priority.
           </p>
           <div className="mt-4 grid gap-2 sm:grid-cols-3">
@@ -47,7 +45,7 @@ export default function SettingsPage() {
                 <button
                   type="submit"
                   aria-pressed={setting.mode === option.mode}
-                  className="h-full w-full rounded-lg border px-4 py-3 text-left"
+                  className="h-full w-full rounded-xl border px-4 py-3 text-left"
                   style={{
                     background:
                       setting.mode === option.mode ? "var(--shell-elevated)" : "var(--shell-panel)",
@@ -57,8 +55,8 @@ export default function SettingsPage() {
                         : "var(--shell-line)",
                   }}
                 >
-                  <span className="block text-[0.84rem] font-medium">{option.label}</span>
-                  <span className="mt-1 block text-[0.72rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+                  <span className="block text-sm font-medium leading-5">{option.label}</span>
+                  <span className="mt-1 block text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
                     {option.description}
                   </span>
                 </button>
@@ -66,15 +64,15 @@ export default function SettingsPage() {
             ))}
           </div>
 
-          <details className="mt-6 rounded-lg border px-4 py-3" style={{ borderColor: "var(--shell-line)" }}>
-            <summary className="cursor-pointer text-[0.82rem]">Follow-through activity</summary>
+          <details className="mt-6 rounded-xl border px-4 py-3" style={{ borderColor: "var(--shell-line)" }}>
+            <summary className="cursor-pointer text-sm leading-5">Follow-through activity</summary>
             <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
               <Metric value={metrics.progressWithoutRegret} label="progress, no regret signal" />
               <Metric value={metrics.accepted} label="offers accepted" />
               <Metric value={metrics.controlsExercised} label="snoozed or dismissed" />
               <Metric value={metrics.regrets} label="regret signals" />
             </div>
-            <p className="mt-3 max-w-[65ch] text-[0.75rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+            <p className="mt-3 max-w-[65ch] text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
               These are transparent signals, not an engagement score. Completion only counts when
               it follows a Zeus recommendation, and regret remains visible.
             </p>
@@ -88,21 +86,25 @@ export default function SettingsPage() {
           </details>
         </section>
 
-        <section id="data" className="mt-14 max-w-[64rem] scroll-mt-4 pb-8">
-          <SectionTitle>Data and privacy</SectionTitle>
-          <h2 className="mt-3 text-[1rem] font-medium">Stored conversations</h2>
-          <p className="mt-2 max-w-[72ch] text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        <section
+          id="data"
+          className="mt-10 scroll-mt-6 border-t pt-8"
+          style={{ borderColor: "var(--shell-line)" }}
+        >
+          <h2 className="text-lg font-semibold leading-6">Data controls</h2>
+          <h3 className="mt-6 text-sm font-medium leading-5">Stored conversations</h3>
+          <p className="mt-2 max-w-[72ch] text-sm leading-6" style={{ color: "var(--shell-muted)" }}>
             Zeus stores conversations locally on this device. Deleting one also removes memories
             supported only by that conversation; memories with another source keep their surviving evidence.
           </p>
 
           <div
-            className="mt-5 flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-4"
-            style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line)" }}
+            className="mt-5 flex flex-wrap items-center justify-between gap-4 rounded-xl border px-4 py-4"
+            style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)" }}
           >
             <div className="min-w-0">
-              <p className="text-[0.86rem] font-medium">Delete all conversations</p>
-              <p className="mt-1 max-w-[58ch] text-[0.74rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+              <p className="text-sm font-medium leading-5">Delete all conversations</p>
+              <p className="mt-1 max-w-[58ch] text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
                 This also removes saved details and open loops that have no evidence outside those conversations.
               </p>
             </div>
@@ -129,13 +131,13 @@ export default function SettingsPage() {
                   <li key={conversation.id} className="border-b py-5" style={{ borderColor: "var(--shell-line)" }}>
                     <div className="flex flex-wrap items-start gap-5">
                       <div className="min-w-0 flex-1">
-                        <p className="text-[0.94rem]">
+                        <p className="text-sm font-medium leading-5">
                           {conversation.title ?? `Conversation ${conversation.id}`}
                         </p>
-                        <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
+                        <p className="mt-1.5 text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
                           {conversation.started_at.slice(0, 10)} · {dependencies.messages} messages · stored locally
                         </p>
-                        <div className="mt-2 flex flex-wrap gap-4 font-mono text-[0.66rem]">
+                        <div className="mt-2 flex flex-wrap gap-4 text-xs leading-5">
                           {inspectHref && (
                             <Link
                               href={inspectHref}
@@ -157,7 +159,7 @@ export default function SettingsPage() {
                           </details>
                         </div>
                       </div>
-                      <form action={deleteConversationAction} className="flex items-center gap-2 font-mono text-[0.65rem]">
+                      <form action={deleteConversationAction} className="flex items-center gap-2 text-xs leading-5">
                         <input type="hidden" name="id" value={conversation.id} />
                         <label htmlFor={`delete-${conversation.id}`} className="sr-only">
                           Type delete to confirm
@@ -168,7 +170,7 @@ export default function SettingsPage() {
                           placeholder="type delete"
                           required
                           pattern="delete"
-                          className="w-[92px] rounded-[3px] border px-2 py-1"
+                          className="w-[92px] rounded-md border px-2 py-1"
                           style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
                         />
                         <button type="submit" style={{ color: "var(--shell-muted)" }}>
@@ -181,11 +183,11 @@ export default function SettingsPage() {
               })}
             </ul>
           ) : (
-            <p className="mt-6 text-[0.9rem]">No conversations are stored.</p>
+            <p className="mt-6 text-sm leading-5">No conversations are stored.</p>
           )}
         </section>
       </div>
-    </div>
+    </SettingsModal>
   );
 }
 
@@ -193,8 +195,8 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
   return (
     <li className="flex flex-wrap items-start gap-4 border-b py-3" style={{ borderColor: "var(--shell-line)" }}>
       <div className="min-w-0 flex-1">
-        <p className="text-[0.84rem]">{event.commitment_title}</p>
-        <p className="mt-1 font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
+        <p className="text-sm leading-5">{event.commitment_title}</p>
+        <p className="mt-1 text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
           {event.created_at.slice(0, 10)} · {event.event_type} ·{" "}
           {event.reason.replace(/_/gu, " ")} · {event.action_kind}
           {event.goal_title ? ` · ${event.goal_title}` : ""}
@@ -204,7 +206,7 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
         <form action={followThroughDecisionAction}>
           <input type="hidden" name="id" value={event.commitment_id} />
           <input type="hidden" name="decision" value="regretted" />
-          <button type="submit" className="font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
+          <button type="submit" className="text-xs leading-5" style={{ color: "var(--shell-faint)" }}>
             this caused regret
           </button>
         </form>
@@ -215,20 +217,12 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
 
 function Metric({ value, label }: { value: number; label: string }) {
   return (
-    <div className="rounded-lg border px-4 py-3" style={{ background: "var(--shell-panel)" }}>
-      <p className="text-[1.35rem] font-medium tabular-nums">{value}</p>
-      <p className="mt-1 text-[0.69rem]" style={{ color: "var(--shell-faint)" }}>
+    <div className="rounded-xl border px-4 py-3" style={{ background: "var(--shell-elevated)" }}>
+      <p className="text-xl font-medium leading-6 tabular-nums">{value}</p>
+      <p className="mt-1 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
         {label}
       </p>
     </div>
-  );
-}
-
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <p className="font-mono text-[0.65rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
-      {children}
-    </p>
   );
 }
 

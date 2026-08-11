@@ -8,33 +8,51 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
   const [confirming, setConfirming] = useState(false);
 
   return (
-    <form action={deleteAllConversationsAction} className="flex shrink-0 items-center gap-3">
+    <form
+      action={deleteAllConversationsAction}
+      className="flex shrink-0 items-center gap-3"
+      aria-label="Delete all conversations"
+    >
       <input type="hidden" name="confirmation" value="delete-all" />
-      {confirming && (
+      {confirming ? (
+        <>
+          <button
+            key="cancel-delete-all"
+            type="button"
+            onClick={() => setConfirming(false)}
+            className="text-sm"
+            style={{ color: "var(--shell-muted)" }}
+          >
+            Cancel
+          </button>
+          <button
+            key="confirm-delete-all"
+            type="submit"
+            className="min-w-[7.5rem] rounded-lg border px-3 py-2 text-sm font-medium"
+            style={{ background: "#7f1d1d", borderColor: "#b91c1c", color: "#ffffff" }}
+          >
+            Are you sure?
+          </button>
+        </>
+      ) : (
         <button
+          key="arm-delete-all"
           type="button"
-          onClick={() => setConfirming(false)}
-          className="text-[0.78rem]"
-          style={{ color: "var(--shell-muted)" }}
+          disabled={disabled}
+          onClick={(event) => {
+            event.preventDefault();
+            setConfirming(true);
+          }}
+          className="min-w-[7.5rem] rounded-lg border px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          style={{
+            background: "var(--shell-panel)",
+            borderColor: "var(--shell-line-strong)",
+            color: "var(--shell-fg)",
+          }}
         >
-          Cancel
+          Delete
         </button>
       )}
-      <button
-        type={confirming ? "submit" : "button"}
-        disabled={disabled}
-        onClick={() => {
-          if (!confirming) setConfirming(true);
-        }}
-        className="min-w-[9.5rem] rounded-lg border px-3 py-2 text-[0.78rem] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-        style={{
-          background: confirming ? "#7f1d1d" : "var(--shell-panel)",
-          borderColor: confirming ? "#b91c1c" : "var(--shell-line-strong)",
-          color: confirming ? "#ffffff" : "var(--shell-fg)",
-        }}
-      >
-        {confirming ? "Are you sure?" : "Delete all conversations"}
-      </button>
     </form>
   );
 }

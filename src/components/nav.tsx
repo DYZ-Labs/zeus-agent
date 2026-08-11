@@ -15,7 +15,12 @@ const PRIMARY_LINKS = [
   { href: "/memory", label: "Memory", icon: "memory" },
 ] as const;
 
-type IconName = (typeof PRIMARY_LINKS)[number]["icon"] | "chats" | "settings";
+const COMPACT_LINKS = [
+  ...PRIMARY_LINKS,
+  { href: "/conversations", label: "Recent chats", icon: "chats" },
+] as const;
+
+type IconName = (typeof COMPACT_LINKS)[number]["icon"] | "settings";
 
 export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }) {
   const pathname = usePathname();
@@ -44,16 +49,19 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
     return (
       <nav
         aria-label="Primary"
-        className="fixed left-3 top-3 z-50 flex flex-col gap-1"
-        style={{ color: "var(--shell-muted)" }}
+        className="flex w-full shrink-0 items-center gap-1 border-b px-3 py-2 lg:h-screen lg:w-[64px] lg:flex-col lg:border-b-0 lg:px-3 lg:py-3"
+        style={{
+          background: "var(--shell-bg)",
+          borderColor: "var(--shell-line)",
+          color: "var(--shell-muted)",
+        }}
       >
         <button
           type="button"
           aria-label="Open sidebar"
           title="Open sidebar"
           onClick={() => setIsOpen(true)}
-          className="group flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
-          style={{ background: "var(--shell-bg)" }}
+          className="group flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
         >
           <span className="group-hover:hidden">
             <SidebarIcon />
@@ -67,11 +75,29 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
           aria-label="New chat"
           title="New chat"
           onClick={startNewChat}
-          className="flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
-          style={{ background: "var(--shell-bg)" }}
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+          style={{ color: "var(--shell-fg)" }}
         >
           <NewChatIcon />
         </button>
+
+        {COMPACT_LINKS.map((link) => (
+          <CompactNavLink
+            key={link.href}
+            href={link.href}
+            label={link.label}
+            icon={link.icon}
+            active={pathname.startsWith(link.href)}
+          />
+        ))}
+
+        <div className="hidden flex-1 lg:block" />
+        <CompactNavLink
+          href="/settings"
+          label="Settings"
+          icon="settings"
+          active={pathname.startsWith("/settings")}
+        />
       </nav>
     );
   }
@@ -105,11 +131,13 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
       <button
         type="button"
         onClick={startNewChat}
-        className="mt-2 flex h-10 w-full shrink-0 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06]"
+        className="mt-2 grid h-10 w-full shrink-0 grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-2.5 rounded-lg px-2.5 text-left text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
         style={{ color: "var(--shell-fg)" }}
       >
-        <NewChatIcon />
-        <span>New chat</span>
+        <SidebarIconSlot>
+          <NewChatIcon />
+        </SidebarIconSlot>
+        <span className="truncate">New chat</span>
       </button>
 
       <ul className="mt-2 flex w-full min-w-0 gap-1 overflow-x-auto lg:flex-col lg:overflow-visible">
@@ -118,18 +146,12 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
 
           return (
             <li key={link.href} className="shrink-0 lg:w-full">
-              <Link
+              <NavLink
                 href={link.href}
-                aria-current={active ? "page" : undefined}
-                className="flex h-10 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06] lg:w-full"
-                style={{
-                  color: active ? "var(--shell-fg)" : "var(--shell-muted)",
-                  background: active ? "var(--shell-elevated)" : undefined,
-                }}
-              >
-                <NavIcon name={link.icon} />
-                <span>{link.label}</span>
-              </Link>
+                label={link.label}
+                icon={link.icon}
+                active={active}
+              />
             </li>
           );
         })}
@@ -152,17 +174,17 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
       </ul>
 
       <section className="mt-5 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
-        <div className="flex items-center justify-between px-3">
+        <div className="flex items-center justify-between px-2.5">
           <h2
             id="recent-chats-heading"
-            className="text-[0.72rem] font-medium"
+            className="text-xs font-semibold leading-5"
             style={{ color: "var(--shell-faint)" }}
           >
             Recent
           </h2>
           <Link
             href="/conversations"
-            className="text-[0.68rem] transition-colors hover:text-white"
+            className="text-xs font-normal leading-5 transition-colors hover:text-white"
             style={{ color: "var(--shell-faint)" }}
           >
             View all
@@ -176,7 +198,7 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
                   <Link
                     href={`/?conversation=${chat.id}`}
                     title={chat.title}
-                    className="block truncate rounded-lg px-3 py-2 text-[0.82rem] transition-colors hover:bg-white/[0.06]"
+                    className="block truncate rounded-lg px-2.5 py-2 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
                     style={{ color: "var(--shell-muted)" }}
                   >
                     {chat.title}
@@ -185,40 +207,36 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
               ))}
             </ul>
           ) : (
-            <p className="px-3 py-2 text-[0.76rem]" style={{ color: "var(--shell-faint)" }}>
+            <p className="px-2.5 py-2 text-sm font-normal leading-5" style={{ color: "var(--shell-faint)" }}>
               No recent chats
             </p>
           )}
         </div>
       </section>
 
-      <Link
-        href="/settings"
-        aria-current={pathname.startsWith("/settings") ? "page" : undefined}
-        className="mt-auto hidden h-10 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06] lg:flex"
-        style={{
-          color: pathname.startsWith("/settings") ? "var(--shell-fg)" : "var(--shell-muted)",
-          background: pathname.startsWith("/settings") ? "var(--shell-elevated)" : undefined,
-        }}
-      >
-        <NavIcon name="settings" />
-        <span>Settings</span>
-      </Link>
+      <div className="mt-auto hidden lg:block">
+        <NavLink
+          href="/settings"
+          label="Settings"
+          icon="settings"
+          active={pathname.startsWith("/settings")}
+        />
+      </div>
 
       <div
-        className="mt-2 hidden border-t px-2 pt-3 lg:flex lg:items-center lg:gap-3"
+        className="mt-2 hidden grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-2.5 border-t px-2.5 pt-3 lg:grid"
         style={{ borderColor: "var(--shell-line)" }}
       >
         <span
           aria-hidden
-          className="flex h-8 w-8 items-center justify-center rounded-full text-[0.7rem] font-semibold"
+          className="flex h-5 w-5 items-center justify-center rounded-full text-[0.58rem] font-semibold"
           style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
         >
           Z
         </span>
         <div className="min-w-0">
-          <p className="text-[0.82rem] font-medium">Stored locally</p>
-          <p className="truncate text-[0.7rem]" style={{ color: "var(--shell-faint)" }}>
+          <p className="text-sm font-normal leading-5">Stored locally</p>
+          <p className="truncate text-xs font-normal leading-4" style={{ color: "var(--shell-faint)" }}>
             Private on this device
           </p>
         </div>
@@ -242,16 +260,50 @@ function NavLink({
     <Link
       href={href}
       aria-current={active ? "page" : undefined}
-      className="flex h-10 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06] lg:w-full"
+      className="grid h-10 grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-2.5 rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] lg:w-full"
+      style={{
+        color: active ? "var(--shell-fg)" : "var(--shell-muted)",
+        background: active ? "var(--shell-elevated)" : undefined,
+      }}
+    >
+      <SidebarIconSlot>
+        <NavIcon name={icon} />
+      </SidebarIconSlot>
+      <span className="truncate">{label}</span>
+    </Link>
+  );
+}
+
+function CompactNavLink({
+  href,
+  label,
+  icon,
+  active,
+}: {
+  href: string;
+  label: string;
+  icon: IconName;
+  active: boolean;
+}) {
+  return (
+    <Link
+      href={href}
+      aria-label={label}
+      title={label}
+      aria-current={active ? "page" : undefined}
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
       style={{
         color: active ? "var(--shell-fg)" : "var(--shell-muted)",
         background: active ? "var(--shell-elevated)" : undefined,
       }}
     >
       <NavIcon name={icon} />
-      <span>{label}</span>
     </Link>
   );
+}
+
+function SidebarIconSlot({ children }: { children: React.ReactNode }) {
+  return <span className="flex h-5 w-5 items-center justify-center">{children}</span>;
 }
 
 function ZeusMark() {
