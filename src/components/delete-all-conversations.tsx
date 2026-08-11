@@ -10,7 +10,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
   return (
     <form
       action={deleteAllConversationsAction}
-      className="flex shrink-0 items-center gap-3"
+      className="flex shrink-0 items-center gap-2"
       aria-label="Delete all conversations"
     >
       <input type="hidden" name="confirmation" value="delete-all" />
@@ -20,7 +20,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             key="cancel-delete-all"
             type="button"
             onClick={() => setConfirming(false)}
-            className="text-sm"
+            className="h-8 rounded-lg px-2 text-xs"
             style={{ color: "var(--shell-muted)" }}
           >
             Cancel
@@ -28,10 +28,10 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
           <button
             key="confirm-delete-all"
             type="submit"
-            className="min-w-[7.5rem] rounded-lg border px-3 py-2 text-sm font-medium"
+            className="h-8 rounded-lg border px-3 text-xs font-medium"
             style={{ background: "#7f1d1d", borderColor: "#b91c1c", color: "#ffffff" }}
           >
-            Are you sure?
+            Confirm delete
           </button>
         </>
       ) : (
@@ -43,11 +43,11 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             event.preventDefault();
             setConfirming(true);
           }}
-          className="min-w-[7.5rem] rounded-lg border px-3 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          className="h-8 rounded-full border px-3 text-xs font-medium transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-40"
           style={{
             background: "var(--shell-panel)",
             borderColor: "var(--shell-line-strong)",
-            color: "var(--shell-fg)",
+            color: "#ff6767",
           }}
         >
           Delete

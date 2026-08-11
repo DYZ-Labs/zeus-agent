@@ -365,9 +365,6 @@ function Composer({
             </svg>
           </button>
         </div>
-        <p className="mt-1.5 text-center text-[0.66rem]" style={{ color: "var(--shell-faint)" }}>
-          AI can make mistakes. Check the linked sources for important saved details.
-        </p>
       </div>
     </form>
   );

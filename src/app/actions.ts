@@ -4,7 +4,13 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { resolveCandidate } from "@/core/candidates";
-import { appendMessage, createConversation, listConversations } from "@/core/conversations";
+import {
+  appendMessage,
+  createConversation,
+  getConversation,
+  listConversations,
+  setConversationTitle,
+} from "@/core/conversations";
 import { deleteEmbedding, embedFact } from "@/core/embed";
 import { mergeEntities, resolveEntity, setEntitySummary } from "@/core/entities";
 import { acceptCandidate } from "@/core/extract";
@@ -229,6 +235,38 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   revalidatePath("/conversations");
   revalidatePath("/settings");
   redirect("/settings#data");
+}
+
+export async function renameConversationAction(id: number, title: string): Promise<void> {
+  const normalizedTitle = title.replace(/\s+/gu, " ").trim().slice(0, 100);
+  if (!Number.isInteger(id) || !normalizedTitle) return;
+
+  const db = getDb();
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return;
+
+  setConversationTitle(db, id, normalizedTitle);
+  revalidatePath("/", "layout");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
+}
+
+export async function deleteConversationFromHistoryAction(
+  id: number,
+  confirmation: string,
+): Promise<void> {
+  if (!Number.isInteger(id) || confirmation !== "delete") return;
+
+  const db = getDb();
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return;
+
+  deleteConversationWithMemory(db, id);
+  revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
 }
 
 export async function deleteAllConversationsAction(formData: FormData): Promise<void> {
