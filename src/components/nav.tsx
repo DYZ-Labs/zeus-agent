@@ -1,12 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { useState } from "react";
+
+import { NEW_CHAT_EVENT } from "@/components/chat-events";
 
 const LINKS = [
   { href: "/today", label: "Today", icon: "today" },
   { href: "/", label: "Chat", icon: "chat" },
-  { href: "/memory", label: "Memory", icon: "memory" },
+  { href: "/memory", label: "Saved", icon: "memory" },
   { href: "/open-loops", label: "Open loops", icon: "loops" },
   { href: "/timeline", label: "Timeline", icon: "timeline" },
   { href: "/conversations", label: "Sources", icon: "sources" },
@@ -16,6 +19,32 @@ type IconName = (typeof LINKS)[number]["icon"];
 
 export function Nav() {
   const pathname = usePathname();
+  const router = useRouter();
+  const [isOpen, setIsOpen] = useState(true);
+
+  function startNewChat() {
+    if (pathname === "/") {
+      window.dispatchEvent(new Event(NEW_CHAT_EVENT));
+      router.replace("/");
+      return;
+    }
+    router.push("/");
+  }
+
+  if (!isOpen) {
+    return (
+      <button
+        type="button"
+        aria-label="Open sidebar"
+        title="Open sidebar"
+        onClick={() => setIsOpen(true)}
+        className="fixed left-3 top-3 z-50 flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+        style={{ background: "var(--shell-bg)", color: "var(--shell-muted)" }}
+      >
+        <SidebarIcon />
+      </button>
+    );
+  }
 
   return (
     <nav
@@ -23,13 +52,35 @@ export function Nav() {
       className="flex w-full min-w-0 shrink-0 flex-col overflow-hidden border-b px-3 py-3 lg:h-screen lg:w-[260px] lg:border-b-0 lg:px-3"
       style={{ background: "var(--shell-sidebar)", borderColor: "var(--shell-line)" }}
     >
-      <Link
-        href="/"
-        className="flex h-10 shrink-0 items-center gap-3 rounded-lg px-2 transition-colors hover:bg-white/[0.06]"
+      <div className="flex h-10 shrink-0 items-center justify-between">
+        <Link
+          href="/"
+          aria-label="Chat home"
+          className="flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+        >
+          <ZeusMark />
+        </Link>
+        <button
+          type="button"
+          aria-label="Close sidebar"
+          title="Close sidebar"
+          onClick={() => setIsOpen(false)}
+          className="flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+          style={{ color: "var(--shell-muted)" }}
+        >
+          <SidebarIcon />
+        </button>
+      </div>
+
+      <button
+        type="button"
+        onClick={startNewChat}
+        className="mt-2 flex h-10 w-full shrink-0 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06]"
+        style={{ color: "var(--shell-fg)" }}
       >
-        <ZeusMark />
-        <span className="text-[0.95rem] font-semibold tracking-[-0.01em]">Zeus</span>
-      </Link>
+        <NewChatIcon />
+        <span>New chat</span>
+      </button>
 
       <ul className="mt-2 flex w-full min-w-0 gap-1 overflow-x-auto lg:flex-col lg:overflow-visible">
         {LINKS.map((link) => {
@@ -67,7 +118,7 @@ export function Nav() {
           Z
         </span>
         <div className="min-w-0">
-          <p className="text-[0.82rem] font-medium">Local memory</p>
+          <p className="text-[0.82rem] font-medium">Stored locally</p>
           <p className="truncate text-[0.7rem]" style={{ color: "var(--shell-faint)" }}>
             Private on this device
           </p>
@@ -86,6 +137,38 @@ function ZeusMark() {
     >
       Z
     </span>
+  );
+}
+
+function SidebarIcon() {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 24 24"
+      className="h-[18px] w-[18px]"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+    >
+      <rect x="3.5" y="4" width="17" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </svg>
+  );
+}
+
+function NewChatIcon() {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 24 24"
+      className="h-[18px] w-[18px]"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+    >
+      <path d="M12 5H6.5A2.5 2.5 0 0 0 4 7.5v10A2.5 2.5 0 0 0 6.5 20h10a2.5 2.5 0 0 0 2.5-2.5V12" />
+      <path d="m13 11 6.2-6.2a1.4 1.4 0 0 1 2 2L15 13l-3 1 1-3Z" strokeLinejoin="round" />
+    </svg>
   );
 }
 

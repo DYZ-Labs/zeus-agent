@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { NEW_CHAT_EVENT } from "@/components/chat-events";
 import type { FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
@@ -31,11 +32,9 @@ type Status = "idle" | "streaming" | "error";
 
 export function Chat({
   hasCredentials,
-  model,
   initialPrompt,
 }: {
   hasCredentials: boolean;
-  model: string;
   initialPrompt?: string;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
@@ -43,8 +42,27 @@ export function Chat({
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const conversationId = useRef<number | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function startNewChat() {
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+      conversationId.current = null;
+      setTurns([]);
+      setInput("");
+      setStatus("idle");
+      setError(null);
+      requestAnimationFrame(() => {
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
+      });
+    }
+
+    window.addEventListener(NEW_CHAT_EVENT, startNewChat);
+    return () => window.removeEventListener(NEW_CHAT_EVENT, startNewChat);
+  }, []);
 
   useEffect(() => {
     if (turns.length === 0) return;
@@ -66,11 +84,15 @@ export function Chat({
     setStatus("streaming");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
+    const request = new AbortController();
+    activeRequest.current = request;
+
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: text, conversationId: conversationId.current }),
+        signal: request.signal,
       });
 
       if (!response.ok || !response.body) {
@@ -133,10 +155,13 @@ export function Chat({
         }
       }
 
-      setStatus("idle");
+      if (!request.signal.aborted) setStatus("idle");
     } catch (caught) {
+      if (request.signal.aborted) return;
       setError(caught instanceof Error ? caught.message : "Something went wrong.");
       setStatus("error");
+    } finally {
+      if (activeRequest.current === request) activeRequest.current = null;
     }
   }
 
@@ -184,28 +209,6 @@ export function Chat({
 
   return (
     <div className="flex h-full min-h-0 flex-col" style={{ background: "var(--shell-bg)" }}>
-      <header className="flex h-14 shrink-0 items-center justify-between px-4 md:px-6">
-        <div className="flex items-baseline gap-2">
-          <h1 className="text-[1rem] font-semibold tracking-[-0.01em]">Zeus</h1>
-          <span className="text-[0.8rem]" style={{ color: "var(--shell-faint)" }}>
-            follow-through
-          </span>
-        </div>
-        <p
-          className="flex min-w-0 max-w-[52%] items-center gap-2 text-[0.75rem]"
-          style={{ color: "var(--shell-muted)" }}
-        >
-          <span
-            aria-hidden
-            className="h-1.5 w-1.5 rounded-full"
-            style={{ background: hasCredentials ? "var(--shell-fg)" : "var(--shell-faint)" }}
-          />
-          <span className="truncate">
-            {hasCredentials ? `OpenAI · ${model}` : "OpenAI key required"}
-          </span>
-        </p>
-      </header>
-
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 pt-6 md:px-6">
           {!hasCredentials && <CredentialsNotice />}
@@ -270,11 +273,11 @@ export function Chat({
       >
         <div className="mx-auto w-full max-w-[48rem]">
           <div
-            className="flex items-end gap-2 rounded-[26px] border px-3 py-2 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] transition-colors focus-within:border-[#666]"
+            className="flex items-end gap-2 rounded-[26px] border px-3 py-2 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]"
             style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
           >
             <label htmlFor="chat-input" className="sr-only">
-              Message Zeus
+              Message
             </label>
             <textarea
               ref={textareaRef}
@@ -290,14 +293,14 @@ export function Chat({
                   void send();
                 }
               }}
-              placeholder="Message Zeus"
+              placeholder="Message"
               className="max-h-[200px] min-h-9 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-[0.95rem] leading-6 outline-none disabled:cursor-not-allowed disabled:opacity-50"
-              style={{ color: "var(--shell-fg)" }}
+              style={{ color: "var(--shell-fg)", outline: "none" }}
             />
             <button
               type="submit"
               disabled={!canSend}
-              aria-label={status === "streaming" ? "Zeus is responding" : "Send message"}
+              aria-label={status === "streaming" ? "Response in progress" : "Send message"}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed"
               style={{
                 background: canSend ? "var(--shell-accent)" : "var(--shell-elevated)",
@@ -310,7 +313,7 @@ export function Chat({
             </button>
           </div>
           <p className="mt-1.5 text-center text-[0.66rem]" style={{ color: "var(--shell-faint)" }}>
-            Zeus can make mistakes. Check the linked sources for important memories.
+            AI can make mistakes. Check the linked sources for important saved details.
           </p>
         </div>
       </form>
@@ -392,7 +395,7 @@ function FollowThroughCard({
 }) {
   const decisionText =
     decision === "accepted"
-      ? "Ready in the composer — Zeus will help without acting externally."
+      ? "Ready in the composer — help is available without acting externally."
       : decision === "completed"
         ? "Marked complete."
         : decision === "snoozed"
@@ -453,7 +456,7 @@ function FollowThroughCard({
       )}
       <div className="mt-2 flex gap-3 font-mono text-[0.61rem]" style={{ color: "var(--shell-faint)" }}>
         <a href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
-          why Zeus knows this
+          why this is known
         </a>
         <a href="/today" className="underline underline-offset-2">
           controls
@@ -477,7 +480,7 @@ function AssistantMark() {
 
 function ThinkingIndicator() {
   return (
-    <span role="status" aria-label="Zeus is thinking" className="inline-flex h-7 items-center gap-1.5">
+    <span role="status" aria-label="Thinking" className="inline-flex h-7 items-center gap-1.5">
       {[0, 150, 300].map((delay) => (
         <span
           key={delay}
@@ -532,7 +535,7 @@ function Receipt({
             className="underline underline-offset-2"
             style={{ color: "var(--shell-fg)" }}
           >
-            review memory
+            review saved details
           </a>
         )}
       </div>
@@ -548,7 +551,7 @@ const STARTERS = [
   },
   {
     title: "Set a goal",
-    detail: "Give Zeus something to follow up",
+    detail: "Add something to follow up",
     prompt: "I want to ship my portfolio this month. Remind me about the case study when it comes up.",
   },
   {
@@ -557,8 +560,8 @@ const STARTERS = [
     prompt: "Sarah Chen runs design here — she's the one to ask about the new dashboard.",
   },
   {
-    title: "Review your memory",
-    detail: "See what Zeus knows so far",
+    title: "Review saved details",
+    detail: "See what has been learned so far",
     prompt: "What do you know about me so far?",
   },
 ] as const;
@@ -570,10 +573,10 @@ function EmptyState({ onSelect }: { onSelect?: (prompt: string) => void }) {
         <AssistantMark />
       </div>
       <h2 className="mt-5 text-[1.75rem] font-semibold leading-tight tracking-[-0.025em]">
-        How can Zeus help?
+        How can I help?
       </h2>
       <p className="mx-auto mt-2 max-w-[34rem] text-[0.9rem]" style={{ color: "var(--shell-muted)" }}>
-        Tell Zeus what matters. It keeps the evidence, notices useful moments, and helps with the next step while you stay in control.
+        Share what matters. I keep the evidence, notice useful moments, and help with the next step while you stay in control.
       </p>
 
       <div className="mt-8 grid gap-2 text-left sm:grid-cols-2">
@@ -604,17 +607,13 @@ function CredentialsNotice() {
       className="mb-4 rounded-2xl border px-5 py-4"
       style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}
     >
-      <p className="text-[0.9rem] font-medium">OpenAI API key required</p>
+      <p className="text-[0.9rem] font-medium">API key required</p>
       <p className="mt-1.5 text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-        Chat and extraction need an API key. Add{" "}
-        <code className="font-mono text-[0.76rem]" style={{ color: "var(--shell-fg)" }}>
-          OPENAI_API_KEY
-        </code>{" "}
-        to{" "}
+        Chat and extraction need a configured API key in{" "}
         <code className="font-mono text-[0.76rem]" style={{ color: "var(--shell-fg)" }}>
           .env.local
         </code>
-        . Browsing and editing memory still works without one.
+        . Browsing and editing saved details still works without one.
       </p>
     </div>
   );
