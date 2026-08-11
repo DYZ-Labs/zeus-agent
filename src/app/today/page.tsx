@@ -1,20 +1,11 @@
 import Link from "next/link";
 
-import {
-  followThroughDecisionAction,
-  setStewardshipModeAction,
-} from "@/app/actions";
+import { followThroughDecisionAction } from "@/app/actions";
 import { PageHeader } from "@/components/page-header";
+import { Plans } from "@/components/plans";
 import { hasCredentials } from "@/core/openai";
-import type {
-  FollowThroughEventView,
-  FollowThroughRecommendation,
-  StewardshipMode,
-} from "@/core/schema";
+import type { FollowThroughRecommendation } from "@/core/schema";
 import {
-  followThroughMetrics,
-  getStewardshipSetting,
-  listFollowThroughEvents,
   recommendationForCommitment,
   recommendNextAction,
 } from "@/core/stewardship";
@@ -25,16 +16,14 @@ export const dynamic = "force-dynamic";
 export default async function TodayPage({
   searchParams,
 }: {
-  searchParams: Promise<{ focus?: string }>;
+  searchParams: Promise<{ focus?: string; show?: string }>;
 }) {
   const db = getDb();
-  const focus = Number((await searchParams).focus);
+  const params = await searchParams;
+  const focus = Number(params.focus);
   const recommendation = Number.isInteger(focus) && focus > 0
     ? recommendationForCommitment(db, focus)
     : recommendNextAction(db, "", { force: true });
-  const setting = getStewardshipSetting(db);
-  const metrics = followThroughMetrics(db);
-  const events = listFollowThroughEvents(db, 20);
 
   return (
     <div className="flex h-full flex-col lg:min-h-0">
@@ -66,62 +55,7 @@ export default async function TodayPage({
           )}
         </section>
 
-        <section className="mt-11 max-w-[54rem]">
-          <SectionTitle>Intervention control</SectionTitle>
-          <p className="mt-2 text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-            This changes when Zeus may interrupt. Snoozes and dismissals always override the mode.
-          </p>
-          <div className="mt-4 grid gap-2 sm:grid-cols-3">
-            {MODE_OPTIONS.map((option) => (
-              <form action={setStewardshipModeAction} key={option.mode}>
-                <input type="hidden" name="mode" value={option.mode} />
-                <button
-                  type="submit"
-                  aria-pressed={setting.mode === option.mode}
-                  className="h-full w-full rounded-lg border px-4 py-3 text-left"
-                  style={{
-                    background:
-                      setting.mode === option.mode ? "var(--shell-elevated)" : "var(--shell-panel)",
-                    borderColor:
-                      setting.mode === option.mode
-                        ? "var(--shell-accent-line)"
-                        : "var(--shell-line)",
-                  }}
-                >
-                  <span className="block text-[0.84rem] font-medium">{option.label}</span>
-                  <span className="mt-1 block text-[0.72rem] leading-5" style={{ color: "var(--shell-faint)" }}>
-                    {option.description}
-                  </span>
-                </button>
-              </form>
-            ))}
-          </div>
-        </section>
-
-        <section className="mt-11 max-w-[54rem]">
-          <SectionTitle>Progress and regret</SectionTitle>
-          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-            <Metric value={metrics.progressWithoutRegret} label="progress, no regret signal" />
-            <Metric value={metrics.accepted} label="offers accepted" />
-            <Metric value={metrics.controlsExercised} label="snoozed or dismissed" />
-            <Metric value={metrics.regrets} label="regret signals" />
-          </div>
-          <p className="mt-3 max-w-[65ch] text-[0.75rem] leading-5" style={{ color: "var(--shell-faint)" }}>
-            These are transparent signals, not an engagement score. Completion only counts here when
-            it follows a Zeus recommendation; regret remains visible rather than being optimized away.
-          </p>
-        </section>
-
-        {events.length > 0 && (
-          <section className="mt-11 max-w-[54rem] pb-8">
-            <SectionTitle>Decision history</SectionTitle>
-            <ol className="mt-2">
-              {events.map((event) => (
-                <EventRow key={event.id} event={event} />
-              ))}
-            </ol>
-          </section>
-        )}
+        <Plans showCompleted={params.show === "completed"} />
       </div>
     </div>
   );
@@ -192,7 +126,7 @@ function RecommendationCard({
           source commitment
         </Link>
         {recommendation.goal_id && (
-          <Link href="/open-loops" className="underline underline-offset-2">
+          <Link href="/today#plans" className="underline underline-offset-2">
             {recommendation.goal_priority ?? "normal"} priority goal
           </Link>
         )}
@@ -218,51 +152,3 @@ function DecisionForm({
     </form>
   );
 }
-
-function EventRow({ event }: { event: FollowThroughEventView }) {
-  return (
-    <li className="flex flex-wrap items-start gap-4 border-b py-3" style={{ borderColor: "var(--shell-line)" }}>
-      <div className="min-w-0 flex-1">
-        <p className="text-[0.84rem]">{event.commitment_title}</p>
-        <p className="mt-1 font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
-          {event.created_at.slice(0, 10)} · {event.event_type} · {event.reason.replace(/_/gu, " ")} · {event.action_kind}
-          {event.goal_title ? ` · ${event.goal_title}` : ""}
-        </p>
-      </div>
-      {event.event_type === "completed" && (
-        <DecisionForm id={event.commitment_id} decision="regretted">
-          <button type="submit" className="font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
-            this caused regret
-          </button>
-        </DecisionForm>
-      )}
-    </li>
-  );
-}
-
-function Metric({ value, label }: { value: number; label: string }) {
-  return (
-    <div className="rounded-lg border px-4 py-3" style={{ background: "var(--shell-panel)" }}>
-      <p className="text-[1.35rem] font-medium tabular-nums">{value}</p>
-      <p className="mt-1 text-[0.69rem]" style={{ color: "var(--shell-faint)" }}>{label}</p>
-    </div>
-  );
-}
-
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <h2 className="font-mono text-[0.65rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
-      {children}
-    </h2>
-  );
-}
-
-const MODE_OPTIONS: readonly {
-  mode: StewardshipMode;
-  label: string;
-  description: string;
-}[] = [
-  { mode: "quiet", label: "Quiet", description: "Only relevant or clearly overdue items." },
-  { mode: "balanced", label: "Balanced", description: "Relevant, due, waiting, or forgotten items." },
-  { mode: "proactive", label: "Proactive", description: "Earlier notice with a shorter cooldown." },
-];

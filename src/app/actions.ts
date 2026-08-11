@@ -77,7 +77,6 @@ export async function editFactAction(formData: FormData): Promise<void> {
   }
 
   revalidatePath("/memory");
-  revalidatePath("/timeline");
 }
 
 export async function acceptCandidateAction(formData: FormData): Promise<void> {
@@ -97,7 +96,7 @@ export async function acceptCandidateAction(formData: FormData): Promise<void> {
     );
   }
   revalidatePath("/memory");
-  revalidatePath("/open-loops");
+  revalidatePath("/today");
 }
 
 export async function rejectCandidateAction(formData: FormData): Promise<void> {
@@ -123,7 +122,7 @@ export async function updateGoalStatusAction(formData: FormData): Promise<void> 
     sourceMessageId: source.id,
     sourceKind: "message",
   });
-  revalidatePath("/open-loops");
+  revalidatePath("/today");
 }
 
 export async function setGoalPriorityAction(formData: FormData): Promise<void> {
@@ -140,7 +139,6 @@ export async function setGoalPriorityAction(formData: FormData): Promise<void> {
     sourceKind: "message",
   });
   revalidatePath("/today");
-  revalidatePath("/open-loops");
 }
 
 export async function updateCommitmentStatusAction(formData: FormData): Promise<void> {
@@ -161,7 +159,7 @@ export async function updateCommitmentStatusAction(formData: FormData): Promise<
     sourceMessageId: source.id,
     sourceKind: "message",
   });
-  revalidatePath("/open-loops");
+  revalidatePath("/today");
 }
 
 export async function snoozeCommitmentAction(formData: FormData): Promise<void> {
@@ -180,7 +178,7 @@ export async function snoozeCommitmentAction(formData: FormData): Promise<void> 
     sourceMessageId: source.id,
     sourceKind: "message",
   });
-  revalidatePath("/open-loops");
+  revalidatePath("/today");
 }
 
 export async function setStewardshipModeAction(formData: FormData): Promise<void> {
@@ -190,6 +188,7 @@ export async function setStewardshipModeAction(formData: FormData): Promise<void
   const source = curationMessage(db, `Set follow-through mode to ${mode}.`);
   setStewardshipMode(db, mode, source.id);
   revalidatePath("/today");
+  revalidatePath("/settings");
 }
 
 export async function followThroughDecisionAction(formData: FormData): Promise<void> {
@@ -210,7 +209,7 @@ export async function followThroughDecisionAction(formData: FormData): Promise<v
   if (!event) return;
 
   revalidatePath("/today");
-  revalidatePath("/open-loops");
+  revalidatePath("/settings");
   if (decision === "accepted" && recommendation) {
     redirect(`/?prompt=${encodeURIComponent(recommendation.chat_prompt)}`);
   }
@@ -222,9 +221,10 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   if (!Number.isInteger(id) || confirmation !== "delete") return;
   deleteConversationWithMemory(getDb(), id);
   revalidatePath("/memory");
-  revalidatePath("/open-loops");
+  revalidatePath("/today");
   revalidatePath("/conversations");
-  redirect("/conversations");
+  revalidatePath("/settings");
+  redirect("/settings#data");
 }
 
 export async function supersedeFactAction(formData: FormData): Promise<void> {
@@ -241,7 +241,6 @@ export async function supersedeFactAction(formData: FormData): Promise<void> {
   addFactEvidence(db, id, source.id, "correction", 1);
   supersedeFact(db, id);
   revalidatePath("/memory");
-  revalidatePath("/timeline");
 }
 
 export async function reviveFactAction(formData: FormData): Promise<void> {
@@ -270,7 +269,6 @@ export async function reviveFactAction(formData: FormData): Promise<void> {
     factSearchText(reasserted.subject_name, reasserted.predicate, reasserted.object),
   ).catch(() => false);
   revalidatePath("/memory");
-  revalidatePath("/timeline");
 }
 
 export async function forgetFactAction(formData: FormData): Promise<void> {
@@ -285,7 +283,6 @@ export async function forgetFactAction(formData: FormData): Promise<void> {
   forgetFact(db, id);
 
   revalidatePath("/memory");
-  revalidatePath("/timeline");
   if (fact.subject_slug) revalidatePath(`/entity/${fact.subject_slug}`);
 }
 

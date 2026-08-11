@@ -7,10 +7,13 @@ import type { FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
 
-type Turn = {
+export type ChatHistoryTurn = {
   id: string;
   role: "user" | "assistant";
   text: string;
+};
+
+type Turn = ChatHistoryTurn & {
   recommendation?: FollowThroughRecommendation;
   recommendationDecision?: RecommendationDecision;
   /** Set on the assistant turn once the stream closes. */
@@ -33,15 +36,19 @@ type Status = "idle" | "streaming" | "error";
 export function Chat({
   hasCredentials,
   initialPrompt,
+  initialTurns = [],
+  initialConversationId,
 }: {
   hasCredentials: boolean;
   initialPrompt?: string;
+  initialTurns?: ChatHistoryTurn[];
+  initialConversationId?: number;
 }) {
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const [turns, setTurns] = useState<Turn[]>(initialTurns);
   const [input, setInput] = useState(initialPrompt ?? "");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
-  const conversationId = useRef<number | null>(null);
+  const conversationId = useRef<number | null>(initialConversationId ?? null);
   const activeRequest = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
@@ -458,8 +465,8 @@ function FollowThroughCard({
         <a href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
           why this is known
         </a>
-        <a href="/today" className="underline underline-offset-2">
-          controls
+        <a href="/settings" className="underline underline-offset-2">
+          follow-through settings
         </a>
       </div>
     </aside>
@@ -531,7 +538,7 @@ function Receipt({
         </a>
         {(accepted > 0 || pending > 0) && (
           <a
-            href={pending > 0 ? "/memory?show=pending" : "/memory"}
+            href={pending > 0 ? "/memory?view=review" : "/memory"}
             className="underline underline-offset-2"
             style={{ color: "var(--shell-fg)" }}
           >
