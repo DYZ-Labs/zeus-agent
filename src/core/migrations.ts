@@ -671,11 +671,26 @@ CREATE INDEX mcp_recall_audit_created_idx ON mcp_recall_audit(created_at DESC);
  * eventually be batch accepted, but the initial proposals need a distinct audit
  * reason that deterministic policy can never mistake for live auto-acceptance. */
 const BACKFILL_PREVIEW_REASON = `
-DROP INDEX memory_candidate_status_idx;
-DROP INDEX memory_candidate_source_idx;
-DROP INDEX memory_candidate_dedupe_idx;
-DROP INDEX memory_candidate_backfill_idx;
-DROP INDEX candidate_resolution_candidate_idx;
+-- Early development builds of 006 created candidate evidence but did not yet
+-- create the resolution audit table. Some local stores can therefore truthfully
+-- report 006 as applied while lacking this table. Materialize the empty audit
+-- table before rebuilding the candidate graph so those stores can still upgrade
+-- without weakening or discarding any existing candidate data.
+CREATE TABLE IF NOT EXISTS candidate_resolution_event (
+  id                  INTEGER PRIMARY KEY,
+  candidate_id        INTEGER NOT NULL REFERENCES memory_candidate(id) ON DELETE CASCADE,
+  decision            TEXT NOT NULL CHECK (decision IN ('accepted','rejected','edited_accepted')),
+  edited_payload_json TEXT CHECK (edited_payload_json IS NULL OR json_valid(edited_payload_json)),
+  source_message_id   INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind         TEXT NOT NULL CHECK (source_kind IN ('user_action','message','system')),
+  created_at          TEXT NOT NULL
+);
+
+DROP INDEX IF EXISTS memory_candidate_status_idx;
+DROP INDEX IF EXISTS memory_candidate_source_idx;
+DROP INDEX IF EXISTS memory_candidate_dedupe_idx;
+DROP INDEX IF EXISTS memory_candidate_backfill_idx;
+DROP INDEX IF EXISTS candidate_resolution_candidate_idx;
 
 ALTER TABLE candidate_evidence RENAME TO candidate_evidence_legacy;
 ALTER TABLE candidate_resolution_event RENAME TO candidate_resolution_event_legacy;
@@ -745,6 +760,31 @@ CREATE INDEX candidate_resolution_candidate_idx
 ON candidate_resolution_event(candidate_id, id);
 `;
 
+/** Some development stores recorded the understanding migration before its resumable
+ * item table was finalized. Recreate only the missing table so source deletion can
+ * inspect and clean up backfill work without rewriting any applied migration. */
+const BACKFILL_ITEM_COMPATIBILITY = `
+CREATE TABLE IF NOT EXISTS understanding_backfill_item (
+  job_id             INTEGER NOT NULL REFERENCES understanding_backfill_job(id) ON DELETE CASCADE,
+  message_id         INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  extractor_version  TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('pending','processing','completed','failed','skipped')),
+  candidate_count    INTEGER NOT NULL DEFAULT 0,
+  error_message      TEXT,
+  updated_at         TEXT NOT NULL,
+  PRIMARY KEY (job_id, message_id, extractor_version)
+);
+`;
+
+/** Removing a chat from visible history must not destroy its transcript or any memory
+ * that cites it. Keep that reversible UI state separate from the evidence itself. */
+const CONVERSATION_HISTORY_STATE = `
+CREATE TABLE conversation_history_state (
+  conversation_id  INTEGER PRIMARY KEY REFERENCES conversation(id) ON DELETE CASCADE,
+  hidden_at        TEXT NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -755,4 +795,6 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "007_facet_embeddings", sql: FACET_EMBEDDINGS },
   { id: "008_mcp_candidate_audit", sql: MCP_CANDIDATE_AUDIT },
   { id: "009_backfill_preview_reason", sql: BACKFILL_PREVIEW_REASON },
+  { id: "010_backfill_item_compatibility", sql: BACKFILL_ITEM_COMPATIBILITY },
+  { id: "011_conversation_history_state", sql: CONVERSATION_HISTORY_STATE },
 ];

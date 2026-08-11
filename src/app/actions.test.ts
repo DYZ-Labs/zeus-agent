@@ -1,9 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createCandidate, getCandidate, listCandidates } from "@/core/candidates";
-import { appendMessage, createConversation } from "@/core/conversations";
+import {
+  appendMessage,
+  createConversation,
+  getConversation,
+  listChatHistory,
+  listConversations,
+  messagesIn,
+} from "@/core/conversations";
 import { openTestDb } from "@/core/db";
-import { listFacets } from "@/core/facets";
+import { listFacets, recordFacet } from "@/core/facets";
 import { ensureEvidencePassage } from "@/core/passages";
 
 const actionMocks = vi.hoisted(() => ({
@@ -31,6 +38,8 @@ vi.mock("@/core/embed", async (importOriginal) => {
 import {
   acceptFacetCandidateAction,
   answerReflectionAction,
+  deleteAllRecentChatsAction,
+  deleteConversationFromHistoryAction,
 } from "./actions";
 
 describe("understanding web-action embeddings", () => {
@@ -121,6 +130,63 @@ describe("understanding web-action embeddings", () => {
       "value Protect time with my family when good options compete.",
     );
     expect(actionMocks.embedPassage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("conversation deletion actions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("hides every recent chat without deleting stored conversations", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const first = createConversation(db, { title: "First chat" });
+    const second = createConversation(db, { title: "Second chat" });
+    appendMessage(db, first.id, "user", "Keep this first transcript.");
+    appendMessage(db, second.id, "user", "Keep this second transcript.");
+
+    const form = new FormData();
+    form.set("confirmation", "delete-all-recent");
+    await deleteAllRecentChatsAction(form);
+
+    expect(listChatHistory(db)).toEqual([]);
+    expect(listConversations(db)).toHaveLength(2);
+    expect(messagesIn(db, first.id)).toHaveLength(1);
+    expect(messagesIn(db, second.id)).toHaveLength(1);
+    expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/settings");
+    expect(actionMocks.redirect).not.toHaveBeenCalled();
+  });
+
+  it("hides only the selected recent chat while preserving its details and transcript", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const deleted = createConversation(db, { title: "Delete me" });
+    const preserved = createConversation(db, { title: "Keep me" });
+    const source = appendMessage(db, deleted.id, "user", "I value careful decisions.");
+    appendMessage(db, preserved.id, "user", "Keep this chat visible.");
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    recordFacet(db, {
+      kind: "value",
+      statement: "The user values careful decisions",
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+      confidence: 0.95,
+    });
+
+    await deleteConversationFromHistoryAction(deleted.id, "delete");
+
+    expect(getConversation(db, deleted.id)).not.toBeNull();
+    expect(getConversation(db, preserved.id)).not.toBeNull();
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([preserved.id]);
+    expect(messagesIn(db, deleted.id)).toHaveLength(1);
+    expect(listFacets(db)).toHaveLength(1);
+    expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/", "layout");
   });
 });
 

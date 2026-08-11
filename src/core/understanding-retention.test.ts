@@ -418,6 +418,63 @@ describe("claim-level retention", () => {
 });
 
 describe("understanding migrations", () => {
+  it("repairs stores whose understanding migration omitted backfill items", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    for (const migration of MIGRATIONS.slice(0, 9)) db.exec(migration.sql);
+    db.exec("DROP TABLE understanding_backfill_item");
+    const conversation = createConversation(db, { title: "Deletable chat" });
+    appendMessage(db, conversation.id, "user", "This source should be deletable.");
+
+    expect(() => db.exec(MIGRATIONS[9]!.sql)).not.toThrow();
+    expect(conversationDependencies(db, conversation.id).backfillItems).toBe(0);
+    expect(() => deleteConversationWithMemory(db, conversation.id)).not.toThrow();
+    expect(getConversation(db, conversation.id)).toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+    db.close();
+  });
+
+  it("upgrades stores created before candidate resolution auditing existed", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    for (const migration of MIGRATIONS.slice(0, 8)) db.exec(migration.sql);
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "I prefer concise plans.");
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "pending",
+    });
+    const candidate = createCandidate(db, {
+      kind: "facet",
+      payload: { statement: "The user prefers concise plans" },
+      reason: "inference",
+      confidence: 0.8,
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+
+    db.exec("DROP TABLE candidate_resolution_event");
+    expect(() => db.exec(MIGRATIONS[8]!.sql)).not.toThrow();
+    expect(
+      db
+        .prepare<[number], { count: number }>(
+          "SELECT COUNT(*) AS count FROM candidate_evidence WHERE candidate_id = ?",
+        )
+        .get(candidate.id)?.count,
+    ).toBe(1);
+    expect(
+      db
+        .prepare<[], { count: number }>(
+          "SELECT COUNT(*) AS count FROM candidate_resolution_event",
+        )
+        .get()?.count,
+    ).toBe(0);
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+    db.close();
+  });
+
   it("adds backfill_preview without losing candidate evidence or resolution audit", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");

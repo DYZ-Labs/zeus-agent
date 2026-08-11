@@ -62,15 +62,20 @@ export function SettingsModal({
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
-        className="flex h-full w-full flex-col overflow-hidden border shadow-2xl sm:h-[560px] sm:max-h-[calc(100vh-3rem)] sm:w-[680px] sm:max-w-[calc(100vw-3rem)] sm:flex-row sm:rounded-2xl"
-        style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+        className="flex h-full w-full flex-col overflow-hidden border text-sm leading-5 shadow-2xl sm:h-[560px] sm:max-h-[calc(100vh-3rem)] sm:w-[680px] sm:max-w-[calc(100vw-3rem)] sm:flex-row sm:rounded-2xl"
+        style={{
+          background: "var(--shell-panel)",
+          borderColor: "var(--shell-line-strong)",
+          fontFamily:
+            'ui-sans-serif, -apple-system, system-ui, "Segoe UI", Helvetica, "Apple Color Emoji", Arial, sans-serif, "Segoe UI Emoji", "Segoe UI Symbol"',
+        }}
       >
         <aside
           className="shrink-0 border-b sm:w-[180px] sm:border-b-0 sm:border-r"
           style={{ background: "var(--shell-sidebar)", borderColor: "var(--shell-line)" }}
         >
           <div className="flex h-12 items-center justify-between px-2 sm:h-auto sm:justify-start sm:pb-3 sm:pt-2">
-            <span className="pl-2 text-xl font-medium leading-7 sm:hidden">Settings</span>
+            <span className="pl-2 text-lg font-semibold leading-6 sm:hidden">Settings</span>
             <button
               type="button"
               onClick={close}
@@ -126,7 +131,7 @@ function SettingsSectionButton({
       type="button"
       aria-current={active ? "page" : undefined}
       onClick={onSelect}
-      className="flex h-10 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-base font-normal leading-6 transition-colors hover:bg-white/[0.06] sm:w-full"
+      className="flex h-10 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] sm:w-full"
       style={{
         background: active ? "var(--shell-elevated)" : undefined,
         color: active ? "var(--shell-fg)" : "var(--shell-muted)",

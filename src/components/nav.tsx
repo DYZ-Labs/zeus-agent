@@ -192,7 +192,7 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
             className="text-xs font-semibold leading-5"
             style={{ color: "var(--shell-faint)" }}
           >
-            Recent
+            Recents
           </h2>
           <span
             className="translate-x-[-2px] opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100"
@@ -213,6 +213,7 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
                   onOpen={() => undefined}
                   onChanged={() => finishConversationChange()}
                   onDeleted={() => finishConversationChange(chat.id)}
+                  directDelete
                 />
               ))}
             </ul>
@@ -243,6 +244,7 @@ export function ChatHistoryItem({
   onOpen,
   onChanged,
   onDeleted,
+  directDelete = false,
 }: {
   chat: RecentChat;
   active: boolean;
@@ -250,6 +252,7 @@ export function ChatHistoryItem({
   onOpen: () => void;
   onChanged: () => void;
   onDeleted: () => void;
+  directDelete?: boolean;
 }) {
   const containerRef = useRef<HTMLLIElement>(null);
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
@@ -295,6 +298,8 @@ export function ChatHistoryItem({
   }
 
   async function deleteChat() {
+    if (pending) return;
+
     setPending(true);
     try {
       await deleteConversationFromHistoryAction(chat.id, "delete");
@@ -367,17 +372,26 @@ export function ChatHistoryItem({
       </Link>
       <button
         type="button"
-        aria-label={`Chat options for ${title}`}
-        aria-expanded={state !== "closed"}
-        onClick={() => setState((current) => (current === "closed" ? "menu" : "closed"))}
-        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md transition-all hover:bg-white/[0.09] ${
+        aria-label={directDelete ? `Delete ${title}` : `Chat options for ${title}`}
+        title={directDelete ? "Delete" : undefined}
+        aria-expanded={directDelete ? undefined : state !== "closed"}
+        disabled={pending}
+        onClick={() => {
+          if (directDelete) {
+            void deleteChat();
+            return;
+          }
+          setState((current) => (current === "closed" ? "menu" : "closed"));
+        }}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] ${
+          directDelete ? "hover:[color:#ff6767]" : ""
+        } disabled:cursor-wait disabled:opacity-50 ${
           active || state !== "closed"
             ? "opacity-100"
             : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
         }`}
-        style={{ color: "var(--shell-muted)" }}
       >
-        <MoreIcon />
+        {directDelete ? <TrashIcon /> : <MoreIcon />}
       </button>
 
       {state !== "closed" && (
@@ -390,9 +404,9 @@ export function ChatHistoryItem({
         >
           {state === "deleting" ? (
             <div className="p-2">
-              <p className="text-sm font-medium leading-5">Delete this chat?</p>
+              <p className="text-sm font-medium leading-5">Remove this chat from history?</p>
               <p className="mt-1 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-                Details supported only by this chat will also be removed.
+                Its messages and saved details will stay stored.
               </p>
               <div className="mt-3 flex justify-end gap-2">
                 <button
@@ -410,7 +424,7 @@ export function ChatHistoryItem({
                   className="h-8 rounded-lg px-2.5 text-xs font-medium disabled:opacity-50"
                   style={{ background: "#7f1d1d", color: "#ffffff" }}
                 >
-                  {pending ? "Deleting…" : "Delete"}
+                  {pending ? "Removing…" : "Remove"}
                 </button>
               </div>
             </div>
@@ -436,7 +450,7 @@ export function ChatHistoryItem({
                 style={{ color: "#ff6767" }}
               >
                 <TrashIcon />
-                Delete
+                Remove from history
               </button>
             </>
           )}

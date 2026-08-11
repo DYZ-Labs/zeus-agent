@@ -19,6 +19,8 @@ import {
   appendMessage,
   createConversation,
   getConversation,
+  hideAllConversationsFromHistory,
+  hideConversationFromHistory,
   listConversations,
   setConversationTitle,
 } from "@/core/conversations";
@@ -56,10 +58,6 @@ import {
   ensureEvidencePassage,
   sourceLooksSensitive,
 } from "@/core/passages";
-import {
-  deleteAllConversationsWithMemory,
-  deleteConversationWithMemory,
-} from "@/core/retention";
 import type { Db } from "@/core/db";
 import type {
   Cardinality,
@@ -442,10 +440,8 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   const id = Number(formData.get("id"));
   const confirmation = String(formData.get("confirmation") ?? "");
   if (!Number.isInteger(id) || confirmation !== "delete") return;
-  deleteConversationWithMemory(getDb(), id);
+  if (!hideConversationFromHistory(getDb(), id)) return;
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
-  revalidatePath("/today");
   revalidatePath("/conversations");
   revalidatePath("/settings");
   redirect("/settings#data");
@@ -472,28 +468,20 @@ export async function deleteConversationFromHistoryAction(
   if (!Number.isInteger(id) || confirmation !== "delete") return;
 
   const db = getDb();
-  const conversation = getConversation(db, id);
-  if (!conversation || conversation.title === "Memory curation") return;
-
-  deleteConversationWithMemory(db, id);
+  if (!hideConversationFromHistory(db, id)) return;
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
-  revalidatePath("/today");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }
 
-export async function deleteAllConversationsAction(formData: FormData): Promise<void> {
+export async function deleteAllRecentChatsAction(formData: FormData): Promise<void> {
   const confirmation = String(formData.get("confirmation") ?? "");
-  if (confirmation !== "delete-all") return;
+  if (confirmation !== "delete-all-recent") return;
 
-  deleteAllConversationsWithMemory(getDb());
+  hideAllConversationsFromHistory(getDb());
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
-  revalidatePath("/today");
   revalidatePath("/conversations");
   revalidatePath("/settings");
-  redirect("/settings#data");
 }
 
 export async function supersedeFactAction(formData: FormData): Promise<void> {

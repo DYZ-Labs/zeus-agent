@@ -2,9 +2,9 @@ import {
   followThroughDecisionAction,
   setStewardshipModeAction,
 } from "@/app/actions";
-import { DeleteAllConversations } from "@/components/delete-all-conversations";
+import { DeleteAllRecentChats } from "@/components/delete-all-conversations";
 import { SettingsModal } from "@/components/settings-modal";
-import { listConversations } from "@/core/conversations";
+import { listChatHistory } from "@/core/conversations";
 import type {
   FollowThroughEventView,
   StewardshipMode,
@@ -23,7 +23,7 @@ export default function SettingsPage() {
   const setting = getStewardshipSetting(db);
   const metrics = followThroughMetrics(db);
   const events = listFollowThroughEvents(db, 20);
-  const conversationCount = listConversations(db, 500).length;
+  const recentChatCount = listChatHistory(db, 500).length;
 
   return (
     <SettingsModal
@@ -34,7 +34,7 @@ export default function SettingsPage() {
           events={events}
         />
       }
-      dataControls={<DataControlsSettings conversationCount={conversationCount} />}
+      dataControls={<DataControlsSettings recentChatCount={recentChatCount} />}
     />
   );
 }
@@ -50,13 +50,13 @@ function FollowThroughSettings({
 }) {
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
-      <h1 className="text-xl font-medium leading-7">Follow-through</h1>
+      <h1 className="text-lg font-semibold leading-6">Follow-through</h1>
       <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
         Choose when Zeus may surface one useful next action.
       </p>
 
       <div className="mt-6">
-        <h2 className="text-base font-medium leading-6">When Zeus should speak up</h2>
+        <h2 className="text-sm font-medium leading-5">When Zeus should speak up</h2>
         <p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
           Snoozes and dismissals always take priority over this setting.
         </p>
@@ -86,8 +86,8 @@ function FollowThroughSettings({
                     {selected && <span className="h-2 w-2 rounded-full" style={{ background: "var(--shell-fg)" }} />}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-base font-normal leading-6">{option.label}</span>
-                    <span className="block text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
+                    <span className="block text-sm font-normal leading-5">{option.label}</span>
+                    <span className="block text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
                       {option.description}
                     </span>
                   </span>
@@ -99,7 +99,7 @@ function FollowThroughSettings({
       </div>
 
       <details className="mt-6 border-t pt-4" style={{ borderColor: "var(--shell-line)" }}>
-        <summary className="flex cursor-pointer list-none items-center justify-between text-base leading-6">
+        <summary className="flex cursor-pointer list-none items-center justify-between text-sm leading-5">
           <span>Follow-through activity</span>
           <ChevronIcon />
         </summary>
@@ -124,24 +124,24 @@ function FollowThroughSettings({
   );
 }
 
-function DataControlsSettings({ conversationCount }: { conversationCount: number }) {
+function DataControlsSettings({ recentChatCount }: { recentChatCount: number }) {
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
-      <h1 className="text-xl font-medium leading-7">Data controls</h1>
+      <h1 className="text-lg font-semibold leading-6">Data controls</h1>
       <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
-        Manage the conversations Zeus stores locally on this device.
+        Manage which chats appear in Recents and chat history.
       </p>
 
       <div className="mt-5 border-y" style={{ borderColor: "var(--shell-line)" }}>
         <div className="flex min-h-16 items-center justify-between gap-4 py-3">
           <div className="min-w-0">
-            <p className="text-base leading-6">Stored conversations</p>
-            <p className="mt-0.5 text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
-              Includes chat messages and their source-backed memory.
+            <p className="text-sm leading-5">Chats in history</p>
+            <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
+              Removing a chat from history does not delete its messages or saved details.
             </p>
           </div>
-          <span className="shrink-0 text-base" style={{ color: "var(--shell-muted)" }}>
-            {conversationCount}
+          <span className="shrink-0 text-sm" style={{ color: "var(--shell-muted)" }}>
+            {recentChatCount}
           </span>
         </div>
         <div
@@ -149,12 +149,12 @@ function DataControlsSettings({ conversationCount }: { conversationCount: number
           style={{ borderColor: "var(--shell-line)" }}
         >
           <div className="min-w-0 flex-1">
-            <p className="text-base leading-6">Delete all conversations</p>
-            <p className="mt-0.5 text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
-              Also removes details and open loops with no surviving evidence.
+            <p className="text-sm leading-5">Delete all recent chats</p>
+            <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
+              Removes chats from Recents and chat history only. Everything stored stays intact.
             </p>
           </div>
-          <DeleteAllConversations disabled={conversationCount === 0} />
+          <DeleteAllRecentChats disabled={recentChatCount === 0} />
         </div>
       </div>
     </section>
@@ -166,7 +166,7 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
     <li className="flex flex-wrap items-start gap-3 border-t py-3" style={{ borderColor: "var(--shell-line)" }}>
       <div className="min-w-0 flex-1">
         <p className="text-sm leading-5">{event.commitment_title}</p>
-        <p className="mt-0.5 text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
+        <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
           {event.created_at.slice(0, 10)} · {event.event_type} · {event.reason.replace(/_/gu, " ")}
           {event.goal_title ? ` · ${event.goal_title}` : ""}
         </p>
@@ -195,8 +195,8 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
 function Metric({ value, label }: { value: number; label: string }) {
   return (
     <div className="rounded-lg px-3 py-2.5" style={{ background: "var(--shell-elevated)" }}>
-      <p className="text-base font-medium leading-5 tabular-nums">{value}</p>
-      <p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
+      <p className="text-sm font-medium leading-5 tabular-nums">{value}</p>
+      <p className="mt-1 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
         {label}
       </p>
     </div>

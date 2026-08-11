@@ -2,16 +2,14 @@ import {
   ConversationHistory,
   type ConversationHistoryEntry,
 } from "@/components/conversation-history";
-import { listConversations } from "@/core/conversations";
+import { listChatHistory } from "@/core/conversations";
 import { getDb } from "@/server/db";
 
 export const dynamic = "force-dynamic";
 
 export default function ConversationsPage() {
   const db = getDb();
-  const conversations = listConversations(db, 500).filter(
-    (conversation) => conversation.title !== "Memory curation",
-  );
+  const conversations = listChatHistory(db, 500);
   const chats: ConversationHistoryEntry[] = conversations.map((conversation) => {
     const firstUserMessage = db
       .prepare<[number], { content: string }>(

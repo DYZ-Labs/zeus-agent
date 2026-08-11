@@ -55,6 +55,23 @@ export function listConversations(db: Db, limit = 50): Conversation[] {
     .all(limit);
 }
 
+/** Conversations visible in user-facing chat history. Hidden rows remain stored so
+ * their messages can continue to serve as inspectable evidence for accepted memory. */
+export function listChatHistory(db: Db, limit = 500): Conversation[] {
+  return db
+    .prepare<[number], Conversation>(
+      `SELECT c.id, c.title, c.source, c.started_at, c.updated_at
+       FROM conversation c
+       WHERE COALESCE(c.title, '') != 'Memory curation'
+         AND NOT EXISTS (
+           SELECT 1 FROM conversation_history_state h WHERE h.conversation_id = c.id
+         )
+       ORDER BY c.updated_at DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+}
+
 /** Compact, display-ready history for the navigation sidebar. */
 export function listRecentChats(db: Db, limit = 12): RecentChat[] {
   const rows = db
@@ -73,6 +90,9 @@ export function listRecentChats(db: Db, limit = 12): RecentChat[] {
                ORDER BY m.id LIMIT 1) AS first_user_message
        FROM conversation c
        WHERE COALESCE(c.title, '') != 'Memory curation'
+         AND NOT EXISTS (
+           SELECT 1 FROM conversation_history_state h WHERE h.conversation_id = c.id
+         )
          AND EXISTS (SELECT 1 FROM message m WHERE m.conversation_id = c.id)
        ORDER BY c.updated_at DESC
        LIMIT ?`,
@@ -83,6 +103,31 @@ export function listRecentChats(db: Db, limit = 12): RecentChat[] {
     id: row.id,
     title: row.title?.trim() || chatTitle(row.first_user_message, row.id),
   }));
+}
+
+/** Remove one conversation from visible chat history without deleting its transcript,
+ * evidence, facts, goals, commitments, or any other source-backed data. */
+export function hideConversationFromHistory(db: Db, conversationId: number): boolean {
+  const result = db
+    .prepare<[string, number]>(
+      `INSERT OR IGNORE INTO conversation_history_state (hidden_at, conversation_id)
+       SELECT ?, id FROM conversation
+       WHERE id = ? AND COALESCE(title, '') != 'Memory curation'`,
+    )
+    .run(now(), conversationId);
+  return result.changes > 0;
+}
+
+/** Hide every ordinary chat while preserving the complete underlying data store. */
+export function hideAllConversationsFromHistory(db: Db): number {
+  const result = db
+    .prepare<[string]>(
+      `INSERT OR IGNORE INTO conversation_history_state (conversation_id, hidden_at)
+       SELECT id, ? FROM conversation
+       WHERE COALESCE(title, '') != 'Memory curation'`,
+    )
+    .run(now());
+  return result.changes;
 }
 
 function chatTitle(content: string | null, conversationId: number): string {

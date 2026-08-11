@@ -105,15 +105,22 @@ for (const entity of entities) {
 
 // Conversations, so the provenance references resolve to something readable.
 const conversations = db
-  .prepare<[], { id: number; title: string | null; started_at: string }>(
-    "SELECT id, title, started_at FROM conversation ORDER BY id",
+  .prepare<
+    [],
+    { id: number; title: string | null; started_at: string; hidden_at: string | null }
+  >(
+    `SELECT c.id, c.title, c.started_at, h.hidden_at
+     FROM conversation c
+     LEFT JOIN conversation_history_state h ON h.conversation_id = c.id
+     ORDER BY c.id`,
   )
   .all();
 
 const transcripts = conversations
   .map((conversation) => {
     const messages = messagesIn(db, conversation.id, 100_000);
-    const header = `## ${conversation.title ?? `Conversation ${conversation.id}`} — ${conversation.started_at.slice(0, 10)}`;
+    const hidden = conversation.hidden_at ? " · removed from chat history" : "";
+    const header = `## ${conversation.title ?? `Conversation ${conversation.id}`} — ${conversation.started_at.slice(0, 10)}${hidden}`;
     const body = messages
       .map(
         (message) =>

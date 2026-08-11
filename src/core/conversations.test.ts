@@ -1,11 +1,18 @@
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
 import {
   appendMessage,
   createConversation,
+  getConversation,
+  hideAllConversationsFromHistory,
+  hideConversationFromHistory,
+  listChatHistory,
   listRecentChats,
+  messagesIn,
 } from "./conversations";
 import { openTestDb } from "./db";
+import { MIGRATIONS } from "./migrations";
 
 describe("recent chats", () => {
   it("uses the first user message as a title and excludes memory curation", () => {
@@ -30,5 +37,37 @@ describe("recent chats", () => {
       { id: newer.id, title: "Named chat" },
       { id: older.id, title: "Plan the launch with the team." },
     ]);
+  });
+
+  it("hides chats from history without deleting their transcripts", () => {
+    const db = openTestDb();
+    const hidden = createConversation(db, { title: "Hidden chat" });
+    const visible = createConversation(db, { title: "Visible chat" });
+    appendMessage(db, hidden.id, "user", "Keep this source message.");
+    appendMessage(db, visible.id, "user", "Keep this chat visible.");
+
+    expect(hideConversationFromHistory(db, hidden.id)).toBe(true);
+    expect(listRecentChats(db).map((chat) => chat.id)).toEqual([visible.id]);
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([visible.id]);
+    expect(getConversation(db, hidden.id)).not.toBeNull();
+    expect(messagesIn(db, hidden.id)).toHaveLength(1);
+
+    expect(hideAllConversationsFromHistory(db)).toBe(1);
+    expect(listChatHistory(db)).toEqual([]);
+    expect(getConversation(db, visible.id)).not.toBeNull();
+  });
+
+  it("adds history visibility state to an existing conversation store", () => {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    for (const migration of MIGRATIONS.slice(0, 10)) db.exec(migration.sql);
+    const conversation = createConversation(db, { title: "Existing chat" });
+
+    expect(() => db.exec(MIGRATIONS[10]!.sql)).not.toThrow();
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([conversation.id]);
+    expect(hideConversationFromHistory(db, conversation.id)).toBe(true);
+    expect(getConversation(db, conversation.id)).not.toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+    db.close();
   });
 });
