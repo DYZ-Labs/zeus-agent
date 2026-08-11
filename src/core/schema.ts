@@ -15,6 +15,12 @@ export type Cardinality = z.infer<typeof Cardinality>;
 export const MessageRole = z.enum(["user", "assistant"]);
 export type MessageRole = z.infer<typeof MessageRole>;
 
+export const MessageOrigin = z.enum(["conversation", "user_action", "reflection", "backfill"]);
+export type MessageOrigin = z.infer<typeof MessageOrigin>;
+
+export const MessageRecallState = z.enum(["unclassified", "classified", "blocked"]);
+export type MessageRecallState = z.infer<typeof MessageRecallState>;
+
 export const ConversationSource = z.enum(["web", "mcp", "seed"]);
 export type ConversationSource = z.infer<typeof ConversationSource>;
 
@@ -24,10 +30,16 @@ export type OwnerKind = z.infer<typeof OwnerKind>;
 export const EvidenceKind = z.enum(["assertion", "reassertion", "correction"]);
 export type EvidenceKind = z.infer<typeof EvidenceKind>;
 
-export const CandidateKind = z.enum(["fact", "goal", "commitment", "interest"]);
+export const CandidateKind = z.enum(["fact", "goal", "commitment", "interest", "facet"]);
 export type CandidateKind = z.infer<typeof CandidateKind>;
 
-export const CandidateReason = z.enum(["inference", "ambiguous", "sensitive", "conflict"]);
+export const CandidateReason = z.enum([
+  "inference",
+  "ambiguous",
+  "sensitive",
+  "conflict",
+  "backfill_preview",
+]);
 export type CandidateReason = z.infer<typeof CandidateReason>;
 
 export const CandidateStatus = z.enum(["pending", "accepted", "rejected"]);
@@ -76,6 +88,49 @@ export const FollowThroughEventType = z.enum([
 ]);
 export type FollowThroughEventType = z.infer<typeof FollowThroughEventType>;
 
+export const FacetKind = z.enum([
+  "value",
+  "decision_criterion",
+  "constraint",
+  "preference",
+  "motivation",
+  "routine",
+  "communication_style",
+  "working_style",
+  "boundary",
+  "capacity_pattern",
+  "skill",
+  "relationship_dynamic",
+]);
+export type FacetKind = z.infer<typeof FacetKind>;
+
+export const FacetScopeKind = z.enum(["global", "domain", "entity", "goal", "commitment"]);
+export type FacetScopeKind = z.infer<typeof FacetScopeKind>;
+
+export const FacetScope = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("global") }).strict(),
+  z.object({ kind: z.literal("domain"), label: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("entity"), entityId: z.number().int() }).strict(),
+  z.object({ kind: z.literal("goal"), goalId: z.number().int() }).strict(),
+  z.object({ kind: z.literal("commitment"), commitmentId: z.number().int() }).strict(),
+]);
+export type FacetScope = z.infer<typeof FacetScope>;
+
+export const FacetImportance = z.enum(["low", "normal", "high"]);
+export type FacetImportance = z.infer<typeof FacetImportance>;
+
+export const FacetSensitivity = z.enum(["normal", "sensitive"]);
+export type FacetSensitivity = z.infer<typeof FacetSensitivity>;
+
+export const FacetMachineEffect = z.enum(["boost", "deprioritize", "block"]);
+export type FacetMachineEffect = z.infer<typeof FacetMachineEffect>;
+
+export const PassageSensitivity = z.enum(["normal", "sensitive", "uncertain"]);
+export type PassageSensitivity = z.infer<typeof PassageSensitivity>;
+
+export const PassageRecallStatus = z.enum(["allowed", "pending", "blocked"]);
+export type PassageRecallStatus = z.infer<typeof PassageRecallStatus>;
+
 // ---------------------------------------------------------------------------
 // Stored rows
 // ---------------------------------------------------------------------------
@@ -122,6 +177,8 @@ export const Message = z
     role: MessageRole,
     content: z.string(),
     created_at: z.string(),
+    origin: MessageOrigin,
+    recall_state: MessageRecallState,
   })
   .strict();
 export type Message = z.infer<typeof Message>;
@@ -142,6 +199,7 @@ export const FactEvidence = z
     id: z.number().int(),
     fact_id: z.number().int(),
     source_message_id: z.number().int(),
+    passage_id: z.number().int().nullable(),
     kind: EvidenceKind,
     confidence: z.number().min(0).max(1),
     created_at: z.string(),
@@ -155,14 +213,82 @@ export const MemoryCandidate = z
     kind: CandidateKind,
     payload_json: z.string(),
     reason: CandidateReason,
+    reasons_json: z.string(),
     confidence: z.number().min(0).max(1),
     source_message_id: z.number().int(),
     status: CandidateStatus,
+    dedupe_key: z.string().nullable(),
+    origin: z.enum(["live", "backfill"]),
+    backfill_job_id: z.number().int().nullable(),
     resolved_at: z.string().nullable(),
     created_at: z.string(),
   })
   .strict();
 export type MemoryCandidate = z.infer<typeof MemoryCandidate>;
+
+export const EvidencePassage = z
+  .object({
+    id: z.number().int(),
+    message_id: z.number().int(),
+    start_offset: z.number().int().nonnegative(),
+    end_offset: z.number().int().positive(),
+    text: z.string(),
+    sensitivity: PassageSensitivity,
+    recall_status: PassageRecallStatus,
+    extraction_run_id: z.number().int().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type EvidencePassage = z.infer<typeof EvidencePassage>;
+
+export const UnderstandingFacet = z
+  .object({
+    id: z.number().int(),
+    kind: FacetKind,
+    statement: z.string(),
+    scope_kind: FacetScopeKind,
+    scope_label: z.string().nullable(),
+    scope_entity_id: z.number().int().nullable(),
+    scope_goal_id: z.number().int().nullable(),
+    scope_commitment_id: z.number().int().nullable(),
+    condition_text: z.string().nullable(),
+    importance: FacetImportance,
+    sensitivity: FacetSensitivity,
+    confidence: z.number().min(0).max(1),
+    machine_effect: FacetMachineEffect.nullable(),
+    valid_from: z.string(),
+    valid_to: z.string().nullable(),
+    superseded_by: z.number().int().nullable(),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type UnderstandingFacet = z.infer<typeof UnderstandingFacet>;
+
+export const UnderstandingFacetView = UnderstandingFacet.extend({
+  scope_entity_name: z.string().nullable(),
+  scope_entity_slug: z.string().nullable(),
+  scope_goal_title: z.string().nullable(),
+  scope_commitment_title: z.string().nullable(),
+}).strict();
+export type UnderstandingFacetView = z.infer<typeof UnderstandingFacetView>;
+
+export const FacetEvidence = z
+  .object({
+    id: z.number().int(),
+    facet_id: z.number().int(),
+    passage_id: z.number().int(),
+    kind: z.enum(["assertion", "pattern_support", "correction"]),
+    confidence: z.number().min(0).max(1),
+    created_at: z.string(),
+    source_message_id: z.number().int(),
+    quote: z.string(),
+    start_offset: z.number().int().nonnegative(),
+    end_offset: z.number().int().positive(),
+  })
+  .strict();
+export type FacetEvidence = z.infer<typeof FacetEvidence>;
 
 export const Goal = z
   .object({
@@ -189,6 +315,7 @@ export const GoalEvent = z
     to_status: GoalStatus.nullable(),
     detail_json: z.string().nullable(),
     source_message_id: z.number().int().nullable(),
+    passage_id: z.number().int().nullable(),
     source_kind: z.enum(["message", "user_action"]),
     created_at: z.string(),
   })
@@ -230,6 +357,7 @@ export const CommitmentEvent = z
     to_status: CommitmentStatus.nullable(),
     detail_json: z.string().nullable(),
     source_message_id: z.number().int().nullable(),
+    passage_id: z.number().int().nullable(),
     source_kind: z.enum(["message", "user_action", "system"]),
     created_at: z.string(),
   })
@@ -352,6 +480,37 @@ const TrustFields = {
   ),
 };
 
+export const ExtractionEvidence = z
+  .object({
+    source_message_id: z
+      .number()
+      .int()
+      .describe("ID printed beside the USER EVIDENCE message containing this exact claim."),
+    quote: z
+      .string()
+      .describe("Exact contiguous quote copied from that user message; never paraphrased."),
+  })
+  .strict();
+export type ExtractionEvidence = z.infer<typeof ExtractionEvidence>;
+
+/**
+ * An extracted update must say whether a field is unchanged, assigned, or
+ * explicitly cleared. In particular, `null` is not allowed to carry both the
+ * meanings "the user said no value" and "the model did not hear an update".
+ */
+export type FieldPatch<T> =
+  | { op: "keep" }
+  | { op: "set"; value: T }
+  | { op: "clear" };
+
+export function FieldPatchSchema<T extends z.ZodType>(value: T) {
+  return z.discriminatedUnion("op", [
+    z.object({ op: z.literal("keep") }).strict(),
+    z.object({ op: z.literal("set"), value }).strict(),
+    z.object({ op: z.literal("clear") }).strict(),
+  ]);
+}
+
 export const ExtractedFact = z
   .object({
     subject: z
@@ -373,6 +532,12 @@ export const ExtractedFact = z
       .describe(
         "If the object is itself an entity in the entities array, its name. Otherwise null. This is what makes the memory a graph.",
       ),
+    operation: z
+      .enum(["assert", "retract"])
+      .default("assert")
+      .describe(
+        "Use retract only when the user explicitly says this exact multi-valued fact is no longer true; otherwise assert.",
+      ),
     confidence: z
       .number()
       .describe(
@@ -388,6 +553,10 @@ export const ExtractedFact = z
       .nullable()
       .default(null)
       .describe("ISO date/time when the fact became true if the user stated it, otherwise null."),
+    evidence: z
+      .array(ExtractionEvidence)
+      .default([])
+      .describe("Exact user-message evidence for this claim. Direct facts need one source."),
     ...TrustFields,
   })
   .strict();
@@ -403,20 +572,36 @@ export const ExtractedGoal = z
       .describe("ID from the supplied active-goal list when updating one; null for a new goal."),
     title: z.string().describe("Short goal title in the user's own terms."),
     status: GoalStatus.describe("The goal state established by this user message."),
-    priority: GoalPriority.nullable()
-      .default(null)
+    priority: FieldPatchSchema(GoalPriority)
       .describe(
-        "low, normal, or high only when the user explicitly states relative priority; null otherwise",
+        "For an update, keep unless the user explicitly changes priority; set to low, normal, or high when stated; clear resets it to normal. For a new goal, set when stated and otherwise clear.",
       ),
-    target_at: z
-      .string()
-      .nullable()
-      .describe("ISO date/time only when the user supplied a target; otherwise null."),
+    target_at: FieldPatchSchema(z.string()).describe(
+      "For an update, keep unless the user changes the target; set to a user-supplied ISO date/time; clear only when the user removes it. For a new goal, set when supplied and otherwise clear.",
+    ),
+    evidence: z.array(ExtractionEvidence).default([]),
     confidence: z.number().describe("Confidence that the user expressed this goal or update."),
     ...TrustFields,
   })
   .strict();
-export type ExtractedGoal = z.input<typeof ExtractedGoal>;
+type ModelExtractedGoal = z.input<typeof ExtractedGoal>;
+/** Also accepts the former nullable fields at the deterministic apply boundary. */
+export type ExtractedGoal = Omit<ModelExtractedGoal, "priority" | "target_at"> & {
+  priority?: ModelExtractedGoal["priority"] | GoalPriority | null;
+  target_at?: ModelExtractedGoal["target_at"] | string | null;
+};
+
+export const ExtractedGoalLink = z.discriminatedUnion("kind", [
+  z
+    .object({ kind: z.literal("id"), id: z.number().int() })
+    .strict()
+    .describe("An existing goal from the supplied active-goal list."),
+  z
+    .object({ kind: z.literal("title"), title: z.string() })
+    .strict()
+    .describe("A goal first created in this same extraction, identified by its exact title."),
+]);
+export type ExtractedGoalLink = z.infer<typeof ExtractedGoalLink>;
 
 export const ExtractedCommitment = z
   .object({
@@ -427,26 +612,85 @@ export const ExtractedCommitment = z
       .default(null)
       .describe("ID from the supplied open-commitment list when updating one; null for a new commitment."),
     title: z.string().describe("Concrete commitment or next action in the user's own terms."),
-    owner: z
-      .string()
-      .default(SELF_REF)
-      .describe(`Who owns it. Use "${SELF_REF}" when the user does.`),
-    linked_goal_id: z.number().int().nullable().default(null),
-    linked_goal_title: z
-      .string()
-      .nullable()
-      .default(null)
-      .describe("For a goal first created in this same extraction, provide its exact title; otherwise null."),
+    owner: FieldPatchSchema(z.string()).describe(
+      `For an update, keep unless ownership changes; set to the owner's entity name (or "${SELF_REF}" for the user); clear resets ownership to "${SELF_REF}". For a new commitment, set a stated owner and otherwise clear.`,
+    ),
+    linked_goal: FieldPatchSchema(ExtractedGoalLink).describe(
+      "For an update, keep unless the link changes; set by an existing goal ID or the exact title of a goal created in this extraction; clear only when the user removes the link. For a new commitment, set when linked and otherwise clear.",
+    ),
     status: CommitmentStatus.describe("The commitment state established by this user message."),
-    due_at: z
-      .string()
-      .nullable()
-      .describe("ISO date/time only when the user supplied a due date; otherwise null."),
+    due_at: FieldPatchSchema(z.string()).describe(
+      "For an update, keep unless the due date changes; set to a user-supplied ISO date/time; clear only when the user removes it. For a new commitment, set when supplied and otherwise clear.",
+    ),
+    evidence: z.array(ExtractionEvidence).default([]),
     confidence: z.number().describe("Confidence that the user expressed this commitment or update."),
     ...TrustFields,
   })
   .strict();
-export type ExtractedCommitment = z.input<typeof ExtractedCommitment>;
+type ModelExtractedCommitment = z.input<typeof ExtractedCommitment>;
+/** Also accepts the former owner/link/date fields at the deterministic apply boundary. */
+export type ExtractedCommitment = Omit<
+  ModelExtractedCommitment,
+  "owner" | "linked_goal" | "due_at"
+> & {
+  owner?: ModelExtractedCommitment["owner"] | string;
+  linked_goal?: ModelExtractedCommitment["linked_goal"];
+  linked_goal_id?: number | null;
+  linked_goal_title?: string | null;
+  due_at?: ModelExtractedCommitment["due_at"] | string | null;
+};
+
+export const ExtractedFacetScope = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("global") }).strict(),
+  z.object({ kind: z.literal("domain"), label: z.string() }).strict(),
+  z.object({ kind: z.literal("entity"), name: z.string() }).strict(),
+  z.object({ kind: z.literal("goal"), id: z.number().int() }).strict(),
+  z.object({ kind: z.literal("commitment"), id: z.number().int() }).strict(),
+]);
+export type ExtractedFacetScope = z.infer<typeof ExtractedFacetScope>;
+
+export const ExtractedFacet = z
+  .object({
+    kind: FacetKind,
+    statement: z
+      .string()
+      .describe("A concise, corrigible statement in the user's terms; never a diagnosis or personality label."),
+    scope: ExtractedFacetScope,
+    condition: z.string().nullable().default(null),
+    importance: FacetImportance.default("normal"),
+    machine_effect: FacetMachineEffect.nullable()
+      .default(null)
+      .describe("Only when the user explicitly asks Zeus to boost, deprioritize, or block this scope."),
+    confidence: z.number(),
+    effective_from: z.string().nullable().default(null),
+    evidence: z
+      .array(ExtractionEvidence)
+      .describe("Exact user evidence. A recurring inferred pattern requires at least two distinct messages."),
+    ...TrustFields,
+  })
+  .strict();
+export type ExtractedFacet = z.input<typeof ExtractedFacet>;
+
+export const FacetCandidatePayload = z
+  .object({
+    item: ExtractedFacet,
+    entities: z.array(ExtractedEntity).default([]),
+    conflict_preview: z.array(z.string()).default([]),
+    supersedes_facet_ids: z.array(z.number().int()).default([]),
+  })
+  .strict();
+export type FacetCandidatePayload = z.input<typeof FacetCandidatePayload>;
+
+export const SourceAssessment = z
+  .object({
+    source_message_id: z.number().int(),
+    sensitivity: z.enum(["normal", "sensitive", "uncertain"]),
+    sensitive_quotes: z
+      .array(z.string())
+      .describe("Exact sensitive excerpts. Empty only when sensitivity is normal."),
+  })
+  .strict();
+export type SourceAssessment = z.infer<typeof SourceAssessment>;
 
 export const Extraction = z
   .object({
@@ -468,10 +712,22 @@ export const Extraction = z
       .array(ExtractedCommitment)
       .default([])
       .describe("Concrete promises, next actions, waiting items, and explicit status changes."),
+    facets: z
+      .array(ExtractedFacet)
+      .default([])
+      .describe("Whole-person understanding: values, contextual preferences, constraints, styles, motivations, routines, boundaries, skills, and relationship dynamics."),
+    source_assessments: z
+      .array(SourceAssessment)
+      .default([])
+      .describe("Privacy classification for every user-evidence message supplied."),
   })
   .strict();
 /** Input form keeps defaults optional so fixture extractions remain concise. */
-export type Extraction = z.input<typeof Extraction>;
+type ModelExtraction = z.input<typeof Extraction>;
+export type Extraction = Omit<ModelExtraction, "goals" | "commitments"> & {
+  goals?: ExtractedGoal[];
+  commitments?: ExtractedCommitment[];
+};
 export type ParsedExtraction = z.output<typeof Extraction>;
 
 // ---------------------------------------------------------------------------
@@ -490,6 +746,9 @@ export type SearchHit = z.infer<typeof SearchHit>;
 
 export const EpisodeHit = z
   .object({
+    passage_id: z.number().int().nullable().default(null),
+    start_offset: z.number().int().nonnegative().nullable().default(null),
+    end_offset: z.number().int().positive().nullable().default(null),
     message: Message,
     conversation_title: z.string().nullable(),
     excerpt: z.string(),
@@ -504,5 +763,43 @@ export const RecallItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("episode"), episode: EpisodeHit }).strict(),
   z.object({ kind: z.literal("goal"), goal: Goal }).strict(),
   z.object({ kind: z.literal("commitment"), commitment: CommitmentView }).strict(),
+  z
+    .object({
+      kind: z.literal("facet"),
+      facet: UnderstandingFacetView,
+      evidence: z.array(FacetEvidence),
+    })
+    .strict(),
 ]);
 export type RecallItem = z.infer<typeof RecallItem>;
+
+export const ContextIntent = z.enum([
+  "factual",
+  "historical",
+  "relational",
+  "advisory",
+  "decision",
+  "follow_through",
+]);
+export type ContextIntent = z.infer<typeof ContextIntent>;
+
+export const ContextSelection = z
+  .object({
+    item: RecallItem,
+    reason: z.enum(["interaction_contract", "query_relevant", "historical", "open_loop", "follow_through"]),
+    score: z.number(),
+    via: z.array(z.enum(["lexical", "semantic", "graph", "core", "policy"])),
+    estimated_tokens: z.number().int().nonnegative(),
+  })
+  .strict();
+export type ContextSelection = z.infer<typeof ContextSelection>;
+
+export const ContextPlan = z
+  .object({
+    intent: ContextIntent,
+    budget_tokens: z.number().int().positive(),
+    estimated_tokens: z.number().int().nonnegative(),
+    selections: z.array(ContextSelection),
+  })
+  .strict();
+export type ContextPlan = z.infer<typeof ContextPlan>;

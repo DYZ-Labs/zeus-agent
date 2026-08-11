@@ -10,6 +10,7 @@ import {
 import { recordResponseContext } from "./context";
 import { openTestDb } from "./db";
 import { searchEpisodes } from "./episodes";
+import { allowWholeMessagePassage } from "./passages";
 import {
   addFactEvidence,
   evidenceForFact,
@@ -25,6 +26,7 @@ import {
   listGoals,
   markCommitmentSurfaced,
   selectNudge,
+  updateCommitment,
   updateGoal,
 } from "./intentions";
 import { selfEntity } from "./entities";
@@ -32,7 +34,10 @@ import {
   deleteAllConversationsWithMemory,
   deleteConversationWithMemory,
 } from "./retention";
-import { recalledForResponse } from "./response-context";
+import {
+  recalledForResponse,
+  responseSelectionsForResponse,
+} from "./response-context";
 import type { ExtractedFact, Extraction } from "./schema";
 
 afterEach(() => vi.unstubAllEnvs());
@@ -287,6 +292,8 @@ describe("episodic recall and source deletion", () => {
       "The user definitely plans to sell Project Aurora next week.",
     );
 
+    expect(await searchEpisodes(db, "Project Aurora", { limit: 10 })).toEqual([]);
+    allowWholeMessagePassage(db, user.id);
     const hits = await searchEpisodes(db, "Project Aurora", { limit: 10 });
     expect(hits.map((hit) => hit.message.id)).toEqual([user.id]);
     expect(hits[0]?.message.role).toBe("user");
@@ -535,5 +542,83 @@ describe("response provenance", () => {
 
     deleteConversationWithMemory(db, conversation.id);
     expect(recalledForResponse(db, assistant.id)).toEqual([]);
+  });
+
+  it("attributes each current intention field to the event that changed it", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const created = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "Launch is high priority, and the deck is due Friday.",
+    );
+    const goal = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: null,
+            title: "Launch",
+            status: "active",
+            priority: "high",
+            target_at: "2030-01-01",
+            confidence: 0.95,
+          },
+        ],
+      }),
+      created.id,
+    ).goals[0]!;
+    const commitment = createCommitment(db, {
+      title: "Send the launch deck",
+      linkedGoalId: goal.id,
+      dueAt: "2030-01-02",
+      sourceMessageId: created.id,
+    });
+    const changed = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "Pause the launch, and move the deck to Monday.",
+    );
+    const paused = updateGoal(db, goal.id, {
+      status: "paused",
+      sourceMessageId: changed.id,
+      sourceKind: "message",
+    })!;
+    const rescheduled = updateCommitment(db, commitment.id, {
+      dueAt: "2030-01-05",
+      sourceMessageId: changed.id,
+      sourceKind: "message",
+    })!;
+    const assistant = appendMessage(db, conversation.id, "assistant", "Understood.");
+    recordResponseContext(db, assistant.id, [
+      { kind: "goal", goal: paused },
+      { kind: "commitment", commitment: rescheduled },
+    ]);
+
+    const selections = responseSelectionsForResponse(db, assistant.id);
+    const goalTrace = selections.find((selection) => selection.item.kind === "goal");
+    const commitmentTrace = selections.find(
+      (selection) => selection.item.kind === "commitment",
+    );
+    expect(goalTrace?.fieldProvenance?.kind).toBe("goal");
+    if (goalTrace?.fieldProvenance?.kind === "goal") {
+      expect(goalTrace.fieldProvenance.fields.status.source_message_id).toBe(changed.id);
+      expect(goalTrace.fieldProvenance.fields.title.source_message_id).toBe(created.id);
+      expect(goalTrace.fieldProvenance.fields.priority.source_message_id).toBe(created.id);
+      expect(goalTrace.fieldProvenance.fields.target_at.source_message_id).toBe(created.id);
+    }
+    expect(commitmentTrace?.fieldProvenance?.kind).toBe("commitment");
+    if (commitmentTrace?.fieldProvenance?.kind === "commitment") {
+      expect(commitmentTrace.fieldProvenance.fields.due_at.source_message_id).toBe(changed.id);
+      expect(commitmentTrace.fieldProvenance.fields.title.source_message_id).toBe(created.id);
+      expect(commitmentTrace.fieldProvenance.fields.owner_entity_id.source_message_id).toBe(
+        created.id,
+      );
+      expect(commitmentTrace.fieldProvenance.fields.linked_goal_id.source_message_id).toBe(
+        created.id,
+      );
+    }
   });
 });

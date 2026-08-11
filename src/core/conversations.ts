@@ -1,6 +1,13 @@
 import type { Db } from "./db";
 import { now } from "./db";
-import type { Conversation, ConversationSource, Message, MessageRole } from "./schema";
+import type {
+  Conversation,
+  ConversationSource,
+  Message,
+  MessageOrigin,
+  MessageRecallState,
+  MessageRole,
+} from "./schema";
 
 export type RecentChat = {
   id: number;
@@ -95,15 +102,20 @@ export function appendMessage(
   conversationId: number,
   role: MessageRole,
   content: string,
+  options: { origin?: MessageOrigin; recallState?: MessageRecallState } = {},
 ): Message {
   const timestamp = now();
+  const origin = options.origin ?? "conversation";
+  const recallState = options.recallState ?? (role === "assistant" ? "blocked" : "unclassified");
 
   return db.transaction((): Message => {
     const result = db
-      .prepare<[number, MessageRole, string, string]>(
-        "INSERT INTO message (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+      .prepare<[number, MessageRole, string, string, MessageOrigin, MessageRecallState]>(
+        `INSERT INTO message
+           (conversation_id, role, content, created_at, origin, recall_state)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(conversationId, role, content, timestamp);
+      .run(conversationId, role, content, timestamp, origin, recallState);
 
     const id = Number(result.lastInsertRowid);
     db.prepare<[number, string]>("INSERT INTO message_fts (rowid, text) VALUES (?, ?)").run(
@@ -125,7 +137,8 @@ export function getMessage(db: Db, id: number): Message | null {
   return (
     db
       .prepare<[number], Message>(
-        "SELECT id, conversation_id, role, content, created_at FROM message WHERE id = ?",
+        `SELECT id, conversation_id, role, content, created_at, origin, recall_state
+         FROM message WHERE id = ?`,
       )
       .get(id) ?? null
   );
@@ -135,6 +148,7 @@ export function messagesIn(db: Db, conversationId: number, limit = 200): Message
   return db
     .prepare<[number, number], Message>(
       `SELECT id, conversation_id, role, content, created_at
+              , origin, recall_state
        FROM message WHERE conversation_id = ? ORDER BY id ASC LIMIT ?`,
     )
     .all(conversationId, limit);
@@ -145,6 +159,7 @@ export function recentMessages(db: Db, conversationId: number, limit = 20): Mess
   const rows = db
     .prepare<[number, number], Message>(
       `SELECT id, conversation_id, role, content, created_at
+              , origin, recall_state
        FROM message WHERE conversation_id = ? ORDER BY id DESC LIMIT ?`,
     )
     .all(conversationId, limit);

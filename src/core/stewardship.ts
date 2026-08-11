@@ -17,6 +17,7 @@ import type {
   FollowThroughEventView,
   FollowThroughReason,
   FollowThroughRecommendation,
+  FacetMachineEffect,
   Goal,
   StewardshipMode,
   StewardshipSetting,
@@ -86,12 +87,15 @@ export function recommendNextAction(
   );
   const terms = tokens(query);
   const me = selfEntity(db);
+  const machineEffects = activeMachineEffects(db);
 
   const ranked = commitments.flatMap((commitment): FollowThroughRecommendation[] => {
     const goal = commitment.linked_goal_id === null ? null : goals.get(commitment.linked_goal_id) ?? null;
     if (goal && goal.status !== "active") return [];
     if (isSnoozed(commitment, referenceTime) || isDismissedWithoutChange(db, commitment)) return [];
     if (!force && isCoolingDown(commitment, mode, referenceTime)) return [];
+    const policy = machineEffectFor(machineEffects, commitment, goal, query);
+    if (policy.blocked) return [];
 
     const recommendation = scoreRecommendation({
       commitment,
@@ -103,6 +107,7 @@ export function recommendNextAction(
       force,
       referenceTime,
       selfEntityId: me.id,
+      machineEffectDelta: policy.scoreDelta,
     });
     return recommendation ? [recommendation] : [];
   });
@@ -122,6 +127,8 @@ export function recommendationForCommitment(
   const commitment = getCommitment(db, commitmentId);
   if (!commitment) return null;
   const goal = commitment.linked_goal_id === null ? null : getGoal(db, commitment.linked_goal_id);
+  const policy = machineEffectFor(activeMachineEffects(db), commitment, goal, query);
+  if (policy.blocked) return null;
   return scoreRecommendation({
     commitment,
     goal,
@@ -132,6 +139,7 @@ export function recommendationForCommitment(
     force: true,
     referenceTime,
     selfEntityId: selfEntity(db).id,
+    machineEffectDelta: policy.scoreDelta,
   });
 }
 
@@ -161,6 +169,8 @@ export function recordFollowThroughDecision(
     responseMessageId?: number | null;
     sourceMessageId?: number | null;
     snoozedUntil?: string | null;
+    /** Optional verbatim user-authored rationale. Silence and clicks never create one. */
+    userReason?: string | null;
   },
 ): FollowThroughEvent | null {
   if (input.sourceMessageId) {
@@ -177,6 +187,10 @@ export function recordFollowThroughDecision(
     input.commitmentId,
     input.responseMessageId ?? null,
   );
+  const decisionSourceKind = sourceKindForUserMessage(
+    db,
+    input.sourceMessageId ?? null,
+  );
 
   return db.transaction(() => {
     let snoozedUntil: string | null = null;
@@ -186,25 +200,43 @@ export function recordFollowThroughDecision(
       updateCommitment(db, input.commitmentId, {
         snoozedUntil,
         sourceMessageId: input.sourceMessageId ?? null,
-        sourceKind: input.sourceMessageId ? "message" : "user_action",
+        sourceKind: decisionSourceKind,
       });
     } else if (input.decision === "completed" && commitment.status !== "done") {
       updateCommitment(db, input.commitmentId, {
         status: "done",
         sourceMessageId: input.sourceMessageId ?? null,
-        sourceKind: input.sourceMessageId ? "message" : "user_action",
+        sourceKind: decisionSourceKind,
       });
     }
 
+    const userReason = normalizeUserReason(input.userReason);
     return insertEvent(db, {
       recommendation,
       eventType: input.decision,
       responseMessageId,
       sourceMessageId: input.sourceMessageId ?? null,
-      sourceKind: input.sourceMessageId ? "message" : "user_action",
-      extraDetail: snoozedUntil ? { snoozed_until: snoozedUntil } : null,
+      sourceKind: decisionSourceKind,
+      extraDetail:
+        snoozedUntil || userReason
+          ? {
+              ...(snoozedUntil ? { snoozed_until: snoozedUntil } : {}),
+              ...(userReason ? { user_reason: userReason } : {}),
+            }
+          : null,
     });
   })();
+}
+
+function sourceKindForUserMessage(
+  db: Db,
+  sourceMessageId: number | null,
+): "message" | "user_action" {
+  if (sourceMessageId === null) return "user_action";
+  const origin = db
+    .prepare<[number], { origin: string }>("SELECT origin FROM message WHERE id = ?")
+    .get(sourceMessageId)?.origin;
+  return origin === "user_action" ? "user_action" : "message";
 }
 
 function validatedRecommendationResponse(
@@ -292,6 +324,54 @@ export function followThroughMetrics(db: Db): FollowThroughMetrics {
   };
 }
 
+type ActiveMachineEffect = {
+  machine_effect: FacetMachineEffect;
+  scope_kind: "global" | "domain" | "entity" | "goal" | "commitment";
+  scope_label: string | null;
+  scope_entity_id: number | null;
+  scope_goal_id: number | null;
+  scope_commitment_id: number | null;
+};
+
+function activeMachineEffects(db: Db): ActiveMachineEffect[] {
+  return db
+    .prepare<[], ActiveMachineEffect>(
+      `SELECT machine_effect, scope_kind, scope_label, scope_entity_id,
+              scope_goal_id, scope_commitment_id
+       FROM understanding_facet
+       WHERE valid_to IS NULL AND machine_effect IS NOT NULL
+       ORDER BY id`,
+    )
+    .all();
+}
+
+function machineEffectFor(
+  effects: readonly ActiveMachineEffect[],
+  commitment: CommitmentView,
+  goal: Goal | null,
+  query: string,
+): { blocked: boolean; scoreDelta: number } {
+  const targetTerms = tokens(
+    `${query} ${commitment.title} ${goal?.title ?? ""}`,
+  );
+  let scoreDelta = 0;
+  for (const effect of effects) {
+    const applies =
+      effect.scope_kind === "global" ||
+      (effect.scope_kind === "commitment" &&
+        effect.scope_commitment_id === commitment.id) ||
+      (effect.scope_kind === "goal" && effect.scope_goal_id === goal?.id) ||
+      (effect.scope_kind === "entity" &&
+        effect.scope_entity_id === commitment.owner_entity_id) ||
+      (effect.scope_kind === "domain" &&
+        [...tokens(effect.scope_label ?? "")].some((term) => targetTerms.has(term)));
+    if (!applies) continue;
+    if (effect.machine_effect === "block") return { blocked: true, scoreDelta: 0 };
+    scoreDelta += effect.machine_effect === "boost" ? 40 : -40;
+  }
+  return { blocked: false, scoreDelta: Math.max(-80, Math.min(80, scoreDelta)) };
+}
+
 type ScoreInput = {
   commitment: CommitmentView;
   goal: Goal | null;
@@ -302,6 +382,7 @@ type ScoreInput = {
   force: boolean;
   referenceTime: Date;
   selfEntityId: number;
+  machineEffectDelta: number;
 };
 
 function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | null {
@@ -352,6 +433,7 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
   if (stale) score += 20 + Math.min(20, ageDays - staleThreshold);
   if (conflict) score += 20 + conflictCount * 5;
   if (commitment.owner_entity_id === input.selfEntityId) score += 5;
+  score += input.machineEffectDelta;
 
   const reason: FollowThroughReason = overdue
     ? "overdue"
@@ -640,6 +722,11 @@ function normalizeFutureDate(value: string | null | undefined): string | null {
   if (!value) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && parsed > Date.now() ? new Date(parsed).toISOString() : null;
+}
+
+function normalizeUserReason(value: string | null | undefined): string | null {
+  const normalized = value?.replace(/\s+/gu, " ").trim().slice(0, 500) ?? "";
+  return normalized || null;
 }
 
 function assertMessageRole(db: Db, messageId: number, role: "user" | "assistant"): void {

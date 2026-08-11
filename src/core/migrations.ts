@@ -341,10 +341,418 @@ CREATE INDEX follow_through_type_idx
 ON follow_through_event(event_type, created_at DESC);
 `;
 
+/**
+ * Evidence-backed whole-person understanding.
+ *
+ * Facts remain atomic claims. Facets are accepted, contextual interpretations such as
+ * values, constraints, and communication preferences. Passages make episodic recall
+ * claim-sized so accepting one sensitive claim cannot unlock its whole source message.
+ */
+const UNDERSTANDING = `
+ALTER TABLE message
+ADD COLUMN origin TEXT NOT NULL DEFAULT 'conversation'
+  CHECK (origin IN ('conversation','user_action','reflection','backfill'));
+
+ALTER TABLE message
+ADD COLUMN recall_state TEXT NOT NULL DEFAULT 'unclassified'
+  CHECK (recall_state IN ('unclassified','classified','blocked'));
+
+-- An alias may name more than one entity. Resolution must surface ambiguity rather
+-- than silently binding a shared first name to whichever entity was inserted first.
+DROP INDEX entity_alias_alias_idx;
+CREATE INDEX entity_alias_lookup_idx ON entity_alias(alias, entity_id);
+
+CREATE TABLE entity_evidence (
+  id                 INTEGER PRIMARY KEY,
+  entity_id          INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  kind               TEXT NOT NULL CHECK (kind IN ('mention','assertion','correction')),
+  created_at         TEXT NOT NULL,
+  UNIQUE (entity_id, source_message_id, kind)
+);
+
+CREATE INDEX entity_evidence_source_idx ON entity_evidence(source_message_id);
+
+CREATE TABLE entity_alias_evidence (
+  entity_id          INTEGER NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+  alias              TEXT NOT NULL,
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  created_at         TEXT NOT NULL,
+  PRIMARY KEY (entity_id, alias, source_message_id),
+  FOREIGN KEY (entity_id, alias) REFERENCES entity_alias(entity_id, alias) ON DELETE CASCADE
+);
+
+CREATE TABLE extraction_run (
+  id                 INTEGER PRIMARY KEY,
+  model              TEXT NOT NULL,
+  prompt_version     TEXT NOT NULL,
+  focus_message_id   INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  status             TEXT NOT NULL CHECK (status IN ('started','completed','failed')),
+  error_code         TEXT,
+  started_at         TEXT NOT NULL,
+  completed_at       TEXT
+);
+
+CREATE INDEX extraction_run_focus_idx ON extraction_run(focus_message_id, id DESC);
+
+CREATE TABLE evidence_passage (
+  id                 INTEGER PRIMARY KEY,
+  message_id         INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  start_offset       INTEGER NOT NULL CHECK (start_offset >= 0),
+  end_offset         INTEGER NOT NULL CHECK (end_offset > start_offset),
+  text               TEXT NOT NULL,
+  sensitivity        TEXT NOT NULL CHECK (sensitivity IN ('normal','sensitive','uncertain')),
+  recall_status      TEXT NOT NULL CHECK (recall_status IN ('allowed','pending','blocked')),
+  extraction_run_id  INTEGER REFERENCES extraction_run(id) ON DELETE SET NULL,
+  created_at         TEXT NOT NULL,
+  UNIQUE (message_id, start_offset, end_offset)
+);
+
+CREATE INDEX evidence_passage_message_idx ON evidence_passage(message_id, start_offset);
+CREATE INDEX evidence_passage_recall_idx ON evidence_passage(recall_status, sensitivity);
+CREATE VIRTUAL TABLE passage_fts USING fts5(text, tokenize='porter unicode61');
+
+-- Canonical claims keep their message-level provenance for compatibility and also
+-- identify the exact validated claim span used by the production extractor.
+ALTER TABLE fact_evidence
+ADD COLUMN passage_id INTEGER REFERENCES evidence_passage(id) ON DELETE SET NULL;
+
+ALTER TABLE goal_event
+ADD COLUMN passage_id INTEGER REFERENCES evidence_passage(id) ON DELETE SET NULL;
+
+ALTER TABLE commitment_event
+ADD COLUMN passage_id INTEGER REFERENCES evidence_passage(id) ON DELETE SET NULL;
+
+CREATE INDEX fact_evidence_passage_idx ON fact_evidence(passage_id);
+CREATE INDEX goal_event_passage_idx ON goal_event(passage_id);
+CREATE INDEX commitment_event_passage_idx ON commitment_event(passage_id);
+
+CREATE TABLE passage_embedding (
+  passage_id   INTEGER PRIMARY KEY REFERENCES evidence_passage(id) ON DELETE CASCADE,
+  vec          BLOB NOT NULL,
+  dim          INTEGER NOT NULL,
+  model        TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+CREATE TABLE understanding_backfill_job (
+  id                 INTEGER PRIMARY KEY,
+  status             TEXT NOT NULL CHECK (status IN ('preview','running','completed','failed','cancelled')),
+  conversation_count INTEGER NOT NULL DEFAULT 0,
+  message_count      INTEGER NOT NULL DEFAULT 0,
+  processed_count    INTEGER NOT NULL DEFAULT 0,
+  last_message_id    INTEGER,
+  error_message      TEXT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  completed_at       TEXT
+);
+
+CREATE TABLE understanding_facet (
+  id                   INTEGER PRIMARY KEY,
+  kind                 TEXT NOT NULL CHECK (kind IN (
+                         'value','decision_criterion','constraint','preference','motivation',
+                         'routine','communication_style','working_style','boundary',
+                         'capacity_pattern','skill','relationship_dynamic'
+                       )),
+  statement            TEXT NOT NULL,
+  scope_kind           TEXT NOT NULL CHECK (scope_kind IN ('global','domain','entity','goal','commitment')),
+  scope_label          TEXT,
+  scope_entity_id      INTEGER REFERENCES entity(id) ON DELETE SET NULL,
+  scope_goal_id        INTEGER REFERENCES goal(id) ON DELETE SET NULL,
+  scope_commitment_id  INTEGER REFERENCES commitment(id) ON DELETE SET NULL,
+  condition_text       TEXT,
+  importance           TEXT NOT NULL DEFAULT 'normal' CHECK (importance IN ('low','normal','high')),
+  sensitivity          TEXT NOT NULL DEFAULT 'normal' CHECK (sensitivity IN ('normal','sensitive')),
+  confidence           REAL NOT NULL CHECK (confidence > 0 AND confidence <= 1),
+  machine_effect       TEXT CHECK (machine_effect IN ('boost','deprioritize','block')),
+  valid_from           TEXT NOT NULL,
+  valid_to             TEXT,
+  superseded_by        INTEGER REFERENCES understanding_facet(id) ON DELETE SET NULL,
+  source_message_id    INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at           TEXT NOT NULL,
+  updated_at           TEXT NOT NULL,
+  CHECK (
+    (scope_kind = 'global' AND scope_label IS NULL AND scope_entity_id IS NULL AND scope_goal_id IS NULL AND scope_commitment_id IS NULL)
+    OR (scope_kind = 'domain' AND scope_label IS NOT NULL AND scope_entity_id IS NULL AND scope_goal_id IS NULL AND scope_commitment_id IS NULL)
+    OR (scope_kind = 'entity' AND scope_entity_id IS NOT NULL AND scope_goal_id IS NULL AND scope_commitment_id IS NULL)
+    OR (scope_kind = 'goal' AND scope_goal_id IS NOT NULL AND scope_entity_id IS NULL AND scope_commitment_id IS NULL)
+    OR (scope_kind = 'commitment' AND scope_commitment_id IS NOT NULL AND scope_entity_id IS NULL AND scope_goal_id IS NULL)
+  )
+);
+
+CREATE INDEX understanding_facet_live_idx ON understanding_facet(kind, scope_kind)
+WHERE valid_to IS NULL;
+CREATE INDEX understanding_facet_source_idx ON understanding_facet(source_message_id);
+CREATE INDEX understanding_facet_entity_idx ON understanding_facet(scope_entity_id)
+WHERE scope_entity_id IS NOT NULL;
+CREATE INDEX understanding_facet_goal_idx ON understanding_facet(scope_goal_id)
+WHERE scope_goal_id IS NOT NULL;
+CREATE INDEX understanding_facet_commitment_idx ON understanding_facet(scope_commitment_id)
+WHERE scope_commitment_id IS NOT NULL;
+CREATE VIRTUAL TABLE facet_fts USING fts5(text, tokenize='porter unicode61');
+
+CREATE TABLE facet_evidence (
+  id                 INTEGER PRIMARY KEY,
+  facet_id           INTEGER NOT NULL REFERENCES understanding_facet(id) ON DELETE CASCADE,
+  passage_id         INTEGER NOT NULL REFERENCES evidence_passage(id) ON DELETE CASCADE,
+  kind               TEXT NOT NULL CHECK (kind IN ('assertion','pattern_support','correction')),
+  confidence         REAL NOT NULL CHECK (confidence > 0 AND confidence <= 1),
+  created_at         TEXT NOT NULL,
+  UNIQUE (facet_id, passage_id)
+);
+
+CREATE INDEX facet_evidence_facet_idx ON facet_evidence(facet_id, id);
+CREATE INDEX facet_evidence_passage_idx ON facet_evidence(passage_id);
+
+CREATE TABLE facet_event (
+  id                 INTEGER PRIMARY KEY,
+  facet_id           INTEGER REFERENCES understanding_facet(id) ON DELETE CASCADE,
+  event_type         TEXT NOT NULL CHECK (event_type IN ('accepted','corrected','closed','revived','forgotten')),
+  detail_json        TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind        TEXT NOT NULL CHECK (source_kind IN ('message','user_action','system')),
+  created_at         TEXT NOT NULL
+);
+
+CREATE INDEX facet_event_facet_idx ON facet_event(facet_id, id);
+
+-- Recreate the candidate table to add facets, multi-reason audit data, dedupe keys,
+-- and optional association with a preview-only historical backfill.
+ALTER TABLE memory_candidate RENAME TO memory_candidate_legacy;
+
+CREATE TABLE memory_candidate (
+  id                 INTEGER PRIMARY KEY,
+  kind               TEXT NOT NULL CHECK (kind IN ('fact','goal','commitment','interest','facet')),
+  payload_json       TEXT NOT NULL CHECK (json_valid(payload_json)),
+  reason             TEXT NOT NULL CHECK (reason IN ('inference','ambiguous','sensitive','conflict')),
+  reasons_json       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(reasons_json)),
+  confidence         REAL NOT NULL CHECK (confidence > 0 AND confidence <= 1),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
+  dedupe_key         TEXT,
+  origin             TEXT NOT NULL DEFAULT 'live' CHECK (origin IN ('live','backfill')),
+  backfill_job_id    INTEGER REFERENCES understanding_backfill_job(id) ON DELETE CASCADE,
+  resolved_at        TEXT,
+  created_at         TEXT NOT NULL
+);
+
+INSERT INTO memory_candidate
+  (id, kind, payload_json, reason, reasons_json, confidence, source_message_id,
+   status, dedupe_key, origin, backfill_job_id, resolved_at, created_at)
+SELECT id, kind, payload_json, reason, json_array(reason), confidence,
+       source_message_id, status, NULL, 'live', NULL, resolved_at, created_at
+FROM memory_candidate_legacy;
+
+DROP TABLE memory_candidate_legacy;
+CREATE INDEX memory_candidate_status_idx ON memory_candidate(status, created_at DESC);
+CREATE INDEX memory_candidate_source_idx ON memory_candidate(source_message_id);
+CREATE INDEX memory_candidate_dedupe_idx ON memory_candidate(dedupe_key, status)
+WHERE dedupe_key IS NOT NULL;
+CREATE INDEX memory_candidate_backfill_idx ON memory_candidate(backfill_job_id, status)
+WHERE backfill_job_id IS NOT NULL;
+
+CREATE TABLE candidate_evidence (
+  candidate_id  INTEGER NOT NULL REFERENCES memory_candidate(id) ON DELETE CASCADE,
+  passage_id    INTEGER NOT NULL REFERENCES evidence_passage(id) ON DELETE CASCADE,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (candidate_id, passage_id)
+);
+
+CREATE TABLE candidate_resolution_event (
+  id                 INTEGER PRIMARY KEY,
+  candidate_id       INTEGER NOT NULL REFERENCES memory_candidate(id) ON DELETE CASCADE,
+  decision           TEXT NOT NULL CHECK (decision IN ('accepted','rejected','edited_accepted')),
+  edited_payload_json TEXT CHECK (edited_payload_json IS NULL OR json_valid(edited_payload_json)),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind        TEXT NOT NULL CHECK (source_kind IN ('user_action','message','system')),
+  created_at         TEXT NOT NULL
+);
+
+CREATE INDEX candidate_resolution_candidate_idx
+ON candidate_resolution_event(candidate_id, id);
+
+CREATE TABLE understanding_backfill_item (
+  job_id             INTEGER NOT NULL REFERENCES understanding_backfill_job(id) ON DELETE CASCADE,
+  message_id         INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  extractor_version  TEXT NOT NULL,
+  status             TEXT NOT NULL CHECK (status IN ('pending','processing','completed','failed','skipped')),
+  candidate_count    INTEGER NOT NULL DEFAULT 0,
+  error_message      TEXT,
+  updated_at         TEXT NOT NULL,
+  PRIMARY KEY (job_id, message_id, extractor_version)
+);
+
+-- Response snapshots now support accepted facets and explain why every item was
+-- selected. Old snapshots and ranks remain byte-for-byte intact.
+ALTER TABLE response_context RENAME TO response_context_legacy;
+
+CREATE TABLE response_context (
+  assistant_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  item_kind             TEXT NOT NULL CHECK (item_kind IN ('fact','episode','goal','commitment','facet')),
+  item_id               INTEGER NOT NULL,
+  rank                  INTEGER NOT NULL,
+  selection_reason      TEXT,
+  selection_score       REAL,
+  retrieval_json        TEXT CHECK (retrieval_json IS NULL OR json_valid(retrieval_json)),
+  created_at            TEXT NOT NULL,
+  snapshot_json         TEXT CHECK (snapshot_json IS NULL OR json_valid(snapshot_json)),
+  PRIMARY KEY (assistant_message_id, item_kind, item_id)
+);
+
+INSERT INTO response_context
+  (assistant_message_id, item_kind, item_id, rank, selection_reason,
+   selection_score, retrieval_json, created_at, snapshot_json)
+SELECT assistant_message_id, item_kind, item_id, rank, NULL, NULL, NULL,
+       created_at, snapshot_json
+FROM response_context_legacy;
+
+DROP TABLE response_context_legacy;
+CREATE INDEX response_context_message_idx ON response_context(assistant_message_id, rank);
+
+CREATE TABLE mcp_recall_audit (
+  id                 INTEGER PRIMARY KEY,
+  tool_name          TEXT NOT NULL,
+  query_text         TEXT NOT NULL,
+  item_kind          TEXT NOT NULL CHECK (item_kind IN ('fact','episode','goal','commitment','facet')),
+  item_id            INTEGER NOT NULL,
+  rank               INTEGER NOT NULL,
+  snapshot_json      TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  created_at         TEXT NOT NULL
+);
+
+CREATE INDEX mcp_recall_audit_created_idx ON mcp_recall_audit(created_at DESC);
+`;
+
+/** Dedicated vectors keep facets out of the legacy owner-kind table and inherit
+ * deletion from their canonical row. Passage vectors already have the same shape
+ * in 006; facets need an independent table because the original generic embedding
+ * CHECK intentionally admits only facts, messages, and entities. */
+const FACET_EMBEDDINGS = `
+CREATE TABLE facet_embedding (
+  facet_id     INTEGER PRIMARY KEY REFERENCES understanding_facet(id) ON DELETE CASCADE,
+  vec          BLOB NOT NULL,
+  dim          INTEGER NOT NULL,
+  model        TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+CREATE INDEX facet_embedding_model_idx ON facet_embedding(model, facet_id);
+CREATE INDEX passage_embedding_model_idx ON passage_embedding(model, passage_id);
+`;
+
+/** Pending candidates are review proposals, not canonical memory, but MCP can read
+ * them through an explicit review tool. Give those reads their own truthful audit
+ * kind instead of disguising a candidate id as a fact or facet id. */
+const MCP_CANDIDATE_AUDIT = `
+ALTER TABLE mcp_recall_audit RENAME TO mcp_recall_audit_legacy;
+
+CREATE TABLE mcp_recall_audit (
+  id                 INTEGER PRIMARY KEY,
+  tool_name          TEXT NOT NULL,
+  query_text         TEXT NOT NULL,
+  item_kind          TEXT NOT NULL CHECK (item_kind IN ('fact','episode','goal','commitment','facet','candidate')),
+  item_id            INTEGER NOT NULL,
+  rank               INTEGER NOT NULL,
+  snapshot_json      TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  created_at         TEXT NOT NULL
+);
+
+INSERT INTO mcp_recall_audit
+  (id, tool_name, query_text, item_kind, item_id, rank, snapshot_json, created_at)
+SELECT id, tool_name, query_text, item_kind, item_id, rank, snapshot_json, created_at
+FROM mcp_recall_audit_legacy;
+
+DROP TABLE mcp_recall_audit_legacy;
+CREATE INDEX mcp_recall_audit_created_idx ON mcp_recall_audit(created_at DESC);
+`;
+
+/** Historical backfill is always preview-only. Its ordinary explicit statements may
+ * eventually be batch accepted, but the initial proposals need a distinct audit
+ * reason that deterministic policy can never mistake for live auto-acceptance. */
+const BACKFILL_PREVIEW_REASON = `
+DROP INDEX memory_candidate_status_idx;
+DROP INDEX memory_candidate_source_idx;
+DROP INDEX memory_candidate_dedupe_idx;
+DROP INDEX memory_candidate_backfill_idx;
+DROP INDEX candidate_resolution_candidate_idx;
+
+ALTER TABLE candidate_evidence RENAME TO candidate_evidence_legacy;
+ALTER TABLE candidate_resolution_event RENAME TO candidate_resolution_event_legacy;
+ALTER TABLE memory_candidate RENAME TO memory_candidate_legacy;
+
+CREATE TABLE memory_candidate (
+  id                 INTEGER PRIMARY KEY,
+  kind               TEXT NOT NULL CHECK (kind IN ('fact','goal','commitment','interest','facet')),
+  payload_json       TEXT NOT NULL CHECK (json_valid(payload_json)),
+  reason             TEXT NOT NULL CHECK (reason IN ('inference','ambiguous','sensitive','conflict','backfill_preview')),
+  reasons_json       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(reasons_json)),
+  confidence         REAL NOT NULL CHECK (confidence > 0 AND confidence <= 1),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
+  dedupe_key         TEXT,
+  origin             TEXT NOT NULL DEFAULT 'live' CHECK (origin IN ('live','backfill')),
+  backfill_job_id    INTEGER REFERENCES understanding_backfill_job(id) ON DELETE CASCADE,
+  resolved_at        TEXT,
+  created_at         TEXT NOT NULL
+);
+
+INSERT INTO memory_candidate
+  (id, kind, payload_json, reason, reasons_json, confidence, source_message_id,
+   status, dedupe_key, origin, backfill_job_id, resolved_at, created_at)
+SELECT id, kind, payload_json, reason, reasons_json, confidence, source_message_id,
+       status, dedupe_key, origin, backfill_job_id, resolved_at, created_at
+FROM memory_candidate_legacy;
+
+CREATE TABLE candidate_evidence (
+  candidate_id  INTEGER NOT NULL REFERENCES memory_candidate(id) ON DELETE CASCADE,
+  passage_id    INTEGER NOT NULL REFERENCES evidence_passage(id) ON DELETE CASCADE,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (candidate_id, passage_id)
+);
+
+INSERT INTO candidate_evidence (candidate_id, passage_id, created_at)
+SELECT candidate_id, passage_id, created_at FROM candidate_evidence_legacy;
+
+CREATE TABLE candidate_resolution_event (
+  id                  INTEGER PRIMARY KEY,
+  candidate_id        INTEGER NOT NULL REFERENCES memory_candidate(id) ON DELETE CASCADE,
+  decision            TEXT NOT NULL CHECK (decision IN ('accepted','rejected','edited_accepted')),
+  edited_payload_json TEXT CHECK (edited_payload_json IS NULL OR json_valid(edited_payload_json)),
+  source_message_id   INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind         TEXT NOT NULL CHECK (source_kind IN ('user_action','message','system')),
+  created_at          TEXT NOT NULL
+);
+
+INSERT INTO candidate_resolution_event
+  (id, candidate_id, decision, edited_payload_json, source_message_id,
+   source_kind, created_at)
+SELECT id, candidate_id, decision, edited_payload_json, source_message_id,
+       source_kind, created_at
+FROM candidate_resolution_event_legacy;
+
+DROP TABLE candidate_evidence_legacy;
+DROP TABLE candidate_resolution_event_legacy;
+DROP TABLE memory_candidate_legacy;
+
+CREATE INDEX memory_candidate_status_idx ON memory_candidate(status, created_at DESC);
+CREATE INDEX memory_candidate_source_idx ON memory_candidate(source_message_id);
+CREATE INDEX memory_candidate_dedupe_idx ON memory_candidate(dedupe_key, status)
+WHERE dedupe_key IS NOT NULL;
+CREATE INDEX memory_candidate_backfill_idx ON memory_candidate(backfill_job_id, status)
+WHERE backfill_job_id IS NOT NULL;
+CREATE INDEX candidate_resolution_candidate_idx
+ON candidate_resolution_event(candidate_id, id);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
   { id: "003_copilot", sql: COPILOT },
   { id: "004_response_snapshots", sql: RESPONSE_SNAPSHOTS },
   { id: "005_stewardship", sql: STEWARDSHIP },
+  { id: "006_understanding", sql: UNDERSTANDING },
+  { id: "007_facet_embeddings", sql: FACET_EMBEDDINGS },
+  { id: "008_mcp_candidate_audit", sql: MCP_CANDIDATE_AUDIT },
+  { id: "009_backfill_preview_reason", sql: BACKFILL_PREVIEW_REASON },
 ];

@@ -96,6 +96,13 @@ const goal = applyExtraction(
         confidence: 0.96,
       },
     ],
+    source_assessments: [
+      {
+        source_message_id: intent.id,
+        sensitivity: "normal",
+        sensitive_quotes: [],
+      },
+    ],
   },
   intent.id,
 );
@@ -136,6 +143,13 @@ const hallucination = applyExtraction(
         confidence: 0.9,
         supersedes_previous: false,
         grounding: "assistant_only",
+      },
+    ],
+    source_assessments: [
+      {
+        source_message_id: intent.id,
+        sensitivity: "normal",
+        sensitive_quotes: [],
       },
     ],
   },

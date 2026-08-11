@@ -172,9 +172,17 @@ function EventRow({ event }: { event: FollowThroughEventView }) {
         </p>
       </div>
       {event.event_type === "completed" && (
-        <form action={followThroughDecisionAction}>
+        <form action={followThroughDecisionAction} className="flex flex-wrap items-center justify-end gap-2">
           <input type="hidden" name="id" value={event.commitment_id} />
           <input type="hidden" name="decision" value="regretted" />
+          <input
+            name="reason"
+            maxLength={1000}
+            placeholder="Reason (optional)"
+            aria-label="Optional reason for regret"
+            className="min-h-[32px] rounded-md border px-2 text-sm"
+            style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)" }}
+          />
           <button type="submit" className="text-sm leading-5" style={{ color: "var(--shell-faint)" }}>
             Caused regret
           </button>

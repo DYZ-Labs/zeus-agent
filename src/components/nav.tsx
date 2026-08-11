@@ -14,6 +14,7 @@ import type { RecentChat } from "@/core/conversations";
 const PRIMARY_LINKS = [
   { href: "/today", label: "Today", icon: "today" },
   { href: "/memory", label: "Memory", icon: "memory" },
+  { href: "/understanding", label: "Understanding", icon: "understanding" },
 ] as const;
 
 const COMPACT_LINKS = [
@@ -558,6 +559,15 @@ function NavIcon({ name }: { name: IconName }) {
       <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
         <path d="M8 5.5a3 3 0 0 1 5.4-1.8A3.2 3.2 0 0 1 18 6.6a3.5 3.5 0 0 1 1 6.7A3.5 3.5 0 0 1 15.5 18H14a3 3 0 0 1-5.5.6A3.5 3.5 0 0 1 5 13.2a3.5 3.5 0 0 1 3-6.7Z" strokeLinecap="round" strokeLinejoin="round" />
         <path d="M12 5v14M8 9h4M12 14h4" strokeLinecap="round" />
+      </svg>
+    );
+  }
+  if (name === "understanding") {
+    return (
+      <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
+        <circle cx="8" cy="9" r="3" />
+        <circle cx="16" cy="9" r="3" />
+        <path d="M3.8 19a4.2 4.2 0 0 1 8.4 0M11.8 19a4.2 4.2 0 0 1 8.4 0M10.5 12.5l3-3" strokeLinecap="round" />
       </svg>
     );
   }

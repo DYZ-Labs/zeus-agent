@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/page-header";
 import { getConversation, getMessage, messagesIn } from "@/core/conversations";
 import { getFacts } from "@/core/facts";
 import { getCommitment, getGoal } from "@/core/intentions";
+import { getPassage } from "@/core/passages";
 import { getDb } from "@/server/db";
 
 export const dynamic = "force-dynamic";
@@ -14,7 +15,13 @@ export const dynamic = "force-dynamic";
  * The other end of a fact's provenance: the exact message it came from, in the context
  * of the conversation around it. Provenance you cannot follow is just decoration.
  */
-export default async function SourcePage({ params }: { params: Promise<{ id: string }> }) {
+export default async function SourcePage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ passage?: string }>;
+}) {
   const { id } = await params;
   const messageId = Number(id);
   if (!Number.isInteger(messageId)) notFound();
@@ -22,6 +29,9 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
   const db = getDb();
   const message = getMessage(db, messageId);
   if (!message) notFound();
+  const passageId = Number((await searchParams).passage);
+  const requestedPassage = Number.isInteger(passageId) ? getPassage(db, passageId) : null;
+  const passage = requestedPassage?.message_id === messageId ? requestedPassage : null;
 
   const conversation = getConversation(db, message.conversation_id);
   const transcript = messagesIn(db, message.conversation_id, 400);
@@ -75,6 +85,21 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
         >
           ← all memory
         </Link>
+
+        {passage && (
+          <section
+            className="mt-7 border-l-2 py-2 pl-4"
+            style={{ borderColor: "var(--shell-accent)" }}
+          >
+            <h2
+              className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
+              style={{ color: "var(--shell-faint)" }}
+            >
+              Recalled passage {passage.id} · offsets {passage.start_offset}-{passage.end_offset}
+            </h2>
+            <p className="mt-2 whitespace-pre-wrap text-[0.92rem]">{passage.text}</p>
+          </section>
+        )}
 
         {derived.length > 0 && (
           <section className="mt-7">

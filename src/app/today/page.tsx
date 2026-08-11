@@ -92,27 +92,33 @@ function RecommendationCard({
         </p>
       )}
 
-      <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-3 text-[0.78rem]">
-        <DecisionForm id={recommendation.commitment_id} decision="accepted">
+      <form action={followThroughDecisionAction} className="mt-5">
+        <input type="hidden" name="id" value={recommendation.commitment_id} />
+        <label className="block max-w-[34rem] text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+          Reason (optional; Zeus will store only what you write)
+          <input
+            name="reason"
+            maxLength={1000}
+            className="mt-1 block min-h-[36px] w-full rounded-md border px-2.5 text-[0.8rem]"
+            style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+          />
+        </label>
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-3 text-[0.78rem]">
           <button
             type="submit"
+            name="decision"
+            value="accepted"
             disabled={!canChat}
             className="rounded-md px-3 py-1.5 font-medium disabled:opacity-50"
             style={{ background: "var(--shell-accent)", color: "#000000" }}
           >
             Help me do this
           </button>
-        </DecisionForm>
-        <DecisionForm id={recommendation.commitment_id} decision="completed">
-          <button type="submit">Already done</button>
-        </DecisionForm>
-        <DecisionForm id={recommendation.commitment_id} decision="snoozed">
-          <button type="submit">Not now</button>
-        </DecisionForm>
-        <DecisionForm id={recommendation.commitment_id} decision="dismissed">
-          <button type="submit" style={{ color: "var(--shell-faint)" }}>Not useful</button>
-        </DecisionForm>
-      </div>
+          <button type="submit" name="decision" value="completed">Already done</button>
+          <button type="submit" name="decision" value="snoozed">Not now</button>
+          <button type="submit" name="decision" value="dismissed" style={{ color: "var(--shell-faint)" }}>Not useful</button>
+        </div>
+      </form>
       {!canChat && (
         <p className="mt-2 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
           Add an OpenAI API key to start this work in chat.
@@ -132,23 +138,5 @@ function RecommendationCard({
         )}
       </div>
     </article>
-  );
-}
-
-function DecisionForm({
-  id,
-  decision,
-  children,
-}: {
-  id: number;
-  decision: "accepted" | "dismissed" | "snoozed" | "completed" | "regretted";
-  children: React.ReactNode;
-}) {
-  return (
-    <form action={followThroughDecisionAction}>
-      <input type="hidden" name="id" value={id} />
-      <input type="hidden" name="decision" value={decision} />
-      {children}
-    </form>
   );
 }

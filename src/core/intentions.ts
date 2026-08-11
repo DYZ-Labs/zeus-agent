@@ -18,6 +18,7 @@ export type GoalInput = {
   targetAt?: string | null;
   confidence?: number;
   sourceMessageId: number;
+  passageId?: number | null;
 };
 
 export type GoalUpdate = {
@@ -28,6 +29,7 @@ export type GoalUpdate = {
   confidence?: number;
   sourceMessageId?: number | null;
   sourceKind?: "message" | "user_action";
+  passageId?: number | null;
 };
 
 export function getGoal(db: Db, id: number): Goal | null {
@@ -133,6 +135,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
       },
       input.sourceMessageId,
       "message",
+      input.passageId ?? null,
     );
     return getGoal(db, id);
   })();
@@ -210,6 +213,7 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
       },
       update.sourceMessageId ?? null,
       update.sourceKind ?? (update.sourceMessageId ? "message" : "user_action"),
+      update.passageId ?? null,
     );
     return getGoal(db, id);
   })();
@@ -219,7 +223,7 @@ export function goalEvents(db: Db, goalId: number): GoalEvent[] {
   return db
     .prepare<[number], GoalEvent>(
       `SELECT id, goal_id, event_type, from_status, to_status, detail_json,
-              source_message_id, source_kind, created_at
+              source_message_id, passage_id, source_kind, created_at
        FROM goal_event WHERE goal_id = ? ORDER BY id`,
     )
     .all(goalId);
@@ -234,7 +238,9 @@ function insertGoalEvent(
   detail: unknown,
   sourceMessageId: number | null,
   sourceKind: GoalEvent["source_kind"],
+  passageId: number | null = null,
 ): void {
+  assertPassageMatchesSource(db, sourceMessageId, passageId);
   db.prepare<[
     number,
     GoalEvent["event_type"],
@@ -242,13 +248,14 @@ function insertGoalEvent(
     GoalStatus | null,
     string | null,
     number | null,
+    number | null,
     GoalEvent["source_kind"],
     string,
   ]>(
     `INSERT INTO goal_event
        (goal_id, event_type, from_status, to_status, detail_json,
-        source_message_id, source_kind, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        source_message_id, passage_id, source_kind, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     goalId,
     eventType,
@@ -256,6 +263,7 @@ function insertGoalEvent(
     toStatus,
     detail === null ? null : JSON.stringify(detail),
     sourceMessageId,
+    passageId,
     sourceKind,
     now(),
   );
@@ -269,6 +277,7 @@ export type CommitmentInput = {
   dueAt?: string | null;
   confidence?: number;
   sourceMessageId: number;
+  passageId?: number | null;
 };
 
 export type CommitmentUpdate = {
@@ -281,6 +290,7 @@ export type CommitmentUpdate = {
   confidence?: number;
   sourceMessageId?: number | null;
   sourceKind?: "message" | "user_action";
+  passageId?: number | null;
 };
 
 const SELECT_COMMITMENT = `
@@ -389,6 +399,7 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
       },
       input.sourceMessageId,
       "message",
+      input.passageId ?? null,
     );
     return getCommitment(db, id);
   })();
@@ -497,6 +508,7 @@ export function updateCommitment(
       },
       update.sourceMessageId ?? null,
       update.sourceKind ?? (update.sourceMessageId ? "message" : "user_action"),
+      update.passageId ?? null,
     );
     return getCommitment(db, id);
   })();
@@ -506,7 +518,7 @@ export function commitmentEvents(db: Db, commitmentId: number): CommitmentEvent[
   return db
     .prepare<[number], CommitmentEvent>(
       `SELECT id, commitment_id, event_type, from_status, to_status, detail_json,
-              source_message_id, source_kind, created_at
+              source_message_id, passage_id, source_kind, created_at
        FROM commitment_event WHERE commitment_id = ? ORDER BY id`,
     )
     .all(commitmentId);
@@ -563,7 +575,9 @@ function insertCommitmentEvent(
   detail: unknown,
   sourceMessageId: number | null,
   sourceKind: CommitmentEvent["source_kind"],
+  passageId: number | null = null,
 ): void {
+  assertPassageMatchesSource(db, sourceMessageId, passageId);
   db.prepare<[
     number,
     CommitmentEvent["event_type"],
@@ -571,13 +585,14 @@ function insertCommitmentEvent(
     CommitmentStatus | null,
     string | null,
     number | null,
+    number | null,
     CommitmentEvent["source_kind"],
     string,
   ]>(
     `INSERT INTO commitment_event
        (commitment_id, event_type, from_status, to_status, detail_json,
-        source_message_id, source_kind, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        source_message_id, passage_id, source_kind, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     commitmentId,
     eventType,
@@ -585,9 +600,26 @@ function insertCommitmentEvent(
     toStatus,
     detail === null ? null : JSON.stringify(detail),
     sourceMessageId,
+    passageId,
     sourceKind,
     now(),
   );
+}
+
+function assertPassageMatchesSource(
+  db: Db,
+  sourceMessageId: number | null,
+  passageId: number | null,
+): void {
+  if (passageId === null) return;
+  const messageId = db
+    .prepare<[number], { message_id: number }>(
+      "SELECT message_id FROM evidence_passage WHERE id = ?",
+    )
+    .get(passageId)?.message_id;
+  if (sourceMessageId === null || messageId !== sourceMessageId) {
+    throw new Error(`Evidence passage ${passageId} does not match its intention source`);
+  }
 }
 
 function tokens(value: string): Set<string> {

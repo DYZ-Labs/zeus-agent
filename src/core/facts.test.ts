@@ -8,13 +8,16 @@ import {
   countFacts,
   correctFact,
   ensurePredicate,
+  evidenceForFact,
   factsForEntity,
   forgetFact,
   getFact,
   getPredicate,
   liveFacts,
   recordFact,
+  recomputeFactEvidenceAggregates,
   reindexFacts,
+  retractFact,
   setPredicateCardinality,
   supersedeFact,
   timeline,
@@ -106,6 +109,80 @@ describe("supersession", () => {
 
     expect(result.supersededIds).toHaveLength(1);
     expect(liveFacts(db, me, "primary_laptop").map((f) => f.object)).toEqual(["MacBook Pro"]);
+  });
+
+  it("closes a prior value when a dated replacement became effective", () => {
+    const me = selfEntity(db).id;
+    const first = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Lisbon",
+      validFrom: "2024-01-01",
+    });
+    const second = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Berlin",
+      validFrom: "2025-03-15",
+    });
+
+    expect(getFact(db, first.fact.id)?.valid_to).toBe("2025-03-15T00:00:00.000Z");
+    expect(getFact(db, first.fact.id)?.superseded_by).toBe(second.fact.id);
+  });
+
+  it("inserts a backdated value into history without replacing current truth", () => {
+    const me = selfEntity(db).id;
+    const current = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Lisbon",
+      validFrom: "2025-06-01",
+    });
+    const historical = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Berlin",
+      validFrom: "2025-01-01",
+    });
+
+    expect(getFact(db, current.fact.id)?.valid_to).toBeNull();
+    expect(getFact(db, historical.fact.id)).toMatchObject({
+      valid_to: "2025-06-01T00:00:00.000Z",
+      superseded_by: current.fact.id,
+    });
+    expect(liveFacts(db, me, "lives_in").map((fact) => fact.object)).toEqual(["Lisbon"]);
+  });
+
+  it("splices a backdated value between two established periods", () => {
+    const me = selfEntity(db).id;
+    const oldest = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Berlin",
+      validFrom: "2024-01-01",
+    });
+    const current = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Lisbon",
+      validFrom: "2025-01-01",
+    });
+    const middle = recordFact(db, {
+      subjectId: me,
+      predicate: "lives_in",
+      object: "Paris",
+      validFrom: "2024-06-01",
+    });
+
+    expect(getFact(db, oldest.fact.id)).toMatchObject({
+      valid_to: "2024-06-01T00:00:00.000Z",
+      superseded_by: middle.fact.id,
+    });
+    expect(getFact(db, middle.fact.id)).toMatchObject({
+      valid_to: "2025-01-01T00:00:00.000Z",
+      superseded_by: current.fact.id,
+    });
+    expect(liveFacts(db, me, "lives_in").map((fact) => fact.object)).toEqual(["Lisbon"]);
   });
 });
 
@@ -223,6 +300,127 @@ describe("curation", () => {
     expect(stale?.superseded_by).toBeNull();
     // Still closed — forgetting the replacement does not resurrect the old truth.
     expect(stale?.valid_to).not.toBeNull();
+  });
+
+  it("retracts one sourced multi-valued fact without losing its history", () => {
+    const me = selfEntity(db).id;
+    const coffeeSource = messageId();
+    const climbingSource = messageId();
+    const coffee = recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "coffee",
+      sourceMessageId: coffeeSource,
+      validFrom: "2024-01-01",
+    }).fact;
+    const climbing = recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "rock climbing",
+      sourceMessageId: climbingSource,
+    }).fact;
+    const retractionSource = messageId();
+
+    const closed = retractFact(db, coffee.id, {
+      sourceMessageId: retractionSource,
+      validTo: "2025-05-20",
+    });
+
+    expect(closed?.valid_to).toBe("2025-05-20T00:00:00.000Z");
+    expect(closed?.superseded_by).toBeNull();
+    expect(liveFacts(db, me, "likes").map((fact) => fact.id)).toEqual([climbing.id]);
+    expect(factsForEntity(db, me, { includeSuperseded: true }).map((fact) => fact.id)).toContain(
+      coffee.id,
+    );
+    expect(evidenceForFact(db, coffee.id).map((entry) => [entry.source_message_id, entry.kind]))
+      .toEqual([
+        [coffeeSource, "assertion"],
+        [retractionSource, "correction"],
+      ]);
+  });
+
+  it("refuses to retract a single-valued fact without a replacement", () => {
+    const me = selfEntity(db).id;
+    const fact = recordFact(db, {
+      subjectId: me,
+      predicate: "works_at",
+      object: "Acme",
+      sourceMessageId: messageId(),
+    }).fact;
+    const retractionSource = messageId();
+
+    expect(() => retractFact(db, fact.id, { sourceMessageId: retractionSource })).toThrow(
+      /single-valued/u,
+    );
+    expect(getFact(db, fact.id)?.valid_to).toBeNull();
+    expect(evidenceForFact(db, fact.id)).toHaveLength(1);
+  });
+
+  it("refuses assistant-authored retraction evidence", () => {
+    const me = selfEntity(db).id;
+    const fact = recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "coffee",
+      sourceMessageId: messageId(),
+    }).fact;
+    const conversation = createConversation(db);
+    const assistant = appendMessage(db, conversation.id, "assistant", "You no longer like coffee.");
+
+    expect(() => retractFact(db, fact.id, { sourceMessageId: assistant.id })).toThrow(
+      /user-authored/u,
+    );
+    expect(getFact(db, fact.id)?.valid_to).toBeNull();
+    expect(evidenceForFact(db, fact.id)).toHaveLength(1);
+  });
+});
+
+describe("evidence aggregates", () => {
+  it("recomputes fact strength and recency from the evidence that survives", () => {
+    const me = selfEntity(db).id;
+    const firstSource = messageId();
+    const secondSource = messageId();
+    const thirdSource = messageId();
+    const first = recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "coffee",
+      sourceMessageId: firstSource,
+      confidence: 0.6,
+    }).fact;
+    recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "coffee",
+      sourceMessageId: secondSource,
+      confidence: 0.8,
+    });
+    recordFact(db, {
+      subjectId: me,
+      predicate: "likes",
+      object: "coffee",
+      sourceMessageId: thirdSource,
+      confidence: 0.7,
+    });
+    db.prepare<[string, number]>(
+      "UPDATE fact_evidence SET created_at = ? WHERE source_message_id = ?",
+    ).run("2024-01-01T00:00:00.000Z", firstSource);
+    db.prepare<[string, number]>(
+      "UPDATE fact_evidence SET created_at = ? WHERE source_message_id = ?",
+    ).run("2024-02-01T00:00:00.000Z", secondSource);
+    db.prepare<[string, number]>(
+      "UPDATE fact_evidence SET created_at = ? WHERE source_message_id = ?",
+    ).run("2024-03-01T00:00:00.000Z", thirdSource);
+
+    db.prepare<[number, number]>(
+      "DELETE FROM fact_evidence WHERE fact_id = ? AND source_message_id = ?",
+    ).run(first.id, secondSource);
+    const repaired = recomputeFactEvidenceAggregates(db, first.id);
+
+    expect(repaired?.assertion_count).toBe(2);
+    expect(repaired?.confidence).toBeCloseTo(0.72);
+    expect(repaired?.last_seen_at).toBe("2024-03-01T00:00:00.000Z");
+    expect(recomputeFactEvidenceAggregates(db, 999_999)).toBeNull();
   });
 });
 

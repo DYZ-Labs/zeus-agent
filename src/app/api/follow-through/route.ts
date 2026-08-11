@@ -12,6 +12,7 @@ const Body = z
     commitmentId: z.number().int().positive(),
     decision: z.enum(["accepted", "dismissed", "snoozed", "completed", "regretted"]),
     responseMessageId: z.number().int().positive().nullable().optional(),
+    userReason: z.string().trim().min(1).max(1000).optional(),
   })
   .strict();
 
@@ -32,6 +33,7 @@ export async function POST(request: Request): Promise<Response> {
     commitmentId: parsed.data.commitmentId,
     decision: parsed.data.decision,
     responseMessageId: parsed.data.responseMessageId ?? null,
+    userReason: parsed.data.userReason ?? null,
   });
   if (!event) {
     return Response.json({ error: "That recommendation is no longer actionable." }, { status: 409 });

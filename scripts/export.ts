@@ -15,6 +15,7 @@ import { messagesIn } from "../src/core/conversations";
 import { listCandidates } from "../src/core/candidates";
 import { defaultDbPath, openDb } from "../src/core/db";
 import { aliasesOf, listEntities } from "../src/core/entities";
+import { evidenceForFacet, listFacets } from "../src/core/facets";
 import { countFacts, evidenceForFact, factsForEntity } from "../src/core/facts";
 import {
   commitmentEvents,
@@ -39,9 +40,12 @@ function renderFact(fact: FactView, withSubject: boolean): string {
   const subject = fact.subject_slug === "self" ? "You" : fact.subject_name;
   const head = withSubject ? `**${subject}** ${fact.predicate}` : `${fact.predicate}`;
   const evidence = evidenceForFact(db, fact.id);
-  const sources = evidence.map((entry) => entry.source_message_id);
+  const sources = evidence.map(
+    (entry) =>
+      `message ${entry.source_message_id}${entry.passage_id ? ` / passage ${entry.passage_id}` : ""}`,
+  );
   const source = sources.length
-    ? ` · evidence: messages ${sources.join(", ")}`
+    ? ` · evidence: ${sources.join(", ")}`
     : fact.source_message_id
       ? ` · source: message ${fact.source_message_id}`
       : " · source: unattributed legacy fact";
@@ -113,7 +117,7 @@ const transcripts = conversations
     const body = messages
       .map(
         (message) =>
-          `**${message.role === "assistant" ? "Zeus" : "You"}** (message ${message.id}):  \n${message.content}`,
+          `**${message.role === "assistant" ? "Zeus" : "You"}** (message ${message.id}; origin ${message.origin}; recall ${message.recall_state}):  \n${message.content}`,
       )
       .join("\n\n");
     return `${header}\n\n${body}`;
@@ -132,7 +136,7 @@ const goalBody = goals.length
   ? goals
       .map((goal) => {
         const events = goalEvents(db, goal.id)
-          .map((event) => `  - ${event.created_at}: ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.detail_json ? ` — ${event.detail_json}` : ""}`)
+          .map((event) => `  - ${event.created_at}: ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.passage_id ? ` (passage ${event.passage_id})` : ""}${event.detail_json ? ` — ${event.detail_json}` : ""}`)
           .join("\n");
         return `- **[${goal.status}] ${goal.title}** — ${goal.priority} priority${goal.target_at ? `, target ${goal.target_at}` : ""}  \n  _source: message ${goal.source_message_id}_\n${events}`;
       })
@@ -142,7 +146,7 @@ const commitmentBody = commitments.length
   ? commitments
       .map((item) => {
         const events = commitmentEvents(db, item.id)
-          .map((event) => `  - ${event.created_at}: ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.detail_json ? ` — ${event.detail_json}` : ""}`)
+          .map((event) => `  - ${event.created_at}: ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.passage_id ? ` (passage ${event.passage_id})` : ""}${event.detail_json ? ` — ${event.detail_json}` : ""}`)
           .join("\n");
         return `- **[${item.status}] ${item.title}** — owner ${item.owner_name}${item.due_at ? `, due ${item.due_at}` : ""}  \n  _source: message ${item.source_message_id}_\n${events}`;
       })
@@ -195,13 +199,164 @@ writeFileSync(
   `# Memory candidates\n\nPending proposals are not canonical and are never used as facts until accepted.\n\n${
     candidates.length
       ? candidates
-          .map(
-            (candidate) =>
-              `## Candidate ${candidate.id} — ${candidate.kind}\n\n- status: ${candidate.status}\n- reason: ${candidate.reason}\n- confidence: ${candidate.confidence}\n- source: message ${candidate.source_message_id}\n\n\`\`\`json\n${JSON.stringify(candidate.payload, null, 2)}\n\`\`\``,
-          )
+          .map((candidate) => {
+            const resolutions = db
+              .prepare<
+                [number],
+                {
+                  decision: string;
+                  edited_payload_json: string | null;
+                  source_message_id: number | null;
+                  source_kind: string;
+                  created_at: string;
+                }
+              >(
+                `SELECT decision, edited_payload_json, source_message_id,
+                        source_kind, created_at
+                 FROM candidate_resolution_event
+                 WHERE candidate_id = ? ORDER BY id`,
+              )
+              .all(candidate.id)
+              .map(
+                (event) =>
+                  `  - ${event.created_at}: ${event.decision} (${event.source_kind}${event.source_message_id === null ? "" : `, message ${event.source_message_id}`})${event.edited_payload_json === null ? "" : ` — edited payload: ${event.edited_payload_json}`}`,
+              )
+              .join("\n");
+            return `## Candidate ${candidate.id} — ${candidate.kind}\n\n- status: ${candidate.status}${candidate.resolved_at ? ` (resolved ${candidate.resolved_at})` : ""}\n- reasons: ${candidate.reasons.join(", ")}\n- confidence: ${candidate.confidence}\n- source: message ${candidate.source_message_id}\n- origin: ${candidate.origin}${candidate.backfill_job_id ? ` (backfill job ${candidate.backfill_job_id})` : ""}\n- evidence: ${candidate.evidence.length ? candidate.evidence.map((passage) => `passage ${passage.id} / message ${passage.message_id}`).join(", ") : "none"}\n\nPayload:\n\n\`\`\`json\n${JSON.stringify(candidate.payload, null, 2)}\n\`\`\`\n\nResolution history:\n${resolutions || "  - _No resolution events._"}`;
+          })
           .join("\n\n")
       : "_Nothing pending._"
   }\n`,
+  "utf8",
+);
+
+const passages = db
+  .prepare<
+    [],
+    {
+      id: number;
+      message_id: number;
+      start_offset: number;
+      end_offset: number;
+      text: string;
+      sensitivity: string;
+      recall_status: string;
+      extraction_run_id: number | null;
+      created_at: string;
+    }
+  >(
+    `SELECT id, message_id, start_offset, end_offset, text, sensitivity,
+            recall_status, extraction_run_id, created_at
+     FROM evidence_passage ORDER BY message_id, start_offset, id`,
+  )
+  .all();
+writeFileSync(
+  join(outDir, "evidence-passages.md"),
+  [
+    "# Evidence passages",
+    "",
+    "Passages are the exact claim-sized source spans Zeus may use as dated episodic evidence.",
+    "A blocked or pending passage is stored but not recallable.",
+    "",
+    passages.length
+      ? passages
+          .map(
+            (passage) =>
+              `## Passage ${passage.id}\n\n- source: message ${passage.message_id}, offsets ${passage.start_offset}–${passage.end_offset}\n- sensitivity: ${passage.sensitivity}\n- recall: ${passage.recall_status}\n- extraction run: ${passage.extraction_run_id ?? "none"}\n- created: ${passage.created_at}\n\n> ${passage.text.replace(/\n/gu, "\n> ")}`,
+          )
+          .join("\n\n")
+      : "_No evidence passages._",
+    "",
+  ].join("\n"),
+  "utf8",
+);
+
+const facets = listFacets(db, { includeClosed: true, limit: 100_000 });
+function facetScope(facet: (typeof facets)[number]): string {
+  if (facet.scope_kind === "domain") return `domain:${facet.scope_label ?? "unknown"}`;
+  if (facet.scope_kind === "entity") {
+    return `entity:${facet.scope_entity_name ?? facet.scope_entity_id ?? "unknown"}`;
+  }
+  if (facet.scope_kind === "goal") {
+    return `goal:${facet.scope_goal_title ?? facet.scope_goal_id ?? "unknown"}`;
+  }
+  if (facet.scope_kind === "commitment") {
+    return `commitment:${facet.scope_commitment_title ?? facet.scope_commitment_id ?? "unknown"}`;
+  }
+  return "global";
+}
+const facetBody = facets.length
+  ? facets
+      .map((facet) => {
+        const evidence = evidenceForFacet(db, facet.id);
+        const events = db
+          .prepare<
+            [number],
+            {
+              event_type: string;
+              detail_json: string | null;
+              source_message_id: number | null;
+              source_kind: string;
+              created_at: string;
+            }
+          >(
+            `SELECT event_type, detail_json, source_message_id, source_kind, created_at
+             FROM facet_event WHERE facet_id = ? ORDER BY id`,
+          )
+          .all(facet.id)
+          .map(
+            (event) =>
+              `  - ${event.created_at}: ${event.event_type} (${event.source_kind}${event.source_message_id ? `, message ${event.source_message_id}` : ""})${event.detail_json ? ` — ${event.detail_json}` : ""}`,
+          )
+          .join("\n");
+        const quotes = evidence.length
+          ? evidence
+              .map(
+                (entry) =>
+                  `  - passage ${entry.passage_id} / message ${entry.source_message_id} [${entry.start_offset}, ${entry.end_offset}): “${entry.quote}”`,
+              )
+              .join("\n")
+          : "  - _No surviving evidence._";
+        return `## Facet ${facet.id} — ${facet.kind}\n\n- status: ${facet.valid_to ? `closed ${facet.valid_to}` : "current"}\n- statement: ${facet.statement}\n- scope: ${facetScope(facet)}\n- condition: ${facet.condition_text ?? "none"}\n- importance: ${facet.importance}\n- sensitivity: ${facet.sensitivity}\n- confidence: ${facet.confidence}\n- machine effect: ${facet.machine_effect ?? "none"}\n- valid: ${facet.valid_from} → ${facet.valid_to ?? "current"}\n- source: message ${facet.source_message_id}\n- superseded by: ${facet.superseded_by ?? "none"}\n\nEvidence:\n${quotes}\n\nHistory:\n${events || "  - _No events._"}`;
+      })
+      .join("\n\n")
+  : "_No understanding facets._";
+writeFileSync(
+  join(outDir, "understanding.md"),
+  `# Understanding\n\nThese are accepted, evidence-backed facets. Closed versions remain history.\n\n${facetBody}\n`,
+  "utf8",
+);
+
+const backfillJobs = db
+  .prepare<[], Record<string, unknown>>(
+    `SELECT id, status, conversation_count, message_count, processed_count,
+            last_message_id, error_message, created_at, updated_at, completed_at
+     FROM understanding_backfill_job ORDER BY id`,
+  )
+  .all();
+const backfillItems = db
+  .prepare<[], Record<string, unknown>>(
+    `SELECT job_id, message_id, extractor_version, status, candidate_count,
+            error_message, updated_at
+     FROM understanding_backfill_item ORDER BY job_id, message_id`,
+  )
+  .all();
+writeFileSync(
+  join(outDir, "historical-backfill.md"),
+  `# Historical backfill\n\nBackfill is opt-in and preview-only until candidates are accepted.\n\n## Jobs\n\n${backfillJobs.length ? `\`\`\`json\n${JSON.stringify(backfillJobs, null, 2)}\n\`\`\`` : "_No jobs._"}\n\n## Items\n\n${backfillItems.length ? `\`\`\`json\n${JSON.stringify(backfillItems, null, 2)}\n\`\`\`` : "_No items._"}\n`,
+  "utf8",
+);
+
+const recallAudit = db
+  .prepare<[], Record<string, unknown>>(
+    `SELECT id, tool_name, query_text, item_kind, item_id, rank,
+            snapshot_json, created_at
+     FROM mcp_recall_audit ORDER BY id`,
+  )
+  .all();
+writeFileSync(
+  join(outDir, "mcp-recall-audit.md"),
+  `# MCP recall audit\n\nEach row is an immutable snapshot of memory returned by an MCP recall tool.\n\n${recallAudit.length ? `\`\`\`json\n${JSON.stringify(recallAudit, null, 2)}\n\`\`\`` : "_No MCP recall traces._"}\n`,
   "utf8",
 );
 
@@ -227,6 +382,10 @@ writeFileSync(
     `Goals and commitments, including their event histories, are in [open-loops.md](open-loops.md).`,
     `Follow-through proposals and user control decisions are in [follow-through.md](follow-through.md).`,
     `Memory proposals and their review status are in [memory-candidates.md](memory-candidates.md).`,
+    `Claim-sized evidence and recall status are in [evidence-passages.md](evidence-passages.md).`,
+    `Accepted understanding facets and their history are in [understanding.md](understanding.md).`,
+    `Historical-backfill controls are in [historical-backfill.md](historical-backfill.md).`,
+    `MCP recall snapshots are in [mcp-recall-audit.md](mcp-recall-audit.md).`,
     ``,
   ].join("\n"),
   "utf8",

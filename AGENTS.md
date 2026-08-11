@@ -82,6 +82,9 @@ npm run mcp            # stdio MCP server
 - `src/core/embed.ts` — local embeddings, vector persistence, similarity floors, fallback.
 - `src/core/search.ts` — FTS, vector, graph retrieval, and reciprocal-rank fusion.
 - `src/core/episodes.ts` — dated retrieval over user messages only.
+- `src/core/passages.ts` — exact evidence spans, privacy classification, and recall state.
+- `src/core/facets.ts` — scoped, temporal, evidence-backed user understanding.
+- `src/core/backfill.ts` — resumable, opt-in historical facet preview.
 - `src/core/context.ts` — canonical prompt context and response trace writes.
 - `src/core/response-context.ts` — read-side reconstruction of recalled items.
 - `src/core/intentions.ts` — goals, commitments, priorities, and append-only lifecycle events.
@@ -312,10 +315,10 @@ write path; it is not evidence of live extraction quality.
 
 ## Known limitations
 
-- A single value of a multi-valued predicate cannot be retracted automatically. Close it
-  explicitly from `/memory`.
-- Entity aliases are globally unique. When extraction splits one person into two, merge
-  them from the curation UI.
+- Natural multi-value retraction is conservative and succeeds only when one current
+  subject/predicate/value resolves exactly; ambiguous retractions remain candidates.
+- Shared aliases deliberately resolve as ambiguous. Merge genuinely duplicate entities
+  from curation; never force a shared short name to one person.
 - Vector search is brute-force and intended for roughly fewer than 50,000 facts. Beyond
   that scale, use an ANN index and recalibrate retrieval behavior.
 - Live extraction quality requires real-conversation evaluation; the offline seed and

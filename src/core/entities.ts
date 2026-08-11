@@ -34,7 +34,10 @@ export function slugify(raw: string): string {
 type EntityRow = Entity;
 
 const SELECT_ENTITY = `
-  SELECT id, kind, name, slug, summary, created_at, updated_at FROM entity
+  SELECT entity.id AS id, entity.kind AS kind, entity.name AS name,
+         entity.slug AS slug, entity.summary AS summary,
+         entity.created_at AS created_at, entity.updated_at AS updated_at
+  FROM entity
 `;
 
 export function getEntity(db: Db, id: number): Entity | null {
@@ -62,26 +65,43 @@ export function selfEntity(db: Db): Entity {
   return entity;
 }
 
+export class AmbiguousEntityError extends Error {
+  readonly candidates: Entity[];
+
+  constructor(name: string, candidates: Entity[]) {
+    super(`Entity reference "${name}" is ambiguous`);
+    this.name = "AmbiguousEntityError";
+    this.candidates = candidates;
+  }
+}
+
+export function resolveEntityCandidates(db: Db, name: string): Entity[] {
+  const folded = foldAlias(name);
+  if (!folded) return [];
+
+  const exact = db
+    .prepare<[string, string], EntityRow>(
+      `${SELECT_ENTITY} WHERE slug = ? OR lower(name) = ? ORDER BY id`,
+    )
+    .all(slugify(name), folded);
+  if (exact.length > 0) return uniqueEntities(exact);
+
+  return uniqueEntities(
+    db
+      .prepare<[string], EntityRow>(
+        `SELECT e.id, e.kind, e.name, e.slug, e.summary, e.created_at, e.updated_at
+         FROM entity e
+         JOIN entity_alias a ON a.entity_id = e.id
+         WHERE a.alias = ? ORDER BY e.id`,
+      )
+      .all(folded),
+  );
+}
+
 /** Find an entity by any known alias, slug, or exact name. Returns null if unknown. */
 export function resolveEntity(db: Db, name: string): Entity | null {
-  const folded = foldAlias(name);
-  if (!folded) return null;
-
-  const byAlias = db
-    .prepare<[string], EntityRow>(
-      `${SELECT_ENTITY} WHERE id = (SELECT entity_id FROM entity_alias WHERE alias = ?)`,
-    )
-    .get(folded);
-  if (byAlias) return byAlias;
-
-  const bySlug = getEntityBySlug(db, slugify(name));
-  if (bySlug) return bySlug;
-
-  return (
-    db
-      .prepare<[string], EntityRow>(`${SELECT_ENTITY} WHERE lower(name) = ?`)
-      .get(folded) ?? null
-  );
+  const candidates = resolveEntityCandidates(db, name);
+  return candidates.length === 1 ? candidates[0]! : null;
 }
 
 /**
@@ -95,18 +115,14 @@ export function addAlias(db: Db, entityId: number, alias: string): boolean {
   const folded = foldAlias(alias);
   if (!folded) return false;
 
-  const existing = db
-    .prepare<[string], { entity_id: number }>(
-      "SELECT entity_id FROM entity_alias WHERE alias = ?",
-    )
-    .get(folded);
-
-  if (existing) return existing.entity_id === entityId;
-
   db.prepare<[number, string, string]>(
-    "INSERT INTO entity_alias (entity_id, alias, created_at) VALUES (?, ?, ?)",
+    "INSERT OR IGNORE INTO entity_alias (entity_id, alias, created_at) VALUES (?, ?, ?)",
   ).run(entityId, folded, now());
-  return true;
+  return Boolean(
+    db.prepare<[number, string]>(
+      "SELECT 1 FROM entity_alias WHERE entity_id = ? AND alias = ?",
+    ).get(entityId, folded),
+  );
 }
 
 export function aliasesOf(db: Db, entityId: number): string[] {
@@ -144,7 +160,9 @@ export type UpsertEntityInput = {
  * so the next mention of any of them resolves here.
  */
 export function upsertEntity(db: Db, input: UpsertEntityInput): Entity {
-  const existing = resolveEntity(db, input.name);
+  const candidates = resolveEntityCandidates(db, input.name);
+  if (candidates.length > 1) throw new AmbiguousEntityError(input.name, candidates);
+  const existing = candidates[0] ?? null;
 
   if (existing) {
     for (const alias of [input.name, ...(input.aliases ?? [])]) {
@@ -170,6 +188,45 @@ export function upsertEntity(db: Db, input: UpsertEntityInput): Entity {
   const created = getEntity(db, id);
   if (!created) throw new Error(`Entity ${id} vanished immediately after insert`);
   return created;
+}
+
+export function upsertEntityWithEvidence(
+  db: Db,
+  input: UpsertEntityInput & {
+    sourceMessageId: number;
+    evidenceKind?: "mention" | "assertion" | "correction";
+  },
+): Entity {
+  const source = db
+    .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
+    .get(input.sourceMessageId);
+  if (source?.role !== "user") {
+    throw new Error("Entity evidence requires a stored user message");
+  }
+  return db.transaction(() => {
+    const entity = upsertEntity(db, input);
+    db.prepare<[number, number, string, string]>(
+      `INSERT OR IGNORE INTO entity_evidence
+         (entity_id, source_message_id, kind, created_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(
+      entity.id,
+      input.sourceMessageId,
+      input.evidenceKind ?? "mention",
+      now(),
+    );
+    for (const alias of [input.name, ...(input.aliases ?? [])]) {
+      const folded = foldAlias(alias);
+      if (!folded) continue;
+      addAlias(db, entity.id, folded);
+      db.prepare<[number, string, number, string]>(
+        `INSERT OR IGNORE INTO entity_alias_evidence
+           (entity_id, alias, source_message_id, created_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(entity.id, folded, input.sourceMessageId, now());
+    }
+    return entity;
+  })();
 }
 
 export function setEntitySummary(db: Db, id: number, summary: string | null): void {
@@ -228,27 +285,286 @@ export function mergeEntities(db: Db, sourceId: number, targetId: number): void 
   }
 
   db.transaction(() => {
+    const sourceAliasEvidence = db
+      .prepare<
+        [number],
+        { alias: string; source_message_id: number; created_at: string }
+      >(
+        `SELECT alias, source_message_id, created_at
+         FROM entity_alias_evidence
+         WHERE entity_id = ?
+         ORDER BY alias, source_message_id`,
+      )
+      .all(sourceId);
+    const affectedFactIds = db
+      .prepare<[number, number], { id: number }>(
+        `SELECT id FROM fact
+         WHERE subject_id = ? OR object_entity_id = ?
+         ORDER BY id`,
+      )
+      .all(sourceId, sourceId)
+      .map((row) => row.id);
+
     db.prepare<[number, number]>(
       "UPDATE fact SET subject_id = ? WHERE subject_id = ?",
     ).run(targetId, sourceId);
     db.prepare<[number, number]>(
       "UPDATE fact SET object_entity_id = ? WHERE object_entity_id = ?",
     ).run(targetId, sourceId);
+    db.prepare<[number, number]>(
+      "UPDATE commitment SET owner_entity_id = ? WHERE owner_entity_id = ?",
+    ).run(targetId, sourceId);
+    db.prepare<[number, number]>(
+      "UPDATE understanding_facet SET scope_entity_id = ? WHERE scope_entity_id = ?",
+    ).run(targetId, sourceId);
 
-    // Re-point aliases individually so a collision with the target's existing
-    // aliases is skipped rather than aborting the whole merge.
-    for (const alias of aliasesOf(db, sourceId)) {
-      db.prepare<[string]>("DELETE FROM entity_alias WHERE alias = ?").run(alias);
-      addAlias(db, targetId, alias);
+    reconcileMergedFacts(db, targetId);
+    reconcileMergedFacets(db, targetId);
+
+    // Evidence is additive. Re-point unique evidence rows without losing either
+    // source when both halves of the merge already cite the same message.
+    db.prepare<[number, number]>(
+      `INSERT INTO entity_evidence
+         (entity_id, source_message_id, kind, created_at)
+       SELECT ?, source_message_id, kind, created_at
+       FROM entity_evidence WHERE entity_id = ?
+       ON CONFLICT (entity_id, source_message_id, kind) DO UPDATE SET
+         created_at = MIN(entity_evidence.created_at, excluded.created_at)`,
+    ).run(targetId, sourceId);
+    db.prepare<[number]>("DELETE FROM entity_evidence WHERE entity_id = ?").run(sourceId);
+
+    // Subject names participate in lexical and semantic fact text. Rebuild every
+    // fact touched by the merge (including incoming graph edges) and discard its
+    // now-stale vector so the normal reindex backlog can regenerate it.
+    const readFact = db.prepare<
+      [number],
+      { id: number; subject_name: string; predicate: string; object: string }
+    >(
+      `SELECT f.id, e.name AS subject_name, f.predicate, f.object
+       FROM fact f JOIN entity e ON e.id = f.subject_id
+       WHERE f.id = ?`,
+    );
+    const deleteFactFts = db.prepare<[number]>("DELETE FROM fact_fts WHERE rowid = ?");
+    const insertFactFts = db.prepare<[number, string]>(
+      "INSERT INTO fact_fts (rowid, text) VALUES (?, ?)",
+    );
+    const deleteFactEmbedding = db.prepare<[number]>(
+      "DELETE FROM embedding WHERE owner_kind = 'fact' AND owner_id = ?",
+    );
+    for (const factId of affectedFactIds) {
+      const fact = readFact.get(factId);
+      if (!fact) continue;
+      deleteFactFts.run(factId);
+      insertFactFts.run(
+        factId,
+        `${fact.subject_name} ${fact.predicate.replace(/_/gu, " ")} ${fact.object}`,
+      );
+      deleteFactEmbedding.run(factId);
     }
 
-    db.prepare<[number]>("DELETE FROM embedding WHERE owner_kind = 'entity' AND owner_id = ?").run(
-      sourceId,
-    );
+    // Re-point aliases individually. Aliases may now be ambiguous across unrelated
+    // entities, so delete only the source binding and preserve all evidence attached
+    // to the binding being moved.
+    for (const alias of aliasesOf(db, sourceId)) {
+      db.prepare<[number, string]>(
+        "DELETE FROM entity_alias WHERE entity_id = ? AND alias = ?",
+      ).run(sourceId, alias);
+      db.prepare<[number, string, string]>(
+        `INSERT OR IGNORE INTO entity_alias (entity_id, alias, created_at)
+         VALUES (?, ?, ?)`,
+      ).run(targetId, alias, now());
+      const evidenceRows = sourceAliasEvidence.filter((entry) => entry.alias === alias);
+      const insertEvidence = db.prepare<[number, string, number, string]>(
+        `INSERT INTO entity_alias_evidence
+           (entity_id, alias, source_message_id, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (entity_id, alias, source_message_id) DO UPDATE SET
+           created_at = MIN(entity_alias_evidence.created_at, excluded.created_at)`,
+      );
+      for (const evidence of evidenceRows) {
+        insertEvidence.run(targetId, alias, evidence.source_message_id, evidence.created_at);
+      }
+    }
+
+    db.prepare<[number, number]>(
+      "DELETE FROM embedding WHERE owner_kind = 'entity' AND owner_id IN (?, ?)",
+    ).run(sourceId, targetId);
     db.prepare<[number]>("DELETE FROM entity WHERE id = ?").run(sourceId);
     db.prepare<[string, number]>("UPDATE entity SET updated_at = ? WHERE id = ?").run(
       now(),
       targetId,
     );
   })();
+}
+
+function reconcileMergedFacts(db: Db, entityId: number): void {
+  type FactRow = {
+    id: number;
+    subject_id: number;
+    predicate: string;
+    object: string;
+    object_entity_id: number | null;
+    confidence: number;
+    valid_from: string;
+    assertion_count: number;
+    last_seen_at: string;
+  };
+  const live = db
+    .prepare<[number, number], FactRow>(
+      `SELECT id, subject_id, predicate, object, object_entity_id, confidence,
+              valid_from, assertion_count, last_seen_at
+       FROM fact
+       WHERE valid_to IS NULL AND (subject_id = ? OR object_entity_id = ?)
+       ORDER BY id`,
+    )
+    .all(entityId, entityId);
+  const exactGroups = new Map<string, FactRow[]>();
+  for (const fact of live) {
+    const objectKey = fact.object_entity_id === null
+      ? `text:${foldAlias(fact.object)}`
+      : `entity:${fact.object_entity_id}`;
+    const key = `${fact.subject_id}\u0000${fact.predicate}\u0000${objectKey}`;
+    exactGroups.set(key, [...(exactGroups.get(key) ?? []), fact]);
+  }
+
+  for (const group of exactGroups.values()) {
+    if (group.length < 2) continue;
+    const ordered = [...group].sort(compareTemporalFact);
+    const winner = ordered.at(-1)!;
+    for (const loser of ordered.slice(0, -1)) mergeDuplicateFact(db, loser, winner);
+  }
+
+  const remaining = db
+    .prepare<[number], FactRow & { cardinality: string }>(
+      `SELECT f.id, f.subject_id, f.predicate, f.object, f.object_entity_id,
+              f.confidence, f.valid_from, f.assertion_count, f.last_seen_at,
+              p.cardinality
+       FROM fact f
+       JOIN predicate p ON p.name = f.predicate
+       WHERE f.valid_to IS NULL AND f.subject_id = ? AND p.cardinality = 'single'
+       ORDER BY f.id`,
+    )
+    .all(entityId);
+  const singleGroups = new Map<string, FactRow[]>();
+  for (const fact of remaining) {
+    const key = `${fact.subject_id}\u0000${fact.predicate}`;
+    singleGroups.set(key, [...(singleGroups.get(key) ?? []), fact]);
+  }
+  for (const group of singleGroups.values()) {
+    if (group.length < 2) continue;
+    const ordered = [...group].sort(compareTemporalFact);
+    const winner = ordered.at(-1)!;
+    for (const stale of ordered.slice(0, -1)) {
+      const validTo = winner.valid_from < stale.valid_from
+        ? stale.valid_from
+        : winner.valid_from;
+      db.prepare<[string, number, number]>(
+        "UPDATE fact SET valid_to = ?, superseded_by = ? WHERE id = ?",
+      ).run(validTo, winner.id, stale.id);
+    }
+  }
+}
+
+function compareTemporalFact(
+  left: { id: number; valid_from: string },
+  right: { id: number; valid_from: string },
+): number {
+  return left.valid_from.localeCompare(right.valid_from) || left.id - right.id;
+}
+
+function mergeDuplicateFact(
+  db: Db,
+  loser: {
+    id: number;
+    confidence: number;
+    assertion_count: number;
+    last_seen_at: string;
+  },
+  winner: {
+    id: number;
+    confidence: number;
+    assertion_count: number;
+    last_seen_at: string;
+  },
+): void {
+  db.prepare<[number, number]>(
+    `INSERT INTO fact_evidence
+       (fact_id, source_message_id, passage_id, kind, confidence, created_at)
+     SELECT ?, source_message_id, passage_id, kind, confidence, created_at
+     FROM fact_evidence WHERE fact_id = ?
+     ON CONFLICT (fact_id, source_message_id) DO UPDATE SET
+       confidence = MAX(fact_evidence.confidence, excluded.confidence),
+       passage_id = COALESCE(fact_evidence.passage_id, excluded.passage_id)`,
+  ).run(winner.id, loser.id);
+  db.prepare<[number, number]>(
+    "UPDATE fact SET superseded_by = ? WHERE superseded_by = ?",
+  ).run(winner.id, loser.id);
+  db.prepare<[number, number, string, number]>(
+    `UPDATE fact
+     SET confidence = ?, assertion_count = ?, last_seen_at = ?
+     WHERE id = ?`,
+  ).run(
+    Math.max(winner.confidence, loser.confidence),
+    winner.assertion_count + loser.assertion_count,
+    winner.last_seen_at > loser.last_seen_at ? winner.last_seen_at : loser.last_seen_at,
+    winner.id,
+  );
+  db.prepare<[number]>("DELETE FROM fact_fts WHERE rowid = ?").run(loser.id);
+  db.prepare<[number]>(
+    "DELETE FROM embedding WHERE owner_kind = 'fact' AND owner_id = ?",
+  ).run(loser.id);
+  db.prepare<[number]>("DELETE FROM fact WHERE id = ?").run(loser.id);
+}
+
+function reconcileMergedFacets(db: Db, entityId: number): void {
+  type FacetRow = {
+    id: number;
+    kind: string;
+    statement: string;
+    condition_text: string | null;
+    confidence: number;
+  };
+  const facets = db
+    .prepare<[number], FacetRow>(
+      `SELECT id, kind, statement, condition_text, confidence
+       FROM understanding_facet
+       WHERE scope_entity_id = ? AND valid_to IS NULL
+       ORDER BY id`,
+    )
+    .all(entityId);
+  const groups = new Map<string, FacetRow[]>();
+  for (const facet of facets) {
+    const key = `${facet.kind}\u0000${foldAlias(facet.statement)}\u0000${foldAlias(facet.condition_text ?? "")}`;
+    groups.set(key, [...(groups.get(key) ?? []), facet]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const winner = group.at(-1)!;
+    for (const loser of group.slice(0, -1)) {
+      db.prepare<[number, number]>(
+        `INSERT INTO facet_evidence
+           (facet_id, passage_id, kind, confidence, created_at)
+         SELECT ?, passage_id, kind, confidence, created_at
+         FROM facet_evidence WHERE facet_id = ?
+         ON CONFLICT (facet_id, passage_id) DO UPDATE SET
+           confidence = MAX(facet_evidence.confidence, excluded.confidence)`,
+      ).run(winner.id, loser.id);
+      db.prepare<[number, number]>(
+        "UPDATE facet_event SET facet_id = ? WHERE facet_id = ?",
+      ).run(winner.id, loser.id);
+      db.prepare<[number, number]>(
+        "UPDATE understanding_facet SET superseded_by = ? WHERE superseded_by = ?",
+      ).run(winner.id, loser.id);
+      db.prepare<[number]>("DELETE FROM facet_fts WHERE rowid = ?").run(loser.id);
+      db.prepare<[number]>("DELETE FROM facet_embedding WHERE facet_id = ?").run(loser.id);
+      db.prepare<[number]>("DELETE FROM understanding_facet WHERE id = ?").run(loser.id);
+      db.prepare<[number, number]>(
+        "UPDATE understanding_facet SET confidence = MAX(confidence, ?) WHERE id = ?",
+      ).run(loser.confidence, winner.id);
+    }
+  }
+}
+
+function uniqueEntities(entities: readonly Entity[]): Entity[] {
+  return [...new Map(entities.map((entity) => [entity.id, entity])).values()];
 }

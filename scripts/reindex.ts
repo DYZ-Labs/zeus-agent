@@ -12,13 +12,17 @@ import { reindexMessages } from "../src/core/conversations";
 import { openDb, defaultDbPath } from "../src/core/db";
 import {
   EMBEDDING_MODEL,
+  embedFacet,
   embedFact,
-  embedMessage,
+  embedPassage,
   embeddingsDisabled,
+  facetsMissingEmbeddings,
   factsMissingEmbeddings,
-  messagesMissingEmbeddings,
+  passagesMissingEmbeddings,
 } from "../src/core/embed";
+import { reindexFacets } from "../src/core/facets";
 import { reindexFacts } from "../src/core/facts";
+import { reindexPassages } from "../src/core/passages";
 
 const ftsOnly = process.argv.includes("--fts-only");
 const path = defaultDbPath();
@@ -28,7 +32,11 @@ console.log(`zeus: reindexing ${path}`);
 
 const facts = reindexFacts(db);
 const messages = reindexMessages(db);
-console.log(`  full-text: ${facts} facts, ${messages} messages`);
+const passages = reindexPassages(db);
+const facets = reindexFacets(db);
+console.log(
+  `  full-text: ${facts} facts, ${messages} messages, ${passages} recallable passages, ${facets} facets`,
+);
 
 if (ftsOnly) {
   console.log("  embeddings: skipped (--fts-only)");
@@ -36,13 +44,14 @@ if (ftsOnly) {
   console.log("  embeddings: skipped (ZEUS_EMBEDDINGS=off)");
 } else {
   const pendingFacts = factsMissingEmbeddings(db, 100_000);
-  const pendingMessages = messagesMissingEmbeddings(db, 100_000);
-  const pending = pendingFacts.length + pendingMessages.length;
+  const pendingPassages = passagesMissingEmbeddings(db, 100_000);
+  const pendingFacets = facetsMissingEmbeddings(db, 100_000);
+  const pending = pendingFacts.length + pendingPassages.length + pendingFacets.length;
   if (pending === 0) {
     console.log("  embeddings: already current");
   } else {
     console.log(
-      `  embeddings: ${pendingFacts.length} facts, ${pendingMessages.length} user episodes with ${EMBEDDING_MODEL}`,
+      `  embeddings: ${pendingFacts.length} facts, ${pendingPassages.length} passages, ${pendingFacets.length} facets with ${EMBEDDING_MODEL}`,
     );
     const started = Date.now();
     let done = 0;
@@ -60,8 +69,20 @@ if (ftsOnly) {
     }
 
     if (!failed) {
-      for (const message of pendingMessages) {
-        const ok = await embedMessage(db, message.id, message.text);
+      for (const passage of pendingPassages) {
+        const ok = await embedPassage(db, passage.id, passage.text);
+        if (!ok) {
+          failed = true;
+          break;
+        }
+        done += 1;
+        if (done % 100 === 0) process.stdout.write(`    ${done}/${pending}\r`);
+      }
+    }
+
+    if (!failed) {
+      for (const facet of pendingFacets) {
+        const ok = await embedFacet(db, facet.id, facet.text);
         if (!ok) {
           failed = true;
           break;

@@ -64,14 +64,21 @@ export async function POST(request: Request): Promise<Response> {
           recalled: result.context.items.length,
           recalledFacts: result.context.items.filter((item) => item.kind === "fact").length,
           recalledEpisodes: result.context.items.filter((item) => item.kind === "episode").length,
+          recalledFacets: result.context.items.filter((item) => item.kind === "facet").length,
           accepted:
             (result.learned?.facts.length ?? 0) +
             (result.learned?.goals.length ?? 0) +
-            (result.learned?.commitments.length ?? 0),
+            (result.learned?.commitments.length ?? 0) +
+            (result.learned?.facets.length ?? 0),
+          acceptedFacets: result.learned?.facets.length ?? 0,
           learned: result.learned?.facts.length ?? 0,
           goalsUpdated: result.learned?.goals.length ?? 0,
           commitmentsUpdated: result.learned?.commitments.length ?? 0,
           pending: result.learned?.candidates.length ?? 0,
+          pendingFacets:
+            result.learned?.candidates.filter(
+              (candidate) => candidate.kind === "facet" && candidate.status === "pending",
+            ).length ?? 0,
           superseded: result.learned?.supersededIds.length ?? 0,
           recommendation: result.context.recommendation,
           extractionFailed: result.learned === null,

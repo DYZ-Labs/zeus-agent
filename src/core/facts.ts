@@ -101,7 +101,7 @@ export function getFacts(db: Db, ids: readonly number[]): FactView[] {
 export function evidenceForFact(db: Db, factId: number): FactEvidence[] {
   return db
     .prepare<[number], FactEvidence>(
-      `SELECT id, fact_id, source_message_id, kind, confidence, created_at
+      `SELECT id, fact_id, source_message_id, passage_id, kind, confidence, created_at
        FROM fact_evidence WHERE fact_id = ? ORDER BY created_at, id`,
     )
     .all(factId);
@@ -114,9 +114,47 @@ export function addFactEvidence(
   sourceMessageId: number,
   kind: EvidenceKind = "correction",
   confidence = 1,
+  passageId: number | null = null,
 ): void {
   if (!getFact(db, factId)) throw new Error(`Fact ${factId} does not exist`);
-  recordEvidence(db, factId, sourceMessageId, kind, clampConfidence(confidence), now());
+  assertUserEvidenceSource(db, sourceMessageId);
+  recordEvidence(
+    db,
+    factId,
+    sourceMessageId,
+    kind,
+    clampConfidence(confidence),
+    now(),
+    passageId,
+  );
+}
+
+/**
+ * Rebuild the evidence-derived fields on a fact after evidence has been removed.
+ *
+ * Legacy facts can legitimately have no evidence rows because their original source
+ * was null. Those rows are left untouched rather than manufacturing an assertion.
+ */
+export function recomputeFactEvidenceAggregates(db: Db, factId: number): FactView | null {
+  const fact = getFact(db, factId);
+  if (!fact) return null;
+
+  const evidence = evidenceForFact(db, factId);
+  if (evidence.length === 0) return fact;
+
+  let confidence = evidence[0]?.confidence ?? fact.confidence;
+  for (const entry of evidence.slice(1)) {
+    confidence = clampConfidence(Math.max(confidence, entry.confidence) + 0.02);
+  }
+  const lastSeenAt = evidence.at(-1)?.created_at ?? fact.last_seen_at;
+
+  db.prepare<[number, number, string, number]>(
+    `UPDATE fact
+     SET assertion_count = ?, confidence = ?, last_seen_at = ?
+     WHERE id = ?`,
+  ).run(evidence.length, confidence, lastSeenAt, factId);
+
+  return getFact(db, factId);
 }
 
 export type FactsForEntityOptions = {
@@ -237,6 +275,8 @@ export type RecordFactInput = {
   /** When the fact became true. Defaults to when Zeus learned it. */
   validFrom?: string | null;
   evidenceKind?: EvidenceKind;
+  /** Exact validated source span. Legacy and explicit curation writes may omit it. */
+  passageId?: number | null;
 };
 
 export type RecordFactResult = {
@@ -312,6 +352,7 @@ export function recordFact(db: Db, input: RecordFactInput): RecordFactResult {
         input.evidenceKind === "correction" ? "correction" : "reassertion",
         confidence,
         timestamp,
+        input.passageId ?? null,
       );
 
       const refreshed = getFact(db, duplicate.id);
@@ -351,24 +392,60 @@ export function recordFact(db: Db, input: RecordFactInput): RecordFactResult {
       input.evidenceKind ?? "assertion",
       confidence,
       timestamp,
+      input.passageId ?? null,
     );
 
-    // 3. Close prior values, but only for single-valued predicates.
+    // 3. Place the assertion into the temporal sequence, but only for
+    // single-valued predicates. A backdated assertion belongs between the value
+    // active at that date and the next later value; it must never retire that
+    // later value or become current merely because Zeus learned it today.
     const supersededIds: number[] = [];
     if (predicate.cardinality === "single") {
-      const stale = db
-        .prepare<[number, string, number], { id: number }>(
-          `SELECT id FROM fact
-           WHERE subject_id = ? AND predicate = ? AND valid_to IS NULL AND id != ?`,
-        )
-        .all(input.subjectId, predicate.name, factId);
-
       const close = db.prepare<[string, number, number]>(
         "UPDATE fact SET valid_to = ?, superseded_by = ? WHERE id = ?",
       );
-      for (const row of stale) {
-        close.run(timestamp, factId, row.id);
-        supersededIds.push(row.id);
+
+      if (input.evidenceKind === "correction") {
+        const stale = db
+          .prepare<[number, string, number], { id: number; valid_from: string }>(
+            `SELECT id, valid_from FROM fact
+             WHERE subject_id = ? AND predicate = ? AND valid_to IS NULL AND id != ?`,
+          )
+          .all(input.subjectId, predicate.name, factId);
+        for (const row of stale) {
+          close.run(validFrom < row.valid_from ? row.valid_from : validFrom, factId, row.id);
+          supersededIds.push(row.id);
+        }
+      } else {
+        const successor = db
+          .prepare<[number, string, number, string], { id: number; valid_from: string }>(
+            `SELECT id, valid_from
+             FROM fact
+             WHERE subject_id = ? AND predicate = ? AND id != ? AND valid_from > ?
+             ORDER BY valid_from ASC, id ASC
+             LIMIT 1`,
+          )
+          .get(input.subjectId, predicate.name, factId, validFrom);
+
+        if (successor) {
+          db.prepare<[string, number, number]>(
+            "UPDATE fact SET valid_to = ?, superseded_by = ? WHERE id = ?",
+          ).run(successor.valid_from, successor.id, factId);
+        }
+
+        const stale = db
+          .prepare<[number, string, number, string, string], { id: number }>(
+            `SELECT id
+             FROM fact
+             WHERE subject_id = ? AND predicate = ? AND id != ?
+               AND valid_from <= ?
+               AND (valid_to IS NULL OR valid_to > ?)`,
+          )
+          .all(input.subjectId, predicate.name, factId, validFrom, validFrom);
+        for (const row of stale) {
+          close.run(validFrom, factId, row.id);
+          supersededIds.push(row.id);
+        }
       }
     }
 
@@ -385,16 +462,44 @@ function recordEvidence(
   kind: EvidenceKind,
   confidence: number,
   timestamp: string,
+  passageId: number | null,
 ): void {
   if (sourceMessageId === null) return;
-  db.prepare<[number, number, EvidenceKind, number, string]>(
+  assertEvidencePassageSource(db, sourceMessageId, passageId);
+  db.prepare<[number, number, number | null, EvidenceKind, number, string]>(
     `INSERT INTO fact_evidence
-       (fact_id, source_message_id, kind, confidence, created_at)
-     VALUES (?, ?, ?, ?, ?)
+       (fact_id, source_message_id, passage_id, kind, confidence, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT (fact_id, source_message_id) DO UPDATE SET
        kind = excluded.kind,
-       confidence = MAX(fact_evidence.confidence, excluded.confidence)`,
-  ).run(factId, sourceMessageId, kind, confidence, timestamp);
+       confidence = MAX(fact_evidence.confidence, excluded.confidence),
+       passage_id = COALESCE(excluded.passage_id, fact_evidence.passage_id)`,
+  ).run(factId, sourceMessageId, passageId, kind, confidence, timestamp);
+}
+
+function assertEvidencePassageSource(
+  db: Db,
+  sourceMessageId: number,
+  passageId: number | null,
+): void {
+  if (passageId === null) return;
+  const messageId = db
+    .prepare<[number], { message_id: number }>(
+      "SELECT message_id FROM evidence_passage WHERE id = ?",
+    )
+    .get(passageId)?.message_id;
+  if (messageId !== sourceMessageId) {
+    throw new Error(`Evidence passage ${passageId} does not belong to source ${sourceMessageId}`);
+  }
+}
+
+function assertUserEvidenceSource(db: Db, sourceMessageId: number): void {
+  const source = db
+    .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
+    .get(sourceMessageId);
+  if (source?.role !== "user") {
+    throw new Error(`Evidence source message ${sourceMessageId} must be user-authored`);
+  }
 }
 
 function normalizeDate(value: string | null | undefined): string | null {
@@ -413,6 +518,57 @@ export function supersedeFact(db: Db, id: number, supersededBy: number | null = 
   db.prepare<[string, number | null, number]>(
     "UPDATE fact SET valid_to = ?, superseded_by = ? WHERE id = ? AND valid_to IS NULL",
   ).run(now(), supersededBy, id);
+}
+
+export type RetractFactInput = {
+  sourceMessageId: number;
+  /** When this value stopped being true. Defaults to when Zeus learned the retraction. */
+  validTo?: string | null;
+  confidence?: number;
+  passageId?: number | null;
+};
+
+/**
+ * Retract exactly one live value of a multi-valued predicate.
+ *
+ * This is intentionally id-based: predicates such as `likes` can have several live
+ * values, and a retraction must never close an adjacent value by accident. The row and
+ * its prior evidence remain as history; the user message that closed it is appended as
+ * correction evidence.
+ */
+export function retractFact(db: Db, id: number, input: RetractFactInput): FactView | null {
+  const existing = getFact(db, id);
+  if (!existing || existing.valid_to !== null) return null;
+
+  const predicate = getPredicate(db, existing.predicate);
+  if (!predicate || predicate.cardinality !== "multi") {
+    throw new Error(
+      `Fact ${id} uses single-valued predicate "${existing.predicate}"; record its replacement instead`,
+    );
+  }
+  assertUserEvidenceSource(db, input.sourceMessageId);
+
+  const timestamp = now();
+  const requestedValidTo = normalizeDate(input.validTo) ?? timestamp;
+  const validTo = requestedValidTo < existing.valid_from
+    ? existing.valid_from
+    : requestedValidTo;
+
+  return db.transaction((): FactView | null => {
+    recordEvidence(
+      db,
+      id,
+      input.sourceMessageId,
+      "correction",
+      clampConfidence(input.confidence ?? 1),
+      timestamp,
+      input.passageId ?? null,
+    );
+    db.prepare<[string, number]>(
+      "UPDATE fact SET valid_to = ?, superseded_by = NULL WHERE id = ? AND valid_to IS NULL",
+    ).run(validTo, id);
+    return getFact(db, id);
+  })();
 }
 
 export type CorrectFactInput = {

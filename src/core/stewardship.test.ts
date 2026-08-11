@@ -5,6 +5,7 @@ import { buildContext } from "./context";
 import { appendMessage, createConversation } from "./conversations";
 import { openTestDb } from "./db";
 import { applyExtraction } from "./extract";
+import { recordFacet } from "./facets";
 import {
   createCommitment,
   createGoal,
@@ -15,6 +16,7 @@ import {
 } from "./intentions";
 import { deleteConversationWithMemory } from "./retention";
 import { MIGRATIONS } from "./migrations";
+import { allowWholeMessagePassage } from "./passages";
 import { recalledForResponse } from "./response-context";
 import {
   followThroughMetrics,
@@ -37,6 +39,49 @@ function source(db: ReturnType<typeof openTestDb>, content = "This matters to me
 }
 
 describe("follow-through selection", () => {
+  it("uses only accepted structured machine effects to alter deterministic ranking", () => {
+    const db = openTestDb();
+    const message = source(db, "I need to write the brief and prepare the demo.");
+    const first = createCommitment(db, {
+      title: "Write the brief",
+      sourceMessageId: message.id,
+    });
+    const second = createCommitment(db, {
+      title: "Prepare the demo",
+      sourceMessageId: message.id,
+    });
+    const evidence = allowWholeMessagePassage(db, message.id);
+
+    recordFacet(db, {
+      kind: "preference",
+      statement: "The demo sounds more exciting",
+      scope: { kind: "commitment", commitmentId: second.id },
+      sourceMessageId: message.id,
+      passageIds: [evidence.id],
+    });
+    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(first.id);
+
+    recordFacet(db, {
+      kind: "decision_criterion",
+      statement: "Prioritize this commitment",
+      scope: { kind: "commitment", commitmentId: second.id },
+      machineEffect: "boost",
+      sourceMessageId: message.id,
+      passageIds: [evidence.id],
+    });
+    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(second.id);
+
+    recordFacet(db, {
+      kind: "boundary",
+      statement: "Do not surface this commitment",
+      scope: { kind: "commitment", commitmentId: second.id },
+      machineEffect: "block",
+      sourceMessageId: message.id,
+      passageIds: [evidence.id],
+    });
+    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(first.id);
+  });
+
   it("uses explicit goal priority and suppresses commitments linked to paused goals", () => {
     const db = openTestDb();
     const message = source(db);
@@ -131,6 +176,35 @@ describe("follow-through selection", () => {
 });
 
 describe("user control and outcomes", () => {
+  it("stores only reasons the user actually authors", () => {
+    const db = openTestDb();
+    const message = source(db);
+    const commitment = createCommitment(db, {
+      title: "Send the note",
+      sourceMessageId: message.id,
+    });
+    markRecommendationSurfaced(
+      db,
+      recommendNextAction(db, "", { force: true })!,
+      null,
+    );
+    const dismissed = recordFollowThroughDecision(db, {
+      commitmentId: commitment.id,
+      decision: "dismissed",
+      userReason: "  The timing is wrong   this week. ",
+    });
+    expect(JSON.parse(dismissed?.detail_json ?? "{}")).toMatchObject({
+      decision: { user_reason: "The timing is wrong this week." },
+    });
+
+    const blank = recordFollowThroughDecision(db, {
+      commitmentId: commitment.id,
+      decision: "accepted",
+      userReason: "   ",
+    });
+    expect(JSON.parse(blank?.detail_json ?? "{}").decision).toBeUndefined();
+  });
+
   it("honors cooldowns, snoozes, and dismissals until the commitment changes", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2030-01-01T09:00:00.000Z"));
@@ -383,7 +457,7 @@ describe("priority history and response context", () => {
     );
   });
 
-  it("retrieves relationship context for follow-through even when the question is unrelated", async () => {
+  it("retrieves canonical relationship context without recalling an unclassified source", async () => {
     vi.stubEnv("ZEUS_EMBEDDINGS", "off");
     const db = openTestDb();
     const conversation = createConversation(db);
@@ -419,6 +493,6 @@ describe("priority history and response context", () => {
     const context = await buildContext(db, "What is on my reading list?", { queryVector: null });
     expect(context.recommendation?.commitment_title).toContain("Maya");
     expect(context.text).toContain("pottery classes");
-    expect(context.text).toContain("DATED EPISODES");
+    expect(context.text).not.toContain("DATED EVIDENCE PASSAGES");
   });
 });

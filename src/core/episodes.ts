@@ -1,5 +1,5 @@
 import type { Db } from "./db";
-import { embed, loadVectors, nearest } from "./embed";
+import { embed, loadPassageVectors, nearest } from "./embed";
 import type { EpisodeHit, Message } from "./schema";
 import { toFtsQuery } from "./search";
 
@@ -11,7 +11,13 @@ export const EPISODE_SEMANTIC_FLOOR = Number(
   process.env.ZEUS_EPISODE_SEMANTIC_FLOOR ?? 0.52,
 );
 
-type EpisodeRow = Message & { conversation_title: string | null };
+type EpisodeRow = Message & {
+  passage_id: number;
+  start_offset: number;
+  end_offset: number;
+  passage_text: string;
+  conversation_title: string | null;
+};
 
 export type EpisodeSearchOptions = {
   limit?: number;
@@ -26,9 +32,9 @@ export async function searchEpisodes(
 ): Promise<EpisodeHit[]> {
   const excluded = new Set(options.excludeMessageIds ?? []);
   const [lexical, semantic] = await Promise.all([
-    Promise.resolve(lexicalCandidates(db, query).filter((id) => !excluded.has(id))),
+    Promise.resolve(filterExcludedPassages(db, lexicalCandidates(db, query), excluded)),
     semanticCandidates(db, query, options.queryVector).then((ids) =>
-      ids.filter((id) => !excluded.has(id)),
+      filterExcludedPassages(db, ids, excluded),
     ),
   ]);
 
@@ -54,19 +60,25 @@ export async function searchEpisodes(
   const rows = db
     .prepare<number[], EpisodeRow>(
       `SELECT m.id, m.conversation_id, m.role, m.content, m.created_at,
+              m.origin, m.recall_state, p.id AS passage_id,
+              p.start_offset, p.end_offset, p.text AS passage_text,
               c.title AS conversation_title
-       FROM message m
+       FROM evidence_passage p
+       JOIN message m ON m.id = p.message_id
        JOIN conversation c ON c.id = m.conversation_id
-       WHERE m.id IN (${placeholders}) AND m.role = 'user'
-         AND COALESCE(c.title, '') != 'Memory curation'
+       WHERE p.id IN (${placeholders}) AND p.recall_status = 'allowed'
+         AND m.role = 'user'
          AND NOT EXISTS (
-           SELECT 1 FROM memory_candidate mc
-           WHERE mc.source_message_id = m.id
-             AND mc.reason = 'sensitive' AND mc.status != 'accepted'
-         )`,
+           SELECT 1 FROM candidate_evidence ce
+           JOIN memory_candidate mc ON mc.id = ce.candidate_id
+           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
+             AND mc.status IN ('pending','rejected')
+         )
+         AND COALESCE(c.title, '') != 'Memory curation'
+         AND m.origin IN ('conversation','reflection','backfill')`,
     )
     .all(...ranked.map(([id]) => id));
-  const byId = new Map(rows.map((row) => [row.id, row]));
+  const byId = new Map(rows.map((row) => [row.passage_id, row]));
 
   return ranked.flatMap(([id, rank]) => {
     const row = byId.get(id);
@@ -77,11 +89,18 @@ export async function searchEpisodes(
           id: row.id,
           conversation_id: row.conversation_id,
           role: row.role,
-          content: row.content,
+          // Least-disclosure projection: callers get source identity and dates, but
+          // never neighbouring text outside the classified passage.
+          content: row.passage_text,
           created_at: row.created_at,
+          origin: row.origin,
+          recall_state: row.recall_state,
         },
+        passage_id: row.passage_id,
+        start_offset: row.start_offset,
+        end_offset: row.end_offset,
         conversation_title: row.conversation_title,
-        excerpt: excerpt(row.content),
+        excerpt: excerpt(row.passage_text),
         score: rank.score,
         via: rank.via,
       },
@@ -95,18 +114,21 @@ function lexicalCandidates(db: Db, query: string): number[] {
   try {
     return db
       .prepare<[string, number], { id: number }>(
-        `SELECT m.id AS id
-         FROM message_fts
-         JOIN message m ON m.id = message_fts.rowid
+      `SELECT p.id AS id
+         FROM passage_fts
+         JOIN evidence_passage p ON p.id = passage_fts.rowid
+         JOIN message m ON m.id = p.message_id
          JOIN conversation c ON c.id = m.conversation_id
-         WHERE message_fts MATCH ? AND m.role = 'user'
-           AND COALESCE(c.title, '') != 'Memory curation'
+         WHERE passage_fts MATCH ? AND p.recall_status = 'allowed' AND m.role = 'user'
            AND NOT EXISTS (
-             SELECT 1 FROM memory_candidate mc
-             WHERE mc.source_message_id = m.id
-               AND mc.reason = 'sensitive' AND mc.status != 'accepted'
+             SELECT 1 FROM candidate_evidence ce
+             JOIN memory_candidate mc ON mc.id = ce.candidate_id
+             WHERE ce.passage_id = p.id AND mc.kind = 'facet'
+               AND mc.status IN ('pending','rejected')
            )
-         ORDER BY bm25(message_fts)
+           AND COALESCE(c.title, '') != 'Memory curation'
+           AND m.origin IN ('conversation','reflection','backfill')
+         ORDER BY bm25(passage_fts)
          LIMIT ?`,
       )
       .all(match, CANDIDATES)
@@ -114,6 +136,24 @@ function lexicalCandidates(db: Db, query: string): number[] {
   } catch {
     return [];
   }
+}
+
+function filterExcludedPassages(
+  db: Db,
+  passageIds: readonly number[],
+  excludedMessageIds: ReadonlySet<number>,
+): number[] {
+  if (passageIds.length === 0 || excludedMessageIds.size === 0) return [...passageIds];
+  const placeholders = passageIds.map(() => "?").join(",");
+  const rows = db
+    .prepare<number[], { id: number; message_id: number }>(
+      `SELECT id, message_id FROM evidence_passage WHERE id IN (${placeholders})`,
+    )
+    .all(...passageIds);
+  const allowed = new Set(
+    rows.filter((row) => !excludedMessageIds.has(row.message_id)).map((row) => row.id),
+  );
+  return passageIds.filter((id) => allowed.has(id));
 }
 
 async function semanticCandidates(
@@ -125,30 +165,12 @@ async function semanticCandidates(
   if (!vector) return [];
   const nearestIds = nearest(
     vector,
-    loadVectors(db, "message"),
+    loadPassageVectors(db),
     CANDIDATES * 2,
     EPISODE_SEMANTIC_FLOOR,
   ).map((hit) => hit.ownerId);
   if (nearestIds.length === 0) return [];
-
-  const placeholders = nearestIds.map(() => "?").join(",");
-  const userIds = new Set(
-    db
-      .prepare<number[], { id: number }>(
-        `SELECT m.id FROM message m
-         JOIN conversation c ON c.id = m.conversation_id
-         WHERE m.id IN (${placeholders}) AND m.role = 'user'
-           AND COALESCE(c.title, '') != 'Memory curation'
-           AND NOT EXISTS (
-             SELECT 1 FROM memory_candidate mc
-             WHERE mc.source_message_id = m.id
-               AND mc.reason = 'sensitive' AND mc.status != 'accepted'
-           )`,
-      )
-      .all(...nearestIds)
-      .map((row) => row.id),
-  );
-  return nearestIds.filter((id) => userIds.has(id)).slice(0, CANDIDATES);
+  return nearestIds.slice(0, CANDIDATES);
 }
 
 function excerpt(content: string, limit = 520): string {

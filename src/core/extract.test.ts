@@ -6,7 +6,7 @@ import { openTestDb } from "./db";
 import { listEntities, resolveEntity, selfEntity } from "./entities";
 import { applyExtraction, extractionContext } from "./extract";
 import { countFacts, factsForEntity, liveFacts } from "./facts";
-import type { Extraction } from "./schema";
+import { Extraction as ExtractionSchema, type Extraction } from "./schema";
 
 let db: Db;
 
@@ -21,7 +21,12 @@ function sourceMessage(text: string): number {
 
 /** Convenience builder so fixtures read as the model's output, not as boilerplate. */
 function extraction(partial: Partial<Extraction>): Extraction {
-  return { entities: partial.entities ?? [], facts: partial.facts ?? [] };
+  return {
+    entities: partial.entities ?? [],
+    facts: partial.facts ?? [],
+    goals: partial.goals,
+    commitments: partial.commitments,
+  };
 }
 
 describe("applyExtraction", () => {
@@ -291,6 +296,218 @@ describe("applyExtraction", () => {
     expect(result.skipped).toHaveLength(1);
     expect(countFacts(db).live).toBe(0);
   });
+
+  it("keeps goal priority and target unless an update explicitly clears them", () => {
+    const created = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: null,
+            title: "Ship Zeus",
+            status: "active",
+            priority: { op: "set", value: "high" },
+            target_at: { op: "set", value: "2026-10-01" },
+            confidence: 0.98,
+          },
+        ],
+      }),
+      sourceMessage("Shipping Zeus by October is high priority."),
+    ).goals[0]!;
+
+    const kept = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            status: "paused",
+            priority: { op: "keep" },
+            target_at: { op: "keep" },
+            confidence: 0.99,
+          },
+        ],
+      }),
+      sourceMessage("Pause the Zeus launch goal."),
+    ).goals[0]!;
+
+    expect(kept.priority).toBe("high");
+    expect(kept.target_at).toBe("2026-10-01T00:00:00.000Z");
+
+    const legacyOmission = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            status: "active",
+            confidence: 0.99,
+          },
+        ],
+      }),
+      sourceMessage("Resume the Zeus launch goal."),
+    ).goals[0]!;
+
+    expect(legacyOmission.priority).toBe("high");
+    expect(legacyOmission.target_at).toBe("2026-10-01T00:00:00.000Z");
+
+    const cleared = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            status: "active",
+            priority: { op: "clear" },
+            target_at: { op: "clear" },
+            confidence: 0.99,
+          },
+        ],
+      }),
+      sourceMessage("Remove the deadline and reset its priority."),
+    ).goals[0]!;
+
+    expect(cleared.priority).toBe("normal");
+    expect(cleared.target_at).toBeNull();
+  });
+
+  it("keeps commitment owner, goal link, and due date unless explicitly cleared", () => {
+    const source = sourceMessage("Morgan owns the launch review due October 5.");
+    const goal = applyExtraction(
+      db,
+      extraction({
+        goals: [
+          {
+            existing_id: null,
+            title: "Launch Zeus",
+            status: "active",
+            priority: { op: "clear" },
+            target_at: { op: "clear" },
+            confidence: 0.95,
+          },
+        ],
+      }),
+      source,
+    ).goals[0]!;
+    const created = applyExtraction(
+      db,
+      extraction({
+        entities: [{ name: "Morgan", kind: "person", aliases: [] }],
+        commitments: [
+          {
+            existing_id: null,
+            title: "Review the Zeus launch",
+            owner: { op: "set", value: "Morgan" },
+            linked_goal: { op: "set", value: { kind: "id", id: goal.id } },
+            status: "open",
+            due_at: { op: "set", value: "2026-10-05" },
+            confidence: 0.95,
+          },
+        ],
+      }),
+      source,
+    ).commitments[0]!;
+
+    const kept = applyExtraction(
+      db,
+      extraction({
+        commitments: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            owner: { op: "keep" },
+            linked_goal: { op: "keep" },
+            status: "waiting",
+            due_at: { op: "keep" },
+            confidence: 0.98,
+          },
+        ],
+      }),
+      sourceMessage("The launch review is waiting."),
+    ).commitments[0]!;
+
+    expect(kept.owner_name).toBe("Morgan");
+    expect(kept.linked_goal_id).toBe(goal.id);
+    expect(kept.due_at).toBe("2026-10-05T00:00:00.000Z");
+
+    const legacyOmission = applyExtraction(
+      db,
+      extraction({
+        commitments: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            status: "open",
+            confidence: 0.98,
+          },
+        ],
+      }),
+      sourceMessage("Resume the launch review."),
+    ).commitments[0]!;
+
+    expect(legacyOmission.owner_name).toBe("Morgan");
+    expect(legacyOmission.linked_goal_id).toBe(goal.id);
+    expect(legacyOmission.due_at).toBe("2026-10-05T00:00:00.000Z");
+
+    const cleared = applyExtraction(
+      db,
+      extraction({
+        commitments: [
+          {
+            existing_id: created.id,
+            title: created.title,
+            owner: { op: "clear" },
+            linked_goal: { op: "clear" },
+            status: "open",
+            due_at: { op: "clear" },
+            confidence: 0.99,
+          },
+        ],
+      }),
+      sourceMessage("I'll own it now; remove the goal link and deadline."),
+    ).commitments[0]!;
+
+    expect(cleared.owner_slug).toBe("self");
+    expect(cleared.linked_goal_id).toBeNull();
+    expect(cleared.due_at).toBeNull();
+  });
+});
+
+describe("Extraction schema", () => {
+  it("requires explicit patches in model output instead of overloaded nulls", () => {
+    const legacy = {
+      entities: [],
+      facts: [],
+      goals: [
+        {
+          existing_id: 1,
+          title: "Ship Zeus",
+          status: "active",
+          priority: null,
+          target_at: null,
+          confidence: 0.95,
+        },
+      ],
+      commitments: [],
+    };
+
+    expect(ExtractionSchema.safeParse(legacy).success).toBe(false);
+    expect(
+      ExtractionSchema.parse({
+        ...legacy,
+        goals: [
+          {
+            ...legacy.goals[0],
+            priority: { op: "keep" },
+            target_at: { op: "clear" },
+          },
+        ],
+      }).goals[0],
+    ).toMatchObject({ priority: { op: "keep" }, target_at: { op: "clear" } });
+  });
 });
 
 describe("extractionContext", () => {
@@ -303,7 +520,19 @@ describe("extractionContext", () => {
   it("lists known entities but never the self placeholder", () => {
     applyExtraction(
       db,
-      extraction({ entities: [{ name: "Acme", kind: "org", aliases: [] }] }),
+      extraction({
+        entities: [{ name: "Acme", kind: "org", aliases: [] }],
+        facts: [
+          {
+            subject: "self",
+            predicate: "works_at",
+            object: "Acme",
+            object_entity: "Acme",
+            confidence: 0.95,
+            supersedes_previous: false,
+          },
+        ],
+      }),
     );
 
     const context = extractionContext(db);

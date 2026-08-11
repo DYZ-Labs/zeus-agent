@@ -26,9 +26,11 @@ export default async function MemoryPage({
   const db = getDb();
   const counts = countFacts(db);
   const pendingCount = countPendingCandidates(db);
-  const candidates = view === "review"
+  const pendingCandidates = view === "review"
     ? listCandidates(db, { status: "pending", limit: 200 })
     : [];
+  const candidates = pendingCandidates.filter((candidate) => candidate.kind !== "facet");
+  const pendingFacetCount = pendingCandidates.length - candidates.length;
   const entities = view === "current"
     ? listEntities(db, { limit: 400 }).filter((entity) => entity.slug !== "self")
     : [];
@@ -125,6 +127,14 @@ export default async function MemoryPage({
             <p className="mt-2 max-w-[65ch] text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
               Uncertain or sensitive suggestions stay out of Zeus&apos;s memory until you accept them.
             </p>
+            {pendingFacetCount > 0 && (
+              <p className="mt-3 text-[0.82rem]" style={{ color: "var(--shell-muted)" }}>
+                <Link href="/understanding" className="underline underline-offset-2">
+                  Review {pendingFacetCount} understanding {pendingFacetCount === 1 ? "facet" : "facets"}
+                </Link>{" "}
+                with editable wording, evidence, and conflict previews.
+              </p>
+            )}
             {candidates.length > 0 ? (
               <ul className="mt-2">
                 {candidates.map((candidate) => (

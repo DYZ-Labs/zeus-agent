@@ -1,10 +1,19 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { buildContext, coreFacts } from "./context";
+import {
+  buildContext,
+  coreFacts,
+  inferContextIntent,
+  recordResponseContext,
+} from "./context";
+import { appendMessage, createConversation } from "./conversations";
 import type { Db } from "./db";
 import { openTestDb } from "./db";
 import { selfEntity, upsertEntity } from "./entities";
+import { recordFacet } from "./facets";
 import { recordFact } from "./facts";
+import { ensureEvidencePassage } from "./passages";
+import { responseSelectionsForResponse } from "./response-context";
 import { entitiesMentioned, search, toFtsQuery } from "./search";
 
 /**
@@ -133,12 +142,13 @@ describe("search", () => {
 });
 
 describe("context assembly", () => {
-  it("always carries core facts about the user", async () => {
+  it("does not inject an unrelated identity profile", async () => {
     seed();
     const context = await buildContext(db, "something unrelated entirely");
 
-    expect(context.text).toContain("What you know about the user");
-    expect(context.text).toContain("Acme");
+    expect(context.text).toMatch(/nothing relevant/u);
+    expect(context.text).not.toContain("Acme");
+    expect(context.items).toEqual([]);
   });
 
   it("states plainly that it knows nothing on an empty memory", async () => {
@@ -190,5 +200,189 @@ describe("context assembly", () => {
 
     const core = coreFacts(db, 5);
     expect(core.map((fact) => fact.predicate)).toContain("works_at");
+  });
+
+  it("classifies request intent deterministically", () => {
+    expect(inferContextIntent("Where did I work before Acme?")).toBe("historical");
+    expect(inferContextIntent("Should I choose Acme or Beta?")).toBe("decision");
+    expect(inferContextIntent("How should I prepare for the interview?")).toBe("advisory");
+    expect(inferContextIntent("What commitments are due?")).toBe("follow_through");
+    expect(inferContextIntent("How is my relationship with Sarah?")).toBe("relational");
+    expect(inferContextIntent("Where do I work?")).toBe("factual");
+  });
+
+  it("uses accepted facets for decisions but not unrelated factual requests", async () => {
+    const conversation = createConversation(db);
+    const source = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "Autonomy is a deciding factor for me.",
+    );
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const facet = recordFacet(db, {
+      kind: "decision_criterion",
+      statement: "Autonomy is a deciding factor",
+      scope: { kind: "global" },
+      importance: "high",
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+
+    const factual = await buildContext(db, "What is the weather?", { queryVector: null });
+    expect(factual.facets).toEqual([]);
+    expect(factual.text).not.toContain("Autonomy");
+
+    const decision = await buildContext(db, "Should I choose the new role?", {
+      queryVector: null,
+    });
+    expect(decision.plan.intent).toBe("decision");
+    expect(decision.facets.map((item) => item.id)).toContain(facet.id);
+    expect(decision.text).toContain("Autonomy is a deciding factor");
+  });
+
+  it("caps total context and interaction contracts at their typed budgets", async () => {
+    const conversation = createConversation(db);
+    for (let index = 0; index < 12; index += 1) {
+      const text = `Communication preference ${index}: keep explanation ${"concise ".repeat(18)}.`;
+      const source = appendMessage(db, conversation.id, "user", text);
+      const passage = ensureEvidencePassage(db, {
+        messageId: source.id,
+        quote: text,
+        sensitivity: "normal",
+        recallStatus: "allowed",
+      });
+      recordFacet(db, {
+        kind: "communication_style",
+        statement: text,
+        scope: { kind: "global" },
+        sourceMessageId: source.id,
+        passageIds: [passage.id],
+      });
+    }
+
+    const context = await buildContext(db, "Explain quantum chromodynamics", {
+      queryVector: null,
+      memoryBudgetTokens: 500,
+      interactionBudgetTokens: 120,
+    });
+    const interactionTokens = context.plan.selections
+      .filter((selection) => selection.reason === "interaction_contract")
+      .reduce((total, selection) => total + selection.estimated_tokens, 0);
+    expect(context.plan.budget_tokens).toBe(500);
+    expect(context.plan.estimated_tokens).toBeLessThanOrEqual(500);
+    expect(interactionTokens).toBeLessThanOrEqual(120);
+  });
+
+  it("persists immutable facet selection reasons, paths, and scores", async () => {
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "I value calm decisions.");
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    recordFacet(db, {
+      kind: "value",
+      statement: "Calm decisions matter",
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+    const context = await buildContext(db, "Should I make this decision now?", {
+      queryVector: null,
+    });
+    const assistant = appendMessage(db, conversation.id, "assistant", "Pause first.");
+    recordResponseContext(db, assistant.id, context.plan);
+
+    const traced = responseSelectionsForResponse(db, assistant.id);
+    const facetTrace = traced.find((selection) => selection.item.kind === "facet");
+    expect(facetTrace).toEqual(
+      expect.objectContaining({
+        reason: "query_relevant",
+        score: expect.any(Number),
+        via: expect.arrayContaining(["policy"]),
+      }),
+    );
+    expect(facetTrace?.item.kind === "facet" ? facetTrace.item.facet.statement : null).toBe(
+      "Calm decisions matter",
+    );
+  });
+
+  it("keeps separate passages from one message as separate auditable response items", async () => {
+    const sourceConversation = createConversation(db);
+    const source = appendMessage(
+      db,
+      sourceConversation.id,
+      "user",
+      "Tea helps me focus. Jazz helps me think.",
+    );
+    const tea = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: "Tea helps me focus.",
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const jazz = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: "Jazz helps me think.",
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const context = await buildContext(db, "tea jazz", {
+      queryVector: null,
+      episodeLimit: 6,
+    });
+    expect(context.episodes.map((episode) => episode.passage_id).sort()).toEqual(
+      [tea.id, jazz.id].sort(),
+    );
+
+    const responseConversation = createConversation(db);
+    const assistant = appendMessage(db, responseConversation.id, "assistant", "Both help.");
+    recordResponseContext(db, assistant.id, context.plan);
+    const storedIds = db
+      .prepare<[number], { item_id: number }>(
+        `SELECT item_id FROM response_context
+         WHERE assistant_message_id = ? AND item_kind = 'episode'
+         ORDER BY item_id`,
+      )
+      .all(assistant.id)
+      .map((row) => row.item_id);
+    expect(storedIds).toEqual([tea.id, jazz.id].sort((a, b) => a - b));
+
+    const episodes = responseSelectionsForResponse(db, assistant.id).flatMap((selection) =>
+      selection.item.kind === "episode" ? [selection.item.episode] : [],
+    );
+    expect(
+      episodes.map((episode) => ({
+        passage: episode.passage_id,
+        source: episode.message.id,
+        start: episode.start_offset,
+        end: episode.end_offset,
+        text: episode.message.content,
+      })),
+    ).toEqual(
+      expect.arrayContaining([
+        {
+          passage: tea.id,
+          source: source.id,
+          start: tea.start_offset,
+          end: tea.end_offset,
+          text: tea.text,
+        },
+        {
+          passage: jazz.id,
+          source: source.id,
+          start: jazz.start_offset,
+          end: jazz.end_offset,
+          text: jazz.text,
+        },
+      ]),
+    );
   });
 });

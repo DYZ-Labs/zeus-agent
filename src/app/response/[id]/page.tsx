@@ -3,7 +3,11 @@ import { notFound } from "next/navigation";
 
 import { PageHeader } from "@/components/page-header";
 import { getMessage } from "@/core/conversations";
-import { recalledForResponse } from "@/core/response-context";
+import type { IntentFieldProvenance } from "@/core/context";
+import {
+  responseSelectionsForResponse,
+  type ResponseContextSelection,
+} from "@/core/response-context";
 import type { RecallItem } from "@/core/schema";
 import { recommendationsForResponse } from "@/core/stewardship";
 import { getDb } from "@/server/db";
@@ -20,14 +24,14 @@ export default async function ResponseSourcesPage({
   const db = getDb();
   const message = getMessage(db, id);
   if (!message || message.role !== "assistant") notFound();
-  const recalled = recalledForResponse(db, id);
+  const selections = responseSelectionsForResponse(db, id);
   const recommendations = recommendationsForResponse(db, id);
 
   return (
     <div className="flex h-full flex-col lg:min-h-0">
       <PageHeader
         title="Response sources"
-        meta={`${recalled.length} memory items · ${recommendations.length} follow-through proposal${recommendations.length === 1 ? "" : "s"}`}
+        meta={`${selections.length} memory items · ${recommendations.length} follow-through proposal${recommendations.length === 1 ? "" : "s"}`}
       />
       <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
         <Link href="/" className="font-mono text-[0.68rem] underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
@@ -69,10 +73,14 @@ export default async function ResponseSourcesPage({
           <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
             Memory supplied to that answer
           </h2>
-          {recalled.length ? (
+          {selections.length ? (
             <ol className="mt-2">
-              {recalled.map((item, index) => (
-                <RecallRow key={key(item)} item={item} rank={index + 1} />
+              {selections.map((selection) => (
+                <RecallRow
+                  key={key(selection.item)}
+                  item={selection.item}
+                  selection={selection}
+                />
               ))}
             </ol>
           ) : (
@@ -86,32 +94,50 @@ export default async function ResponseSourcesPage({
   );
 }
 
-function RecallRow({ item, rank }: { item: RecallItem; rank: number }) {
+function RecallRow({
+  item,
+  selection,
+}: {
+  item: RecallItem;
+  selection: ResponseContextSelection;
+}) {
   let title: string;
   let detail: string;
   let source: number | null = null;
+  let sourcePassage: number | null = null;
   if (item.kind === "fact") {
     title = `${item.fact.subject_slug === "self" ? "You" : item.fact.subject_name} ${item.fact.predicate.replace(/_/gu, " ")} ${item.fact.object}`;
     detail = `canonical fact · ${item.evidence.length} evidence source${item.evidence.length === 1 ? "" : "s"}`;
     source = item.fact.source_message_id;
   } else if (item.kind === "episode") {
     title = `“${item.episode.excerpt}”`;
-    detail = `dated episode · ${item.episode.message.created_at.slice(0, 10)}`;
+    const passage = item.episode.passage_id === null
+      ? "legacy episode"
+      : `passage ${item.episode.passage_id}`;
+    const offsets = item.episode.start_offset === null || item.episode.end_offset === null
+      ? ""
+      : ` · offsets ${item.episode.start_offset}-${item.episode.end_offset}`;
+    detail = `dated episode · ${item.episode.message.created_at.slice(0, 10)} · ${passage}${offsets}`;
     source = item.episode.message.id;
+    sourcePassage = item.episode.passage_id;
   } else if (item.kind === "goal") {
     title = item.goal.title;
     detail = `goal · ${item.goal.status} · ${item.goal.priority} priority${item.goal.target_at ? ` · target ${item.goal.target_at.slice(0, 10)}` : ""}`;
     source = item.goal.source_message_id;
-  } else {
+  } else if (item.kind === "commitment") {
     title = item.commitment.title;
     detail = `commitment · ${item.commitment.status}${item.commitment.due_at ? ` · due ${item.commitment.due_at.slice(0, 10)}` : ""}`;
     source = item.commitment.source_message_id;
+  } else {
+    title = item.facet.statement;
+    detail = `${item.facet.kind.replace(/_/gu, " ")} facet · ${facetScope(item)} · confidence ${item.facet.confidence.toFixed(2)} · ${item.evidence.length} evidence passage${item.evidence.length === 1 ? "" : "s"}`;
+    source = item.evidence[0]?.source_message_id ?? item.facet.source_message_id;
   }
 
   return (
     <li className="flex gap-3 border-b py-4" style={{ borderColor: "var(--shell-line)" }}>
       <span className="font-mono text-[0.63rem]" style={{ color: "var(--shell-faint)" }}>
-        {rank}
+        {selection.rank + 1}
       </span>
       <div className="min-w-0">
         <p className="text-[0.9rem]">{title}</p>
@@ -120,12 +146,24 @@ function RecallRow({ item, rank }: { item: RecallItem; rank: number }) {
           {source !== null && (
             <>
               {" · "}
-              <Link href={`/source/${source}`} className="underline underline-offset-2">
+              <Link
+                href={`/source/${source}${sourcePassage === null ? "" : `?passage=${sourcePassage}`}`}
+                className="underline underline-offset-2"
+              >
                 source
               </Link>
             </>
           )}
         </p>
+        <p className="mt-1 font-mono text-[0.61rem]" style={{ color: "var(--shell-muted)" }}>
+          selected because {selection.reason.replace(/_/gu, " ")}
+          {selection.via.length > 0 ? ` · via ${selection.via.join(" + ")}` : ""}
+          {selection.score > 0 ? ` · score ${selection.score.toFixed(2)}` : ""}
+          {selection.estimated_tokens > 0 ? ` · ~${selection.estimated_tokens} tokens` : ""}
+        </p>
+        {selection.fieldProvenance && (
+          <FieldSources provenance={selection.fieldProvenance} />
+        )}
       </div>
     </li>
   );
@@ -135,8 +173,40 @@ function key(item: RecallItem): string {
   return item.kind === "fact"
     ? `fact-${item.fact.id}`
     : item.kind === "episode"
-      ? `episode-${item.episode.message.id}`
+      ? `episode-${item.episode.passage_id ?? `legacy-message-${item.episode.message.id}`}`
       : item.kind === "goal"
         ? `goal-${item.goal.id}`
-        : `commitment-${item.commitment.id}`;
+        : item.kind === "commitment"
+          ? `commitment-${item.commitment.id}`
+          : `facet-${item.facet.id}`;
+}
+
+function FieldSources({ provenance }: { provenance: IntentFieldProvenance }) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[0.59rem]" style={{ color: "var(--shell-faint)" }}>
+      <span>current field sources:</span>
+      {Object.entries(provenance.fields).map(([field, source]) => (
+        <span key={field}>
+          {field.replace(/_/gu, " ")} {source.source_message_id === null ? (
+            <span>· {source.source_kind.replace(/_/gu, " ")}</span>
+          ) : (
+            <Link
+              href={`/source/${source.source_message_id}${source.passage_id ? `?passage=${source.passage_id}` : ""}`}
+              className="underline underline-offset-2"
+            >
+              · source
+            </Link>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function facetScope(item: Extract<RecallItem, { kind: "facet" }>): string {
+  if (item.facet.scope_kind === "global") return "global";
+  if (item.facet.scope_kind === "domain") return item.facet.scope_label ?? "domain";
+  if (item.facet.scope_kind === "entity") return item.facet.scope_entity_name ?? "entity";
+  if (item.facet.scope_kind === "goal") return item.facet.scope_goal_title ?? "goal";
+  return item.facet.scope_commitment_title ?? "commitment";
 }

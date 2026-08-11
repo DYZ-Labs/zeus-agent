@@ -24,8 +24,9 @@ contextual follow-through.
 - **Temporal truth.** Facts have validity windows. A new employer can close the old
   employer without erasing it, so both “Where do I work?” and “Where did I work before?”
   remain answerable.
-- **Source-level provenance.** Every new fact points to the stored user message that
-  produced it. Later reassertions and corrections are recorded as additional evidence.
+- **Claim-level provenance.** Every production claim cites an exact user-authored span
+  with stable offsets. Later reassertions, field updates, and corrections retain their
+  own evidence instead of borrowing provenance from the surrounding message.
 - **A review boundary.** Direct, clear statements can be accepted automatically.
   Inference, ambiguity, sensitive material, and unexplained conflicts go to a candidate
   queue for explicit acceptance or rejection.
@@ -53,6 +54,11 @@ contextual follow-through.
 - Entity dossiers for people, projects, organizations, places, topics, and things.
 - A timeline of what Zeus learned and when.
 - A review queue for proposed memories that were not safe to accept automatically.
+- An **Understanding** workspace for accepted values, constraints, decision criteria,
+  preferences, motivations, routines, styles, boundaries, skills, and relationship
+  dynamics—with evidence, scope, validity, corrections, and history.
+- A user-started, one-question-at-a-time reflection flow and resumable, opt-in preview
+  of past conversations.
 - Structured goals and commitments with append-only event histories and restrained
   follow-through recommendations.
 - A **Today** view with one best current action, intervention controls, and a transparent
@@ -135,14 +141,18 @@ The main views are:
   and inspect progress, control, and regret signals.
 - **Chat** — converse with Zeus and inspect the memory receipt for each turn.
 - **Memory** — search and curate accepted facts or review pending candidates.
+- **Understanding** — inspect, correct, close, or delete accepted facets; edit and
+  review pending inferences or sensitive proposals; optionally start a reflection or
+  historical preview.
 - **Open loops** — update goals and commitments, inspect their histories, and snooze
   commitment nudges.
 - **Timeline** — see current and superseded facts in learned-at order.
 - **Sources** — inspect or delete stored conversations and their dependent memory.
 
-Deleting a source conversation also removes facts, candidates, goals, and commitments
-supported only by that conversation. A fact with independent evidence survives and is
-relinked to a remaining source.
+Deleting a source conversation also removes or restores dependent passages, facts,
+facets, candidates, goals, commitments, indexes, and recall traces. Independently
+supported memory survives with a remaining real source; intention fields are replayed
+from surviving events rather than retaining deleted-source state.
 
 ## MCP integration
 
@@ -168,6 +178,9 @@ when the checkout moves.
 The server provides:
 
 - `zeus_recall` — retrieve relevant accepted memory.
+- `zeus_understanding` — retrieve current accepted facets within an explicit scope.
+- `zeus_memory_candidates` — inspect pending proposals without treating them as truth.
+- `zeus_review_candidate` — explicitly edit/accept or reject one proposal.
 - `zeus_remember` — extract durable memory from an explicit statement.
 - `zeus_entity` — inspect everything known about one entity.
 - `zeus_timeline` — list facts by the date Zeus learned them.
@@ -242,7 +255,11 @@ What stays local:
 What is sent to OpenAI:
 
 - The chat prompt, relevant memory context, and recent transcript needed for a reply.
-- The conversation and known-memory context needed for structured extraction.
+- A bounded extraction window containing the current user message, at most twelve
+  preceding messages, and relevant accepted context. Evidence IDs are restricted to
+  the user messages actually present in that window.
+- Historical user excerpts only after the user explicitly starts the disclosed
+  backfill preview.
 
 Both OpenAI paths use the Responses API with `store: false`. Zeus is local-first, but it
 is **not encrypted at rest**: any process running as your operating-system user can read
@@ -254,11 +271,15 @@ the database. Treat Markdown exports as equally sensitive and do not commit eith
   no email, calendar, reminder, shopping, or coordination adapters yet, so it never
   claims those external actions happened.
 
-- Retracting one value of a multi-valued predicate is not automatic. For example,
-  “I no longer like coffee” must be closed manually from **Memory**.
-- Aliases are globally unique. If two people share a short name, the later entity keeps
-  its fuller name until the user merges or curates the records.
+- Natural retraction is intentionally conservative: Zeus closes one multi-valued fact
+  only when the subject, predicate, and value resolve to exactly one current claim;
+  otherwise it asks for review.
+- Shared aliases remain ambiguous until context or explicit curation identifies the
+  entity. Zeus does not silently choose the first matching person.
 - Vector search is brute-force and intended for personal-scale stores. Around 50,000
   facts, an approximate nearest-neighbor index becomes the next architectural step.
 - `npm run seed:demo` uses fixture extractions. It validates the deterministic write path,
   not live model extraction quality.
+- The initial longitudinal evaluation corpus is English-first. Trust gates are
+  deterministic, while live extraction and response-quality targets still require a
+  configured model run before rollout.

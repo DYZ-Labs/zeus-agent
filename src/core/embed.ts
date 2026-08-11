@@ -67,10 +67,17 @@ export async function embed(text: string): Promise<Float32Array | null> {
   const extractor = await getExtractor();
   if (!extractor) return null;
 
-  const output = await extractor(trimmed, { pooling: "mean", normalize: true });
-  return output.data instanceof Float32Array
-    ? output.data
-    : Float32Array.from(output.data as number[]);
+  try {
+    const output = await extractor(trimmed, { pooling: "mean", normalize: true });
+    return output.data instanceof Float32Array
+      ? output.data
+      : Float32Array.from(output.data as number[]);
+  } catch {
+    // Do not include the input or model exception in logs: embedding text may itself
+    // be sensitive. Every retrieval caller can continue through FTS/graph paths.
+    console.warn("[zeus] local embedding failed; falling back to non-semantic retrieval");
+    return null;
+  }
 }
 
 /** Cosine similarity of two unit-normalized vectors — a dot product, given normalize:true. */
@@ -130,6 +137,38 @@ export function loadVectors(db: Db, ownerKind: OwnerKind): StoredVector[] {
     .map((row) => ({ ownerId: row.owner_id, vector: fromBlob(row.vec) }));
 }
 
+/** Only allowed claim-sized passages participate in episodic semantic recall. */
+export function loadPassageVectors(db: Db): StoredVector[] {
+  return db
+    .prepare<[string], { passage_id: number; vec: Buffer }>(
+      `SELECT pe.passage_id, pe.vec
+       FROM passage_embedding pe
+       JOIN evidence_passage p ON p.id = pe.passage_id
+       WHERE pe.model = ? AND p.recall_status = 'allowed'
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_evidence ce
+           JOIN memory_candidate mc ON mc.id = ce.candidate_id
+           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
+             AND mc.status IN ('pending','rejected')
+         )`,
+    )
+    .all(EMBEDDING_MODEL)
+    .map((row) => ({ ownerId: row.passage_id, vector: fromBlob(row.vec) }));
+}
+
+/** Closed facets remain historical data but do not enter current semantic recall. */
+export function loadFacetVectors(db: Db): StoredVector[] {
+  return db
+    .prepare<[string], { facet_id: number; vec: Buffer }>(
+      `SELECT fe.facet_id, fe.vec
+       FROM facet_embedding fe
+       JOIN understanding_facet f ON f.id = fe.facet_id
+       WHERE fe.model = ? AND f.valid_to IS NULL`,
+    )
+    .all(EMBEDDING_MODEL)
+    .map((row) => ({ ownerId: row.facet_id, vector: fromBlob(row.vec) }));
+}
+
 /**
  * Minimum cosine similarity for a vector hit to count as a hit at all.
  *
@@ -185,6 +224,56 @@ export async function embedMessage(db: Db, messageId: number, text: string): Pro
   return true;
 }
 
+/** Embed an allowed immutable source passage without exposing neighbouring text. */
+export async function embedPassage(
+  db: Db,
+  passageId: number,
+  text: string,
+): Promise<boolean> {
+  const allowed = db
+    .prepare<[number], { found: number }>(
+      `SELECT 1 AS found FROM evidence_passage p
+       WHERE p.id = ? AND p.recall_status = 'allowed'
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_evidence ce
+           JOIN memory_candidate mc ON mc.id = ce.candidate_id
+           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
+             AND mc.status IN ('pending','rejected')
+         )`,
+    )
+    .get(passageId);
+  if (!allowed) return false;
+  const vector = await embed(text);
+  if (!vector) return false;
+  db.prepare<[number, Buffer, number, string, string]>(
+    `INSERT INTO passage_embedding (passage_id, vec, dim, model, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (passage_id) DO UPDATE SET
+       vec = excluded.vec, dim = excluded.dim,
+       model = excluded.model, created_at = excluded.created_at`,
+  ).run(passageId, toBlob(vector), vector.length, EMBEDDING_MODEL, now());
+  return true;
+}
+
+export async function embedFacet(db: Db, facetId: number, text: string): Promise<boolean> {
+  const current = db
+    .prepare<[number], { found: number }>(
+      "SELECT 1 AS found FROM understanding_facet WHERE id = ? AND valid_to IS NULL",
+    )
+    .get(facetId);
+  if (!current) return false;
+  const vector = await embed(text);
+  if (!vector) return false;
+  db.prepare<[number, Buffer, number, string, string]>(
+    `INSERT INTO facet_embedding (facet_id, vec, dim, model, created_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT (facet_id) DO UPDATE SET
+       vec = excluded.vec, dim = excluded.dim,
+       model = excluded.model, created_at = excluded.created_at`,
+  ).run(facetId, toBlob(vector), vector.length, EMBEDDING_MODEL, now());
+  return true;
+}
+
 /** Facts with no current-model embedding — the backlog `reindex` works through. */
 export function factsMissingEmbeddings(
   db: Db,
@@ -217,6 +306,46 @@ export function messagesMissingEmbeddings(
          ON e.owner_kind = 'message' AND e.owner_id = m.id AND e.model = ?
        WHERE m.role = 'user' AND e.owner_id IS NULL
        LIMIT ?`,
+    )
+    .all(EMBEDDING_MODEL, limit);
+}
+
+export function passagesMissingEmbeddings(
+  db: Db,
+  limit = 1000,
+): { id: number; text: string }[] {
+  return db
+    .prepare<[string, number], { id: number; text: string }>(
+      `SELECT p.id, p.text
+       FROM evidence_passage p
+       LEFT JOIN passage_embedding e
+         ON e.passage_id = p.id AND e.model = ?
+       WHERE p.recall_status = 'allowed' AND e.passage_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_evidence ce
+           JOIN memory_candidate mc ON mc.id = ce.candidate_id
+           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
+             AND mc.status IN ('pending','rejected')
+         )
+       ORDER BY p.id LIMIT ?`,
+    )
+    .all(EMBEDDING_MODEL, limit);
+}
+
+export function facetsMissingEmbeddings(
+  db: Db,
+  limit = 1000,
+): { id: number; text: string }[] {
+  return db
+    .prepare<[string, number], { id: number; text: string }>(
+      `SELECT f.id,
+              replace(f.kind, '_', ' ') || ' ' || f.statement ||
+              CASE WHEN f.condition_text IS NULL THEN '' ELSE ' ' || f.condition_text END AS text
+       FROM understanding_facet f
+       LEFT JOIN facet_embedding e
+         ON e.facet_id = f.id AND e.model = ?
+       WHERE f.valid_to IS NULL AND e.facet_id IS NULL
+       ORDER BY f.id LIMIT ?`,
     )
     .all(EMBEDDING_MODEL, limit);
 }

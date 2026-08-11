@@ -10,14 +10,24 @@ export function CandidateRow({ candidate }: { candidate: CandidateView }) {
         <div className="min-w-0 flex-1">
           <p className="text-[0.92rem]">{candidateLabel(candidate)}</p>
           <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
-            {candidate.kind} · held for {candidate.reason} · confidence {candidate.confidence.toFixed(2)} ·{" "}
+            {candidate.kind} · held for {candidate.reasons.join(", ")} · confidence {candidate.confidence.toFixed(2)} ·{" "}
             <Link href={`/source/${candidate.source_message_id}`} className="underline underline-offset-2">
               source
             </Link>
           </p>
-          <p className="mt-2 line-clamp-2 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
-            “{candidate.source_excerpt}”
-          </p>
+          {candidate.evidence.length > 0 ? (
+            <div className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
+              {candidate.evidence.map((passage) => (
+                <p key={passage.id} className="line-clamp-2">
+                  “{passage.text}” <span className="font-mono text-[0.62rem]">span {passage.start_offset}–{passage.end_offset}</span>
+                </p>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-2 line-clamp-2 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
+              Legacy message provenance: “{candidate.source_excerpt}”
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-3 font-mono text-[0.68rem]">
           <form action={acceptCandidateAction}>
@@ -39,7 +49,8 @@ export function CandidateRow({ candidate }: { candidate: CandidateView }) {
 }
 
 function candidateLabel(candidate: CandidateView): string {
-  const payload = asRecord(candidate.payload);
+  const envelope = asRecord(candidate.payload);
+  const payload = asRecord(envelope.item ?? envelope);
   if (candidate.kind === "fact" || candidate.kind === "interest") {
     return `${string(payload.subject, "Unknown")} ${string(payload.predicate, "asserts").replace(/_/gu, " ")} ${string(payload.object, "")}`;
   }

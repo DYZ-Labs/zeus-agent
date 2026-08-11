@@ -22,8 +22,11 @@ type Turn = ChatHistoryTurn & {
     recalled: number;
     recalledFacts: number;
     recalledEpisodes: number;
+    recalledFacets: number;
     accepted: number;
+    acceptedFacets: number;
     pending: number;
+    pendingFacets: number;
     goalsUpdated: number;
     commitmentsUpdated: number;
     superseded: number;
@@ -147,8 +150,11 @@ export function Chat({
                         recalled: event.recalled as number,
                         recalledFacts: event.recalledFacts as number,
                         recalledEpisodes: event.recalledEpisodes as number,
+                        recalledFacets: event.recalledFacets as number,
                         accepted: event.accepted as number,
+                        acceptedFacets: event.acceptedFacets as number,
                         pending: event.pending as number,
+                        pendingFacets: event.pendingFacets as number,
                         goalsUpdated: event.goalsUpdated as number,
                         commitmentsUpdated: event.commitmentsUpdated as number,
                         superseded: event.superseded as number,
@@ -190,6 +196,7 @@ export function Chat({
     recommendation: FollowThroughRecommendation,
     decision: RecommendationDecision,
     responseMessageId: number | null,
+    userReason?: string,
   ) {
     try {
       const response = await fetch("/api/follow-through", {
@@ -199,6 +206,7 @@ export function Chat({
           commitmentId: recommendation.commitment_id,
           decision,
           responseMessageId,
+          ...(userReason?.trim() ? { userReason: userReason.trim() } : {}),
         }),
       });
       if (!response.ok) {
@@ -256,12 +264,13 @@ export function Chat({
                         receipt={turn.receipt}
                         recommendation={turn.recommendation}
                         recommendationDecision={turn.recommendationDecision}
-                        onRecommendationDecision={(recommendation, decision) =>
+                        onRecommendationDecision={(recommendation, decision, userReason) =>
                           respondToRecommendation(
                             turn.id,
                             recommendation,
                             decision,
                             turn.receipt?.messageId ?? null,
+                            userReason,
                           )
                         }
                         pending={status === "streaming" && !turn.receipt}
@@ -403,6 +412,7 @@ function AssistantTurn({
   onRecommendationDecision: (
     recommendation: FollowThroughRecommendation,
     decision: RecommendationDecision,
+    userReason?: string,
   ) => void;
   pending: boolean;
 }) {
@@ -440,8 +450,10 @@ function FollowThroughCard({
   onDecision: (
     recommendation: FollowThroughRecommendation,
     decision: RecommendationDecision,
+    userReason?: string,
   ) => void;
 }) {
+  const [userReason, setUserReason] = useState("");
   const decisionText =
     decision === "accepted"
       ? "Ready in the composer — help is available without acting externally."
@@ -479,28 +491,40 @@ function FollowThroughCard({
           {decisionText}
         </p>
       ) : (
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-[0.76rem]">
+        <div className="mt-3 text-[0.76rem]">
+          <label className="block max-w-[30rem] text-[0.68rem]" style={{ color: "var(--shell-faint)" }}>
+            Reason (optional; silence is never interpreted)
+            <input
+              value={userReason}
+              onChange={(event) => setUserReason(event.target.value)}
+              maxLength={1000}
+              className="mt-1 block min-h-[34px] w-full rounded-md border px-2.5"
+              style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+            />
+          </label>
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
           <button
             type="button"
-            onClick={() => onDecision(recommendation, "accepted")}
+            onClick={() => onDecision(recommendation, "accepted", userReason)}
             className="rounded-md px-3 py-1.5 font-medium"
             style={{ background: "var(--shell-accent)", color: "#000000" }}
           >
             Help me do this
           </button>
-          <button type="button" onClick={() => onDecision(recommendation, "completed")}>
+          <button type="button" onClick={() => onDecision(recommendation, "completed", userReason)}>
             Already done
           </button>
-          <button type="button" onClick={() => onDecision(recommendation, "snoozed")}>
+          <button type="button" onClick={() => onDecision(recommendation, "snoozed", userReason)}>
             Not now
           </button>
           <button
             type="button"
-            onClick={() => onDecision(recommendation, "dismissed")}
+            onClick={() => onDecision(recommendation, "dismissed", userReason)}
             style={{ color: "var(--shell-faint)" }}
           >
             Not useful
           </button>
+          </div>
         </div>
       )}
       <div className="mt-2 flex gap-3 font-mono text-[0.61rem]" style={{ color: "var(--shell-faint)" }}>
@@ -548,8 +572,11 @@ function Receipt({
   recalled,
   recalledFacts,
   recalledEpisodes,
+  recalledFacets,
   accepted,
+  acceptedFacets,
   pending,
+  pendingFacets,
   goalsUpdated,
   commitmentsUpdated,
   superseded,
@@ -572,7 +599,9 @@ function Receipt({
         style={{ borderColor: "var(--shell-line-strong)" }}
       >
         <span>{recalledFacts} facts</span>
-        <span>{recalledEpisodes} episodes</span>
+        <span>{recalledEpisodes} passages</span>
+        <span>{recalledFacets} understanding facets</span>
+        {acceptedFacets > 0 && <span>{acceptedFacets} facets accepted</span>}
         {goalsUpdated > 0 && <span>{goalsUpdated} goals updated</span>}
         {commitmentsUpdated > 0 && <span>{commitmentsUpdated} commitments updated</span>}
         <a href={`/response/${messageId}`} className="underline underline-offset-2" style={{ color: "var(--shell-fg)" }}>
@@ -580,11 +609,11 @@ function Receipt({
         </a>
         {(accepted > 0 || pending > 0) && (
           <a
-            href={pending > 0 ? "/memory?view=review" : "/memory"}
+            href={pendingFacets > 0 ? "/understanding" : pending > 0 ? "/memory?view=review" : "/memory"}
             className="underline underline-offset-2"
             style={{ color: "var(--shell-fg)" }}
           >
-            review saved details
+            {pendingFacets > 0 ? "review understanding" : "review saved details"}
           </a>
         )}
       </div>
