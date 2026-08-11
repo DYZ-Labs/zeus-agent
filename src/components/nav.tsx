@@ -2,22 +2,34 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { NEW_CHAT_EVENT } from "@/components/chat-events";
+import {
+  CHAT_UPDATED_EVENT,
+  NEW_CHAT_EVENT,
+} from "@/components/chat-events";
+import type { RecentChat } from "@/core/conversations";
 
 const PRIMARY_LINKS = [
   { href: "/today", label: "Today", icon: "today" },
   { href: "/memory", label: "Memory", icon: "memory" },
-  { href: "/conversations", label: "Chats", icon: "chats" },
 ] as const;
 
-type IconName = (typeof PRIMARY_LINKS)[number]["icon"] | "settings";
+type IconName = (typeof PRIMARY_LINKS)[number]["icon"] | "chats" | "settings";
 
-export function Nav() {
+export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }) {
   const pathname = usePathname();
   const router = useRouter();
   const [isOpen, setIsOpen] = useState(true);
+
+  useEffect(() => {
+    function refreshRecentChats() {
+      router.refresh();
+    }
+
+    window.addEventListener(CHAT_UPDATED_EVENT, refreshRecentChats);
+    return () => window.removeEventListener(CHAT_UPDATED_EVENT, refreshRecentChats);
+  }, [router]);
 
   function startNewChat() {
     if (pathname === "/") {
@@ -30,16 +42,37 @@ export function Nav() {
 
   if (!isOpen) {
     return (
-      <button
-        type="button"
-        aria-label="Open sidebar"
-        title="Open sidebar"
-        onClick={() => setIsOpen(true)}
-        className="fixed left-3 top-3 z-50 flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
-        style={{ background: "var(--shell-bg)", color: "var(--shell-muted)" }}
+      <nav
+        aria-label="Primary"
+        className="fixed left-3 top-3 z-50 flex flex-col gap-1"
+        style={{ color: "var(--shell-muted)" }}
       >
-        <SidebarIcon />
-      </button>
+        <button
+          type="button"
+          aria-label="Open sidebar"
+          title="Open sidebar"
+          onClick={() => setIsOpen(true)}
+          className="group flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+          style={{ background: "var(--shell-bg)" }}
+        >
+          <span className="group-hover:hidden">
+            <SidebarIcon />
+          </span>
+          <span className="hidden group-hover:flex">
+            <ZeusMark />
+          </span>
+        </button>
+        <button
+          type="button"
+          aria-label="New chat"
+          title="New chat"
+          onClick={startNewChat}
+          className="flex h-10 w-10 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+          style={{ background: "var(--shell-bg)" }}
+        >
+          <NewChatIcon />
+        </button>
+      </nav>
     );
   }
 
@@ -102,6 +135,14 @@ export function Nav() {
         })}
         <li className="shrink-0 lg:hidden">
           <NavLink
+            href="/conversations"
+            label="Recent chats"
+            icon="chats"
+            active={pathname.startsWith("/conversations")}
+          />
+        </li>
+        <li className="shrink-0 lg:hidden">
+          <NavLink
             href="/settings"
             label="Settings"
             icon="settings"
@@ -109,6 +150,47 @@ export function Nav() {
           />
         </li>
       </ul>
+
+      <section className="mt-5 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
+        <div className="flex items-center justify-between px-3">
+          <h2
+            id="recent-chats-heading"
+            className="text-[0.72rem] font-medium"
+            style={{ color: "var(--shell-faint)" }}
+          >
+            Recent
+          </h2>
+          <Link
+            href="/conversations"
+            className="text-[0.68rem] transition-colors hover:text-white"
+            style={{ color: "var(--shell-faint)" }}
+          >
+            View all
+          </Link>
+        </div>
+        <div className="mt-2 min-h-0 overflow-y-auto">
+          {initialRecentChats.length > 0 ? (
+            <ul className="space-y-0.5">
+              {initialRecentChats.map((chat) => (
+                <li key={chat.id}>
+                  <Link
+                    href={`/?conversation=${chat.id}`}
+                    title={chat.title}
+                    className="block truncate rounded-lg px-3 py-2 text-[0.82rem] transition-colors hover:bg-white/[0.06]"
+                    style={{ color: "var(--shell-muted)" }}
+                  >
+                    {chat.title}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="px-3 py-2 text-[0.76rem]" style={{ color: "var(--shell-faint)" }}>
+              No recent chats
+            </p>
+          )}
+        </div>
+      </section>
 
       <Link
         href="/settings"

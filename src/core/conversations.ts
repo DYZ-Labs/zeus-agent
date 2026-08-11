@@ -2,6 +2,11 @@ import type { Db } from "./db";
 import { now } from "./db";
 import type { Conversation, ConversationSource, Message, MessageRole } from "./schema";
 
+export type RecentChat = {
+  id: number;
+  title: string;
+};
+
 /**
  * The episodic log. Every fact points at the message that produced it, so this table
  * is what makes provenance real rather than decorative — you can always walk from a
@@ -41,6 +46,42 @@ export function listConversations(db: Db, limit = 50): Conversation[] {
        FROM conversation ORDER BY updated_at DESC LIMIT ?`,
     )
     .all(limit);
+}
+
+/** Compact, display-ready history for the navigation sidebar. */
+export function listRecentChats(db: Db, limit = 12): RecentChat[] {
+  const rows = db
+    .prepare<
+      [number],
+      {
+        id: number;
+        title: string | null;
+        first_user_message: string | null;
+      }
+    >(
+      `SELECT c.id, c.title,
+              (SELECT m.content
+               FROM message m
+               WHERE m.conversation_id = c.id AND m.role = 'user'
+               ORDER BY m.id LIMIT 1) AS first_user_message
+       FROM conversation c
+       WHERE COALESCE(c.title, '') != 'Memory curation'
+         AND EXISTS (SELECT 1 FROM message m WHERE m.conversation_id = c.id)
+       ORDER BY c.updated_at DESC
+       LIMIT ?`,
+    )
+    .all(limit);
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title?.trim() || chatTitle(row.first_user_message, row.id),
+  }));
+}
+
+function chatTitle(content: string | null, conversationId: number): string {
+  const normalized = content?.replace(/\s+/gu, " ").trim();
+  if (!normalized) return `Conversation ${conversationId}`;
+  return normalized.length > 72 ? `${normalized.slice(0, 69)}…` : normalized;
 }
 
 export function setConversationTitle(db: Db, id: number, title: string): void {

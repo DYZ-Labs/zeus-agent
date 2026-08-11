@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { acceptCandidate, applyExtraction } from "./extract";
-import { appendMessage, createConversation, getConversation } from "./conversations";
+import {
+  appendMessage,
+  createConversation,
+  getConversation,
+  listConversations,
+} from "./conversations";
 import { recordResponseContext } from "./context";
 import { openTestDb } from "./db";
 import { searchEpisodes } from "./episodes";
@@ -23,7 +28,10 @@ import {
   updateGoal,
 } from "./intentions";
 import { selfEntity } from "./entities";
-import { deleteConversationWithMemory } from "./retention";
+import {
+  deleteAllConversationsWithMemory,
+  deleteConversationWithMemory,
+} from "./retention";
 import { recalledForResponse } from "./response-context";
 import type { ExtractedFact, Extraction } from "./schema";
 
@@ -359,6 +367,21 @@ describe("episodic recall and source deletion", () => {
     expect(listCommitments(db, { includeClosed: true })).toEqual([]);
 
     deleteConversationWithMemory(db, secondConversation.id);
+    expect(getFact(db, stored.id)).toBeNull();
+  });
+
+  it("deletes every conversation and memory supported by them", () => {
+    const db = openTestDb();
+    const firstConversation = createConversation(db, { title: "First" });
+    const secondConversation = createConversation(db, { title: "Second" });
+    createConversation(db, { title: "Memory curation" });
+    const first = appendMessage(db, firstConversation.id, "user", "I live in Lisbon.");
+    const second = appendMessage(db, secondConversation.id, "user", "Lisbon is still home.");
+    const stored = applyExtraction(db, extraction({ facts: [fact()] }), first.id).facts[0]!;
+    applyExtraction(db, extraction({ facts: [fact()] }), second.id);
+
+    expect(deleteAllConversationsWithMemory(db)).toBe(3);
+    expect(listConversations(db)).toEqual([]);
     expect(getFact(db, stored.id)).toBeNull();
   });
 

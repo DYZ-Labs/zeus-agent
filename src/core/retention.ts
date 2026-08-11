@@ -195,6 +195,22 @@ export function deleteConversationWithMemory(
   return dependencies;
 }
 
+/** Explicitly delete every stored conversation using the same evidence-aware policy. */
+export function deleteAllConversationsWithMemory(db: Db): number {
+  const conversationIds = db
+    .prepare<[], { id: number }>("SELECT id FROM conversation ORDER BY id")
+    .all()
+    .map((row) => row.id);
+
+  db.transaction(() => {
+    for (const conversationId of conversationIds) {
+      deleteConversationWithMemory(db, conversationId);
+    }
+  })();
+
+  return conversationIds.length;
+}
+
 function reopenAfterSoleCorrectionDeletion(
   db: Db,
   fact: {

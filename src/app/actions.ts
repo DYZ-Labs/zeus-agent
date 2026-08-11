@@ -19,7 +19,10 @@ import {
   supersedeFact,
 } from "@/core/facts";
 import { getCommitment, getGoal, updateCommitment, updateGoal } from "@/core/intentions";
-import { deleteConversationWithMemory } from "@/core/retention";
+import {
+  deleteAllConversationsWithMemory,
+  deleteConversationWithMemory,
+} from "@/core/retention";
 import type { Db } from "@/core/db";
 import type {
   Cardinality,
@@ -220,6 +223,20 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   const confirmation = String(formData.get("confirmation") ?? "");
   if (!Number.isInteger(id) || confirmation !== "delete") return;
   deleteConversationWithMemory(getDb(), id);
+  revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
+  redirect("/settings#data");
+}
+
+export async function deleteAllConversationsAction(formData: FormData): Promise<void> {
+  const confirmation = String(formData.get("confirmation") ?? "");
+  if (confirmation !== "delete-all") return;
+
+  deleteAllConversationsWithMemory(getDb());
+  revalidatePath("/", "layout");
   revalidatePath("/memory");
   revalidatePath("/today");
   revalidatePath("/conversations");

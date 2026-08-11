@@ -5,6 +5,7 @@ import {
   followThroughDecisionAction,
   setStewardshipModeAction,
 } from "@/app/actions";
+import { DeleteAllConversations } from "@/components/delete-all-conversations";
 import { PageHeader } from "@/components/page-header";
 import { listConversations } from "@/core/conversations";
 import { conversationDependencies } from "@/core/retention";
@@ -94,6 +95,19 @@ export default function SettingsPage() {
             Zeus stores conversations locally on this device. Deleting one also removes memories
             supported only by that conversation; memories with another source keep their surviving evidence.
           </p>
+
+          <div
+            className="mt-5 flex flex-wrap items-center justify-between gap-4 rounded-lg border px-4 py-4"
+            style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line)" }}
+          >
+            <div className="min-w-0">
+              <p className="text-[0.86rem] font-medium">Delete all conversations</p>
+              <p className="mt-1 max-w-[58ch] text-[0.74rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+                This also removes saved details and open loops that have no evidence outside those conversations.
+              </p>
+            </div>
+            <DeleteAllConversations disabled={conversations.length === 0} />
+          </div>
 
           {conversations.length > 0 ? (
             <ul className="mt-6">
