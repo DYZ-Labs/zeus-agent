@@ -1,0 +1,412 @@
+import { z } from "zod";
+
+/**
+ * Zod is the source of truth for everything crossing a boundary — the SQLite rows,
+ * the MCP tool arguments, and the extraction model's output. Types are inferred from
+ * these schemas rather than declared alongside them, so the two can never drift.
+ */
+
+export const EntityKind = z.enum(["person", "project", "org", "place", "topic", "thing"]);
+export type EntityKind = z.infer<typeof EntityKind>;
+
+export const Cardinality = z.enum(["single", "multi"]);
+export type Cardinality = z.infer<typeof Cardinality>;
+
+export const MessageRole = z.enum(["user", "assistant"]);
+export type MessageRole = z.infer<typeof MessageRole>;
+
+export const ConversationSource = z.enum(["web", "mcp", "seed"]);
+export type ConversationSource = z.infer<typeof ConversationSource>;
+
+export const OwnerKind = z.enum(["fact", "message", "entity"]);
+export type OwnerKind = z.infer<typeof OwnerKind>;
+
+export const EvidenceKind = z.enum(["assertion", "reassertion", "correction"]);
+export type EvidenceKind = z.infer<typeof EvidenceKind>;
+
+export const CandidateKind = z.enum(["fact", "goal", "commitment", "interest"]);
+export type CandidateKind = z.infer<typeof CandidateKind>;
+
+export const CandidateReason = z.enum(["inference", "ambiguous", "sensitive", "conflict"]);
+export type CandidateReason = z.infer<typeof CandidateReason>;
+
+export const CandidateStatus = z.enum(["pending", "accepted", "rejected"]);
+export type CandidateStatus = z.infer<typeof CandidateStatus>;
+
+export const GoalStatus = z.enum(["active", "paused", "achieved", "abandoned"]);
+export type GoalStatus = z.infer<typeof GoalStatus>;
+
+export const CommitmentStatus = z.enum(["open", "waiting", "done", "cancelled"]);
+export type CommitmentStatus = z.infer<typeof CommitmentStatus>;
+
+// ---------------------------------------------------------------------------
+// Stored rows
+// ---------------------------------------------------------------------------
+
+export const Entity = z
+  .object({
+    id: z.number().int(),
+    kind: EntityKind,
+    name: z.string(),
+    slug: z.string(),
+    summary: z.string().nullable(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type Entity = z.infer<typeof Entity>;
+
+export const Fact = z
+  .object({
+    id: z.number().int(),
+    subject_id: z.number().int(),
+    predicate: z.string(),
+    object: z.string(),
+    object_entity_id: z.number().int().nullable(),
+    confidence: z.number().min(0).max(1),
+    valid_from: z.string(),
+    /** NULL means "still true". A timestamp means it was superseded then. */
+    valid_to: z.string().nullable(),
+    superseded_by: z.number().int().nullable(),
+    /** The message that produced this fact. Provenance is a foreign key, not a note. */
+    source_message_id: z.number().int().nullable(),
+    /** How many times this has been independently asserted. Repetition is evidence. */
+    assertion_count: z.number().int(),
+    last_seen_at: z.string(),
+    created_at: z.string(),
+  })
+  .strict();
+export type Fact = z.infer<typeof Fact>;
+
+export const Message = z
+  .object({
+    id: z.number().int(),
+    conversation_id: z.number().int(),
+    role: MessageRole,
+    content: z.string(),
+    created_at: z.string(),
+  })
+  .strict();
+export type Message = z.infer<typeof Message>;
+
+export const Conversation = z
+  .object({
+    id: z.number().int(),
+    title: z.string().nullable(),
+    source: ConversationSource,
+    started_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type Conversation = z.infer<typeof Conversation>;
+
+export const FactEvidence = z
+  .object({
+    id: z.number().int(),
+    fact_id: z.number().int(),
+    source_message_id: z.number().int(),
+    kind: EvidenceKind,
+    confidence: z.number().min(0).max(1),
+    created_at: z.string(),
+  })
+  .strict();
+export type FactEvidence = z.infer<typeof FactEvidence>;
+
+export const MemoryCandidate = z
+  .object({
+    id: z.number().int(),
+    kind: CandidateKind,
+    payload_json: z.string(),
+    reason: CandidateReason,
+    confidence: z.number().min(0).max(1),
+    source_message_id: z.number().int(),
+    status: CandidateStatus,
+    resolved_at: z.string().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type MemoryCandidate = z.infer<typeof MemoryCandidate>;
+
+export const Goal = z
+  .object({
+    id: z.number().int(),
+    title: z.string(),
+    status: GoalStatus,
+    target_at: z.string().nullable(),
+    confidence: z.number().min(0).max(1),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    closed_at: z.string().nullable(),
+  })
+  .strict();
+export type Goal = z.infer<typeof Goal>;
+
+export const GoalEvent = z
+  .object({
+    id: z.number().int(),
+    goal_id: z.number().int(),
+    event_type: z.enum(["created", "updated", "status_changed"]),
+    from_status: GoalStatus.nullable(),
+    to_status: GoalStatus.nullable(),
+    detail_json: z.string().nullable(),
+    source_message_id: z.number().int().nullable(),
+    source_kind: z.enum(["message", "user_action"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type GoalEvent = z.infer<typeof GoalEvent>;
+
+export const Commitment = z
+  .object({
+    id: z.number().int(),
+    title: z.string(),
+    owner_entity_id: z.number().int(),
+    linked_goal_id: z.number().int().nullable(),
+    status: CommitmentStatus,
+    due_at: z.string().nullable(),
+    snoozed_until: z.string().nullable(),
+    last_surfaced_at: z.string().nullable(),
+    confidence: z.number().min(0).max(1),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    closed_at: z.string().nullable(),
+  })
+  .strict();
+export type Commitment = z.infer<typeof Commitment>;
+
+export const CommitmentView = Commitment.extend({
+  owner_name: z.string(),
+  owner_slug: z.string(),
+  goal_title: z.string().nullable(),
+}).strict();
+export type CommitmentView = z.infer<typeof CommitmentView>;
+
+export const CommitmentEvent = z
+  .object({
+    id: z.number().int(),
+    commitment_id: z.number().int(),
+    event_type: z.enum(["created", "updated", "status_changed", "surfaced", "snoozed"]),
+    from_status: CommitmentStatus.nullable(),
+    to_status: CommitmentStatus.nullable(),
+    detail_json: z.string().nullable(),
+    source_message_id: z.number().int().nullable(),
+    source_kind: z.enum(["message", "user_action", "system"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type CommitmentEvent = z.infer<typeof CommitmentEvent>;
+
+/** A fact joined to the names it references — what the UI and prompt builder consume. */
+export const FactView = Fact.extend({
+  subject_name: z.string(),
+  subject_slug: z.string(),
+  object_entity_name: z.string().nullable(),
+  object_entity_slug: z.string().nullable(),
+}).strict();
+export type FactView = z.infer<typeof FactView>;
+
+// ---------------------------------------------------------------------------
+// Extraction — the shape the model must return
+// ---------------------------------------------------------------------------
+
+/**
+ * Sentinel subject meaning "the user". The model is told to use this rather than
+ * guessing the user's name, which it usually does not know.
+ */
+export const SELF_REF = "self";
+
+export const ExtractedEntity = z
+  .object({
+    name: z
+      .string()
+      .describe("Canonical display name, e.g. 'Sarah Chen', 'Project Apollo', 'rock climbing'"),
+    kind: EntityKind.describe(
+      "person for humans; org for companies; project for named efforts; place for locations; topic for subjects the user tracks; thing for anything else",
+    ),
+    aliases: z
+      .array(z.string())
+      .describe(
+        "Other names used for this entity in the conversation, e.g. ['Sarah', 'sarah chen']. Empty array if none.",
+      ),
+  })
+  .strict();
+export type ExtractedEntity = z.infer<typeof ExtractedEntity>;
+
+export const ExtractionExplicitness = z.enum(["explicit", "inferred"]);
+export type ExtractionExplicitness = z.infer<typeof ExtractionExplicitness>;
+
+export const ExtractionSensitivity = z.enum(["normal", "sensitive"]);
+export type ExtractionSensitivity = z.infer<typeof ExtractionSensitivity>;
+
+export const ExtractionAmbiguity = z.enum(["clear", "ambiguous"]);
+export type ExtractionAmbiguity = z.infer<typeof ExtractionAmbiguity>;
+
+const TrustFields = {
+  grounding: z
+    .enum(["user_statement", "assistant_only"])
+    .default("user_statement")
+    .describe(
+      "user_statement only when the user stated or endorsed it; assistant_only when it appears solely in assistant text",
+    ),
+  explicitness: ExtractionExplicitness.default("explicit").describe(
+    "explicit when the user directly stated it; inferred when it requires interpretation",
+  ),
+  sensitivity: ExtractionSensitivity.default("normal").describe(
+    "sensitive for health, finances, legal matters, intimate identity, credentials, or private secrets",
+  ),
+  ambiguity: ExtractionAmbiguity.default("clear").describe(
+    "ambiguous when the subject, meaning, date, owner, or intended permanence is unclear",
+  ),
+};
+
+export const ExtractedFact = z
+  .object({
+    subject: z
+      .string()
+      .describe(
+        `Name of the entity this fact is about. Use "${SELF_REF}" for facts about the user themselves.`,
+      ),
+    predicate: z
+      .string()
+      .describe(
+        "snake_case relation. Prefer an existing predicate from the provided list; invent one only when none fits.",
+      ),
+    object: z
+      .string()
+      .describe("The value, as a short natural-language phrase. Never a full sentence."),
+    object_entity: z
+      .string()
+      .nullable()
+      .describe(
+        "If the object is itself an entity in the entities array, its name. Otherwise null. This is what makes the memory a graph.",
+      ),
+    confidence: z
+      .number()
+      .describe(
+        "0.0-1.0. Use 0.9+ only for facts the user stated plainly about themselves; lower for inference or hearsay.",
+      ),
+    supersedes_previous: z
+      .boolean()
+      .describe(
+        "True only when the user is explicitly correcting or replacing something previously true (e.g. 'I left Acme, I'm at Beta now').",
+      ),
+    effective_from: z
+      .string()
+      .nullable()
+      .default(null)
+      .describe("ISO date/time when the fact became true if the user stated it, otherwise null."),
+    ...TrustFields,
+  })
+  .strict();
+export type ExtractedFact = z.input<typeof ExtractedFact>;
+
+export const ExtractedGoal = z
+  .object({
+    existing_id: z
+      .number()
+      .int()
+      .nullable()
+      .default(null)
+      .describe("ID from the supplied active-goal list when updating one; null for a new goal."),
+    title: z.string().describe("Short goal title in the user's own terms."),
+    status: GoalStatus.describe("The goal state established by this user message."),
+    target_at: z
+      .string()
+      .nullable()
+      .describe("ISO date/time only when the user supplied a target; otherwise null."),
+    confidence: z.number().describe("Confidence that the user expressed this goal or update."),
+    ...TrustFields,
+  })
+  .strict();
+export type ExtractedGoal = z.input<typeof ExtractedGoal>;
+
+export const ExtractedCommitment = z
+  .object({
+    existing_id: z
+      .number()
+      .int()
+      .nullable()
+      .default(null)
+      .describe("ID from the supplied open-commitment list when updating one; null for a new commitment."),
+    title: z.string().describe("Concrete commitment or next action in the user's own terms."),
+    owner: z
+      .string()
+      .default(SELF_REF)
+      .describe(`Who owns it. Use "${SELF_REF}" when the user does.`),
+    linked_goal_id: z.number().int().nullable().default(null),
+    linked_goal_title: z
+      .string()
+      .nullable()
+      .default(null)
+      .describe("For a goal first created in this same extraction, provide its exact title; otherwise null."),
+    status: CommitmentStatus.describe("The commitment state established by this user message."),
+    due_at: z
+      .string()
+      .nullable()
+      .describe("ISO date/time only when the user supplied a due date; otherwise null."),
+    confidence: z.number().describe("Confidence that the user expressed this commitment or update."),
+    ...TrustFields,
+  })
+  .strict();
+export type ExtractedCommitment = z.input<typeof ExtractedCommitment>;
+
+export const Extraction = z
+  .object({
+    entities: z
+      .array(ExtractedEntity)
+      .describe(
+        "Every entity referenced by a fact or commitment below. Omit entities that no extracted item uses.",
+      ),
+    facts: z
+      .array(ExtractedFact)
+      .describe(
+        "Durable facts worth remembering months from now. Extract nothing rather than something trivial or transient.",
+      ),
+    goals: z
+      .array(ExtractedGoal)
+      .default([])
+      .describe("Longer-lived outcomes the user is trying to achieve, including explicit status changes."),
+    commitments: z
+      .array(ExtractedCommitment)
+      .default([])
+      .describe("Concrete promises, next actions, waiting items, and explicit status changes."),
+  })
+  .strict();
+/** Input form keeps defaults optional so fixture extractions remain concise. */
+export type Extraction = z.input<typeof Extraction>;
+export type ParsedExtraction = z.output<typeof Extraction>;
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+export const SearchHit = z
+  .object({
+    fact: FactView,
+    score: z.number(),
+    /** Which retrieval paths surfaced this — useful when debugging bad recall. */
+    via: z.array(z.enum(["lexical", "semantic", "graph"])),
+  })
+  .strict();
+export type SearchHit = z.infer<typeof SearchHit>;
+
+export const EpisodeHit = z
+  .object({
+    message: Message,
+    conversation_title: z.string().nullable(),
+    excerpt: z.string(),
+    score: z.number(),
+    via: z.array(z.enum(["lexical", "semantic"])),
+  })
+  .strict();
+export type EpisodeHit = z.infer<typeof EpisodeHit>;
+
+export const RecallItem = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("fact"), fact: FactView, evidence: z.array(FactEvidence) }).strict(),
+  z.object({ kind: z.literal("episode"), episode: EpisodeHit }).strict(),
+  z.object({ kind: z.literal("goal"), goal: Goal }).strict(),
+  z.object({ kind: z.literal("commitment"), commitment: CommitmentView }).strict(),
+]);
+export type RecallItem = z.infer<typeof RecallItem>;

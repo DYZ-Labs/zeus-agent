@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: Arial, Helvetica, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+:root {
+  --shell-bg: #000000;
+  --shell-sidebar: #171717;
+  --shell-fg: #f4f4f4;
+  --shell-panel: #212121;
+  --shell-elevated: #2f2f2f;
+  --shell-hover: #292929;
+  --shell-line: #2f2f2f;
+  --shell-line-strong: #4d4d4d;
+  --shell-muted: #b4b4b4;
+  --shell-faint: #8e8e8e;
+  --shell-accent: #ffffff;
+  --shell-accent-soft: #2f2f2f;
+  --shell-accent-line: #565656;
+  --shell-selection: #414141;
+}
+
+* {
+  border-color: var(--shell-line);
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--shell-bg);
+  color-scheme: dark;
+}
+
+body {
+  background: var(--shell-bg);
+  color: var(--shell-fg);
+  font-family: var(--font-display);
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.5;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+textarea::placeholder,
+input::placeholder {
+  color: var(--shell-faint);
+  opacity: 1;
+}
+
+::selection {
+  background: var(--shell-selection);
+  color: var(--shell-fg);
+}
+
+:focus-visible {
+  outline: 2px solid var(--shell-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@supports (scrollbar-width: thin) {
+  * {
+    scrollbar-color: var(--shell-line-strong) transparent;
+    scrollbar-width: thin;
+  }
+}
