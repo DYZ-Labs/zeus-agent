@@ -70,7 +70,7 @@ export function SettingsModal({
           style={{ background: "var(--shell-sidebar)", borderColor: "var(--shell-line)" }}
         >
           <div className="flex h-12 items-center justify-between px-2 sm:h-auto sm:justify-start sm:pb-3 sm:pt-2">
-            <span className="pl-2 text-base font-semibold sm:hidden">Settings</span>
+            <span className="pl-2 text-xl font-medium leading-7 sm:hidden">Settings</span>
             <button
               type="button"
               onClick={close}
@@ -126,7 +126,7 @@ function SettingsSectionButton({
       type="button"
       aria-current={active ? "page" : undefined}
       onClick={onSelect}
-      className="flex h-9 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] sm:w-full"
+      className="flex h-10 shrink-0 items-center gap-2.5 rounded-lg px-2.5 text-base font-normal leading-6 transition-colors hover:bg-white/[0.06] sm:w-full"
       style={{
         background: active ? "var(--shell-elevated)" : undefined,
         color: active ? "var(--shell-fg)" : "var(--shell-muted)",

@@ -191,7 +191,7 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
             className="text-xs font-semibold leading-5"
             style={{ color: "var(--shell-faint)" }}
           >
-            Chats
+            Recent
           </h2>
           <span
             className="translate-x-[-2px] opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100"
@@ -462,7 +462,7 @@ function NavLink({
       aria-current={active ? "page" : undefined}
       className="grid h-9 shrink-0 grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-2.5 rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] lg:w-full"
       style={{
-        color: active ? "var(--shell-fg)" : "var(--shell-muted)",
+        color: "var(--shell-fg)",
         background: active ? "var(--shell-elevated)" : undefined,
       }}
     >

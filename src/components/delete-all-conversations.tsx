@@ -20,7 +20,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             key="cancel-delete-all"
             type="button"
             onClick={() => setConfirming(false)}
-            className="h-8 rounded-lg px-2 text-xs"
+            className="h-9 rounded-lg px-2.5 text-sm"
             style={{ color: "var(--shell-muted)" }}
           >
             Cancel
@@ -28,7 +28,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
           <button
             key="confirm-delete-all"
             type="submit"
-            className="h-8 rounded-lg border px-3 text-xs font-medium"
+            className="h-9 rounded-lg border px-3 text-sm font-medium"
             style={{ background: "#7f1d1d", borderColor: "#b91c1c", color: "#ffffff" }}
           >
             Confirm delete
@@ -43,7 +43,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             event.preventDefault();
             setConfirming(true);
           }}
-          className="h-8 rounded-full border px-3 text-xs font-medium transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-40"
+          className="h-9 rounded-full border px-3.5 text-sm font-medium transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-40"
           style={{
             background: "var(--shell-panel)",
             borderColor: "var(--shell-line-strong)",
