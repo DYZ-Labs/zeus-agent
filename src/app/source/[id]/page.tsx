@@ -98,7 +98,7 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
               className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
               style={{ color: "var(--shell-faint)" }}
             >
-              Open-loop changes from this message
+              Plan changes from this message
             </h2>
             <ul className="mt-2 space-y-2 text-[0.9rem]">
               {goals.map((goal) => (
@@ -113,11 +113,11 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
               ))}
             </ul>
             <Link
-              href="/open-loops"
+              href="/today#plans"
               className="mt-3 inline-block font-mono text-[0.67rem] underline underline-offset-2"
               style={{ color: "var(--shell-accent)" }}
             >
-              review open loops
+              review plans
             </Link>
           </section>
         )}

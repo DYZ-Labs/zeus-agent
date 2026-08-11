@@ -6,16 +6,13 @@ import { useState } from "react";
 
 import { NEW_CHAT_EVENT } from "@/components/chat-events";
 
-const LINKS = [
+const PRIMARY_LINKS = [
   { href: "/today", label: "Today", icon: "today" },
-  { href: "/", label: "Chat", icon: "chat" },
-  { href: "/memory", label: "Saved", icon: "memory" },
-  { href: "/open-loops", label: "Open loops", icon: "loops" },
-  { href: "/timeline", label: "Timeline", icon: "timeline" },
-  { href: "/conversations", label: "Sources", icon: "sources" },
+  { href: "/memory", label: "Memory", icon: "memory" },
+  { href: "/conversations", label: "Chats", icon: "chats" },
 ] as const;
 
-type IconName = (typeof LINKS)[number]["icon"];
+type IconName = (typeof PRIMARY_LINKS)[number]["icon"] | "settings";
 
 export function Nav() {
   const pathname = usePathname();
@@ -83,9 +80,8 @@ export function Nav() {
       </button>
 
       <ul className="mt-2 flex w-full min-w-0 gap-1 overflow-x-auto lg:flex-col lg:overflow-visible">
-        {LINKS.map((link) => {
-          const active =
-            link.href === "/" ? pathname === "/" : pathname.startsWith(link.href);
+        {PRIMARY_LINKS.map((link) => {
+          const active = pathname.startsWith(link.href);
 
           return (
             <li key={link.href} className="shrink-0 lg:w-full">
@@ -104,10 +100,31 @@ export function Nav() {
             </li>
           );
         })}
+        <li className="shrink-0 lg:hidden">
+          <NavLink
+            href="/settings"
+            label="Settings"
+            icon="settings"
+            active={pathname.startsWith("/settings")}
+          />
+        </li>
       </ul>
 
+      <Link
+        href="/settings"
+        aria-current={pathname.startsWith("/settings") ? "page" : undefined}
+        className="mt-auto hidden h-10 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06] lg:flex"
+        style={{
+          color: pathname.startsWith("/settings") ? "var(--shell-fg)" : "var(--shell-muted)",
+          background: pathname.startsWith("/settings") ? "var(--shell-elevated)" : undefined,
+        }}
+      >
+        <NavIcon name="settings" />
+        <span>Settings</span>
+      </Link>
+
       <div
-        className="mt-auto hidden border-t px-2 pt-3 lg:flex lg:items-center lg:gap-3"
+        className="mt-2 hidden border-t px-2 pt-3 lg:flex lg:items-center lg:gap-3"
         style={{ borderColor: "var(--shell-line)" }}
       >
         <span
@@ -125,6 +142,33 @@ export function Nav() {
         </div>
       </div>
     </nav>
+  );
+}
+
+function NavLink({
+  href,
+  label,
+  icon,
+  active,
+}: {
+  href: string;
+  label: string;
+  icon: IconName;
+  active: boolean;
+}) {
+  return (
+    <Link
+      href={href}
+      aria-current={active ? "page" : undefined}
+      className="flex h-10 items-center gap-3 rounded-lg px-3 text-[0.9rem] transition-colors hover:bg-white/[0.06] lg:w-full"
+      style={{
+        color: active ? "var(--shell-fg)" : "var(--shell-muted)",
+        background: active ? "var(--shell-elevated)" : undefined,
+      }}
+    >
+      <NavIcon name={icon} />
+      <span>{label}</span>
+    </Link>
   );
 }
 
@@ -181,13 +225,6 @@ function NavIcon({ name }: { name: IconName }) {
       </svg>
     );
   }
-  if (name === "chat") {
-    return (
-      <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
-        <path d="M7 18.5 3.5 21v-5A8.5 8.5 0 1 1 7 18.5Z" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  }
   if (name === "memory") {
     return (
       <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -196,27 +233,18 @@ function NavIcon({ name }: { name: IconName }) {
       </svg>
     );
   }
-  if (name === "loops") {
+  if (name === "chats") {
     return (
       <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
-        <path d="M7 7h10v10H7z" strokeLinejoin="round" />
-        <path d="m9.5 12 1.7 1.7 3.5-3.7" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    );
-  }
-  if (name === "timeline") {
-    return (
-      <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
-        <path d="M5 6h14M5 12h9M5 18h6" strokeLinecap="round" />
-        <circle cx="18" cy="12" r="1.5" fill="currentColor" stroke="none" />
-        <circle cx="15" cy="18" r="1.5" fill="currentColor" stroke="none" />
+        <path d="M7 17.5 3.5 20v-4.5a7.5 7.5 0 1 1 3.5 2Z" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M8 9h8M8 12.5h5" strokeLinecap="round" />
       </svg>
     );
   }
   return (
     <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M5 5.5h14v13H5z" strokeLinejoin="round" />
-      <path d="M8 9h8M8 12h8M8 15h5" strokeLinecap="round" />
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 3.5v2M12 18.5v2M20.5 12h-2M5.5 12h-2M18 6l-1.4 1.4M7.4 16.6 6 18M18 18l-1.4-1.4M7.4 7.4 6 6" strokeLinecap="round" />
     </svg>
   );
 }
