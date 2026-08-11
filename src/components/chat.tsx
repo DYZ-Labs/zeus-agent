@@ -2,10 +2,16 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import type { FollowThroughRecommendation } from "@/core/schema";
+
+type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
+
 type Turn = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  recommendation?: FollowThroughRecommendation;
+  recommendationDecision?: RecommendationDecision;
   /** Set on the assistant turn once the stream closes. */
   receipt?: {
     messageId: number;
@@ -26,12 +32,14 @@ type Status = "idle" | "streaming" | "error";
 export function Chat({
   hasCredentials,
   model,
+  initialPrompt,
 }: {
   hasCredentials: boolean;
   model: string;
+  initialPrompt?: string;
 }) {
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(initialPrompt ?? "");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const conversationId = useRef<number | null>(null);
@@ -113,6 +121,8 @@ export function Chat({
                         superseded: event.superseded as number,
                         failed: event.extractionFailed as boolean,
                       },
+                      recommendation:
+                        (event.recommendation as FollowThroughRecommendation | null) ?? undefined,
                     }
                   : turn,
               ),
@@ -139,6 +149,37 @@ export function Chat({
     });
   }
 
+  async function respondToRecommendation(
+    turnId: string,
+    recommendation: FollowThroughRecommendation,
+    decision: RecommendationDecision,
+    responseMessageId: number | null,
+  ) {
+    try {
+      const response = await fetch("/api/follow-through", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          commitmentId: recommendation.commitment_id,
+          decision,
+          responseMessageId,
+        }),
+      });
+      if (!response.ok) {
+        const detail = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(detail?.error ?? "Could not record that choice.");
+      }
+      setTurns((prior) =>
+        prior.map((turn) =>
+          turn.id === turnId ? { ...turn, recommendationDecision: decision } : turn,
+        ),
+      );
+      if (decision === "accepted") chooseStarter(recommendation.chat_prompt);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not record that choice.");
+    }
+  }
+
   const canSend = Boolean(input.trim()) && status !== "streaming" && hasCredentials;
 
   return (
@@ -147,7 +188,7 @@ export function Chat({
         <div className="flex items-baseline gap-2">
           <h1 className="text-[1rem] font-semibold tracking-[-0.01em]">Zeus</h1>
           <span className="text-[0.8rem]" style={{ color: "var(--shell-faint)" }}>
-            memory
+            follow-through
           </span>
         </div>
         <p
@@ -183,6 +224,16 @@ export function Chat({
                     <AssistantTurn
                       text={turn.text}
                       receipt={turn.receipt}
+                      recommendation={turn.recommendation}
+                      recommendationDecision={turn.recommendationDecision}
+                      onRecommendationDecision={(recommendation, decision) =>
+                        respondToRecommendation(
+                          turn.id,
+                          recommendation,
+                          decision,
+                          turn.receipt?.messageId ?? null,
+                        )
+                      }
                       pending={status === "streaming" && !turn.receipt}
                     />
                   )}
@@ -288,10 +339,19 @@ function UserTurn({ text }: { text: string }) {
 function AssistantTurn({
   text,
   receipt,
+  recommendation,
+  recommendationDecision,
+  onRecommendationDecision,
   pending,
 }: {
   text: string;
   receipt?: Turn["receipt"];
+  recommendation?: FollowThroughRecommendation;
+  recommendationDecision?: RecommendationDecision;
+  onRecommendationDecision: (
+    recommendation: FollowThroughRecommendation,
+    decision: RecommendationDecision,
+  ) => void;
   pending: boolean;
 }) {
   return (
@@ -305,9 +365,101 @@ function AssistantTurn({
         ) : (
           pending && <ThinkingIndicator />
         )}
+        {recommendation && (
+          <FollowThroughCard
+            recommendation={recommendation}
+            decision={recommendationDecision}
+            onDecision={onRecommendationDecision}
+          />
+        )}
         {receipt && <Receipt {...receipt} />}
       </div>
     </div>
+  );
+}
+
+function FollowThroughCard({
+  recommendation,
+  decision,
+  onDecision,
+}: {
+  recommendation: FollowThroughRecommendation;
+  decision?: RecommendationDecision;
+  onDecision: (
+    recommendation: FollowThroughRecommendation,
+    decision: RecommendationDecision,
+  ) => void;
+}) {
+  const decisionText =
+    decision === "accepted"
+      ? "Ready in the composer — Zeus will help without acting externally."
+      : decision === "completed"
+        ? "Marked complete."
+        : decision === "snoozed"
+          ? "Snoozed for seven days."
+          : decision === "dismissed"
+            ? "Dismissed. It will stay quiet unless the commitment changes."
+            : null;
+
+  return (
+    <aside
+      className="mt-4 rounded-xl border px-4 py-3.5"
+      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+      aria-label="Follow-through recommendation"
+    >
+      <p
+        className="font-mono text-[0.62rem] uppercase tracking-[0.14em]"
+        style={{ color: "var(--shell-faint)" }}
+      >
+        Useful next action
+      </p>
+      <p className="mt-2 text-[0.9rem] font-medium">{recommendation.suggested_action}</p>
+      <p className="mt-1.5 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        {recommendation.why}
+      </p>
+      {recommendation.requires_confirmation && (
+        <p className="mt-2 font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
+          external action requires your confirmation
+        </p>
+      )}
+      {decisionText ? (
+        <p className="mt-3 text-[0.76rem]" style={{ color: "var(--shell-muted)" }}>
+          {decisionText}
+        </p>
+      ) : (
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-[0.76rem]">
+          <button
+            type="button"
+            onClick={() => onDecision(recommendation, "accepted")}
+            className="rounded-md px-3 py-1.5 font-medium"
+            style={{ background: "var(--shell-accent)", color: "#000000" }}
+          >
+            Help me do this
+          </button>
+          <button type="button" onClick={() => onDecision(recommendation, "completed")}>
+            Already done
+          </button>
+          <button type="button" onClick={() => onDecision(recommendation, "snoozed")}>
+            Not now
+          </button>
+          <button
+            type="button"
+            onClick={() => onDecision(recommendation, "dismissed")}
+            style={{ color: "var(--shell-faint)" }}
+          >
+            Not useful
+          </button>
+        </div>
+      )}
+      <div className="mt-2 flex gap-3 font-mono text-[0.61rem]" style={{ color: "var(--shell-faint)" }}>
+        <a href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
+          why Zeus knows this
+        </a>
+        <a href="/today" className="underline underline-offset-2">
+          controls
+        </a>
+      </div>
+    </aside>
   );
 }
 
@@ -421,7 +573,7 @@ function EmptyState({ onSelect }: { onSelect?: (prompt: string) => void }) {
         How can Zeus help?
       </h2>
       <p className="mx-auto mt-2 max-w-[34rem] text-[0.9rem]" style={{ color: "var(--shell-muted)" }}>
-        Chat normally. Zeus keeps durable, sourced memories and tells you when it does not know.
+        Tell Zeus what matters. It keeps the evidence, notices useful moments, and helps with the next step while you stay in control.
       </p>
 
       <div className="mt-8 grid gap-2 text-left sm:grid-cols-2">

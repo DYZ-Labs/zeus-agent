@@ -36,8 +36,45 @@ export type CandidateStatus = z.infer<typeof CandidateStatus>;
 export const GoalStatus = z.enum(["active", "paused", "achieved", "abandoned"]);
 export type GoalStatus = z.infer<typeof GoalStatus>;
 
+export const GoalPriority = z.enum(["low", "normal", "high"]);
+export type GoalPriority = z.infer<typeof GoalPriority>;
+
 export const CommitmentStatus = z.enum(["open", "waiting", "done", "cancelled"]);
 export type CommitmentStatus = z.infer<typeof CommitmentStatus>;
+
+export const StewardshipMode = z.enum(["quiet", "balanced", "proactive"]);
+export type StewardshipMode = z.infer<typeof StewardshipMode>;
+
+export const FollowThroughReason = z.enum([
+  "overdue",
+  "due_soon",
+  "relevant",
+  "waiting",
+  "stale",
+  "conflict",
+  "priority",
+]);
+export type FollowThroughReason = z.infer<typeof FollowThroughReason>;
+
+export const FollowThroughActionKind = z.enum([
+  "draft",
+  "schedule",
+  "research",
+  "remind",
+  "coordinate",
+  "plan",
+]);
+export type FollowThroughActionKind = z.infer<typeof FollowThroughActionKind>;
+
+export const FollowThroughEventType = z.enum([
+  "surfaced",
+  "accepted",
+  "dismissed",
+  "snoozed",
+  "completed",
+  "regretted",
+]);
+export type FollowThroughEventType = z.infer<typeof FollowThroughEventType>;
 
 // ---------------------------------------------------------------------------
 // Stored rows
@@ -132,6 +169,7 @@ export const Goal = z
     id: z.number().int(),
     title: z.string(),
     status: GoalStatus,
+    priority: GoalPriority,
     target_at: z.string().nullable(),
     confidence: z.number().min(0).max(1),
     source_message_id: z.number().int(),
@@ -197,6 +235,59 @@ export const CommitmentEvent = z
   })
   .strict();
 export type CommitmentEvent = z.infer<typeof CommitmentEvent>;
+
+export const StewardshipSetting = z
+  .object({
+    id: z.literal(1),
+    mode: StewardshipMode,
+    source_message_id: z.number().int().nullable(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type StewardshipSetting = z.infer<typeof StewardshipSetting>;
+
+export const FollowThroughRecommendation = z
+  .object({
+    commitment_id: z.number().int(),
+    commitment_title: z.string(),
+    commitment_source_message_id: z.number().int(),
+    goal_id: z.number().int().nullable(),
+    goal_title: z.string().nullable(),
+    goal_priority: GoalPriority.nullable(),
+    due_at: z.string().nullable(),
+    reason: FollowThroughReason,
+    action_kind: FollowThroughActionKind,
+    why: z.string(),
+    suggested_action: z.string(),
+    chat_prompt: z.string(),
+    requires_confirmation: z.boolean(),
+    score: z.number(),
+  })
+  .strict();
+export type FollowThroughRecommendation = z.infer<typeof FollowThroughRecommendation>;
+
+export const FollowThroughEvent = z
+  .object({
+    id: z.number().int(),
+    commitment_id: z.number().int(),
+    goal_id: z.number().int().nullable(),
+    event_type: FollowThroughEventType,
+    reason: FollowThroughReason,
+    action_kind: FollowThroughActionKind,
+    detail_json: z.string().nullable(),
+    response_message_id: z.number().int().nullable(),
+    source_message_id: z.number().int().nullable(),
+    source_kind: z.enum(["system", "message", "user_action"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type FollowThroughEvent = z.infer<typeof FollowThroughEvent>;
+
+export const FollowThroughEventView = FollowThroughEvent.extend({
+  commitment_title: z.string(),
+  goal_title: z.string().nullable(),
+}).strict();
+export type FollowThroughEventView = z.infer<typeof FollowThroughEventView>;
 
 /** A fact joined to the names it references — what the UI and prompt builder consume. */
 export const FactView = Fact.extend({
@@ -312,6 +403,11 @@ export const ExtractedGoal = z
       .describe("ID from the supplied active-goal list when updating one; null for a new goal."),
     title: z.string().describe("Short goal title in the user's own terms."),
     status: GoalStatus.describe("The goal state established by this user message."),
+    priority: GoalPriority.nullable()
+      .default(null)
+      .describe(
+        "low, normal, or high only when the user explicitly states relative priority; null otherwise",
+      ),
     target_at: z
       .string()
       .nullable()

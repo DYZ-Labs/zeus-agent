@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const LINKS = [
+  { href: "/today", label: "Today", icon: "today" },
   { href: "/", label: "Chat", icon: "chat" },
   { href: "/memory", label: "Memory", icon: "memory" },
   { href: "/open-loops", label: "Open loops", icon: "loops" },
@@ -89,6 +90,14 @@ function ZeusMark() {
 }
 
 function NavIcon({ name }: { name: IconName }) {
+  if (name === "today") {
+    return (
+      <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
+        <circle cx="12" cy="12" r="8" />
+        <path d="M12 8v4l2.8 1.7" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
   if (name === "chat") {
     return (
       <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">

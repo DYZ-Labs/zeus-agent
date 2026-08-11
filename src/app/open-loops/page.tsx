@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import {
   snoozeCommitmentAction,
+  setGoalPriorityAction,
   updateCommitmentStatusAction,
   updateGoalStatusAction,
 } from "@/app/actions";
@@ -12,7 +13,13 @@ import {
   listCommitments,
   listGoals,
 } from "@/core/intentions";
-import type { CommitmentStatus, CommitmentView, Goal, GoalStatus } from "@/core/schema";
+import type {
+  CommitmentStatus,
+  CommitmentView,
+  Goal,
+  GoalPriority,
+  GoalStatus,
+} from "@/core/schema";
 import { getDb } from "@/server/db";
 
 export const dynamic = "force-dynamic";
@@ -87,7 +94,7 @@ function GoalRow({ goal }: { goal: Goal }) {
         <div className="min-w-0 flex-1">
           <p className="text-[0.94rem]">{goal.title}</p>
           <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
-            {goal.status}
+            {goal.status} · {goal.priority} priority
             {goal.target_at ? ` · target ${goal.target_at.slice(0, 10)}` : ""} ·{" "}
             <Link href={`/source/${goal.source_message_id}`} className="underline underline-offset-2">
               source
@@ -100,6 +107,24 @@ function GoalRow({ goal }: { goal: Goal }) {
           action={updateGoalStatusAction}
         />
       </div>
+      {(goal.status === "active" || goal.status === "paused") && (
+        <div className="mt-3 flex flex-wrap items-center gap-3 font-mono text-[0.64rem]">
+          <span style={{ color: "var(--shell-faint)" }}>priority</span>
+          {(["low", "normal", "high"] as GoalPriority[]).map((priority) => (
+            <form action={setGoalPriorityAction} key={priority}>
+              <input type="hidden" name="id" value={goal.id} />
+              <input type="hidden" name="priority" value={priority} />
+              <button
+                type="submit"
+                disabled={priority === goal.priority}
+                style={{ color: priority === goal.priority ? "var(--shell-fg)" : "var(--shell-faint)" }}
+              >
+                {priority}
+              </button>
+            </form>
+          ))}
+        </div>
+      )}
       <EventHistory
         events={events.map(
           (event) =>

@@ -10,7 +10,11 @@ import { searchEpisodes } from "../src/core/episodes";
 import { selfEntity } from "../src/core/entities";
 import { acceptCandidate, applyExtraction } from "../src/core/extract";
 import { liveFacts } from "../src/core/facts";
-import { listCommitments, listGoals, selectNudge } from "../src/core/intentions";
+import { listCommitments, listGoals } from "../src/core/intentions";
+import {
+  recommendNextAction,
+  recordFollowThroughDecision,
+} from "../src/core/stewardship";
 
 process.env.ZEUS_EMBEDDINGS ??= "off";
 
@@ -75,6 +79,7 @@ const goal = applyExtraction(
         existing_id: null,
         title: "Launch my portfolio",
         status: "active",
+        priority: "high",
         target_at: null,
         confidence: 0.96,
       },
@@ -85,6 +90,7 @@ const goal = applyExtraction(
         title: "Write the portfolio case study",
         owner: "self",
         linked_goal_id: null,
+        linked_goal_title: "Launch my portfolio",
         status: "open",
         due_at: "2020-01-03",
         confidence: 0.96,
@@ -97,7 +103,19 @@ assert.equal(goal.goals.length, 1);
 assert.equal(goal.commitments.length, 1);
 assert.equal(listGoals(db).length, 1);
 assert.equal(listCommitments(db).length, 1);
-assert.ok(selectNudge(db, "portfolio"), "relevant overdue commitment did not nudge");
+const recommendation = recommendNextAction(db, "portfolio");
+assert.ok(recommendation, "relevant overdue commitment did not produce a next action");
+assert.equal(recommendation.goal_priority, "high");
+assert.match(recommendation.why, /high-priority goal/u);
+recordFollowThroughDecision(db, {
+  commitmentId: recommendation.commitment_id,
+  decision: "dismissed",
+});
+assert.equal(
+  recommendNextAction(db, "portfolio", { force: true }),
+  null,
+  "dismissed recommendation surfaced again without a commitment change",
+);
 
 const assistant = appendMessage(
   db,
@@ -130,4 +148,6 @@ assert.ok(episodes.some((entry) => entry.message.id === intent.id));
 assert.ok(!episodes.some((entry) => entry.message.id === assistant.id));
 
 db.close();
-console.log("zeus: trust evaluation passed (conflicts, grounding, intentions, nudges, episodes)");
+console.log(
+  "zeus: trust evaluation passed (conflicts, grounding, intentions, follow-through, control, episodes)",
+);

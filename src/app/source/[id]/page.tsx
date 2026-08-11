@@ -102,7 +102,9 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
             </h2>
             <ul className="mt-2 space-y-2 text-[0.9rem]">
               {goals.map((goal) => (
-                <li key={`goal-${goal.id}`}>goal · {goal.title} · {goal.status}</li>
+                <li key={`goal-${goal.id}`}>
+                  goal · {goal.title} · {goal.status} · {goal.priority} priority
+                </li>
               ))}
               {commitments.map((commitment) => (
                 <li key={`commitment-${commitment.id}`}>

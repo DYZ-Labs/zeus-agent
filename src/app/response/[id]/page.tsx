@@ -5,6 +5,7 @@ import { PageHeader } from "@/components/page-header";
 import { getMessage } from "@/core/conversations";
 import { recalledForResponse } from "@/core/response-context";
 import type { RecallItem } from "@/core/schema";
+import { recommendationsForResponse } from "@/core/stewardship";
 import { getDb } from "@/server/db";
 
 export const dynamic = "force-dynamic";
@@ -20,10 +21,14 @@ export default async function ResponseSourcesPage({
   const message = getMessage(db, id);
   if (!message || message.role !== "assistant") notFound();
   const recalled = recalledForResponse(db, id);
+  const recommendations = recommendationsForResponse(db, id);
 
   return (
     <div className="flex h-full flex-col lg:min-h-0">
-      <PageHeader title="Response sources" meta={`${recalled.length} memory items`} />
+      <PageHeader
+        title="Response sources"
+        meta={`${recalled.length} memory items · ${recommendations.length} follow-through proposal${recommendations.length === 1 ? "" : "s"}`}
+      />
       <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
         <Link href="/" className="font-mono text-[0.68rem] underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
           ← chat
@@ -35,6 +40,30 @@ export default async function ResponseSourcesPage({
           </h2>
           <p className="mt-3 whitespace-pre-wrap text-[0.92rem]">{message.content}</p>
         </section>
+
+        {recommendations.length > 0 && (
+          <section className="mt-9">
+            <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
+              Follow-through proposal supplied
+            </h2>
+            <ol className="mt-2">
+              {recommendations.map((recommendation) => (
+                <li key={recommendation.commitment_id} className="border-b py-4" style={{ borderColor: "var(--shell-line)" }}>
+                  <p className="text-[0.9rem]">{recommendation.suggested_action}</p>
+                  <p className="mt-1.5 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+                    {recommendation.why}
+                  </p>
+                  <p className="mt-1.5 font-mono text-[0.63rem]" style={{ color: "var(--shell-faint)" }}>
+                    system proposal · {recommendation.reason.replace(/_/gu, " ")} · not canonical memory ·{" "}
+                    <Link href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
+                      commitment source
+                    </Link>
+                  </p>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
 
         <section className="mt-9">
           <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
@@ -71,7 +100,7 @@ function RecallRow({ item, rank }: { item: RecallItem; rank: number }) {
     source = item.episode.message.id;
   } else if (item.kind === "goal") {
     title = item.goal.title;
-    detail = `goal · ${item.goal.status}${item.goal.target_at ? ` · target ${item.goal.target_at.slice(0, 10)}` : ""}`;
+    detail = `goal · ${item.goal.status} · ${item.goal.priority} priority${item.goal.target_at ? ` · target ${item.goal.target_at.slice(0, 10)}` : ""}`;
     source = item.goal.source_message_id;
   } else {
     title = item.commitment.title;

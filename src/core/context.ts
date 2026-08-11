@@ -4,16 +4,18 @@ import { searchEpisodes } from "./episodes";
 import { embed } from "./embed";
 import { selfEntity } from "./entities";
 import { evidenceForFact, factsForEntity } from "./facts";
-import { listCommitments, listGoals, selectNudge } from "./intentions";
+import { getCommitment, getGoal, listCommitments, listGoals } from "./intentions";
 import type {
   CommitmentView,
   EpisodeHit,
   FactView,
+  FollowThroughRecommendation,
   Goal,
   RecallItem,
   SearchHit,
 } from "./schema";
 import { search } from "./search";
+import { recommendNextAction } from "./stewardship";
 
 export type MemoryContext = {
   text: string;
@@ -22,6 +24,8 @@ export type MemoryContext = {
   core: FactView[];
   goals: Goal[];
   commitments: CommitmentView[];
+  recommendation: FollowThroughRecommendation | null;
+  /** Compatibility alias for callers that only need the selected commitment. */
   nudge: CommitmentView | null;
   items: RecallItem[];
   /** Shared query embedding; the turn stores it as the current user episode. */
@@ -74,7 +78,7 @@ export async function buildContext(
 ): Promise<MemoryContext> {
   const queryVector =
     options.queryVector === undefined ? await embed(query) : options.queryVector;
-  const [hits, episodes] = await Promise.all([
+  const [queryHits, queryEpisodes] = await Promise.all([
     search(db, query, {
       limit: options.limit ?? 16,
       includeSuperseded: asksAboutHistory(query),
@@ -89,7 +93,39 @@ export async function buildContext(
   const core = coreFacts(db, options.coreLimit ?? 12);
   const goals = listGoals(db, { limit: 8 });
   const commitments = listCommitments(db, { limit: 10 });
-  const nudge = selectNudge(db, query);
+  const recommendation = recommendNextAction(db, query);
+  const followThroughQuery = recommendation
+    ? `${recommendation.commitment_title} ${recommendation.goal_title ?? ""}`
+    : null;
+  const [followThroughHits, followThroughEpisodes] = followThroughQuery
+    ? await Promise.all([
+        search(db, followThroughQuery, { limit: 6, queryVector: null }),
+        searchEpisodes(db, followThroughQuery, {
+          limit: 2,
+          excludeMessageIds: options.excludeMessageIds,
+          queryVector: null,
+        }),
+      ])
+    : [[], []];
+  const hits = [
+    ...new Map(
+      [...queryHits, ...followThroughHits].map((hit) => [hit.fact.id, hit]),
+    ).values(),
+  ];
+  const episodes = [
+    ...new Map(
+      [...queryEpisodes, ...followThroughEpisodes].map((episode) => [
+        episode.message.id,
+        episode,
+      ]),
+    ).values(),
+  ];
+  const nudge = recommendation ? getCommitment(db, recommendation.commitment_id) : null;
+  const recommendedGoal = recommendation?.goal_id ? getGoal(db, recommendation.goal_id) : null;
+  const tracedGoals =
+    recommendedGoal && !goals.some((goal) => goal.id === recommendedGoal.id)
+      ? [...goals, recommendedGoal]
+      : goals;
   const tracedCommitments =
     nudge && !commitments.some((item) => item.id === nudge.id)
       ? [...commitments, nudge]
@@ -105,7 +141,9 @@ export async function buildContext(
     );
   }
   if (retrieved.length > 0) {
-    sections.push(`CANONICAL FACTS RELEVANT TO THIS QUESTION:\n${retrieved.map((hit) => formatFact(hit.fact)).join("\n")}`);
+    sections.push(
+      `CANONICAL FACTS RELEVANT TO THIS QUESTION${recommendation ? " OR FOLLOW-THROUGH" : ""}:\n${retrieved.map((hit) => formatFact(hit.fact)).join("\n")}`,
+    );
   }
   if (episodes.length > 0) {
     sections.push(
@@ -122,7 +160,7 @@ export async function buildContext(
       `ACTIVE GOALS:\n${goals
         .map(
           (goal) =>
-            `- [goal:${goal.id}] ${escapeMemory(goal.title)} — ${goal.status}${goal.target_at ? `, target ${goal.target_at.slice(0, 10)}` : ""}`,
+            `- [goal:${goal.id}] ${escapeMemory(goal.title)} — ${goal.status}, ${goal.priority} priority${goal.target_at ? `, target ${goal.target_at.slice(0, 10)}` : ""}`,
         )
         .join("\n")}`,
     );
@@ -137,9 +175,9 @@ export async function buildContext(
         .join("\n")}`,
     );
   }
-  if (nudge) {
+  if (recommendation) {
     sections.push(
-      `OPTIONAL NUDGE CANDIDATE:\n- [commitment:${nudge.id}] ${escapeMemory(nudge.title)}${nudge.due_at ? `, due ${nudge.due_at.slice(0, 10)}` : ""}\nUse at most one short nudge after answering, only if it is relevant or overdue. Do not derail the user's request.`,
+      `FOLLOW-THROUGH OPPORTUNITY — a system proposal, not a fact about the user:\n- [commitment:${recommendation.commitment_id}] ${escapeMemory(recommendation.commitment_title)}${recommendation.due_at ? `, due ${recommendation.due_at.slice(0, 10)}` : ""}\n- WHY NOW: ${escapeMemory(recommendation.why)}\n- USEFUL NEXT ACTION: ${escapeMemory(recommendation.suggested_action)}\nFirst answer the user's request. Offer this next step only if it helps rather than derails them. You may draft, research, or plan in the conversation; sending, scheduling, purchasing, reminding, or coordinating externally always requires explicit confirmation.`,
     );
   }
 
@@ -152,7 +190,7 @@ export async function buildContext(
       evidence: evidenceForFact(db, fact.id),
     })),
     ...episodes.map((episode): RecallItem => ({ kind: "episode", episode })),
-    ...goals.map((goal): RecallItem => ({ kind: "goal", goal })),
+    ...tracedGoals.map((goal): RecallItem => ({ kind: "goal", goal })),
     ...tracedCommitments.map(
       (commitment): RecallItem => ({ kind: "commitment", commitment }),
     ),
@@ -166,8 +204,9 @@ export async function buildContext(
     hits,
     episodes,
     core,
-    goals,
+    goals: tracedGoals,
     commitments: tracedCommitments,
+    recommendation,
     nudge,
     items,
     queryVector,

@@ -282,9 +282,69 @@ ALTER TABLE response_context
 ADD COLUMN snapshot_json TEXT CHECK (snapshot_json IS NULL OR json_valid(snapshot_json));
 `;
 
+/**
+ * Follow-through is deliberately separate from memory. A recommendation is a proposal,
+ * not a fact about the user; this append-only log records what Zeus surfaced and how the
+ * user responded without promoting assistant-authored text into canonical context.
+ */
+const STEWARDSHIP = `
+ALTER TABLE goal
+ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'
+  CHECK (priority IN ('low','normal','high'));
+
+-- Goal snapshots written before priorities existed must remain parseable and immutable.
+-- Backfill only the new field inside the stored snapshot; do not reconstruct it from the
+-- now-current goal row, which could have changed since the response.
+UPDATE response_context
+SET snapshot_json = json_set(snapshot_json, '$.goal.priority', 'normal')
+WHERE item_kind = 'goal'
+  AND snapshot_json IS NOT NULL
+  AND json_type(snapshot_json, '$.goal.priority') IS NULL;
+
+CREATE TABLE stewardship_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  mode               TEXT NOT NULL DEFAULT 'balanced'
+                     CHECK (mode IN ('quiet','balanced','proactive')),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  updated_at         TEXT NOT NULL
+);
+
+INSERT INTO stewardship_setting (id, mode, source_message_id, updated_at)
+VALUES (1, 'balanced', NULL, ${NOW});
+
+CREATE TABLE follow_through_event (
+  id                   INTEGER PRIMARY KEY,
+  commitment_id        INTEGER NOT NULL REFERENCES commitment(id) ON DELETE CASCADE,
+  goal_id              INTEGER REFERENCES goal(id) ON DELETE SET NULL,
+  event_type           TEXT NOT NULL
+                       CHECK (event_type IN ('surfaced','accepted','dismissed','snoozed','completed','regretted')),
+  reason               TEXT NOT NULL
+                       CHECK (reason IN ('overdue','due_soon','relevant','waiting','stale','conflict','priority')),
+  action_kind          TEXT NOT NULL
+                       CHECK (action_kind IN ('draft','schedule','research','remind','coordinate','plan')),
+  detail_json          TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  response_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_message_id    INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind          TEXT NOT NULL CHECK (source_kind IN ('system','message','user_action')),
+  created_at           TEXT NOT NULL
+);
+
+CREATE INDEX follow_through_commitment_idx
+ON follow_through_event(commitment_id, created_at DESC);
+CREATE INDEX follow_through_response_idx
+ON follow_through_event(response_message_id)
+WHERE response_message_id IS NOT NULL;
+CREATE INDEX follow_through_source_idx
+ON follow_through_event(source_message_id)
+WHERE source_message_id IS NOT NULL;
+CREATE INDEX follow_through_type_idx
+ON follow_through_event(event_type, created_at DESC);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
   { id: "003_copilot", sql: COPILOT },
   { id: "004_response_snapshots", sql: RESPONSE_SNAPSHOTS },
+  { id: "005_stewardship", sql: STEWARDSHIP },
 ];

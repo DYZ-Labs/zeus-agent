@@ -8,6 +8,7 @@ export type ConversationDependencies = {
   candidates: number;
   goals: number;
   commitments: number;
+  followThroughEvents: number;
 };
 
 export function conversationDependencies(db: Db, conversationId: number): ConversationDependencies {
@@ -20,6 +21,7 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
       candidates: 0,
       goals: 0,
       commitments: 0,
+      followThroughEvents: 0,
     };
   }
   const placeholders = messageIds.map(() => "?").join(",");
@@ -61,6 +63,14 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
     candidates: scalar("memory_candidate"),
     goals: scalar("goal"),
     commitments: scalar("commitment"),
+    followThroughEvents:
+      db
+        .prepare<number[], { count: number }>(
+          `SELECT COUNT(*) AS count FROM follow_through_event
+           WHERE source_message_id IN (${placeholders})
+              OR response_message_id IN (${placeholders})`,
+        )
+        .get(...messageIds, ...messageIds)?.count ?? 0,
   };
 }
 
@@ -81,6 +91,14 @@ export function deleteConversationWithMemory(
       return;
     }
     const placeholders = messageIds.map(() => "?").join(",");
+
+    // Suggestions and feedback tied to a deleted source/response are audit data, not
+    // canonical memory. Remove them rather than retain a rationale the user deleted.
+    db.prepare<number[]>(
+      `DELETE FROM follow_through_event
+       WHERE source_message_id IN (${placeholders})
+          OR response_message_id IN (${placeholders})`,
+    ).run(...messageIds, ...messageIds);
 
     rehomeOrDeleteIntent(db, "commitment", "commitment_event", messageIds, placeholders);
     rehomeOrDeleteIntent(db, "goal", "goal_event", messageIds, placeholders);

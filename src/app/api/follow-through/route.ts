@@ -1,0 +1,41 @@
+import { z } from "zod";
+
+import { getCommitment } from "@/core/intentions";
+import { recordFollowThroughDecision } from "@/core/stewardship";
+import { getDb } from "@/server/db";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const Body = z
+  .object({
+    commitmentId: z.number().int().positive(),
+    decision: z.enum(["accepted", "dismissed", "snoozed", "completed", "regretted"]),
+    responseMessageId: z.number().int().positive().nullable().optional(),
+  })
+  .strict();
+
+export async function POST(request: Request): Promise<Response> {
+  const parsed = Body.safeParse(await request.json().catch(() => null));
+  if (!parsed.success) {
+    return Response.json(
+      { error: "Expected a commitment id and follow-through decision." },
+      { status: 400 },
+    );
+  }
+
+  const db = getDb();
+  if (!getCommitment(db, parsed.data.commitmentId)) {
+    return Response.json({ error: "That commitment no longer exists." }, { status: 404 });
+  }
+  const event = recordFollowThroughDecision(db, {
+    commitmentId: parsed.data.commitmentId,
+    decision: parsed.data.decision,
+    responseMessageId: parsed.data.responseMessageId ?? null,
+  });
+  if (!event) {
+    return Response.json({ error: "That recommendation is no longer actionable." }, { status: 409 });
+  }
+
+  return Response.json({ ok: true, eventId: event.id, decision: event.event_type });
+}

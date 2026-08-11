@@ -21,7 +21,19 @@ import {
 import { getCommitment, getGoal, updateCommitment, updateGoal } from "@/core/intentions";
 import { deleteConversationWithMemory } from "@/core/retention";
 import type { Db } from "@/core/db";
-import type { Cardinality, CommitmentStatus, GoalStatus } from "@/core/schema";
+import type {
+  Cardinality,
+  CommitmentStatus,
+  FollowThroughEventType,
+  GoalPriority,
+  GoalStatus,
+  StewardshipMode,
+} from "@/core/schema";
+import {
+  recommendationForCommitment,
+  recordFollowThroughDecision,
+  setStewardshipMode,
+} from "@/core/stewardship";
 import { getDb } from "@/server/db";
 
 /**
@@ -114,6 +126,23 @@ export async function updateGoalStatusAction(formData: FormData): Promise<void> 
   revalidatePath("/open-loops");
 }
 
+export async function setGoalPriorityAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const priority = String(formData.get("priority") ?? "") as GoalPriority;
+  if (!Number.isInteger(id) || !["low", "normal", "high"].includes(priority)) return;
+  const db = getDb();
+  const goal = getGoal(db, id);
+  if (!goal || goal.priority === priority) return;
+  const source = curationMessage(db, `Set goal "${goal.title}" to ${priority} priority.`);
+  updateGoal(db, id, {
+    priority,
+    sourceMessageId: source.id,
+    sourceKind: "message",
+  });
+  revalidatePath("/today");
+  revalidatePath("/open-loops");
+}
+
 export async function updateCommitmentStatusAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   const status = String(formData.get("status") ?? "") as CommitmentStatus;
@@ -152,6 +181,39 @@ export async function snoozeCommitmentAction(formData: FormData): Promise<void> 
     sourceKind: "message",
   });
   revalidatePath("/open-loops");
+}
+
+export async function setStewardshipModeAction(formData: FormData): Promise<void> {
+  const mode = String(formData.get("mode") ?? "") as StewardshipMode;
+  if (!["quiet", "balanced", "proactive"].includes(mode)) return;
+  const db = getDb();
+  const source = curationMessage(db, `Set follow-through mode to ${mode}.`);
+  setStewardshipMode(db, mode, source.id);
+  revalidatePath("/today");
+}
+
+export async function followThroughDecisionAction(formData: FormData): Promise<void> {
+  const commitmentId = Number(formData.get("id"));
+  const decision = String(formData.get("decision") ?? "") as Exclude<
+    FollowThroughEventType,
+    "surfaced"
+  >;
+  if (
+    !Number.isInteger(commitmentId) ||
+    !["accepted", "dismissed", "snoozed", "completed", "regretted"].includes(decision)
+  ) {
+    return;
+  }
+  const db = getDb();
+  const recommendation = recommendationForCommitment(db, commitmentId);
+  const event = recordFollowThroughDecision(db, { commitmentId, decision });
+  if (!event) return;
+
+  revalidatePath("/today");
+  revalidatePath("/open-loops");
+  if (decision === "accepted" && recommendation) {
+    redirect(`/?prompt=${encodeURIComponent(recommendation.chat_prompt)}`);
+  }
 }
 
 export async function deleteConversationAction(formData: FormData): Promise<void> {

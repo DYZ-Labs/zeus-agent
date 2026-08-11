@@ -23,6 +23,11 @@ import {
   listGoals,
 } from "../src/core/intentions";
 import type { FactView } from "../src/core/schema";
+import {
+  followThroughMetrics,
+  getStewardshipSetting,
+  listFollowThroughEvents,
+} from "../src/core/stewardship";
 
 const outDir = process.argv[2] ?? "zeus-export";
 const db = openDb();
@@ -129,7 +134,7 @@ const goalBody = goals.length
         const events = goalEvents(db, goal.id)
           .map((event) => `  - ${event.created_at}: ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.detail_json ? ` — ${event.detail_json}` : ""}`)
           .join("\n");
-        return `- **[${goal.status}] ${goal.title}**${goal.target_at ? ` — target ${goal.target_at}` : ""}  \n  _source: message ${goal.source_message_id}_\n${events}`;
+        return `- **[${goal.status}] ${goal.title}** — ${goal.priority} priority${goal.target_at ? `, target ${goal.target_at}` : ""}  \n  _source: message ${goal.source_message_id}_\n${events}`;
       })
       .join("\n")
   : "_No goals._";
@@ -146,6 +151,39 @@ const commitmentBody = commitments.length
 writeFileSync(
   join(outDir, "open-loops.md"),
   `# Open loops\n\n## Goals\n\n${goalBody}\n\n## Commitments\n\n${commitmentBody}\n`,
+  "utf8",
+);
+
+const stewardship = getStewardshipSetting(db);
+const followThrough = listFollowThroughEvents(db, 100_000);
+const metrics = followThroughMetrics(db);
+const followThroughBody = followThrough.length
+  ? followThrough
+      .map(
+        (event) =>
+          `- ${event.created_at} — **${event.event_type}** ${event.commitment_title}  \n  _reason: ${event.reason}; action: ${event.action_kind}; source: ${event.source_kind}${event.response_message_id ? `; response: message ${event.response_message_id}` : ""}${event.source_message_id ? `; user source: message ${event.source_message_id}` : ""}_`,
+      )
+      .join("\n")
+  : "_No follow-through decisions recorded._";
+writeFileSync(
+  join(outDir, "follow-through.md"),
+  [
+    "# Follow-through",
+    "",
+    "Recommendations are system proposals, not canonical facts about the user.",
+    "",
+    `- intervention mode: ${stewardship.mode}`,
+    `- recommendations surfaced: ${metrics.surfaced}`,
+    `- offers accepted: ${metrics.accepted}`,
+    `- progress without a later regret signal: ${metrics.progressWithoutRegret}`,
+    `- controls exercised: ${metrics.controlsExercised}`,
+    `- regret signals: ${metrics.regrets}`,
+    "",
+    "## Event history",
+    "",
+    followThroughBody,
+    "",
+  ].join("\n"),
   "utf8",
 );
 
@@ -187,6 +225,7 @@ writeFileSync(
     `Every fact records the message that produced it. Those transcripts are in`,
     `[conversations.md](conversations.md).`,
     `Goals and commitments, including their event histories, are in [open-loops.md](open-loops.md).`,
+    `Follow-through proposals and user control decisions are in [follow-through.md](follow-through.md).`,
     `Memory proposals and their review status are in [memory-candidates.md](memory-candidates.md).`,
     ``,
   ].join("\n"),

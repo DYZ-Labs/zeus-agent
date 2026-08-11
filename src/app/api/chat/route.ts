@@ -73,6 +73,7 @@ export async function POST(request: Request): Promise<Response> {
           commitmentsUpdated: result.learned?.commitments.length ?? 0,
           pending: result.learned?.candidates.length ?? 0,
           superseded: result.learned?.supersededIds.length ?? 0,
+          recommendation: result.context.recommendation,
           extractionFailed: result.learned === null,
         });
       } catch (error) {

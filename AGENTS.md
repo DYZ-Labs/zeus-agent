@@ -84,7 +84,9 @@ npm run mcp            # stdio MCP server
 - `src/core/episodes.ts` — dated retrieval over user messages only.
 - `src/core/context.ts` — canonical prompt context and response trace writes.
 - `src/core/response-context.ts` — read-side reconstruction of recalled items.
-- `src/core/intentions.ts` — goals, commitments, append-only events, and nudges.
+- `src/core/intentions.ts` — goals, commitments, priorities, and append-only lifecycle events.
+- `src/core/stewardship.ts` — priority-aware next-action selection, intervention settings,
+  permission boundaries, user decisions, and progress/regret signals.
 - `src/core/retention.ts` — explicit source deletion and evidence-aware cleanup.
 - `src/core/chat.ts` — retrieve → stream → trace → extract → apply turn loop.
 - `src/core/openai.ts` — lazy OpenAI client and response/refusal checks.
@@ -168,9 +170,32 @@ Goals and commitments have their own lifecycle tables and append-only event tabl
 not encode the same item as a generic fact. Updates must preserve owners, dates, statuses,
 source messages, and history.
 
-Zeus may surface at most one eligible commitment nudge during a chat turn. External
-actions are out of scope: Zeus can suggest or clarify, but must not claim it sent,
-scheduled, purchased, or changed anything outside the local store.
+Zeus may surface at most one eligible follow-through recommendation during a chat turn.
+The current repository has no external action adapters: Zeus can prepare, suggest, or
+clarify, but must not claim it sent, scheduled, purchased, or changed anything outside
+the local store.
+
+### Follow-through proposals are not memory
+
+Zeus is a steward of the user's intentions, not an optimizer of their attention. The
+follow-through selector may surface at most one accepted commitment, using deterministic
+signals such as current relevance, urgency, explicit goal priority, waiting, staleness,
+and deadline collisions. Paused goals, snoozes, dismissals, cooldowns, and the user's
+intervention mode are hard gates.
+
+A recommendation is system-authored proposal data and must never become a canonical fact
+about the user. Persist it in `follow_through_event`, with the accepted goal and commitment
+still serving as its source-backed basis. Record acceptance, completion, snooze, dismissal,
+and regret as append-only user-control events. Do not infer those outcomes from silence or
+from the assistant's own text.
+
+Zeus may draft, research, compare, or plan inside the conversation after authorization.
+Sending, scheduling, purchasing, reminding, coordinating, or any other external state
+change requires explicit confirmation and an available tool. No adapter means no action.
+
+Measure assisted progress, control signals, and regret separately. Do not replace them with
+conversation count, time spent, tasks surfaced, or a composite engagement score that could
+reward interruption.
 
 ### Response provenance is persistent
 

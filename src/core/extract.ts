@@ -41,7 +41,7 @@ Only the user's statements can be evidence. Assistant text may help resolve what
 
 A fact is worth extracting when it is likely to remain useful in six months: names, relationships, roles, locations, preferences, ongoing projects, values, and topics the user explicitly follows. Passing states and details of the current chat are not durable facts.
 
-Goals are outcomes the user wants to achieve. Commitments are concrete promises, next actions, or things the user is waiting on. Do not also encode goals or commitments as generic facts. Use an existing ID when the user updates, completes, pauses, abandons, waits on, or cancels an item from the supplied lists. When a new commitment belongs to a new goal in the same output, use linked_goal_title with the exact new goal title.
+Goals are outcomes the user wants to achieve. Commitments are concrete promises, next actions, or things the user is waiting on. Do not also encode goals or commitments as generic facts. Use an existing ID when the user updates, completes, pauses, abandons, waits on, or cancels an item from the supplied lists. Set goal priority only when the user explicitly calls something low, normal, or high priority; otherwise leave it null so an update cannot silently change an earlier priority. When a new commitment belongs to a new goal in the same output, use linked_goal_title with the exact new goal title.
 
 Declare every named person who owns a commitment in entities. Use "self" for the user rather than declaring them.
 
@@ -54,7 +54,13 @@ Confidence: 0.9+ for a direct user statement about themselves, 0.7-0.85 for a cl
 export type ExtractionContext = {
   knownPredicates: readonly string[];
   knownEntities: readonly string[];
-  activeGoals: readonly { id: number; title: string; status: string; target_at: string | null }[];
+  activeGoals: readonly {
+    id: number;
+    title: string;
+    status: string;
+    priority: string;
+    target_at: string | null;
+  }[];
   openCommitments: readonly {
     id: number;
     title: string;
@@ -76,6 +82,7 @@ export function extractionContext(db: Db, entityLimit = 100): ExtractionContext 
     id: goal.id,
     title: goal.title,
     status: goal.status,
+    priority: goal.priority,
     target_at: goal.target_at,
   }));
   const openCommitments = listCommitments(db, { limit: 50 }).map((commitment) => ({
@@ -328,6 +335,7 @@ function applyGoal(
     ? updateGoal(db, existing.id, {
         title: goal.title,
         status: goal.status,
+        priority: goal.priority ?? undefined,
         targetAt: goal.target_at,
         confidence: goal.confidence,
         sourceMessageId,
@@ -336,6 +344,7 @@ function applyGoal(
     : createGoal(db, {
         title: goal.title,
         status: goal.status,
+        priority: goal.priority ?? undefined,
         targetAt: goal.target_at,
         confidence: goal.confidence,
         sourceMessageId,

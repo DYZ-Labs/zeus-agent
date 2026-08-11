@@ -1,10 +1,15 @@
 # Zeus
 
-**A local personal agent with memory you can inspect, correct, and trust.**
+**A local steward of your intentions, grounded in memory you can inspect, correct, and trust.**
 
-Zeus remembers durable facts about one person: you. It keeps current facts, preserves
-what used to be true, links every accepted memory to its source, and holds uncertain
-claims for review instead of quietly turning them into truth.
+Zeus turns what it understands about one person—you—into a useful next action at the
+right moment. Durable memory is the evidence layer: it keeps current facts, preserves
+what used to be true, links accepted claims to their sources, and holds uncertainty for
+review instead of quietly turning it into identity.
+
+The objective is meaningful progress on something the user genuinely cares about,
+without creating regret or reducing their control. Conversations, attention, activity,
+and raw task count are not success metrics.
 
 The application and SQLite store run on your machine. Chat and memory extraction use
 the OpenAI Responses API; local search continues to work without an API key.
@@ -13,7 +18,8 @@ the OpenAI Responses API; local search continues to work without an API key.
 
 Most assistant memory fails in one of two ways: old facts linger after life changes, or
 the assistant starts treating an inference as something the user actually said. Zeus is
-designed around preventing both failures.
+designed around preventing both failures—and around making memory useful through
+contextual follow-through.
 
 - **Temporal truth.** Facts have validity windows. A new employer can close the old
   employer without erasing it, so both “Where do I work?” and “Where did I work before?”
@@ -29,6 +35,15 @@ designed around preventing both failures.
 - **User control.** Facts can be corrected, closed, revived, or forgotten. Entities can
   be merged, source conversations can be deleted, and the complete store can be exported
   as readable Markdown.
+- **Intention stewardship.** One deterministic policy ranks relevance, deadlines,
+  waiting, staleness, deadline conflicts, and explicitly stated goal priority. Paused
+  goals, cooldowns, snoozes, dismissals, and intervention mode are hard gates.
+- **Permission before action.** Zeus can draft, research, compare, and plan in chat.
+  Sending, scheduling, purchasing, reminding, coordinating, or changing external state
+  requires explicit confirmation and an available adapter.
+- **Outcomes without hiding regret.** Follow-through offers and user decisions form an
+  append-only audit trail. Progress, control signals, and regret remain separately
+  visible instead of collapsing into an engagement score.
 
 ## What it includes
 
@@ -39,30 +54,33 @@ designed around preventing both failures.
 - A timeline of what Zeus learned and when.
 - A review queue for proposed memories that were not safe to accept automatically.
 - Structured goals and commitments with append-only event histories and restrained
-  follow-up nudges.
+  follow-through recommendations.
+- A **Today** view with one best current action, intervention controls, and a transparent
+  progress-and-regret readout.
 - Source transcripts and per-response recall traces for investigating why Zeus answered
   a particular way.
 - A stdio MCP server so other local agents can use the same memory.
 
-## How a turn works
+## The follow-through loop
 
 ```mermaid
 flowchart LR
-    A["User message"] --> B["Store source message"]
-    B --> C["Hybrid retrieval"]
-    C --> D["OpenAI chat"]
-    D --> E["Stream reply and save recall trace"]
-    E --> F["OpenAI structured extraction"]
-    F --> G{"Deterministic trust gate"}
-    G -->|"direct and clear"| H["Accepted facts and open loops"]
-    G -->|"uncertain or sensitive"| I["Candidate review queue"]
-    G -->|"assistant-only or noise"| J["Discard"]
-    H --> C
+    A["Understand\naccepted memory + intentions"] --> B["Notice\nrelevance, timing, conflicts"]
+    B --> C{"Worth interrupting?"}
+    C -->|"no"| D["Stay quiet"]
+    C -->|"yes"| E["Recommend\none useful next action + why"]
+    E --> F{"User decision"}
+    F -->|"authorize preparation"| G["Act\ndraft, research, compare, plan"]
+    F -->|"done / snooze / dismiss"| H["Record control outcome"]
+    G --> I["Learn\nsource-backed corrections and outcomes"]
+    H --> I
+    I --> A
 ```
 
-The model proposes memories; deterministic application code decides whether they are
-accepted, held, or discarded. Assistant messages may provide conversational context to
-the extraction pass, but they are never evidence for a memory.
+The model still proposes memories; deterministic application code decides whether they
+are accepted, held, or discarded. Recommendation policy is also deterministic. A
+follow-through proposal is stored separately from canonical memory, so an
+assistant-authored next step can never become a claimed fact about the user.
 
 ## Quick start
 
@@ -113,6 +131,8 @@ items were recalled, accepted, held for review, or superseded.
 
 The main views are:
 
+- **Today** — see one useful next action, choose quiet/balanced/proactive intervention,
+  and inspect progress, control, and regret signals.
 - **Chat** — converse with Zeus and inspect the memory receipt for each turn.
 - **Memory** — search and curate accepted facts or review pending candidates.
 - **Open loops** — update goals and commitments, inspect their histories, and snooze
@@ -153,6 +173,9 @@ The server provides:
 - `zeus_timeline` — list facts by the date Zeus learned them.
 - `zeus_open_loops` — list goals and commitments.
 - `zeus_update_open_loop` — update an item only after an explicit user instruction.
+- `zeus_next_action` — select one source-backed follow-through recommendation.
+- `zeus_follow_through_feedback` — record an explicitly authorized decision on that
+  recommendation.
 
 Run `npm run mcp` to launch the same server directly. It writes protocol data only to
 stdout and diagnostics to stderr.
@@ -212,6 +235,7 @@ MCP processes can safely share it.
 What stays local:
 
 - The SQLite store, transcripts, facts, candidates, intentions, and recall traces.
+- Follow-through proposals, intervention settings, and user decision events.
 - FTS5 indexes and embedding vectors.
 - Embedding inference after the model has been downloaded.
 
@@ -225,6 +249,10 @@ is **not encrypted at rest**: any process running as your operating-system user 
 the database. Treat Markdown exports as equally sensitive and do not commit either one.
 
 ## Known limitations
+
+- Zeus can prepare drafts, research, comparisons, and plans in chat. This repository has
+  no email, calendar, reminder, shopping, or coordination adapters yet, so it never
+  claims those external actions happened.
 
 - Retracting one value of a multi-valued predicate is not automatic. For example,
   “I no longer like coffee” must be closed manually from **Memory**.

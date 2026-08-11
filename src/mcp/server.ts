@@ -30,6 +30,11 @@ import {
 } from "../core/intentions";
 import type { CommitmentStatus, FactView, GoalStatus } from "../core/schema";
 import { search } from "../core/search";
+import {
+  markRecommendationSurfaced,
+  recordFollowThroughDecision,
+  recommendNextAction,
+} from "../core/stewardship";
 
 const db: Db = openDb();
 
@@ -169,7 +174,7 @@ server.registerTool(
     if (goals.length + commitments.length === 0) return text("Zeus has no matching open loops.");
     const goalLines = goals.map(
       (goal) =>
-        `- goal:${goal.id} [${goal.status}] ${goal.title}${goal.target_at ? ` (target ${goal.target_at.slice(0, 10)})` : ""}`,
+        `- goal:${goal.id} [${goal.status}; ${goal.priority} priority] ${goal.title}${goal.target_at ? ` (target ${goal.target_at.slice(0, 10)})` : ""}`,
     );
     const commitmentLines = commitments.map(
       (item) =>
@@ -182,6 +187,69 @@ server.registerTool(
       ]
         .filter((part): part is string => part !== null)
         .join("\n\n"),
+    );
+  },
+);
+
+server.registerTool(
+  "zeus_next_action",
+  {
+    title: "Recommend the user's best current next action",
+    description:
+      "Select at most one accepted commitment using explicit goal priority, timing, relevance, waiting/staleness, conflicts, snoozes, dismissals, and intervention mode. Use when the user asks what to focus on or when a concrete next step would help. The result is a proposal, never a fact or authorization for external action.",
+    inputSchema: {
+      context: z
+        .string()
+        .optional()
+        .describe("What the user is doing or discussing now, if known."),
+    },
+  },
+  async ({ context }) => {
+    const recommendation = recommendNextAction(db, context ?? "", { force: true });
+    if (!recommendation) {
+      return text(
+        "Zeus found no accepted, unsnoozed commitment worth recommending. Staying quiet is the correct result.",
+      );
+    }
+    markRecommendationSurfaced(db, recommendation, null);
+    return text(
+      [
+        `Recommended commitment:${recommendation.commitment_id} — ${recommendation.commitment_title}`,
+        `Why now: ${recommendation.why}`,
+        `Next action: ${recommendation.suggested_action}`,
+        recommendation.requires_confirmation
+          ? "Control boundary: prepare only; sending, scheduling, purchasing, reminding, or coordinating externally requires explicit user confirmation."
+          : "Control boundary: this can be prepared locally; any later external action still requires explicit user confirmation.",
+      ].join("\n"),
+    );
+  },
+);
+
+server.registerTool(
+  "zeus_follow_through_feedback",
+  {
+    title: "Record the user's decision on a Zeus recommendation",
+    description:
+      "Record acceptance, dismissal, snooze, completion, or regret only after the user explicitly says so. The instruction is stored as a real user source. Completion changes the linked commitment to done; snooze suppresses it for seven days.",
+    inputSchema: {
+      commitment_id: z.number().int().positive(),
+      decision: z.enum(["accepted", "dismissed", "snoozed", "completed", "regretted"]),
+      user_instruction: z.string().min(1).describe("The user's explicit instruction authorizing this decision."),
+    },
+  },
+  async ({ commitment_id, decision, user_instruction }) => {
+    const conversation = mcpConversation();
+    const source = appendMessage(db, conversation.id, "user", user_instruction);
+    await embedMessage(db, source.id, source.content).catch(() => false);
+    const event = recordFollowThroughDecision(db, {
+      commitmentId: commitment_id,
+      decision,
+      sourceMessageId: source.id,
+    });
+    return text(
+      event
+        ? `Recorded ${decision} for commitment ${commitment_id}. No external action was performed.`
+        : `Commitment ${commitment_id} does not exist or is no longer actionable; nothing changed.`,
     );
   },
 );

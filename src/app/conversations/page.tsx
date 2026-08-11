@@ -35,7 +35,7 @@ export default function ConversationsPage() {
                     <div className="min-w-0 flex-1">
                       <p className="text-[0.94rem]">{conversation.title ?? `Conversation ${conversation.id}`}</p>
                       <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
-                        {conversation.source} · {conversation.started_at.slice(0, 10)} · {dependencies.messages} messages · {dependencies.factsOnlyHere} exclusive facts · {dependencies.factsWithOtherEvidence} shared facts · {dependencies.candidates} candidates · {dependencies.goals} goals · {dependencies.commitments} commitments
+                        {conversation.source} · {conversation.started_at.slice(0, 10)} · {dependencies.messages} messages · {dependencies.factsOnlyHere} exclusive facts · {dependencies.factsWithOtherEvidence} shared facts · {dependencies.candidates} candidates · {dependencies.goals} goals · {dependencies.commitments} commitments · {dependencies.followThroughEvents} follow-through events
                       </p>
                       {firstMessage && (
                         <Link href={`/source/${firstMessage.id}`} className="mt-2 inline-block font-mono text-[0.66rem] underline underline-offset-2" style={{ color: "var(--shell-accent)" }}>

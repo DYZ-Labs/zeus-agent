@@ -7,12 +7,14 @@ import type {
   CommitmentView,
   Goal,
   GoalEvent,
+  GoalPriority,
   GoalStatus,
 } from "./schema";
 
 export type GoalInput = {
   title: string;
   status?: GoalStatus;
+  priority?: GoalPriority;
   targetAt?: string | null;
   confidence?: number;
   sourceMessageId: number;
@@ -21,6 +23,7 @@ export type GoalInput = {
 export type GoalUpdate = {
   title?: string;
   status?: GoalStatus;
+  priority?: GoalPriority;
   targetAt?: string | null;
   confidence?: number;
   sourceMessageId?: number | null;
@@ -31,7 +34,7 @@ export function getGoal(db: Db, id: number): Goal | null {
   return (
     db
       .prepare<[number], Goal>(
-        `SELECT id, title, status, target_at, confidence, source_message_id,
+        `SELECT id, title, status, priority, target_at, confidence, source_message_id,
                 created_at, updated_at, closed_at
          FROM goal WHERE id = ?`,
       )
@@ -46,10 +49,12 @@ export function listGoals(
   const closed = options.includeClosed ? "" : "WHERE status IN ('active','paused')";
   return db
     .prepare<[number], Goal>(
-      `SELECT id, title, status, target_at, confidence, source_message_id,
+      `SELECT id, title, status, priority, target_at, confidence, source_message_id,
               created_at, updated_at, closed_at
        FROM goal ${closed}
-       ORDER BY status = 'active' DESC, target_at IS NULL, target_at, updated_at DESC
+       ORDER BY status = 'active' DESC,
+                CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+                target_at IS NULL, target_at, updated_at DESC
        LIMIT ?`,
     )
     .all(options.limit ?? 200);
@@ -67,12 +72,14 @@ export function createGoal(db: Db, input: GoalInput): Goal {
     if (
       duplicate.source_message_id === input.sourceMessageId &&
       duplicate.status === (input.status ?? "active") &&
+      duplicate.priority === (input.priority ?? "normal") &&
       duplicate.target_at === target
     ) {
       return duplicate;
     }
     return updateGoal(db, duplicate.id, {
       status: input.status,
+      priority: input.priority,
       targetAt: input.targetAt,
       confidence: input.confidence,
       sourceMessageId: input.sourceMessageId,
@@ -84,15 +91,26 @@ export function createGoal(db: Db, input: GoalInput): Goal {
   const status = input.status ?? "active";
   const result = db.transaction(() => {
     const inserted = db
-      .prepare<[string, GoalStatus, string | null, number, number, string, string, string | null]>(
+      .prepare<[
+        string,
+        GoalStatus,
+        GoalPriority,
+        string | null,
+        number,
+        number,
+        string,
+        string,
+        string | null,
+      ]>(
         `INSERT INTO goal
-           (title, status, target_at, confidence, source_message_id,
+           (title, status, priority, target_at, confidence, source_message_id,
             created_at, updated_at, closed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         title,
         status,
+        input.priority ?? "normal",
         normalizeDate(input.targetAt),
         clamp(input.confidence ?? 0.9),
         input.sourceMessageId,
@@ -107,7 +125,12 @@ export function createGoal(db: Db, input: GoalInput): Goal {
       "created",
       null,
       status,
-      { title, target_at: normalizeDate(input.targetAt), confidence: clamp(input.confidence ?? 0.9) },
+      {
+        title,
+        priority: input.priority ?? "normal",
+        target_at: normalizeDate(input.targetAt),
+        confidence: clamp(input.confidence ?? 0.9),
+      },
       input.sourceMessageId,
       "message",
     );
@@ -123,6 +146,7 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
   if (!existing) return null;
   const title = update.title?.trim() || existing.title;
   const status = update.status ?? existing.status;
+  const priority = update.priority ?? existing.priority;
   const targetAt = update.targetAt === undefined ? existing.target_at : normalizeDate(update.targetAt);
   const confidence = update.confidence === undefined ? existing.confidence : clamp(update.confidence);
   const timestamp = now();
@@ -131,6 +155,7 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
     update.sourceMessageId &&
     title === existing.title &&
     status === existing.status &&
+    priority === existing.priority &&
     targetAt === existing.target_at &&
     confidence === existing.confidence &&
     db
@@ -143,13 +168,23 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
   }
 
   return db.transaction(() => {
-    db.prepare<[string, GoalStatus, string | null, number, string, string | null, number]>(
+    db.prepare<[
+      string,
+      GoalStatus,
+      GoalPriority,
+      string | null,
+      number,
+      string,
+      string | null,
+      number,
+    ]>(
       `UPDATE goal
-       SET title = ?, status = ?, target_at = ?, confidence = ?, updated_at = ?, closed_at = ?
+       SET title = ?, status = ?, priority = ?, target_at = ?, confidence = ?, updated_at = ?, closed_at = ?
        WHERE id = ?`,
     ).run(
       title,
       status,
+      priority,
       targetAt,
       confidence,
       timestamp,
@@ -167,10 +202,11 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
       {
         before: {
           title: existing.title,
+          priority: existing.priority,
           target_at: existing.target_at,
           confidence: existing.confidence,
         },
-        after: { title, target_at: targetAt, confidence },
+        after: { title, priority, target_at: targetAt, confidence },
       },
       update.sourceMessageId ?? null,
       update.sourceKind ?? (update.sourceMessageId ? "message" : "user_action"),
