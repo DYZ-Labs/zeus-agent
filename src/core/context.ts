@@ -1,5 +1,6 @@
 import type { Db } from "./db";
 import { now } from "./db";
+import { buildEvaluationContextForTrigger } from "./ambient";
 import { searchEpisodes } from "./episodes";
 import { embed } from "./embed";
 import { selfEntity } from "./entities";
@@ -12,6 +13,8 @@ import {
 } from "./facets";
 import { evidenceForFact, factsForEntity } from "./facts";
 import { getCommitment, getGoal, listCommitments, listGoals } from "./intentions";
+import { computePersonalizationProfile } from "./personalization";
+import { listProjects } from "./projects";
 import type {
   CommitmentView,
   CommitmentEvent,
@@ -23,12 +26,20 @@ import type {
   FollowThroughRecommendation,
   Goal,
   GoalEvent,
+  ProjectView,
+  ProjectEvent,
   RecallItem,
   SearchHit,
+  EvaluationContext,
   UnderstandingFacetView,
 } from "./schema";
 import { entitiesMentioned, search } from "./search";
-import { recommendNextAction } from "./stewardship";
+import {
+  evaluateOpportunity,
+  recommendationForOpportunity,
+  structuredFacetConditionMatches,
+} from "./stewardship";
+import { StructuredFacetCondition as StructuredFacetConditionSchema } from "./schema";
 
 const DEFAULT_MEMORY_BUDGET = 3_000;
 const MAX_MEMORY_BUDGET = 3_000;
@@ -50,7 +61,7 @@ export type IntentFieldProvenance =
   | {
       kind: "goal";
       fields: Record<
-        "title" | "status" | "priority" | "target_at" | "confidence",
+        "title" | "status" | "priority" | "target_at" | "project_id" | "confidence",
         FieldProvenanceSource
       >;
     }
@@ -60,10 +71,18 @@ export type IntentFieldProvenance =
         | "title"
         | "owner_entity_id"
         | "linked_goal_id"
+        | "project_id"
         | "status"
         | "due_at"
         | "snoozed_until"
         | "confidence",
+        FieldProvenanceSource
+      >;
+    }
+  | {
+      kind: "project";
+      fields: Record<
+        "entity_id" | "status" | "progress_summary" | "progress_percent" | "blocked_at" | "confidence",
         FieldProvenanceSource
       >;
     };
@@ -81,8 +100,11 @@ export type MemoryContext = {
   core: FactView[];
   goals: Goal[];
   commitments: CommitmentView[];
+  projects: ProjectView[];
   facets: UnderstandingFacetView[];
   recommendation: FollowThroughRecommendation | null;
+  /** Durable recommendation-cycle id shared by every delivery channel. */
+  opportunityId: number;
   /** Compatibility alias for callers that only need the selected commitment. */
   nudge: CommitmentView | null;
   items: RecallItem[];
@@ -118,14 +140,26 @@ function formatCommitment(item: CommitmentView): string {
   return `- [commitment:${item.id}] ${escapeMemory(item.title)} — ${item.status}, owner ${escapeMemory(item.owner_name)}${item.due_at ? `, due ${item.due_at.slice(0, 10)}` : ""}`;
 }
 
+function formatProject(project: ProjectView): string {
+  const progress = project.progress_percent === null
+    ? ""
+    : `, ${Math.round(project.progress_percent * 100)}% complete`;
+  const blocked = project.blocked_at ? ", blocked" : "";
+  const summary = project.progress_summary ? ` — ${escapeMemory(project.progress_summary)}` : "";
+  return `- [project:${project.id}] ${escapeMemory(project.entity_name)} — ${project.status}${progress}${blocked}${summary}`;
+}
+
 function formatFacet(facet: UnderstandingFacetView): string {
   const kind = facet.kind.replace(/_/gu, " ");
   const scope = facetScopeLabel(facet);
   const condition = facet.condition_text
     ? `; applies when ${escapeMemory(facet.condition_text)}`
     : "";
+  const structuredCondition = facet.condition_json
+    ? `; typed condition ${escapeMemory(facet.condition_json)}`
+    : "";
   const confidence = facet.confidence >= 0.9 ? "" : `; confidence ${facet.confidence.toFixed(2)}`;
-  return `- [facet:${facet.id}] ${escapeMemory(kind)} (${escapeMemory(scope)}): ${escapeMemory(facet.statement)}${condition}${confidence}`;
+  return `- [facet:${facet.id}] ${escapeMemory(kind)} (${escapeMemory(scope)}): ${escapeMemory(facet.statement)}${condition}${structuredCondition}${confidence}`;
 }
 
 /** Retained as a curation/read helper; buildContext deliberately does not inject it. */
@@ -156,6 +190,8 @@ export type BuildContextOptions = {
   episodeLimit?: number;
   excludeMessageIds?: readonly number[];
   queryVector?: Float32Array | null;
+  /** Stored user query that owns the chat recommendation-cycle trace, when applicable. */
+  querySourceMessageId?: number | null;
   memoryBudgetTokens?: number;
   interactionBudgetTokens?: number;
 };
@@ -190,7 +226,15 @@ export async function buildContext(
     MAX_INTERACTION_BUDGET,
   );
   const queryVector = options.queryVector === undefined ? await embed(query) : options.queryVector;
-  const recommendation = recommendNextAction(db, query);
+  const personalization = computePersonalizationProfile(db);
+  const evaluationContext = buildEvaluationContextForTrigger(db, "chat");
+  const cycle = evaluateOpportunity(
+    db,
+    evaluationContext,
+    query,
+    { sourceMessageId: options.querySourceMessageId ?? null },
+  );
+  const recommendation = recommendationForOpportunity(db, cycle.id);
   const followThroughQuery = recommendation
     ? `${recommendation.commitment_title} ${recommendation.goal_title ?? ""}`.trim()
     : null;
@@ -228,6 +272,10 @@ export async function buildContext(
     includeClosed: intent === "historical",
     limit: 300,
   });
+  const allProjects = listProjects(db, {
+    includeClosed: intent === "historical",
+    limit: 200,
+  });
   const recommendedCommitment = recommendation
     ? getCommitment(db, recommendation.commitment_id)
     : null;
@@ -235,6 +283,7 @@ export async function buildContext(
   const entityIds = new Set(entitiesMentioned(db, `${query} ${followThroughQuery ?? ""}`));
   const relevantGoalIds = new Set<number>();
   const relevantCommitmentIds = new Set<number>();
+  const relevantProjectIds = new Set<number>();
   const candidates = new Map<string, PlannedCandidate>();
 
   const addCandidate = (candidate: PlannedCandidate): void => {
@@ -299,6 +348,7 @@ export async function buildContext(
     const related = recommendation?.goal_id === goal.id;
     if (!(overlap > 0 || genericGoalRequest || related)) continue;
     relevantGoalIds.add(goal.id);
+    if (goal.project_id !== null) relevantProjectIds.add(goal.project_id);
     const item: RecallItem = { kind: "goal", goal };
     addCandidate(
       candidateFor(item, formatGoal(goal), {
@@ -315,6 +365,7 @@ export async function buildContext(
     if (!(overlap > 0 || genericCommitmentRequest || related || relationalOwner)) continue;
     relevantCommitmentIds.add(commitment.id);
     if (commitment.linked_goal_id !== null) relevantGoalIds.add(commitment.linked_goal_id);
+    if (commitment.project_id !== null) relevantProjectIds.add(commitment.project_id);
     const item: RecallItem = { kind: "commitment", commitment };
     addCandidate(
       candidateFor(item, formatCommitment(commitment), {
@@ -326,6 +377,7 @@ export async function buildContext(
   }
   if (recommendedGoal && !relevantGoalIds.has(recommendedGoal.id)) {
     relevantGoalIds.add(recommendedGoal.id);
+    if (recommendedGoal.project_id !== null) relevantProjectIds.add(recommendedGoal.project_id);
     const item: RecallItem = { kind: "goal", goal: recommendedGoal };
     addCandidate(
       candidateFor(item, formatGoal(recommendedGoal), {
@@ -337,6 +389,9 @@ export async function buildContext(
   }
   if (recommendedCommitment && !relevantCommitmentIds.has(recommendedCommitment.id)) {
     relevantCommitmentIds.add(recommendedCommitment.id);
+    if (recommendedCommitment.project_id !== null) {
+      relevantProjectIds.add(recommendedCommitment.project_id);
+    }
     const item: RecallItem = { kind: "commitment", commitment: recommendedCommitment };
     addCandidate(
       candidateFor(item, formatCommitment(recommendedCommitment), {
@@ -347,12 +402,62 @@ export async function buildContext(
     );
   }
 
+  const genericProjectRequest = /\b(projects?|initiatives?|workstreams?)\b/iu.test(query);
+  for (const project of allProjects) {
+    const overlap = tokenOverlap(query, `${project.entity_name} ${project.progress_summary ?? ""}`);
+    const entityRelated = entityIds.has(project.entity_id);
+    const linked = relevantProjectIds.has(project.id);
+    if (!(genericProjectRequest || overlap > 0 || entityRelated || linked)) continue;
+    relevantProjectIds.add(project.id);
+    const item: RecallItem = { kind: "project", project };
+    addCandidate(
+      candidateFor(item, formatProject(project), {
+        reason: linked ? "open_loop" : "query_relevant",
+        score: linked ? 74 : 58 + overlap * 10 + (project.blocked_at ? 8 : 0),
+        via: linked ? ["graph"] : entityRelated ? ["graph"] : ["lexical"],
+      }),
+    );
+  }
+
+  // Project relevance is a graph edge in both directions. A query may name only the
+  // project while its source-backed goal and commitment use entirely different words;
+  // bring that lifecycle cluster together rather than recalling an isolated label.
+  for (const goal of allGoals) {
+    if (goal.project_id === null || !relevantProjectIds.has(goal.project_id)) continue;
+    relevantGoalIds.add(goal.id);
+    const item: RecallItem = { kind: "goal", goal };
+    addCandidate(
+      candidateFor(item, formatGoal(goal), {
+        reason: "open_loop",
+        score: 72 + priorityBonus(goal.priority),
+        via: ["graph"],
+      }),
+    );
+  }
+  for (const commitment of allCommitments) {
+    if (commitment.project_id === null || !relevantProjectIds.has(commitment.project_id)) continue;
+    relevantCommitmentIds.add(commitment.id);
+    if (commitment.linked_goal_id !== null) relevantGoalIds.add(commitment.linked_goal_id);
+    const item: RecallItem = { kind: "commitment", commitment };
+    addCandidate(
+      candidateFor(item, formatCommitment(commitment), {
+        reason: "open_loop",
+        score: 74,
+        via: ["graph"],
+      }),
+    );
+  }
+
   const facetHits = dedupeFacetHits(queryFacetHits, followThroughFacetHits);
   for (const hit of facetHits) {
     if (!facetScopeApplies(hit.facet, query, entityIds, relevantGoalIds, relevantCommitmentIds)) {
       continue;
     }
-    if (!facetConditionApplies(hit.facet, `${query} ${followThroughQuery ?? ""}`)) continue;
+    if (!facetConditionApplies(
+      hit.facet,
+      `${query} ${followThroughQuery ?? ""}`,
+      evaluationContext,
+    )) continue;
     const evidence = evidenceForFacet(db, hit.facet.id);
     if (evidence.length === 0) continue;
     const fromFollowThrough = !queryFacetHits.some((entry) => entry.facet.id === hit.facet.id);
@@ -375,7 +480,7 @@ export async function buildContext(
       limit: 12,
     })) {
       if (facet.scope_kind !== "global") continue;
-      if (!facetConditionApplies(facet, query)) continue;
+      if (!facetConditionApplies(facet, query, evaluationContext)) continue;
       const evidence = evidenceForFacet(db, facet.id);
       if (evidence.length === 0) continue;
       const item: RecallItem = { kind: "facet", facet, evidence };
@@ -393,7 +498,7 @@ export async function buildContext(
     const facet = hit.facet;
     const domainApplies = facet.scope_kind === "global" ||
       (facet.scope_kind === "domain" && tokenOverlap(query, facet.scope_label ?? "") > 0);
-    if (!domainApplies || !facetConditionApplies(facet, query)) continue;
+    if (!domainApplies || !facetConditionApplies(facet, query, evaluationContext)) continue;
     const evidence = evidenceForFacet(db, facet.id);
     if (evidence.length === 0) continue;
     const item: RecallItem = { kind: "facet", facet, evidence };
@@ -430,11 +535,11 @@ export async function buildContext(
     selectedTokens += candidate.estimated_tokens;
   }
 
-  let text = renderSelections(selected, recommendationText);
+  let text = renderSelections(selected, recommendationText, personalization.conflicts);
   while (estimateTokens(text) > budgetTokens && selected.length > 0) {
     const removableIndex = findLowestPriorityRemovable(selected);
     selected.splice(removableIndex, 1);
-    text = renderSelections(selected, recommendationText);
+    text = renderSelections(selected, recommendationText, personalization.conflicts);
   }
 
   const promptOrdered = orderSelectionsForRender(selected);
@@ -446,6 +551,9 @@ export async function buildContext(
   const selectedGoals = selectedItems.flatMap((item) => (item.kind === "goal" ? [item.goal] : []));
   const selectedCommitments = selectedItems.flatMap(
     (item) => (item.kind === "commitment" ? [item.commitment] : []),
+  );
+  const selectedProjects = selectedItems.flatMap(
+    (item) => (item.kind === "project" ? [item.project] : []),
   );
   const selectedFacets = selectedItems.flatMap((item) => (item.kind === "facet" ? [item.facet] : []));
   const plan: ContextPlan = {
@@ -462,8 +570,10 @@ export async function buildContext(
     core: selectedFacts,
     goals: selectedGoals,
     commitments: selectedCommitments,
+    projects: selectedProjects,
     facets: selectedFacets,
     recommendation,
+    opportunityId: cycle.id,
     nudge: selectedCommitments.find((item) => item.id === recommendation?.commitment_id) ?? null,
     items: selectedItems,
     plan,
@@ -539,6 +649,7 @@ export function intentFieldProvenance(
   if (item.kind === "commitment") {
     return commitmentFieldProvenance(db, item.commitment);
   }
+  if (item.kind === "project") return projectFieldProvenance(db, item.project);
   return null;
 }
 
@@ -557,6 +668,7 @@ function goalFieldProvenance(db: Db, goal: Goal): IntentFieldProvenance {
     status: base,
     priority: base,
     target_at: base,
+    project_id: base,
     confidence: base,
   };
 
@@ -568,7 +680,7 @@ function goalFieldProvenance(db: Db, goal: Goal): IntentFieldProvenance {
     }
     applyChangedFieldSources(
       fields,
-      ["title", "priority", "target_at", "confidence"],
+      ["title", "priority", "target_at", "project_id", "confidence"],
       event.detail_json,
       source,
     );
@@ -593,6 +705,7 @@ function commitmentFieldProvenance(
     title: base,
     owner_entity_id: base,
     linked_goal_id: base,
+    project_id: base,
     status: base,
     due_at: base,
     snoozed_until: base,
@@ -611,6 +724,7 @@ function commitmentFieldProvenance(
         "title",
         "owner_entity_id",
         "linked_goal_id",
+        "project_id",
         "due_at",
         "snoozed_until",
         "confidence",
@@ -622,42 +736,86 @@ function commitmentFieldProvenance(
   return { kind: "commitment", fields };
 }
 
+function projectFieldProvenance(db: Db, project: ProjectView): IntentFieldProvenance {
+  const events = db
+    .prepare<[number], ProjectEvent>(
+      `SELECT id, project_id, event_type, from_status, to_status, detail_json,
+              source_message_id, passage_id, source_kind, created_at
+       FROM project_event WHERE project_id = ? ORDER BY id`,
+    )
+    .all(project.id);
+  const created = events.find((event) => event.event_type === "created");
+  const base = eventSource(created, project.source_message_id, project.created_at);
+  const fields: Extract<IntentFieldProvenance, { kind: "project" }> ["fields"] = {
+    entity_id: base,
+    status: base,
+    progress_summary: base,
+    progress_percent: base,
+    blocked_at: base,
+    confidence: base,
+  };
+  for (const event of events) {
+    if (event.event_type === "created") continue;
+    const source = eventSource(event, event.source_message_id, event.created_at);
+    if (event.from_status !== event.to_status && event.to_status !== null) fields.status = source;
+    if (event.event_type === "progress") {
+      const changes = parseEventChanges(event.detail_json);
+      if (Object.hasOwn(changes, "summary")) fields.progress_summary = source;
+      if (Object.hasOwn(changes, "percent")) fields.progress_percent = source;
+    } else {
+      applyChangedFieldSources(
+        fields,
+        ["progress_summary", "progress_percent", "blocked_at", "confidence"],
+        event.detail_json,
+        source,
+      );
+    }
+    if (event.event_type === "blocked" || event.event_type === "unblocked") {
+      fields.blocked_at = source;
+    }
+  }
+  return { kind: "project", fields };
+}
+
 function applyChangedFieldSources<K extends string>(
   fields: Record<K, FieldProvenanceSource>,
   names: readonly K[],
   detailJson: string | null,
   source: FieldProvenanceSource,
 ): void {
-  const detail = parseEventDetail(detailJson);
-  if (!detail) return;
+  const changes = parseEventChanges(detailJson);
   for (const name of names) {
-    if (!Object.hasOwn(detail.before, name) || !Object.hasOwn(detail.after, name)) continue;
-    if (!sameFieldValue(detail.before[name], detail.after[name])) fields[name] = source;
+    if (Object.hasOwn(changes, name)) fields[name] = source;
   }
 }
 
-function parseEventDetail(
-  detailJson: string | null,
-): { before: Record<string, unknown>; after: Record<string, unknown> } | null {
-  if (!detailJson) return null;
+function parseEventChanges(detailJson: string | null): Record<string, unknown> {
+  if (!detailJson) return {};
   try {
     const parsed = JSON.parse(detailJson) as unknown;
-    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed !== "object" || parsed === null) return {};
     const record = parsed as Record<string, unknown>;
+    if (typeof record.changes === "object" && record.changes !== null) {
+      return record.changes as Record<string, unknown>;
+    }
     if (
       typeof record.before !== "object" ||
       record.before === null ||
       typeof record.after !== "object" ||
       record.after === null
     ) {
-      return null;
+      return {};
     }
-    return {
-      before: record.before as Record<string, unknown>,
-      after: record.after as Record<string, unknown>,
-    };
+    const before = record.before as Record<string, unknown>;
+    const after = record.after as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(after).filter(
+        ([name, value]) =>
+          !Object.hasOwn(before, name) || !sameFieldValue(before[name], value),
+      ),
+    );
   } catch {
-    return null;
+    return {};
   }
 }
 
@@ -666,7 +824,7 @@ function sameFieldValue(left: unknown, right: unknown): boolean {
 }
 
 function eventSource(
-  event: GoalEvent | CommitmentEvent | undefined,
+  event: GoalEvent | CommitmentEvent | ProjectEvent | undefined,
   fallbackMessageId: number | null,
   fallbackDate: string,
 ): FieldProvenanceSource {
@@ -732,6 +890,7 @@ function scoreFacet(hit: FacetSearchHit, intent: ContextIntent, followThrough: b
 function renderSelections(
   selections: readonly PlannedCandidate[],
   recommendationText: string | null,
+  personalizationConflicts: ReturnType<typeof computePersonalizationProfile>["conflicts"] = [],
 ): string {
   const sections: string[] = [];
   const interaction = selections.filter((selection) => selection.reason === "interaction_contract");
@@ -742,6 +901,7 @@ function renderSelections(
   const episodes = selections.filter((selection) => selection.item.kind === "episode");
   const goals = selections.filter((selection) => selection.item.kind === "goal");
   const commitments = selections.filter((selection) => selection.item.kind === "commitment");
+  const projects = selections.filter((selection) => selection.item.kind === "project");
 
   if (interaction.length > 0) {
     sections.push(
@@ -758,6 +918,17 @@ function renderSelections(
       `ACCEPTED UNDERSTANDING FACETS RELEVANT TO THIS REQUEST:\n${facets.map((item) => item.formatted).join("\n")}\nUse these to frame tradeoffs. If accepted facets, goals, or constraints conflict, surface the conflict instead of silently deciding for the user.`,
     );
   }
+  const selectedKeys = new Set(selections.map((selection) => recallKey(selection.item)));
+  const activeConflicts = personalizationConflicts.filter((conflict) =>
+    conflict.item_ids.every((id) => selectedKeys.has(id)),
+  );
+  if (activeConflicts.length > 0) {
+    sections.push(
+      `PERSONALIZATION CONFLICTS — accepted preferences that Zeus must surface rather than silently resolve:\n${activeConflicts
+        .map((conflict) => `- ${conflict.item_ids.join(" vs ")} (${conflict.reasons.join(", ")})`)
+        .join("\n")}`,
+    );
+  }
   if (episodes.length > 0) {
     sections.push(
       `DATED EVIDENCE PASSAGES — exact user-authored recollections, not guaranteed current facts:\n${episodes.map((item) => item.formatted).join("\n")}`,
@@ -769,6 +940,11 @@ function renderSelections(
   if (commitments.length > 0) {
     sections.push(
       `RELEVANT OPEN LOOPS:\n${commitments.map((item) => item.formatted).join("\n")}`,
+    );
+  }
+  if (projects.length > 0) {
+    sections.push(
+      `RELEVANT PROJECTS:\n${projects.map((item) => item.formatted).join("\n")}`,
     );
   }
   if (recommendationText) sections.push(recommendationText);
@@ -785,8 +961,9 @@ function orderSelectionsForRender(
     if (selection.item.kind === "fact") return 1;
     if (selection.item.kind === "facet") return 2;
     if (selection.item.kind === "episode") return 3;
-    if (selection.item.kind === "goal") return 4;
-    return 5;
+    if (selection.item.kind === "project") return 4;
+    if (selection.item.kind === "goal") return 5;
+    return 6;
   };
   return [...selections].sort(
     (a, b) => sectionRank(a) - sectionRank(b) || b.score - a.score ||
@@ -803,6 +980,7 @@ function formatRecallItem(item: RecallItem): string {
   if (item.kind === "episode") return formatEpisode(item.episode);
   if (item.kind === "goal") return formatGoal(item.goal);
   if (item.kind === "commitment") return formatCommitment(item.commitment);
+  if (item.kind === "project") return formatProject(item.project);
   return formatFacet(item.facet);
 }
 
@@ -832,7 +1010,19 @@ function facetScopeApplies(
   return facet.scope_commitment_id !== null && commitmentIds.has(facet.scope_commitment_id);
 }
 
-function facetConditionApplies(facet: UnderstandingFacetView, query: string): boolean {
+function facetConditionApplies(
+  facet: UnderstandingFacetView,
+  query: string,
+  context: EvaluationContext,
+): boolean {
+  if (facet.condition_json !== null) {
+    try {
+      const condition = StructuredFacetConditionSchema.safeParse(JSON.parse(facet.condition_json));
+      return condition.success && structuredFacetConditionMatches(condition.data, context);
+    } catch {
+      return false;
+    }
+  }
   return facet.condition_text === null || tokenOverlap(query, facet.condition_text) > 0;
 }
 
@@ -909,6 +1099,7 @@ function recallId(item: RecallItem): number {
   }
   if (item.kind === "goal") return item.goal.id;
   if (item.kind === "commitment") return item.commitment.id;
+  if (item.kind === "project") return item.project.id;
   return item.facet.id;
 }
 

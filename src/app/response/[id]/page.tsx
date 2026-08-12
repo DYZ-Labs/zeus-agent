@@ -128,6 +128,10 @@ function RecallRow({
     title = item.commitment.title;
     detail = `commitment · ${item.commitment.status}${item.commitment.due_at ? ` · due ${item.commitment.due_at.slice(0, 10)}` : ""}`;
     source = item.commitment.source_message_id;
+  } else if (item.kind === "project") {
+    title = item.project.entity_name;
+    detail = `project · ${item.project.status}${item.project.progress_percent === null ? "" : ` · ${Math.round(item.project.progress_percent * 100)}% complete`}${item.project.blocked_at ? " · blocked" : ""}`;
+    source = item.project.source_message_id;
   } else {
     title = item.facet.statement;
     detail = `${item.facet.kind.replace(/_/gu, " ")} facet · ${facetScope(item)} · confidence ${item.facet.confidence.toFixed(2)} · ${item.evidence.length} evidence passage${item.evidence.length === 1 ? "" : "s"}`;
@@ -178,7 +182,9 @@ function key(item: RecallItem): string {
         ? `goal-${item.goal.id}`
         : item.kind === "commitment"
           ? `commitment-${item.commitment.id}`
-          : `facet-${item.facet.id}`;
+          : item.kind === "project"
+            ? `project-${item.project.id}`
+            : `facet-${item.facet.id}`;
 }
 
 function FieldSources({ provenance }: { provenance: IntentFieldProvenance }) {

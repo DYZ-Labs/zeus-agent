@@ -806,6 +806,622 @@ CREATE TABLE app_owner (
 );
 `;
 
+/** Personal-agent control and execution remain append-only, typed, and separate from
+ * canonical memory. This migration deliberately defaults ambient behavior to disabled
+ * and grants no external-write capability. */
+const PERSONAL_AGENT = `
+ALTER TABLE stewardship_setting RENAME TO stewardship_setting_legacy;
+CREATE TABLE stewardship_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  mode               TEXT NOT NULL DEFAULT 'balanced'
+                     CHECK (mode IN ('off','quiet','balanced','proactive')),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  updated_at         TEXT NOT NULL
+);
+INSERT INTO stewardship_setting (id, mode, source_message_id, updated_at)
+SELECT id, mode, source_message_id, updated_at FROM stewardship_setting_legacy;
+DROP TABLE stewardship_setting_legacy;
+
+ALTER TABLE understanding_facet
+ADD COLUMN condition_json TEXT CHECK (condition_json IS NULL OR json_valid(condition_json));
+
+CREATE TABLE project (
+  id                 INTEGER PRIMARY KEY,
+  entity_id          INTEGER NOT NULL UNIQUE REFERENCES entity(id) ON DELETE RESTRICT,
+  status             TEXT NOT NULL DEFAULT 'planned'
+                     CHECK (status IN ('planned','active','paused','completed','abandoned')),
+  progress_summary   TEXT,
+  progress_percent   REAL CHECK (progress_percent IS NULL OR (progress_percent >= 0 AND progress_percent <= 1)),
+  blocked_at         TEXT,
+  confidence         REAL NOT NULL DEFAULT 0.9 CHECK (confidence > 0 AND confidence <= 1),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  closed_at          TEXT
+);
+CREATE INDEX project_status_idx ON project(status, updated_at DESC);
+CREATE INDEX project_source_idx ON project(source_message_id);
+
+CREATE TABLE project_event (
+  id                 INTEGER PRIMARY KEY,
+  project_id         INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  event_type         TEXT NOT NULL
+                     CHECK (event_type IN ('created','updated','status_changed','progress','blocked','unblocked')),
+  from_status        TEXT,
+  to_status          TEXT,
+  detail_json        TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  passage_id         INTEGER REFERENCES evidence_passage(id) ON DELETE SET NULL,
+  source_kind        TEXT NOT NULL CHECK (source_kind IN ('message','user_action')),
+  created_at         TEXT NOT NULL
+);
+CREATE INDEX project_event_project_idx ON project_event(project_id, id);
+CREATE INDEX project_event_passage_idx ON project_event(passage_id) WHERE passage_id IS NOT NULL;
+
+ALTER TABLE goal ADD COLUMN project_id INTEGER REFERENCES project(id) ON DELETE SET NULL;
+ALTER TABLE commitment ADD COLUMN project_id INTEGER REFERENCES project(id) ON DELETE SET NULL;
+CREATE INDEX goal_project_idx ON goal(project_id) WHERE project_id IS NOT NULL;
+CREATE INDEX commitment_project_idx ON commitment(project_id) WHERE project_id IS NOT NULL;
+
+CREATE TABLE recommendation_cycle (
+  id                        INTEGER PRIMARY KEY,
+  policy_version            TEXT NOT NULL,
+  trigger                   TEXT NOT NULL CHECK (trigger IN ('chat','today','mcp','worker')),
+  context_json              TEXT NOT NULL CHECK (json_valid(context_json)),
+  query_text                TEXT NOT NULL,
+  candidate_scores_json     TEXT NOT NULL CHECK (json_valid(candidate_scores_json)),
+  applied_facet_ids_json    TEXT NOT NULL CHECK (json_valid(applied_facet_ids_json)),
+  exclusions_json           TEXT NOT NULL CHECK (json_valid(exclusions_json)),
+  selected_commitment_id    INTEGER REFERENCES commitment(id) ON DELETE SET NULL,
+  recommendation_json       TEXT CHECK (recommendation_json IS NULL OR json_valid(recommendation_json)),
+  created_at                TEXT NOT NULL
+);
+CREATE INDEX recommendation_cycle_created_idx ON recommendation_cycle(created_at DESC);
+CREATE INDEX recommendation_cycle_selected_idx
+ON recommendation_cycle(selected_commitment_id, created_at DESC)
+WHERE selected_commitment_id IS NOT NULL;
+
+ALTER TABLE follow_through_event
+ADD COLUMN effect_kind TEXT NOT NULL DEFAULT 'prepare_local'
+  CHECK (effect_kind IN ('memory_read','web_read','prepare_local','send','schedule','purchase','modify_external'));
+UPDATE follow_through_event
+SET effect_kind = CASE action_kind
+  WHEN 'research' THEN 'web_read'
+  WHEN 'schedule' THEN 'schedule'
+  WHEN 'remind' THEN 'modify_external'
+  WHEN 'coordinate' THEN 'send'
+  ELSE 'prepare_local'
+END;
+UPDATE follow_through_event
+SET detail_json = json_set(
+  detail_json,
+  '$.recommendation.effect_kind',
+  effect_kind
+)
+WHERE detail_json IS NOT NULL
+  AND json_type(detail_json, '$.recommendation') = 'object'
+  AND json_type(detail_json, '$.recommendation.effect_kind') IS NULL;
+ALTER TABLE follow_through_event
+ADD COLUMN opportunity_id INTEGER REFERENCES recommendation_cycle(id) ON DELETE SET NULL;
+CREATE INDEX follow_through_opportunity_idx
+ON follow_through_event(opportunity_id) WHERE opportunity_id IS NOT NULL;
+
+CREATE TABLE opportunity_delivery (
+  id                   INTEGER PRIMARY KEY,
+  opportunity_id       INTEGER NOT NULL REFERENCES recommendation_cycle(id) ON DELETE CASCADE,
+  channel              TEXT NOT NULL CHECK (channel IN ('chat','today','mcp','macos')),
+  response_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  delivered_at         TEXT NOT NULL,
+  UNIQUE (opportunity_id, channel)
+);
+CREATE INDEX opportunity_delivery_time_idx ON opportunity_delivery(delivered_at DESC);
+
+CREATE TABLE ambient_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  timezone           TEXT NOT NULL DEFAULT 'UTC',
+  quiet_start        TEXT NOT NULL DEFAULT '22:00',
+  quiet_end          TEXT NOT NULL DEFAULT '08:00',
+  daily_limit        INTEGER NOT NULL DEFAULT 1 CHECK (daily_limit = 1),
+  channels_json      TEXT NOT NULL DEFAULT '["macos"]' CHECK (json_valid(channels_json)),
+  location_consent   INTEGER NOT NULL DEFAULT 0 CHECK (location_consent IN (0,1)),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  updated_at         TEXT NOT NULL
+);
+INSERT INTO ambient_setting
+  (id, enabled, timezone, quiet_start, quiet_end, daily_limit, channels_json,
+   location_consent, source_message_id, updated_at)
+VALUES (1, 0, 'UTC', '22:00', '08:00', 1, '["macos"]', 0, NULL, ${NOW});
+
+CREATE TABLE coarse_location (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  zone_id      TEXT NOT NULL,
+  observed_at  TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+
+CREATE TABLE work_plan (
+  id                       INTEGER PRIMARY KEY,
+  objective                TEXT NOT NULL,
+  status                   TEXT NOT NULL DEFAULT 'proposed'
+                           CHECK (status IN ('proposed','authorized','running','paused','completed','failed','cancelled')),
+  plan_hash                TEXT NOT NULL UNIQUE,
+  allowed_effects_json     TEXT NOT NULL CHECK (json_valid(allowed_effects_json)),
+  completion_criteria_json TEXT NOT NULL CHECK (json_valid(completion_criteria_json)),
+  max_steps                INTEGER NOT NULL DEFAULT 12 CHECK (max_steps BETWEEN 1 AND 12),
+  max_model_tool_calls     INTEGER NOT NULL DEFAULT 20 CHECK (max_model_tool_calls BETWEEN 1 AND 20),
+  max_retries_per_step     INTEGER NOT NULL DEFAULT 2 CHECK (max_retries_per_step BETWEEN 0 AND 2),
+  max_duration_seconds     INTEGER NOT NULL DEFAULT 900 CHECK (max_duration_seconds BETWEEN 1 AND 900),
+  source_message_id        INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  source_goal_id           INTEGER REFERENCES goal(id) ON DELETE SET NULL,
+  source_commitment_id     INTEGER REFERENCES commitment(id) ON DELETE SET NULL,
+  source_project_id        INTEGER REFERENCES project(id) ON DELETE SET NULL,
+  origin                   TEXT NOT NULL CHECK (origin IN ('explicit_request','surfaced_proposal')),
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL,
+  completed_at             TEXT
+);
+CREATE INDEX work_plan_status_idx ON work_plan(status, updated_at DESC);
+CREATE INDEX work_plan_source_idx ON work_plan(source_message_id);
+
+CREATE TABLE work_step (
+  id             INTEGER PRIMARY KEY,
+  work_plan_id   INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  position       INTEGER NOT NULL CHECK (position > 0),
+  title          TEXT NOT NULL,
+  instruction    TEXT NOT NULL,
+  effect_kind    TEXT NOT NULL
+                 CHECK (effect_kind IN ('memory_read','web_read','prepare_local','send','schedule','purchase','modify_external')),
+  status         TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','running','completed','failed','skipped','cancelled')),
+  attempt_count  INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  started_at     TEXT,
+  completed_at   TEXT,
+  error_code     TEXT,
+  error_message  TEXT,
+  UNIQUE (work_plan_id, position)
+);
+CREATE INDEX work_step_plan_idx ON work_step(work_plan_id, status, position);
+
+CREATE TABLE work_step_dependency (
+  work_step_id        INTEGER NOT NULL REFERENCES work_step(id) ON DELETE CASCADE,
+  depends_on_step_id INTEGER NOT NULL REFERENCES work_step(id) ON DELETE CASCADE,
+  PRIMARY KEY (work_step_id, depends_on_step_id),
+  CHECK (work_step_id != depends_on_step_id)
+);
+
+CREATE TABLE work_authorization (
+  id                       INTEGER PRIMARY KEY,
+  work_plan_id             INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  plan_hash                TEXT NOT NULL,
+  authorization_kind       TEXT NOT NULL CHECK (authorization_kind IN ('explicit_request','user_approval')),
+  allowed_effects_json     TEXT NOT NULL CHECK (json_valid(allowed_effects_json)),
+  max_model_tool_calls     INTEGER NOT NULL CHECK (max_model_tool_calls BETWEEN 1 AND 20),
+  max_retries_per_step     INTEGER NOT NULL CHECK (max_retries_per_step BETWEEN 0 AND 2),
+  max_duration_seconds     INTEGER NOT NULL CHECK (max_duration_seconds BETWEEN 1 AND 900),
+  expires_at               TEXT NOT NULL,
+  source_message_id        INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at               TEXT NOT NULL,
+  revoked_at               TEXT
+);
+CREATE INDEX work_authorization_plan_idx ON work_authorization(work_plan_id, id DESC);
+CREATE UNIQUE INDEX work_authorization_active_idx
+ON work_authorization(work_plan_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE work_run (
+  id                  INTEGER PRIMARY KEY,
+  work_plan_id        INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  authorization_id    INTEGER NOT NULL REFERENCES work_authorization(id) ON DELETE RESTRICT,
+  plan_hash           TEXT NOT NULL,
+  status              TEXT NOT NULL DEFAULT 'queued'
+                      CHECK (status IN ('queued','running','paused','completed','failed','cancelled')),
+  model_call_count    INTEGER NOT NULL DEFAULT 0 CHECK (model_call_count >= 0),
+  tool_call_count     INTEGER NOT NULL DEFAULT 0 CHECK (tool_call_count >= 0),
+  checkpoint_step_id  INTEGER REFERENCES work_step(id) ON DELETE SET NULL,
+  started_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  deadline_at         TEXT NOT NULL,
+  completed_at        TEXT,
+  error_code          TEXT,
+  error_message       TEXT
+);
+CREATE INDEX work_run_plan_idx ON work_run(work_plan_id, status, id DESC);
+
+CREATE TABLE work_artifact (
+  id              INTEGER PRIMARY KEY,
+  work_plan_id    INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  work_run_id     INTEGER NOT NULL REFERENCES work_run(id) ON DELETE CASCADE,
+  work_step_id    INTEGER REFERENCES work_step(id) ON DELETE SET NULL,
+  kind            TEXT NOT NULL CHECK (kind IN ('draft','comparison','report','research_notes')),
+  title           TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  citations_json  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(citations_json)),
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
+CREATE INDEX work_artifact_run_idx ON work_artifact(work_run_id, id);
+
+CREATE TABLE tool_receipt (
+  id               INTEGER PRIMARY KEY,
+  work_run_id      INTEGER NOT NULL REFERENCES work_run(id) ON DELETE CASCADE,
+  work_step_id     INTEGER REFERENCES work_step(id) ON DELETE SET NULL,
+  tool_name        TEXT NOT NULL CHECK (tool_name IN ('memory_recall','web_search','local_artifact')),
+  effect_kind      TEXT NOT NULL CHECK (effect_kind IN ('memory_read','web_read','prepare_local')),
+  call_index       INTEGER NOT NULL CHECK (call_index > 0),
+  input_json       TEXT NOT NULL CHECK (json_valid(input_json)),
+  output_json      TEXT CHECK (output_json IS NULL OR json_valid(output_json)),
+  citations_json   TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(citations_json)),
+  status           TEXT NOT NULL CHECK (status IN ('started','completed','failed')),
+  error_code       TEXT,
+  error_message    TEXT,
+  idempotency_key  TEXT NOT NULL UNIQUE,
+  started_at       TEXT NOT NULL,
+  completed_at     TEXT
+);
+CREATE INDEX tool_receipt_run_idx ON tool_receipt(work_run_id, call_index);
+
+-- Project context is canonical and therefore eligible for the same immutable response
+-- and MCP recall traces as facts, facets, and intentions.
+UPDATE response_context
+SET snapshot_json = json_set(snapshot_json, '$.goal.project_id', json('null'))
+WHERE item_kind = 'goal' AND snapshot_json IS NOT NULL
+  AND json_type(snapshot_json, '$.goal.project_id') IS NULL;
+UPDATE response_context
+SET snapshot_json = json_set(snapshot_json, '$.commitment.project_id', json('null'))
+WHERE item_kind = 'commitment' AND snapshot_json IS NOT NULL
+  AND json_type(snapshot_json, '$.commitment.project_id') IS NULL;
+UPDATE response_context
+SET snapshot_json = json_set(snapshot_json, '$.facet.condition_json', json('null'))
+WHERE item_kind = 'facet' AND snapshot_json IS NOT NULL
+  AND json_type(snapshot_json, '$.facet.condition_json') IS NULL;
+
+ALTER TABLE response_context RENAME TO response_context_personal_agent_legacy;
+CREATE TABLE response_context (
+  assistant_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  item_kind             TEXT NOT NULL CHECK (item_kind IN ('fact','episode','goal','commitment','facet','project')),
+  item_id               INTEGER NOT NULL,
+  rank                  INTEGER NOT NULL,
+  selection_reason      TEXT,
+  selection_score       REAL,
+  retrieval_json        TEXT CHECK (retrieval_json IS NULL OR json_valid(retrieval_json)),
+  created_at            TEXT NOT NULL,
+  snapshot_json         TEXT CHECK (snapshot_json IS NULL OR json_valid(snapshot_json)),
+  PRIMARY KEY (assistant_message_id, item_kind, item_id)
+);
+INSERT INTO response_context
+  (assistant_message_id, item_kind, item_id, rank, selection_reason,
+   selection_score, retrieval_json, created_at, snapshot_json)
+SELECT assistant_message_id, item_kind, item_id, rank, selection_reason,
+       selection_score, retrieval_json, created_at, snapshot_json
+FROM response_context_personal_agent_legacy;
+DROP TABLE response_context_personal_agent_legacy;
+CREATE INDEX response_context_message_idx ON response_context(assistant_message_id, rank);
+
+UPDATE mcp_recall_audit
+SET snapshot_json = json_set(snapshot_json, '$.goal.project_id', json('null'))
+WHERE item_kind = 'goal' AND json_type(snapshot_json, '$.goal.project_id') IS NULL;
+UPDATE mcp_recall_audit
+SET snapshot_json = json_set(snapshot_json, '$.commitment.project_id', json('null'))
+WHERE item_kind = 'commitment' AND json_type(snapshot_json, '$.commitment.project_id') IS NULL;
+UPDATE mcp_recall_audit
+SET snapshot_json = json_set(snapshot_json, '$.facet.condition_json', json('null'))
+WHERE item_kind = 'facet' AND json_type(snapshot_json, '$.facet.condition_json') IS NULL;
+
+ALTER TABLE mcp_recall_audit RENAME TO mcp_recall_audit_personal_agent_legacy;
+CREATE TABLE mcp_recall_audit (
+  id                 INTEGER PRIMARY KEY,
+  tool_name          TEXT NOT NULL,
+  query_text         TEXT NOT NULL,
+  item_kind          TEXT NOT NULL
+                     CHECK (item_kind IN ('fact','episode','goal','commitment','facet','candidate','project')),
+  item_id            INTEGER NOT NULL,
+  rank               INTEGER NOT NULL,
+  snapshot_json      TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  created_at         TEXT NOT NULL
+);
+INSERT INTO mcp_recall_audit
+  (id, tool_name, query_text, item_kind, item_id, rank, snapshot_json, created_at)
+SELECT id, tool_name, query_text, item_kind, item_id, rank, snapshot_json, created_at
+FROM mcp_recall_audit_personal_agent_legacy;
+DROP TABLE mcp_recall_audit_personal_agent_legacy;
+CREATE INDEX mcp_recall_audit_created_idx ON mcp_recall_audit(created_at DESC);
+`;
+
+/**
+ * Reviewable behavioral-policy proposals stay outside canonical memory. Their only
+ * evidence is explicit user-control/progress events, and every decision is appended
+ * rather than overwriting earlier review history.
+ */
+const BEHAVIORAL_POLICY_SUGGESTIONS = `
+ALTER TABLE recommendation_cycle
+ADD COLUMN source_message_id INTEGER REFERENCES message(id) ON DELETE CASCADE;
+CREATE INDEX recommendation_cycle_source_idx
+ON recommendation_cycle(source_message_id)
+WHERE source_message_id IS NOT NULL;
+
+CREATE TABLE behavioral_policy_suggestion (
+  id                           INTEGER PRIMARY KEY,
+  pattern_key                  TEXT NOT NULL UNIQUE,
+  event_type                   TEXT NOT NULL
+                               CHECK (event_type IN ('dismissed','snoozed','completed','regretted')),
+  action_kind                  TEXT NOT NULL
+                               CHECK (action_kind IN ('draft','schedule','research','remind','coordinate','plan')),
+  kind                         TEXT NOT NULL
+                               CHECK (kind IN ('temporary_suppression','confirm_routine')),
+  summary                      TEXT NOT NULL,
+  allowed_interruption_change  TEXT NOT NULL
+                               CHECK (allowed_interruption_change IN ('none','suppress_only')),
+  minimum_evidence_count       INTEGER NOT NULL CHECK (minimum_evidence_count >= 2),
+  created_at                   TEXT NOT NULL,
+  CHECK (
+    (kind = 'temporary_suppression' AND allowed_interruption_change = 'suppress_only')
+    OR (kind = 'confirm_routine' AND allowed_interruption_change = 'none')
+  )
+);
+
+CREATE TABLE behavioral_policy_suggestion_evidence (
+  suggestion_id            INTEGER NOT NULL
+                           REFERENCES behavioral_policy_suggestion(id) ON DELETE CASCADE,
+  follow_through_event_id  INTEGER NOT NULL
+                           REFERENCES follow_through_event(id) ON DELETE CASCADE,
+  created_at               TEXT NOT NULL,
+  PRIMARY KEY (suggestion_id, follow_through_event_id)
+);
+CREATE INDEX behavioral_policy_suggestion_evidence_event_idx
+ON behavioral_policy_suggestion_evidence(follow_through_event_id);
+
+CREATE TRIGGER behavioral_policy_suggestion_evidence_explicit_insert
+BEFORE INSERT ON behavioral_policy_suggestion_evidence
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM follow_through_event e
+  JOIN behavioral_policy_suggestion s ON s.id = NEW.suggestion_id
+  WHERE e.id = NEW.follow_through_event_id
+    AND e.event_type IN ('dismissed','snoozed','completed','regretted')
+    AND e.source_kind IN ('message','user_action')
+    AND e.event_type = s.event_type
+    AND e.action_kind = s.action_kind
+)
+BEGIN
+  SELECT RAISE(ABORT, 'behavioral policy evidence must be an explicit user event');
+END;
+
+CREATE TABLE behavioral_policy_suggestion_event (
+  id                 INTEGER PRIMARY KEY,
+  suggestion_id      INTEGER NOT NULL
+                     REFERENCES behavioral_policy_suggestion(id) ON DELETE CASCADE,
+  event_type         TEXT NOT NULL
+                     CHECK (event_type IN ('materialized','accepted_for_review','dismissed')),
+  detail_json        TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE CASCADE,
+  source_kind        TEXT NOT NULL CHECK (source_kind IN ('system','message','user_action')),
+  created_at         TEXT NOT NULL,
+  CHECK (
+    (event_type = 'materialized' AND source_kind = 'system' AND source_message_id IS NULL)
+    OR
+    (event_type IN ('accepted_for_review','dismissed')
+      AND source_kind IN ('message','user_action') AND source_message_id IS NOT NULL)
+  )
+);
+CREATE INDEX behavioral_policy_suggestion_event_suggestion_idx
+ON behavioral_policy_suggestion_event(suggestion_id, id);
+CREATE INDEX behavioral_policy_suggestion_event_source_idx
+ON behavioral_policy_suggestion_event(source_message_id)
+WHERE source_message_id IS NOT NULL;
+
+CREATE TRIGGER behavioral_policy_suggestion_immutable
+BEFORE UPDATE ON behavioral_policy_suggestion
+BEGIN
+  SELECT RAISE(ABORT, 'behavioral policy suggestions are immutable');
+END;
+CREATE TRIGGER behavioral_policy_suggestion_evidence_immutable
+BEFORE UPDATE ON behavioral_policy_suggestion_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'behavioral policy evidence is immutable');
+END;
+CREATE TRIGGER behavioral_policy_suggestion_event_immutable
+BEFORE UPDATE ON behavioral_policy_suggestion_event
+BEGIN
+  SELECT RAISE(ABORT, 'behavioral policy review history is append-only');
+END;
+`;
+
+/**
+ * Ambient notification delivery happens outside SQLite so an operating-system prompt
+ * cannot hold the memory store's write lock. A durable claim reserves the one local-day
+ * slot first. Unknown crash outcomes retain that reservation, preferring one missed
+ * notification to a duplicate interruption.
+ */
+const AMBIENT_DELIVERY_CLAIMS = `
+CREATE TABLE ambient_delivery_attempt (
+  id                   INTEGER PRIMARY KEY,
+  opportunity_id       INTEGER NOT NULL
+                       REFERENCES recommendation_cycle(id) ON DELETE CASCADE,
+  channel              TEXT NOT NULL CHECK (channel = 'macos'),
+  local_day            TEXT NOT NULL,
+  claim_slot           TEXT UNIQUE,
+  lease_token          TEXT NOT NULL UNIQUE,
+  status               TEXT NOT NULL
+                       CHECK (status IN ('claimed','succeeded','failed','unknown')),
+  leased_until         TEXT NOT NULL,
+  notifier_started_at  TEXT NOT NULL,
+  completed_at         TEXT,
+  error_code           TEXT,
+  delivery_id          INTEGER REFERENCES opportunity_delivery(id) ON DELETE SET NULL,
+  created_at           TEXT NOT NULL,
+  CHECK (
+    (status = 'claimed' AND completed_at IS NULL AND delivery_id IS NULL AND claim_slot IS NOT NULL)
+    OR
+    (status = 'succeeded' AND completed_at IS NOT NULL AND delivery_id IS NOT NULL AND claim_slot IS NOT NULL)
+    OR
+    (status = 'failed' AND completed_at IS NOT NULL AND delivery_id IS NULL AND claim_slot IS NULL)
+    OR
+    (status = 'unknown' AND completed_at IS NOT NULL AND delivery_id IS NULL AND claim_slot IS NOT NULL)
+  )
+);
+CREATE INDEX ambient_delivery_attempt_opportunity_idx
+ON ambient_delivery_attempt(opportunity_id, id DESC);
+CREATE INDEX ambient_delivery_attempt_status_idx
+ON ambient_delivery_attempt(status, leased_until);
+`;
+
+/** A durable lease prevents a second web process from treating a live model call as a
+ * crashed attempt. Terminal and paused transitions clear ownership. */
+const WORK_RUN_LEASES = `
+ALTER TABLE work_run ADD COLUMN runner_token TEXT;
+ALTER TABLE work_run ADD COLUMN runner_lease_until TEXT;
+CREATE UNIQUE INDEX work_run_runner_token_idx
+ON work_run(runner_token) WHERE runner_token IS NOT NULL;
+`;
+
+/** Exact source dependencies let explicit deletion remove derived artifacts and audit
+ * snapshots without brittle text inspection. An active-run uniqueness constraint also
+ * closes the cross-process first-start race before a provider call can begin. */
+const DERIVED_SOURCE_DEPENDENCIES = `
+CREATE TABLE work_artifact_source (
+  work_artifact_id  INTEGER NOT NULL REFERENCES work_artifact(id) ON DELETE CASCADE,
+  source_message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  PRIMARY KEY (work_artifact_id, source_message_id)
+);
+CREATE INDEX work_artifact_source_message_idx
+ON work_artifact_source(source_message_id, work_artifact_id);
+
+-- A dev store may contain duplicate active runs from before the uniqueness policy.
+-- Retain the newest deterministically and close every older row before adding the
+-- constraint, preserving a durable reason instead of making migration fail.
+UPDATE tool_receipt
+SET status = 'failed', error_code = 'superseded_active_run',
+    error_message = 'A newer active run superseded this pre-constraint run',
+    completed_at = COALESCE(completed_at, ${NOW})
+WHERE status = 'started'
+  AND work_run_id IN (
+    SELECT older.id
+    FROM work_run older
+    WHERE older.status IN ('queued','running','paused')
+      AND EXISTS (
+        SELECT 1 FROM work_run newer
+        WHERE newer.work_plan_id = older.work_plan_id
+          AND newer.status IN ('queued','running','paused')
+          AND newer.id > older.id
+      )
+  );
+UPDATE work_run
+SET status = 'failed', error_code = 'superseded_active_run',
+    error_message = 'A newer active run superseded this pre-constraint run',
+    updated_at = ${NOW}, completed_at = ${NOW},
+    runner_token = NULL, runner_lease_until = NULL
+WHERE status IN ('queued','running','paused')
+  AND EXISTS (
+    SELECT 1 FROM work_run newer
+    WHERE newer.work_plan_id = work_run.work_plan_id
+      AND newer.status IN ('queued','running','paused')
+      AND newer.id > work_run.id
+  );
+
+CREATE UNIQUE INDEX work_run_active_plan_idx
+ON work_run(work_plan_id) WHERE status IN ('queued','running','paused');
+`;
+
+/** Generated plans bind the exact accepted personalization and local evaluation
+ * context supplied to the model. Item-level and message-level dependencies make
+ * explicit deletion reliable even when the originating conversation still exists. */
+const WORK_PLAN_GENERATION_PROVENANCE = `
+ALTER TABLE work_plan
+ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 2 CHECK (hash_version IN (2,3));
+
+CREATE TABLE work_plan_generation_context (
+  work_plan_id             INTEGER PRIMARY KEY
+                           REFERENCES work_plan(id) ON DELETE CASCADE,
+  evaluation_context_json TEXT NOT NULL CHECK (json_valid(evaluation_context_json)),
+  conflict_snapshot_json  TEXT NOT NULL CHECK (json_valid(conflict_snapshot_json)),
+  created_at              TEXT NOT NULL
+);
+
+CREATE TABLE work_plan_memory_source (
+  work_plan_id       INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  source_kind        TEXT NOT NULL CHECK (source_kind IN ('fact','facet')),
+  source_id          INTEGER NOT NULL,
+  included_in_prompt INTEGER NOT NULL CHECK (included_in_prompt IN (0,1)),
+  exclusion_reason  TEXT,
+  snapshot_json     TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  PRIMARY KEY (work_plan_id, source_kind, source_id),
+  CHECK (
+    (included_in_prompt = 1 AND exclusion_reason IS NULL)
+    OR (included_in_prompt = 0 AND exclusion_reason IS NOT NULL)
+  )
+);
+CREATE INDEX work_plan_memory_source_item_idx
+ON work_plan_memory_source(source_kind, source_id, work_plan_id);
+
+CREATE TABLE work_plan_memory_source_message (
+  work_plan_id      INTEGER NOT NULL,
+  source_kind       TEXT NOT NULL,
+  source_id         INTEGER NOT NULL,
+  source_message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  PRIMARY KEY (work_plan_id, source_kind, source_id, source_message_id),
+  FOREIGN KEY (work_plan_id, source_kind, source_id)
+    REFERENCES work_plan_memory_source(work_plan_id, source_kind, source_id)
+    ON DELETE CASCADE
+);
+CREATE INDEX work_plan_memory_source_message_idx
+ON work_plan_memory_source_message(source_message_id, work_plan_id);
+`;
+
+/** Execution-time memory recall can introduce canonical dependencies that were not
+ * part of plan generation. Artifact-level item snapshots make later explicit forget
+ * remove every downstream draft derived from that exact fact or facet. */
+const WORK_ARTIFACT_MEMORY_PROVENANCE = `
+CREATE TABLE work_artifact_memory_source (
+  work_artifact_id INTEGER NOT NULL REFERENCES work_artifact(id) ON DELETE CASCADE,
+  source_kind      TEXT NOT NULL CHECK (source_kind IN ('fact','facet')),
+  source_id        INTEGER NOT NULL,
+  snapshot_json    TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+  PRIMARY KEY (work_artifact_id, source_kind, source_id)
+);
+CREATE INDEX work_artifact_memory_source_item_idx
+ON work_artifact_memory_source(source_kind, source_id, work_artifact_id);
+`;
+
+/**
+ * MCP tool arguments are model-controlled and therefore cannot themselves be user
+ * provenance. Mutations use capability-negotiated elicitation and record only a digest
+ * until the user approves. Approved/applied events link to the resulting real user
+ * action; deleting that source cascades those source-derived audit rows as well.
+ */
+const MCP_MUTATION_APPROVAL = `
+CREATE TABLE mcp_mutation_event (
+  id                    INTEGER PRIMARY KEY,
+  operation_id          TEXT NOT NULL,
+  tool_name             TEXT NOT NULL,
+  request_hash          TEXT NOT NULL
+                        CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
+  target_kind           TEXT,
+  target_id             INTEGER,
+  event_type            TEXT NOT NULL
+                        CHECK (event_type IN (
+                          'approval_requested','approval_unsupported','approval_declined',
+                          'approval_cancelled','approval_expired','approved','applied','failed'
+                        )),
+  source_message_id     INTEGER REFERENCES message(id) ON DELETE CASCADE,
+  approval_expires_at   TEXT,
+  created_at            TEXT NOT NULL,
+  UNIQUE (operation_id, event_type),
+  CHECK (target_id IS NULL OR (target_id > 0 AND target_kind IS NOT NULL)),
+  CHECK (
+    source_message_id IS NULL
+    OR event_type IN ('approved','applied','failed')
+  )
+);
+CREATE INDEX mcp_mutation_event_operation_idx
+ON mcp_mutation_event(operation_id, id);
+CREATE INDEX mcp_mutation_event_source_idx
+ON mcp_mutation_event(source_message_id)
+WHERE source_message_id IS NOT NULL;
+CREATE INDEX mcp_mutation_event_created_idx
+ON mcp_mutation_event(created_at DESC);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -819,4 +1435,12 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "010_backfill_item_compatibility", sql: BACKFILL_ITEM_COMPATIBILITY },
   { id: "011_conversation_history_state", sql: CONVERSATION_HISTORY_STATE },
   { id: "012_app_owner", sql: APP_OWNER },
+  { id: "013_personal_agent", sql: PERSONAL_AGENT },
+  { id: "014_behavioral_policy_suggestions", sql: BEHAVIORAL_POLICY_SUGGESTIONS },
+  { id: "015_ambient_delivery_claims", sql: AMBIENT_DELIVERY_CLAIMS },
+  { id: "016_work_run_leases", sql: WORK_RUN_LEASES },
+  { id: "017_derived_source_dependencies", sql: DERIVED_SOURCE_DEPENDENCIES },
+  { id: "018_work_plan_generation_provenance", sql: WORK_PLAN_GENERATION_PROVENANCE },
+  { id: "019_work_artifact_memory_provenance", sql: WORK_ARTIFACT_MEMORY_PROVENANCE },
+  { id: "020_mcp_mutation_approval", sql: MCP_MUTATION_APPROVAL },
 ];

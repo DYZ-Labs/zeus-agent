@@ -39,7 +39,7 @@ vi.mock("@/core/embed", async (importOriginal) => {
 import {
   acceptFacetCandidateAction,
   answerReflectionAction,
-  deleteAllRecentChatsAction,
+  deleteAllConversationsAction,
   deleteConversationFromHistoryAction,
 } from "./actions";
 
@@ -139,7 +139,7 @@ describe("conversation deletion actions", () => {
     vi.clearAllMocks();
   });
 
-  it("hides every recent chat without deleting stored conversations", async () => {
+  it("permanently erases every source conversation and its messages", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);
     const first = createConversation(db, { title: "First chat" });
@@ -148,18 +148,18 @@ describe("conversation deletion actions", () => {
     appendMessage(db, second.id, "user", "Keep this second transcript.");
 
     const form = new FormData();
-    form.set("confirmation", "delete-all-recent");
-    await deleteAllRecentChatsAction(form);
+    form.set("confirmation", "erase-all-sources");
+    await deleteAllConversationsAction(form);
 
     expect(listChatHistory(db)).toEqual([]);
-    expect(listConversations(db)).toHaveLength(2);
-    expect(messagesIn(db, first.id)).toHaveLength(1);
-    expect(messagesIn(db, second.id)).toHaveLength(1);
+    expect(listConversations(db)).toHaveLength(0);
+    expect(messagesIn(db, first.id)).toHaveLength(0);
+    expect(messagesIn(db, second.id)).toHaveLength(0);
     expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/settings");
     expect(actionMocks.redirect).not.toHaveBeenCalled();
   });
 
-  it("hides only the selected recent chat while preserving its details and transcript", async () => {
+  it("permanently erases only the selected source and its solely evidenced details", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);
     const deleted = createConversation(db, { title: "Delete me" });
@@ -180,13 +180,13 @@ describe("conversation deletion actions", () => {
       confidence: 0.95,
     });
 
-    await deleteConversationFromHistoryAction(deleted.id, "delete");
+    await deleteConversationFromHistoryAction(deleted.id, "erase-source");
 
-    expect(getConversation(db, deleted.id)).not.toBeNull();
+    expect(getConversation(db, deleted.id)).toBeNull();
     expect(getConversation(db, preserved.id)).not.toBeNull();
     expect(listChatHistory(db).map((chat) => chat.id)).toEqual([preserved.id]);
-    expect(messagesIn(db, deleted.id)).toHaveLength(1);
-    expect(listFacets(db)).toHaveLength(1);
+    expect(messagesIn(db, deleted.id)).toHaveLength(0);
+    expect(listFacets(db)).toHaveLength(0);
     expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/", "layout");
   });
 });

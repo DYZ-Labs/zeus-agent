@@ -68,6 +68,26 @@ export function FacetRow({
                   color: "var(--shell-fg)",
                 }}
               />
+              <label
+                htmlFor={`facet-condition-${facet.id}`}
+                className="mt-3 block font-mono text-[0.65rem]"
+                style={{ color: "var(--shell-faint)" }}
+              >
+                structured condition JSON (weekdays, local_time, zones, expires_at)
+              </label>
+              <textarea
+                id={`facet-condition-${facet.id}`}
+                name="structuredCondition"
+                defaultValue={formatStructuredCondition(facet.condition_json)}
+                rows={3}
+                placeholder='{"weekdays":["mon","tue"],"local_time":{"start":"09:00","end":"17:00"}}'
+                className="mt-1 w-full resize-y rounded-md border px-3 py-2 font-mono text-[0.72rem] leading-5"
+                style={{
+                  background: "var(--shell-panel)",
+                  borderColor: "var(--shell-line-strong)",
+                  color: "var(--shell-fg)",
+                }}
+              />
               <div className="mt-2 flex flex-wrap items-center gap-3">
                 <label
                   htmlFor={`facet-effect-${facet.id}`}
@@ -118,6 +138,19 @@ export function FacetRow({
               Applies when {facet.condition_text}
             </p>
           )}
+          {facet.condition_json ? (
+            <pre
+              className="mt-1.5 max-w-[48rem] overflow-x-auto rounded-md px-2 py-1.5 text-[0.68rem] leading-5"
+              style={{ background: "var(--shell-elevated)", color: "var(--shell-muted)" }}
+            >
+              {formatStructuredCondition(facet.condition_json)}
+            </pre>
+          ) : facet.condition_text && facet.machine_effect ? (
+            <p className="mt-1.5 text-[0.76rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+              This legacy conditional ranking effect is inactive until you correct it with a
+              structured condition.
+            </p>
+          ) : null}
 
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[0.64rem]">
             <span style={{ color: "var(--shell-faint)" }}>
@@ -187,6 +220,15 @@ export function FacetRow({
       </div>
     </li>
   );
+}
+
+function formatStructuredCondition(value: string | null): string {
+  if (!value) return "";
+  try {
+    return JSON.stringify(JSON.parse(value) as unknown, null, 2);
+  } catch {
+    return value;
+  }
 }
 
 function Evidence({

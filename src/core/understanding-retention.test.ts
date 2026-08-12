@@ -10,10 +10,13 @@ import { recordResponseContext } from "./context";
 import { appendMessage, createConversation, getConversation } from "./conversations";
 import { openTestDb } from "./db";
 import { toBlob } from "./embed";
+import { upsertEntity } from "./entities";
 import { searchEpisodes } from "./episodes";
 import {
+  closeFacet,
   correctFacet,
   evidenceForFacet,
+  forgetFacet,
   getFacet,
   recordFacet,
 } from "./facets";
@@ -31,12 +34,94 @@ import {
 } from "./intentions";
 import { ensureEvidencePassage } from "./passages";
 import {
+  createProject,
+  getProject,
+  projectEvents,
+  updateProject,
+} from "./projects";
+import {
   conversationDependencies,
   deleteConversationWithMemory,
 } from "./retention";
 import { recalledForResponse } from "./response-context";
 
 describe("claim-level retention", () => {
+  it("restores an independently sourced facet when its sole close source is erased", () => {
+    const db = openTestDb();
+    const sourceConversation = createConversation(db);
+    const closeConversation = createConversation(db);
+    const source = appendMessage(db, sourceConversation.id, "user", "I value careful pacing.");
+    const closeSource = appendMessage(
+      db,
+      closeConversation.id,
+      "user",
+      "That careful-pacing preference no longer applies.",
+    );
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const facet = recordFacet(db, {
+      kind: "value",
+      statement: "Careful pacing matters",
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+    closeFacet(db, facet.id, closeSource.id);
+    expect(getFacet(db, facet.id)?.valid_to).not.toBeNull();
+
+    deleteConversationWithMemory(db, closeConversation.id);
+
+    expect(getFacet(db, facet.id)?.valid_to).toBeNull();
+    expect(
+      db.prepare<[number]>("SELECT 1 FROM facet_event WHERE source_message_id = ?")
+        .get(closeSource.id),
+    ).toBeUndefined();
+  });
+
+  it("removes response, MCP, and opportunity traces when a facet is explicitly forgotten", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "At work, prioritize focus time.");
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const facet = recordFacet(db, {
+      kind: "preference",
+      statement: "Prioritize focus time",
+      machineEffect: "boost",
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+    const assistant = appendMessage(db, conversation.id, "assistant", "Understood.");
+    db.prepare(
+      `INSERT INTO response_context
+         (assistant_message_id, item_kind, item_id, rank, snapshot_json,
+          selection_reason, selection_score, retrieval_json, created_at)
+       VALUES (?, 'facet', ?, 0, ?, 'query_relevant', 1, '["policy"]', ?)`,
+    ).run(assistant.id, facet.id, JSON.stringify({ kind: "facet", facet }), new Date().toISOString());
+    recordMcpRecallAudit(db, "zeus_recall", "focus", [
+      { kind: "facet", id: facet.id, snapshot: { statement: facet.statement } },
+    ]);
+    db.prepare(
+      `INSERT INTO recommendation_cycle
+         (policy_version, trigger, context_json, query_text, candidate_scores_json,
+          applied_facet_ids_json, exclusions_json, selected_commitment_id,
+          recommendation_json, source_message_id, created_at)
+       VALUES ('test', 'chat', '{}', '', '[]', ?, '[]', NULL, NULL, ?, ?)`,
+    ).run(JSON.stringify([facet.id]), source.id, new Date().toISOString());
+
+    expect(forgetFacet(db, facet.id)).toBe(true);
+    expect(db.prepare("SELECT 1 FROM response_context WHERE item_kind='facet' AND item_id=?").get(facet.id)).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM mcp_recall_audit WHERE item_kind='facet' AND item_id=?").get(facet.id)).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM recommendation_cycle").get()).toBeUndefined();
+  });
+
   it("rehomes multiply evidenced facets and removes their final source and indexes", () => {
     const db = openTestDb();
     const firstConversation = createConversation(db, { title: "First" });
@@ -258,6 +343,16 @@ describe("claim-level retention", () => {
     expect(
       commitmentEvents(db, commitment.id).map((event) => event.source_message_id),
     ).toEqual([base.id, survivingUpdate.id]);
+    expect(goalEvents(db, goal.id).map((event) => event.detail_json).join(" ")).not.toContain(
+      "Launch brilliantly",
+    );
+    expect(
+      commitmentEvents(db, commitment.id).map((event) => event.detail_json).join(" "),
+    ).not.toContain("Publish launch plan");
+    expect(JSON.parse(goalEvents(db, goal.id)[1]?.detail_json ?? "{}"))
+      .toEqual({ changes: { confidence: 0.99 } });
+    expect(JSON.parse(commitmentEvents(db, commitment.id)[1]?.detail_json ?? "{}"))
+      .toEqual({ changes: { confidence: 0.99 } });
     expect(
       db
         .prepare<[], { count: number }>(
@@ -265,6 +360,191 @@ describe("claim-level retention", () => {
         )
         .get()?.count,
     ).toBe(0);
+  });
+
+  it("rehomes projects to surviving evidence without retaining deleted progress text", () => {
+    const db = openTestDb();
+    const originalConversation = createConversation(db, { title: "Original project" });
+    const survivingConversation = createConversation(db, { title: "Current project" });
+    const linkedConversation = createConversation(db, { title: "Linked goal" });
+    const original = appendMessage(
+      db,
+      originalConversation.id,
+      "user",
+      "Apollo is planned and the private first draft is nearly ready.",
+    );
+    const surviving = appendMessage(
+      db,
+      survivingConversation.id,
+      "user",
+      "Apollo is active now.",
+    );
+    const linked = appendMessage(
+      db,
+      linkedConversation.id,
+      "user",
+      "I want to ship Apollo.",
+    );
+    const entity = upsertEntity(db, { name: "Apollo", kind: "project" });
+    const project = createProject(db, {
+      entityId: entity.id,
+      status: "planned",
+      progressSummary: "The private first draft is nearly ready",
+      progressPercent: 0.8,
+      sourceMessageId: original.id,
+    });
+    updateProject(db, project.id, {
+      status: "active",
+      sourceMessageId: surviving.id,
+      sourceKind: "message",
+    });
+    const goal = createGoal(db, {
+      title: "Ship Apollo",
+      projectId: project.id,
+      sourceMessageId: linked.id,
+    });
+    const responseConversation = createConversation(db, { title: "Response" });
+    const response = appendMessage(
+      db,
+      responseConversation.id,
+      "assistant",
+      "Apollo is active.",
+    );
+    recordResponseContext(db, response.id, [{ kind: "project", project: getProject(db, project.id)! }]);
+    recordMcpRecallAudit(db, "zeus_projects", "Apollo", [
+      { kind: "project", id: project.id, snapshot: getProject(db, project.id) },
+    ]);
+
+    expect(conversationDependencies(db, originalConversation.id).projects).toBe(1);
+    deleteConversationWithMemory(db, originalConversation.id);
+
+    expect(getProject(db, project.id)).toMatchObject({
+      status: "active",
+      progress_summary: null,
+      progress_percent: null,
+      source_message_id: surviving.id,
+    });
+    expect(projectEvents(db, project.id)).toMatchObject([
+      { event_type: "status_changed", source_message_id: surviving.id },
+    ]);
+    expect(projectEvents(db, project.id)[0]?.detail_json ?? "").not.toContain(
+      "private first draft",
+    );
+    expect(projectEvents(db, project.id)[0]).toMatchObject({
+      from_status: null,
+      to_status: "active",
+      detail_json: null,
+    });
+    expect(recalledForResponse(db, response.id)).toEqual([]);
+    expect(
+      db
+        .prepare<[number], { found: number }>(
+          "SELECT 1 AS found FROM mcp_recall_audit WHERE item_kind = 'project' AND item_id = ?",
+        )
+        .get(project.id),
+    ).toBeUndefined();
+
+    deleteConversationWithMemory(db, survivingConversation.id);
+    expect(getProject(db, project.id)).toBeNull();
+    expect(getGoal(db, goal.id)?.project_id).toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("does not treat a surviving event's inherited snapshot as new intention evidence", () => {
+    const db = openTestDb();
+    const deletedConversation = createConversation(db, { title: "Deleted intention" });
+    const survivingConversation = createConversation(db, { title: "Later status" });
+    const deleted = appendMessage(
+      db,
+      deletedConversation.id,
+      "user",
+      "My confidential goal is Project Nightjar and I must draft the Nightjar memo.",
+    );
+    const surviving = appendMessage(
+      db,
+      survivingConversation.id,
+      "user",
+      "Mark both of those as complete.",
+    );
+    const goal = createGoal(db, {
+      title: "Confidential Project Nightjar",
+      sourceMessageId: deleted.id,
+    });
+    const commitment = createCommitment(db, {
+      title: "Draft the Nightjar memo",
+      linkedGoalId: goal.id,
+      sourceMessageId: deleted.id,
+    });
+    updateGoal(db, goal.id, {
+      status: "achieved",
+      sourceMessageId: surviving.id,
+      sourceKind: "message",
+    });
+    updateCommitment(db, commitment.id, {
+      status: "done",
+      sourceMessageId: surviving.id,
+      sourceKind: "message",
+    });
+
+    deleteConversationWithMemory(db, deletedConversation.id);
+
+    expect(getGoal(db, goal.id)).toBeNull();
+    expect(getCommitment(db, commitment.id)).toBeNull();
+    expect(getConversation(db, survivingConversation.id)).not.toBeNull();
+    expect(
+      db.prepare<[], { count: number }>(
+        `SELECT COUNT(*) AS count FROM goal_event
+         WHERE detail_json LIKE '%Nightjar%'`,
+      ).get()?.count,
+    ).toBe(0);
+    expect(
+      db.prepare<[], { count: number }>(
+        `SELECT COUNT(*) AS count FROM commitment_event
+         WHERE detail_json LIKE '%Nightjar%'`,
+      ).get()?.count,
+    ).toBe(0);
+  });
+
+  it("replays project links on goals and commitments after their update source is deleted", () => {
+    const db = openTestDb();
+    const baseConversation = createConversation(db, { title: "Base" });
+    const projectConversation = createConversation(db, { title: "Project" });
+    const deletedConversation = createConversation(db, { title: "Temporary links" });
+    const base = appendMessage(db, baseConversation.id, "user", "I want to launch and draft it.");
+    const projectSource = appendMessage(db, projectConversation.id, "user", "Apollo is planned.");
+    const temporaryLink = appendMessage(
+      db,
+      deletedConversation.id,
+      "user",
+      "Temporarily link both launch tasks to Apollo.",
+    );
+    const entity = upsertEntity(db, { name: "Apollo", kind: "project" });
+    const project = createProject(db, {
+      entityId: entity.id,
+      sourceMessageId: projectSource.id,
+    });
+    const goal = createGoal(db, { title: "Launch", sourceMessageId: base.id });
+    const commitment = createCommitment(db, {
+      title: "Draft launch",
+      sourceMessageId: base.id,
+    });
+    updateGoal(db, goal.id, {
+      projectId: project.id,
+      sourceMessageId: temporaryLink.id,
+      sourceKind: "message",
+    });
+    updateCommitment(db, commitment.id, {
+      projectId: project.id,
+      sourceMessageId: temporaryLink.id,
+      sourceKind: "message",
+    });
+
+    deleteConversationWithMemory(db, deletedConversation.id);
+
+    expect(getGoal(db, goal.id)?.project_id).toBeNull();
+    expect(getCommitment(db, commitment.id)?.project_id).toBeNull();
+    expect(getProject(db, project.id)).not.toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
   });
 
   it("removes only passage traces sourced by the deleted conversation when ids collide", async () => {

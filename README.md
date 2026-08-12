@@ -38,7 +38,9 @@ contextual follow-through.
   as readable Markdown.
 - **Intention stewardship.** One deterministic policy ranks relevance, deadlines,
   waiting, staleness, deadline conflicts, and explicitly stated goal priority. Paused
-  goals, cooldowns, snoozes, dismissals, and intervention mode are hard gates.
+  goals, cooldowns, snoozes, dismissals, conditional preferences, quiet hours, and
+  intervention mode are hard gates. Stewardship can be turned off without disabling
+  explicit Today, MCP, or “what should I do?” requests.
 - **Permission before action.** Zeus can draft, research, compare, and plan in chat.
   Sending, scheduling, purchasing, reminding, coordinating, or changing external state
   requires explicit confirmation and an available adapter.
@@ -61,6 +63,14 @@ contextual follow-through.
   of past conversations.
 - Structured goals and commitments with append-only event histories and restrained
   follow-through recommendations.
+- Source-backed projects with planned, active, paused, completed, and abandoned
+  lifecycles; linked goals and commitments; and append-only progress/blocker history.
+- Bounded, resumable work plans for accepted-memory recall, read-only web research, and
+  local database-backed drafts, comparisons, and reports. Exact plan hashes, limits,
+  authorizations, receipts, citations, and checkpoints remain reviewable.
+- Opt-in macOS ambient support with quiet hours, a one-notification-per-day budget,
+  short-lived named coarse zones, deterministic background evaluation, and no model call
+  in the worker.
 - A **Today** view with one best current action, intervention controls, and a transparent
   progress-and-regret readout.
 - Source transcripts and per-response recall traces for investigating why Zeus answered
@@ -175,6 +185,18 @@ part of that group locks private web data until configuration is completed.
 The semantic floors are model-specific safety thresholds, not general tuning knobs.
 Re-measure them before changing the embedding model or lowering either value.
 
+Ambient notifications stay disabled until they are enabled in Settings and the local
+LaunchAgent is explicitly installed:
+
+```bash
+npm run ambient:install    # deterministic 15-minute macOS worker
+npm run ambient:uninstall  # remove the LaunchAgent
+```
+
+The worker opens the configured SQLite path directly and performs no OpenAI call. The
+browser converts coordinates to a coarse cell and keeps only its cell-to-name mapping
+locally; Zeus stores only the name and an observation time that expires after 30 minutes.
+
 ## Using Zeus
 
 Chat normally. After each response, the receipt beneath the answer shows how many memory
@@ -182,8 +204,9 @@ items were recalled, accepted, held for review, or superseded.
 
 The main views are:
 
-- **Today** — see one useful next action, choose quiet/balanced/proactive intervention,
-  and inspect progress, control, and regret signals.
+- **Today** — see one useful next action, choose off/quiet/balanced/proactive intervention,
+  inspect progress, control, and regret signals, and authorize, resume, cancel, or review
+  bounded work and its receipts.
 - **Chat** — converse with Zeus and inspect the memory receipt for each turn.
 - **Memory** — search and curate accepted facts or review pending candidates.
 - **Understanding** — inspect, correct, close, or delete accepted facets; edit and
@@ -197,7 +220,9 @@ The main views are:
 Deleting a source conversation also removes or restores dependent passages, facts,
 facets, candidates, goals, commitments, indexes, and recall traces. Independently
 supported memory survives with a remaining real source; intention fields are replayed
-from surviving events rather than retaining deleted-source state.
+from surviving events rather than retaining deleted-source state. Permanent deletion
+also checkpoints and truncates SQLite's WAL, rebuilds FTS, vacuums and verifies the store,
+and removes Zeus-managed pre-migration backups that could retain the erased source.
 
 ## MCP integration
 
@@ -258,7 +283,7 @@ trust boundary and can access the same store when a same-OS process launches it.
 | `npm run reindex` | Rebuild FTS5 and any missing embeddings |
 | `npm run reindex -- --fts-only` | Rebuild full-text indexes without embeddings |
 | `npm run export` | Export the store as Markdown to `./zeus-export` |
-| `npm run export -- /path/to/output` | Export to a chosen directory |
+| `npm run export -- /path/to/output` | Export to a private chosen directory (must be empty or a managed Zeus export) |
 | `npm run mcp` | Start the stdio MCP server |
 
 `npm run check` is the required development gate.
@@ -292,6 +317,12 @@ non-fatal: search falls back to the remaining paths.
 The default store is `~/.zeus/zeus.db`, outside the repository. SQLite runs with WAL,
 foreign keys, a busy timeout, and best-effort owner-only file permissions so the web and
 MCP processes can safely share it.
+
+Supported npm commands run `npm run secure:local` first. It enforces owner-only modes on
+local environment/credential/key files and repository-local exports without printing
+their contents. Exports are staged privately and replace only marker-validated Zeus
+export trees, so re-exporting after source deletion cannot leave stale Markdown; a
+non-empty arbitrary directory or a symlinked/traversal destination is refused.
 
 What stays local:
 

@@ -1,6 +1,8 @@
 import type { Db } from "./db";
-import { now } from "./db";
+import { now, purgeManagedMigrationBackups } from "./db";
 import { forgetFact, recomputeFactEvidenceAggregates } from "./facts";
+import { pruneBehavioralPolicySuggestions } from "./personalization";
+import { invalidateWorkPlansForSourceLink } from "./work-plans";
 
 export type ConversationDependencies = {
   messages: number;
@@ -9,7 +11,10 @@ export type ConversationDependencies = {
   candidates: number;
   goals: number;
   commitments: number;
+  projects: number;
+  workPlans: number;
   followThroughEvents: number;
+  behavioralPolicySuggestions: number;
   passages: number;
   facetsOnlyHere: number;
   facetsWithOtherEvidence: number;
@@ -26,7 +31,10 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
       candidates: 0,
       goals: 0,
       commitments: 0,
+      projects: 0,
+      workPlans: 0,
       followThroughEvents: 0,
+      behavioralPolicySuggestions: 0,
       passages: 0,
       facetsOnlyHere: 0,
       facetsWithOtherEvidence: 0,
@@ -79,10 +87,12 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
        FROM understanding_facet f
        LEFT JOIN facet_evidence fe ON fe.facet_id = f.id
        LEFT JOIN evidence_passage p ON p.id = fe.passage_id
+       LEFT JOIN facet_event ev ON ev.facet_id = f.id
        WHERE f.source_message_id IN (${placeholders})
-          OR p.message_id IN (${placeholders})`,
+          OR p.message_id IN (${placeholders})
+          OR ev.source_message_id IN (${placeholders})`,
     )
-    .all(...messageIds, ...messageIds)
+    .all(...messageIds, ...messageIds, ...messageIds)
     .map((row) => row.id);
   let facetsOnlyHere = 0;
   let facetsWithOtherEvidence = 0;
@@ -116,6 +126,37 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
         .get(...messageIds, ...messageIds)?.count ?? 0,
     goals: intentionCount("goal", "goal_event", "goal_id"),
     commitments: intentionCount("commitment", "commitment_event", "commitment_id"),
+    projects: hasTable(db, "project")
+      ? db
+        .prepare<number[], { count: number }>(
+          `SELECT COUNT(DISTINCT p.id) AS count
+           FROM project p
+           LEFT JOIN project_event ev ON ev.project_id = p.id
+           LEFT JOIN evidence_passage ep ON ep.id = ev.passage_id
+           WHERE p.source_message_id IN (${placeholders})
+              OR ev.source_message_id IN (${placeholders})
+              OR ep.message_id IN (${placeholders})`,
+        )
+        .get(...messageIds, ...messageIds, ...messageIds)?.count ?? 0
+      : 0,
+    workPlans: hasTable(db, "work_plan")
+      ? db
+        .prepare<number[], { count: number }>(
+          `SELECT COUNT(DISTINCT p.id) AS count
+           FROM work_plan p
+           LEFT JOIN work_authorization a ON a.work_plan_id = p.id
+           LEFT JOIN work_artifact artifact ON artifact.work_plan_id = p.id
+           LEFT JOIN work_artifact_source artifact_source
+             ON artifact_source.work_artifact_id = artifact.id
+           LEFT JOIN work_plan_memory_source_message generation_source
+             ON generation_source.work_plan_id = p.id
+           WHERE p.source_message_id IN (${placeholders})
+              OR a.source_message_id IN (${placeholders})
+              OR artifact_source.source_message_id IN (${placeholders})
+              OR generation_source.source_message_id IN (${placeholders})`,
+        )
+        .get(...messageIds, ...messageIds, ...messageIds, ...messageIds)?.count ?? 0
+      : 0,
     followThroughEvents:
       db
         .prepare<number[], { count: number }>(
@@ -124,6 +165,23 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
               OR response_message_id IN (${placeholders})`,
         )
         .get(...messageIds, ...messageIds)?.count ?? 0,
+    behavioralPolicySuggestions: hasTable(db, "behavioral_policy_suggestion")
+      ? db
+        .prepare<number[], { count: number }>(
+          `SELECT COUNT(DISTINCT suggestion.id) AS count
+           FROM behavioral_policy_suggestion suggestion
+           LEFT JOIN behavioral_policy_suggestion_evidence evidence
+             ON evidence.suggestion_id = suggestion.id
+           LEFT JOIN follow_through_event feedback
+             ON feedback.id = evidence.follow_through_event_id
+           LEFT JOIN behavioral_policy_suggestion_event review
+             ON review.suggestion_id = suggestion.id
+           WHERE feedback.source_message_id IN (${placeholders})
+              OR feedback.response_message_id IN (${placeholders})
+              OR review.source_message_id IN (${placeholders})`,
+        )
+        .get(...messageIds, ...messageIds, ...messageIds)?.count ?? 0
+      : 0,
     passages:
       db
         .prepare<number[], { count: number }>(
@@ -147,7 +205,7 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
  * Explicit source deletion. Multiply evidenced facts survive with a real remaining
  * source; memories supported only by the deleted conversation are removed with it.
  */
-export function deleteConversationWithMemory(
+function deleteConversationRowsWithMemory(
   db: Db,
   conversationId: number,
 ): ConversationDependencies {
@@ -195,6 +253,18 @@ export function deleteConversationWithMemory(
       .all(...messageIds)
       .map((row) => row.id);
 
+    // These audit rows use SET NULL for historical compatibility, but their mutable
+    // JSON/error fields may repeat source text. Explicit erasure removes the whole
+    // source-linked row instead of keeping an unattributed copy.
+    db.prepare<number[]>(
+      `DELETE FROM candidate_resolution_event
+       WHERE source_message_id IN (${placeholders})`,
+    ).run(...messageIds);
+    db.prepare<number[]>(
+      `DELETE FROM extraction_run
+       WHERE focus_message_id IN (${placeholders})`,
+    ).run(...messageIds);
+
     // Suggestions and feedback tied to a deleted source/response are audit data, not
     // canonical memory. Remove them rather than retain a rationale the user deleted.
     db.prepare<number[]>(
@@ -202,11 +272,39 @@ export function deleteConversationWithMemory(
        WHERE source_message_id IN (${placeholders})
           OR response_message_id IN (${placeholders})`,
     ).run(...messageIds, ...messageIds);
+    if (hasTable(db, "recommendation_cycle")) {
+      db.prepare<number[]>(
+        `DELETE FROM recommendation_cycle
+         WHERE source_message_id IN (${placeholders})
+            OR id IN (
+              SELECT opportunity_id FROM opportunity_delivery
+              WHERE response_message_id IN (${placeholders})
+            )`,
+      ).run(...messageIds, ...messageIds);
+    }
     db.prepare<[string, ...number[]]>(
       `UPDATE stewardship_setting
        SET mode = 'balanced', source_message_id = NULL, updated_at = ?
        WHERE source_message_id IN (${placeholders})`,
     ).run(now(), ...messageIds);
+    if (hasTable(db, "ambient_setting")) {
+      const reset = db.prepare<[string, ...number[]]>(
+        `UPDATE ambient_setting
+         SET enabled = 0,
+             timezone = 'UTC',
+             quiet_start = '22:00',
+             quiet_end = '08:00',
+             daily_limit = 1,
+             channels_json = '["macos"]',
+             location_consent = 0,
+             source_message_id = NULL,
+             updated_at = ?
+         WHERE source_message_id IN (${placeholders})`,
+      ).run(now(), ...messageIds);
+      if (reset.changes > 0 && hasTable(db, "coarse_location")) {
+        db.prepare("DELETE FROM coarse_location WHERE id = 1").run();
+      }
+    }
     if (sourceCandidateIds.length > 0) {
       const candidatePlaceholders = sourceCandidateIds.map(() => "?").join(",");
       db.prepare<number[]>(
@@ -215,8 +313,14 @@ export function deleteConversationWithMemory(
       ).run(...sourceCandidateIds);
     }
 
+    deleteSourceBackedWorkPlans(db, messageIds, placeholders);
+
     rehomeOrDeleteIntent(db, "commitment", "commitment_event", messageIds, placeholders);
     rehomeOrDeleteIntent(db, "goal", "goal_event", messageIds, placeholders);
+    deleteOrRehomeProjects(db, messageIds, passageIds, placeholders);
+    if (hasTable(db, "behavioral_policy_suggestion")) {
+      pruneBehavioralPolicySuggestions(db);
+    }
 
     const affectedFacts = db
       .prepare<
@@ -341,6 +445,100 @@ export function deleteConversationWithMemory(
 }
 
 /**
+ * Explicitly erase one source and then compact/checkpoint the on-disk store. Row
+ * deletion alone is insufficient: SQLite may otherwise retain the old message in
+ * free pages or the WAL after the action reports success.
+ */
+export function deleteConversationWithMemory(
+  db: Db,
+  conversationId: number,
+): ConversationDependencies {
+  const dependencies = deleteConversationRowsWithMemory(db, conversationId);
+  finalizeExplicitErasure(db);
+  return dependencies;
+}
+
+function finalizeExplicitErasure(db: Db): void {
+  const databases = db.pragma("database_list") as Array<{ name: string; file: string }>;
+  const main = databases.find((row) => row.name === "main");
+  if (typeof main?.file !== "string" || !main.file) return;
+  if (db.inTransaction) {
+    throw new Error("Cannot finalize source erasure while a database transaction is active");
+  }
+
+  rebuildFullTextIndexes(db);
+  checkpointAndVerifyTruncated(db);
+  db.exec("VACUUM");
+  checkpointAndVerifyTruncated(db);
+  const foreignKeyErrors = db.pragma("foreign_key_check") as unknown[];
+  if (foreignKeyErrors.length > 0) {
+    throw new Error("Source erasure left invalid database references");
+  }
+  const integrity = db.pragma("integrity_check") as Array<{ integrity_check: string }>;
+  if (integrity.length !== 1 || integrity[0]?.integrity_check !== "ok") {
+    throw new Error("Source erasure failed SQLite integrity verification");
+  }
+  // Pre-migration snapshots are Zeus-managed copies of the same personal store.
+  // Once the live database is verified, retaining an older copy would make source
+  // deletion misleading. The helper removes only exact, validated sibling backups.
+  purgeManagedMigrationBackups(main.file);
+}
+
+function rebuildFullTextIndexes(db: Db): void {
+  // FTS5 segments are append-oriented. Rebuilding after the logical transaction
+  // guarantees a deleted term is absent from every surviving segment before VACUUM.
+  for (const table of ["fact_fts", "message_fts", "passage_fts", "facet_fts"] as const) {
+    db.exec(`INSERT INTO ${table} (${table}) VALUES ('rebuild')`);
+  }
+}
+
+function checkpointAndVerifyTruncated(db: Db): void {
+  const result = db.pragma("wal_checkpoint(TRUNCATE)") as Array<{
+    busy?: number;
+    log?: number;
+    checkpointed?: number;
+  }>;
+  const status = result[0];
+  if (!status || status.busy !== 0 || status.log !== 0) {
+    throw new Error("Could not truncate the SQLite WAL while finalizing source erasure");
+  }
+}
+
+/**
+ * A work plan and every authorization are exact hashes over explicit user instructions.
+ * They cannot be rehomed to a different message without falsifying that authorization.
+ * Explicit source deletion therefore removes the complete local plan/run/artifact/receipt
+ * subtree before deleting the source message; no external state exists to undo.
+ */
+function deleteSourceBackedWorkPlans(
+  db: Db,
+  messageIds: number[],
+  placeholders: string,
+): void {
+  if (!hasTable(db, "work_plan")) return;
+  const ids = db
+    .prepare<number[], { id: number }>(
+      `SELECT DISTINCT p.id
+       FROM work_plan p
+       LEFT JOIN work_authorization a ON a.work_plan_id = p.id
+       LEFT JOIN work_artifact artifact ON artifact.work_plan_id = p.id
+       LEFT JOIN work_artifact_source artifact_source
+         ON artifact_source.work_artifact_id = artifact.id
+       LEFT JOIN work_plan_memory_source_message generation_source
+         ON generation_source.work_plan_id = p.id
+       WHERE p.source_message_id IN (${placeholders})
+          OR a.source_message_id IN (${placeholders})
+          OR artifact_source.source_message_id IN (${placeholders})
+          OR generation_source.source_message_id IN (${placeholders})`,
+    )
+    .all(...messageIds, ...messageIds, ...messageIds, ...messageIds)
+    .map((row) => row.id);
+  if (ids.length === 0) return;
+  const idPlaceholders = ids.map(() => "?").join(",");
+  db.prepare<number[]>(`DELETE FROM work_plan WHERE id IN (${idPlaceholders})`).run(...ids);
+}
+
+/**
  * Message ids and passage ids are independent sequences and can collide. Normal
  * traces always have a snapshot, so key deletion by its immutable source message.
  * Snapshot-less rows use metadata to distinguish the known legacy and claim-level
@@ -427,10 +625,12 @@ function deleteOrRehomeFacets(
        FROM understanding_facet f
        LEFT JOIN facet_evidence fe ON fe.facet_id = f.id
        LEFT JOIN evidence_passage p ON p.id = fe.passage_id
+       LEFT JOIN facet_event ev ON ev.facet_id = f.id
        WHERE f.source_message_id IN (${messagePlaceholders})
-          OR p.message_id IN (${messagePlaceholders})`,
+          OR p.message_id IN (${messagePlaceholders})
+          OR ev.source_message_id IN (${messagePlaceholders})`,
     )
-    .all(...messageIds, ...messageIds);
+    .all(...messageIds, ...messageIds, ...messageIds);
 
   if (affected.length > 0) {
     const facetPlaceholders = affected.map(() => "?").join(",");
@@ -445,6 +645,10 @@ function deleteOrRehomeFacets(
   }
 
   for (const facet of affected) {
+    db.prepare<[number, ...number[]]>(
+      `DELETE FROM facet_event
+       WHERE facet_id = ? AND source_message_id IN (${messagePlaceholders})`,
+    ).run(facet.id, ...messageIds);
     const replacement = db
       .prepare<[number, ...number[]], { message_id: number }>(
         `SELECT p.message_id
@@ -491,7 +695,32 @@ function deleteOrRehomeFacets(
         "UPDATE understanding_facet SET confidence = ?, updated_at = ? WHERE id = ?",
       ).run(aggregate.confidence, now(), facet.id);
     }
+    const current = getFacetRetentionState(db, facet.id);
+    if (current?.valid_to !== null && current?.superseded_by === null) {
+      const survivingClose = db
+        .prepare<[number], { found: number }>(
+          "SELECT 1 AS found FROM facet_event WHERE facet_id = ? AND event_type = 'closed' LIMIT 1",
+        )
+        .get(facet.id);
+      if (!survivingClose) {
+        db.prepare<[string, number]>(
+          `UPDATE understanding_facet
+           SET valid_to = NULL, updated_at = ? WHERE id = ?`,
+        ).run(now(), facet.id);
+      }
+    }
   }
+}
+
+function getFacetRetentionState(
+  db: Db,
+  facetId: number,
+): { valid_to: string | null; superseded_by: number | null } | null {
+  return db
+    .prepare<[number], { valid_to: string | null; superseded_by: number | null }>(
+      "SELECT valid_to, superseded_by FROM understanding_facet WHERE id = ?",
+    )
+    .get(facetId) ?? null;
 }
 
 function deleteFacetCompletely(db: Db, facetId: number): void {
@@ -584,6 +813,9 @@ function removeAliasesSupportedOnlyHere(
 function pruneDeletedSourceEntities(db: Db, sourceEntityIds: readonly number[]): void {
   if (sourceEntityIds.length === 0) return;
   const placeholders = sourceEntityIds.map(() => "?").join(",");
+  const projectGuard = hasTable(db, "project")
+    ? "AND NOT EXISTS (SELECT 1 FROM project p WHERE p.entity_id = e.id)"
+    : "";
   const candidates = db
     .prepare<number[], { id: number }>(
       `SELECT e.id FROM entity e
@@ -591,6 +823,7 @@ function pruneDeletedSourceEntities(db: Db, sourceEntityIds: readonly number[]):
          AND NOT EXISTS (SELECT 1 FROM entity_evidence ee WHERE ee.entity_id = e.id)
          AND NOT EXISTS (SELECT 1 FROM fact f WHERE f.subject_id = e.id OR f.object_entity_id = e.id)
          AND NOT EXISTS (SELECT 1 FROM commitment c WHERE c.owner_entity_id = e.id)
+         ${projectGuard}
          AND NOT EXISTS (SELECT 1 FROM understanding_facet f WHERE f.scope_entity_id = e.id)`,
     )
     .all(...sourceEntityIds);
@@ -647,9 +880,11 @@ export function deleteAllConversationsWithMemory(db: Db): number {
 
   db.transaction(() => {
     for (const conversationId of conversationIds) {
-      deleteConversationWithMemory(db, conversationId);
+      deleteConversationRowsWithMemory(db, conversationId);
     }
   })();
+
+  finalizeExplicitErasure(db);
 
   return conversationIds.length;
 }
@@ -723,6 +958,31 @@ function rehomeOrDeleteIntent(
     db.prepare<[string, number]>(
       "DELETE FROM mcp_recall_audit WHERE item_kind = ? AND item_id = ?",
     ).run(table, row.id);
+    if (table === "commitment" && hasTable(db, "recommendation_cycle")) {
+      db.prepare<[number]>(
+        "DELETE FROM recommendation_cycle WHERE selected_commitment_id = ?",
+      ).run(row.id);
+    }
+    if (table === "goal" && hasTable(db, "recommendation_cycle")) {
+      db.prepare<[number]>(
+        `DELETE FROM recommendation_cycle
+         WHERE selected_commitment_id IN (
+           SELECT id FROM commitment WHERE linked_goal_id = ?
+         )`,
+      ).run(row.id);
+      db.prepare<[number]>("DELETE FROM follow_through_event WHERE goal_id = ?").run(row.id);
+    }
+    // The zeus_projects read stores linked intention snapshots inside the project
+    // audit item. Remove that composite trace when one nested source is deleted.
+    const nestedPath = table === "goal" ? "$.goals" : "$.commitments";
+    db.prepare<[string, number]>(
+      `DELETE FROM mcp_recall_audit
+       WHERE item_kind = 'project' AND json_valid(snapshot_json)
+         AND EXISTS (
+           SELECT 1 FROM json_each(snapshot_json, ?)
+           WHERE json_extract(value, '$.id') = ?
+         )`,
+    ).run(nestedPath, row.id);
     if (messageIds.includes(row.source_message_id)) {
       const replacement = db
         .prepare<[number, ...number[]], { source_message_id: number }>(
@@ -738,6 +998,7 @@ function rehomeOrDeleteIntent(
           `UPDATE ${table} SET source_message_id = ? WHERE id = ?`,
         ).run(replacement.source_message_id, row.id);
       } else {
+        invalidateWorkPlansForSourceLink(db, table, row.id);
         deleteFacetsScopedTo(db, table, row.id);
         db.prepare<[number]>(`DELETE FROM ${table} WHERE id = ?`).run(row.id);
         continue;
@@ -751,14 +1012,313 @@ function rehomeOrDeleteIntent(
       `DELETE FROM ${eventTable}
        WHERE ${foreignKey} = ? AND source_message_id IN (${placeholders})`,
     ).run(row.id, ...messageIds);
+    sanitizeSurvivingLifecycleEvents(db, eventTable, foreignKey, row.id);
     if (!replayIntentProjection(db, table, eventTable, row.id)) {
       // If surviving provenance cannot reconstruct the projection, removing the
       // intention is safer than retaining fields that may only have come from the
       // deleted source.
+      invalidateWorkPlansForSourceLink(db, table, row.id);
       deleteFacetsScopedTo(db, table, row.id);
       db.prepare<[number]>(`DELETE FROM ${table} WHERE id = ?`).run(row.id);
     }
   }
+}
+
+/**
+ * Remove project state derived from an explicitly deleted conversation while
+ * retaining a lifecycle that still has independent user provenance. Project event
+ * detail can contain the user's deleted wording, so affected immutable recall traces
+ * and the events themselves are removed rather than merely allowing their message
+ * foreign keys to become null.
+ */
+function deleteOrRehomeProjects(
+  db: Db,
+  messageIds: number[],
+  passageIds: number[],
+  placeholders: string,
+): void {
+  if (!hasTable(db, "project")) return;
+  const affected = db
+    .prepare<
+      number[],
+      { id: number; source_message_id: number }
+    >(
+      `SELECT DISTINCT p.id, p.source_message_id
+       FROM project p
+       LEFT JOIN project_event ev ON ev.project_id = p.id
+       LEFT JOIN evidence_passage ep ON ep.id = ev.passage_id
+       WHERE p.source_message_id IN (${placeholders})
+          OR ev.source_message_id IN (${placeholders})
+          OR ep.message_id IN (${placeholders})`,
+    )
+    .all(...messageIds, ...messageIds, ...messageIds);
+
+  const passagePlaceholders = passageIds.map(() => "?").join(",");
+  for (const project of affected) {
+    db.prepare<[number]>(
+      "DELETE FROM response_context WHERE item_kind = 'project' AND item_id = ?",
+    ).run(project.id);
+    db.prepare<[number]>(
+      "DELETE FROM mcp_recall_audit WHERE item_kind = 'project' AND item_id = ?",
+    ).run(project.id);
+
+    if (messageIds.includes(project.source_message_id)) {
+      const replacement = db
+        .prepare<[number, ...number[]], { source_message_id: number }>(
+          `SELECT source_message_id FROM project_event
+           WHERE project_id = ?
+             AND source_message_id IS NOT NULL
+             AND source_message_id NOT IN (${placeholders})
+           ORDER BY id LIMIT 1`,
+        )
+        .get(project.id, ...messageIds);
+      if (!replacement) {
+        invalidateWorkPlansForSourceLink(db, "project", project.id);
+        db.prepare<[number]>("DELETE FROM project WHERE id = ?").run(project.id);
+        continue;
+      }
+      db.prepare<[number, number]>(
+        "UPDATE project SET source_message_id = ? WHERE id = ?",
+      ).run(replacement.source_message_id, project.id);
+    }
+
+    if (passageIds.length > 0) {
+      db.prepare<unknown[]>(
+        `DELETE FROM project_event
+         WHERE project_id = ? AND (
+           source_message_id IN (${placeholders})
+           OR passage_id IN (${passagePlaceholders})
+         )`,
+      ).run(project.id, ...messageIds, ...passageIds);
+    } else {
+      db.prepare<[number, ...number[]]>(
+        `DELETE FROM project_event
+         WHERE project_id = ? AND source_message_id IN (${placeholders})`,
+      ).run(project.id, ...messageIds);
+    }
+
+    sanitizeSurvivingLifecycleEvents(db, "project_event", "project_id", project.id);
+    if (!replayProjectProjection(db, project.id)) {
+      invalidateWorkPlansForSourceLink(db, "project", project.id);
+      db.prepare<[number]>("DELETE FROM project WHERE id = ?").run(project.id);
+    }
+  }
+}
+
+/**
+ * Later lifecycle events historically stored complete before/after projections. If an
+ * earlier source is explicitly deleted, those inherited snapshots can retain its text
+ * even though the later event did not assert it. Keep only the later source's actual
+ * field delta and its new status; remove the prior-state snapshot in place as part of
+ * the explicit deletion transaction. Event identity, source, time, and ordering remain
+ * intact, so surviving provenance stays append-only and auditable.
+ */
+function sanitizeSurvivingLifecycleEvents(
+  db: Db,
+  eventTable: "goal_event" | "commitment_event" | "project_event",
+  foreignKey: "goal_id" | "commitment_id" | "project_id",
+  ownerId: number,
+): void {
+  const events = db
+    .prepare<
+      [number],
+      {
+        id: number;
+        event_type: string;
+        from_status: string | null;
+        to_status: string | null;
+        detail_json: string | null;
+      }
+    >(
+      `SELECT id, event_type, from_status, to_status, detail_json
+       FROM ${eventTable} WHERE ${foreignKey} = ? ORDER BY id`,
+    )
+    .all(ownerId);
+  const update = db.prepare<[string | null, string | null, number]>(
+    `UPDATE ${eventTable}
+     SET detail_json = ?, from_status = NULL, to_status = ? WHERE id = ?`,
+  );
+
+  for (const event of events) {
+    if (event.event_type === "created") continue;
+    const detail = parseReplayDetail(event.detail_json);
+    let sanitizedDetail = event.detail_json;
+    if (detail?.before && detail.after) {
+      const changes: Record<string, unknown> = {};
+      for (const [name, value] of Object.entries(detail.after)) {
+        if (!Object.hasOwn(detail.before, name) || !sameReplayValue(detail.before[name], value)) {
+          changes[name] = value;
+        }
+      }
+      sanitizedDetail = Object.keys(changes).length > 0
+        ? JSON.stringify({ changes })
+        : null;
+    }
+    const changedStatus = event.to_status !== null && event.to_status !== event.from_status;
+    update.run(sanitizedDetail, changedStatus ? event.to_status : null, event.id);
+  }
+}
+
+function hasTable(db: Db, table: string): boolean {
+  return Boolean(
+    db
+      .prepare<[string], { found: number }>(
+        "SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(table),
+  );
+}
+
+type ProjectReplayProjection = {
+  status: string;
+  progressSummary: string | null;
+  progressPercent: number | null;
+  blockedAt: string | null;
+  confidence: number;
+  updatedAt: string;
+  closedAt: string | null;
+};
+
+/** Rebuild the mutable project row solely from the surviving append-only events. */
+function replayProjectProjection(db: Db, projectId: number): boolean {
+  const events = db
+    .prepare<[number], EventReplayRow>(
+      `SELECT event_type, from_status, to_status, detail_json, created_at
+       FROM project_event WHERE project_id = ? ORDER BY id`,
+    )
+    .all(projectId);
+  if (events.length === 0) return false;
+
+  let projection: ProjectReplayProjection | null = null;
+  for (const event of events) {
+    const detail = parseJsonRecord(event.detail_json);
+    if (event.event_type === "created") {
+      const status = projectStatus(event.to_status);
+      const confidence = replayNumber(detail?.confidence);
+      if (!status || confidence === null) continue;
+      projection = {
+        status,
+        progressSummary: replayNullableString(detail?.progress_summary),
+        progressPercent: replayNullableNumber(detail?.progress_percent),
+        blockedAt: null,
+        confidence,
+        updatedAt: event.created_at,
+        closedAt: isClosedProjectStatus(status) ? event.created_at : null,
+      };
+      continue;
+    }
+
+    // A later source can preserve a project even if its original creation source was
+    // deleted. Start conservatively: status transitions are evidenced by the event,
+    // while progress text from a deleted earlier source is not copied from a before
+    // snapshot. Confidence is policy metadata rather than a user claim.
+    projection ??= {
+      status: projectStatus(event.from_status) ?? projectStatus(event.to_status) ?? "planned",
+      progressSummary: null,
+      progressPercent: null,
+      blockedAt: null,
+      confidence: 0.8,
+      updatedAt: event.created_at,
+      closedAt: null,
+    };
+
+    if (event.event_type === "updated" || event.event_type === "status_changed") {
+      const changes = replayEventChanges(detail);
+      if (Object.hasOwn(changes, "progress_summary")) {
+        projection.progressSummary = replayNullableString(changes.progress_summary);
+      }
+      if (Object.hasOwn(changes, "progress_percent")) {
+        projection.progressPercent = replayNullableNumber(changes.progress_percent);
+      }
+      if (Object.hasOwn(changes, "blocked_at")) {
+        projection.blockedAt = replayNullableString(changes.blocked_at);
+      }
+      if (Object.hasOwn(changes, "confidence")) {
+        const confidence = replayNumber(changes.confidence);
+        if (confidence !== null) projection.confidence = confidence;
+      }
+    } else if (event.event_type === "progress") {
+      const changes = replayEventChanges(detail);
+      if (Object.hasOwn(changes, "summary")) {
+        projection.progressSummary = replayNullableString(changes.summary);
+      }
+      if (Object.hasOwn(changes, "percent")) {
+        projection.progressPercent = replayNullableNumber(changes.percent);
+      }
+    } else if (event.event_type === "blocked") {
+      projection.blockedAt = replayNullableString(detail?.blocked_at) ?? event.created_at;
+    } else if (event.event_type === "unblocked") {
+      projection.blockedAt = null;
+    }
+
+    const nextStatus = projectStatus(event.to_status);
+    if (nextStatus) projection.status = nextStatus;
+    projection.updatedAt = event.created_at;
+    projection.closedAt = isClosedProjectStatus(projection.status)
+      ? projection.closedAt ?? event.created_at
+      : null;
+  }
+
+  if (!projection) return false;
+  db.prepare<[
+    string,
+    string | null,
+    number | null,
+    string | null,
+    number,
+    string,
+    string | null,
+    number,
+  ]>(
+    `UPDATE project
+     SET status = ?, progress_summary = ?, progress_percent = ?, blocked_at = ?,
+         confidence = ?, updated_at = ?, closed_at = ?
+     WHERE id = ?`,
+  ).run(
+    projection.status,
+    projection.progressSummary,
+    projection.progressPercent,
+    projection.blockedAt,
+    projection.confidence,
+    projection.updatedAt,
+    projection.closedAt,
+    projectId,
+  );
+  return true;
+}
+
+function projectStatus(value: string | null): string | null {
+  return value === "planned" || value === "active" || value === "paused" ||
+      value === "completed" || value === "abandoned"
+    ? value
+    : null;
+}
+
+function isClosedProjectStatus(status: string): boolean {
+  return status === "completed" || status === "abandoned";
+}
+
+function parseJsonRecord(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return asReplayRecord(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function replayEventChanges(detail: Record<string, unknown> | null): Record<string, unknown> {
+  const explicit = asReplayRecord(detail?.changes);
+  if (explicit) return explicit;
+  const before = asReplayRecord(detail?.before);
+  const after = asReplayRecord(detail?.after);
+  if (!before || !after) return {};
+  return Object.fromEntries(
+    Object.entries(after).filter(
+      ([name, value]) => !Object.hasOwn(before, name) || !sameReplayValue(before[name], value),
+    ),
+  );
 }
 
 function deleteFacetsScopedTo(
@@ -811,16 +1371,12 @@ function replayIntentProjection(
       fields = { ...detail.direct };
       status = event.to_status;
     } else {
-      if (!fields && detail?.before) {
-        fields = { ...detail.before };
-        status = event.from_status;
+      const changes = replayIntentChanges(detail);
+      if (Object.keys(changes).length > 0) {
+        fields ??= {};
+        Object.assign(fields, changes);
       }
-      if (fields && detail?.before && detail.after) {
-        for (const [name, value] of Object.entries(detail.after)) {
-          if (!sameReplayValue(detail.before[name], value)) fields[name] = value;
-        }
-      }
-      if (event.to_status !== null && event.to_status !== event.from_status) {
+      if (event.to_status !== null) {
         status = event.to_status;
       }
     }
@@ -841,16 +1397,27 @@ function replayIntentProjection(
       return false;
     }
     db.prepare<
-      [string, string, string, string | null, number, string, string | null, number]
+      [
+        string,
+        string,
+        string,
+        string | null,
+        number | null,
+        number,
+        string,
+        string | null,
+        number,
+      ]
     >(
       `UPDATE goal SET title = ?, status = ?, priority = ?, target_at = ?,
-                       confidence = ?, updated_at = ?, closed_at = ?
+                       project_id = ?, confidence = ?, updated_at = ?, closed_at = ?
        WHERE id = ?`,
     ).run(
       title,
       status,
       priority!,
       replayNullableString(fields.target_at),
+      replayNullableNumber(fields.project_id),
       confidence,
       updatedAt,
       closedAt,
@@ -864,10 +1431,23 @@ function replayIntentProjection(
   const confidence = replayNumber(fields.confidence);
   if (!title || ownerId === null || confidence === null) return false;
   db.prepare<
-    [string, number, number | null, string, string | null, string | null, number, string | null, string, string | null, number]
+    [
+      string,
+      number,
+      number | null,
+      number | null,
+      string,
+      string | null,
+      string | null,
+      number,
+      string | null,
+      string,
+      string | null,
+      number,
+    ]
   >(
     `UPDATE commitment
-     SET title = ?, owner_entity_id = ?, linked_goal_id = ?, status = ?,
+     SET title = ?, owner_entity_id = ?, linked_goal_id = ?, project_id = ?, status = ?,
          due_at = ?, snoozed_until = ?, confidence = ?, last_surfaced_at = ?,
          updated_at = ?, closed_at = ?
      WHERE id = ?`,
@@ -875,6 +1455,7 @@ function replayIntentProjection(
     title,
     ownerId,
     replayNullableNumber(fields.linked_goal_id),
+    replayNullableNumber(fields.project_id),
     status,
     replayNullableString(fields.due_at),
     replayNullableString(fields.snoozed_until),
@@ -891,6 +1472,7 @@ function parseReplayDetail(value: string | null): {
   direct?: Record<string, unknown>;
   before?: Record<string, unknown>;
   after?: Record<string, unknown>;
+  changes?: Record<string, unknown>;
 } | null {
   if (!value) return null;
   try {
@@ -899,10 +1481,26 @@ function parseReplayDetail(value: string | null): {
     const record = parsed as Record<string, unknown>;
     const before = asReplayRecord(record.before);
     const after = asReplayRecord(record.after);
+    const changes = asReplayRecord(record.changes);
+    if (changes) return { changes };
     return before && after ? { before, after } : { direct: record };
   } catch {
     return null;
   }
+}
+
+function replayIntentChanges(
+  detail: ReturnType<typeof parseReplayDetail>,
+): Record<string, unknown> {
+  if (detail?.changes) return detail.changes;
+  if (!detail?.before || !detail.after) return {};
+  return Object.fromEntries(
+    Object.entries(detail.after).filter(
+      ([name, value]) =>
+        !Object.hasOwn(detail.before!, name) ||
+        !sameReplayValue(detail.before![name], value),
+    ),
+  );
 }
 
 function asReplayRecord(value: unknown): Record<string, unknown> | null {

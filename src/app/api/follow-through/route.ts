@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { getCommitment } from "@/core/intentions";
 import { recordFollowThroughDecision } from "@/core/stewardship";
-import { getOwnerAccess } from "@/server/auth/access";
+import { getBrowserOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,11 +17,18 @@ const Body = z
   .strict();
 
 export async function POST(request: Request): Promise<Response> {
-  const access = await getOwnerAccess();
+  const access = await getBrowserOwnerAccess(request, "private-mutation");
   if (!access.canAccessPrivateData) {
     return Response.json(
       { error: access.message },
-      { status: access.state === "signed_out" ? 401 : access.state === "wrong_account" ? 403 : 503 },
+      {
+        status:
+          access.state === "signed_out"
+            ? 401
+            : access.state === "wrong_account" || access.state === "forbidden_origin"
+              ? 403
+              : 503,
+      },
     );
   }
 

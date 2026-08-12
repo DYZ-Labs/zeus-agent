@@ -5,6 +5,7 @@ import { evidenceForFacet, getFacet } from "./facets";
 import { evidenceForFact, getFact } from "./facts";
 import { getCommitment, getGoal } from "./intentions";
 import { getPassage, passagesForMessage } from "./passages";
+import { getProject } from "./projects";
 import type { ContextSelection, RecallItem } from "./schema";
 import { RecallItem as RecallItemSchema } from "./schema";
 
@@ -119,6 +120,10 @@ function reconstructItem(db: Db, row: ResponseContextRow): RecallItem | null {
     const commitment = getCommitment(db, row.item_id);
     return commitment ? { kind: "commitment", commitment } : null;
   }
+  if (row.item_kind === "project") {
+    const project = getProject(db, row.item_id);
+    return project ? { kind: "project", project } : null;
+  }
   const facet = getFacet(db, row.item_id);
   return facet
     ? { kind: "facet", facet, evidence: evidenceForFacet(db, facet.id) }
@@ -227,20 +232,25 @@ function parseRetrieval(value: string | null): {
 function parseFieldProvenance(value: unknown): IntentFieldProvenance | null {
   if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
-  if (record.kind !== "goal" && record.kind !== "commitment") return null;
+  if (record.kind !== "goal" && record.kind !== "commitment" && record.kind !== "project") {
+    return null;
+  }
   if (typeof record.fields !== "object" || record.fields === null) return null;
   const fields = record.fields as Record<string, unknown>;
   const required = record.kind === "goal"
-    ? ["title", "status", "priority", "target_at", "confidence"]
-    : [
+    ? ["title", "status", "priority", "target_at", "project_id", "confidence"]
+    : record.kind === "commitment"
+      ? [
         "title",
         "owner_entity_id",
         "linked_goal_id",
+        "project_id",
         "status",
         "due_at",
         "snoozed_until",
         "confidence",
-      ];
+      ]
+      : ["entity_id", "status", "progress_summary", "progress_percent", "blocked_at", "confidence"];
   if (required.some((name) => !validFieldSource(fields[name]))) return null;
   return value as IntentFieldProvenance;
 }

@@ -22,6 +22,8 @@ import {
   supersedeFact,
   timeline,
 } from "./facts";
+import { recordMcpRecallAudit } from "./mcp-audit";
+import { authorizeWorkPlan, createWorkArtifact, createWorkPlan, getWorkPlan, runWorkPlan } from "./work-plans";
 
 let db: Db;
 
@@ -285,6 +287,84 @@ describe("curation", () => {
       .prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM fact_fts")
       .get();
     expect(remaining?.n).toBe(0);
+  });
+
+  it("removes immutable MCP snapshots when a fact is explicitly forgotten", () => {
+    const me = selfEntity(db).id;
+    const { fact } = recordFact(db, {
+      subjectId: me,
+      predicate: "note",
+      object: "private launch phrase",
+      sourceMessageId: messageId(),
+    });
+    recordMcpRecallAudit(db, "zeus_recall", "launch", [
+      { kind: "fact", id: fact.id, snapshot: { object: fact.object } },
+    ]);
+
+    expect(forgetFact(db, fact.id)).toBe(true);
+    const audit = db.prepare<[], { count: number }>(
+      "SELECT COUNT(*) AS count FROM mcp_recall_audit",
+    ).get();
+    expect(audit?.count).toBe(0);
+  });
+
+  it("removes a bounded plan whose artifact was derived from a forgotten fact", async () => {
+    const me = selfEntity(db).id;
+    const sourceId = messageId();
+    const { fact } = recordFact(db, {
+      subjectId: me,
+      predicate: "note",
+      object: "private artifact basis",
+      sourceMessageId: sourceId,
+    });
+    const request = messageId();
+    const detail = createWorkPlan(db, {
+      proposal: {
+        objective: "Prepare a local note",
+        steps: [{
+          title: "Recall note",
+          instruction: "Recall accepted memory",
+          effect_kind: "memory_read",
+          depends_on: [],
+        }],
+        allowed_effects: ["memory_read"],
+        completion_criteria: ["A local note exists"],
+        limits: { max_model_tool_calls: 2, max_retries_per_step: 0, max_duration_seconds: 60 },
+      },
+      sourceMessageId: request,
+      origin: "explicit_request",
+    });
+    authorizeWorkPlan(db, detail.plan.id, {
+      planHash: detail.plan.plan_hash,
+      authorizationKind: "explicit_request",
+      allowedEffects: ["memory_read"],
+      maxModelToolCalls: 2,
+      maxRetriesPerStep: 0,
+      maxDurationSeconds: 60,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      sourceMessageId: request,
+    });
+    const run = await runWorkPlan(db, detail.plan.id, {
+      executor: async (input) => {
+        createWorkArtifact(db, {
+          planId: detail.plan.id,
+          runId: input.run.id,
+          stepId: input.step.id,
+          artifact: {
+            kind: "research_notes",
+            title: "Private note",
+            content: fact.object,
+            sourceMessageIds: [sourceId],
+            sourceMemoryItems: [{ sourceKind: "fact", sourceId: fact.id, snapshot: fact }],
+          },
+        });
+        return { artifacts: [{ kind: "research_notes", title: "Checkpoint", content: "done" }] };
+      },
+    });
+    expect(run.status).toBe("completed");
+
+    expect(forgetFact(db, fact.id)).toBe(true);
+    expect(getWorkPlan(db, detail.plan.id)).toBeNull();
   });
 
   it("does not orphan a superseding link when the newer fact is forgotten", () => {

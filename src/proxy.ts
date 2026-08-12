@@ -2,6 +2,10 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 import { getAuthConfiguration } from "@/server/auth/config";
+import {
+  applyLocalBrowserSecurityHeaders,
+  checkBrowserBoundary,
+} from "@/server/auth/browser-origin";
 
 const PUBLIC_PATHS = new Set(["/", "/settings"]);
 
@@ -12,7 +16,21 @@ const PUBLIC_PATHS = new Set(["/", "/settings"]);
  */
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const configuration = getAuthConfiguration();
-  if (configuration.mode === "local") return NextResponse.next({ request });
+  if (configuration.mode === "local") {
+    const capability = isSafeMethod(request.method) ? "private-read" : "private-mutation";
+    const boundary = checkBrowserBoundary(request, capability, configuration);
+    if (!boundary.allowed) {
+      return localBoundaryDenied(request, boundary.message);
+    }
+    return applyLocalBrowserSecurityHeaders(
+      NextResponse.next({ request }),
+    ) as NextResponse;
+  }
+
+  if (configuration.mode === "configured" && !isSafeMethod(request.method)) {
+    const boundary = checkBrowserBoundary(request, "private-mutation", configuration);
+    if (!boundary.allowed) return configuredBoundaryDenied(request, boundary.message);
+  }
 
   const isAuthPath = request.nextUrl.pathname.startsWith("/auth/");
   const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath;
@@ -74,6 +92,27 @@ export const config = {
     "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
   ],
 };
+
+function isSafeMethod(method: string): boolean {
+  return method === "GET" || method === "HEAD" || method === "OPTIONS";
+}
+
+function localBoundaryDenied(request: NextRequest, message: string): NextResponse {
+  const response = request.nextUrl.pathname.startsWith("/api/")
+    ? NextResponse.json({ error: message }, { status: 403 })
+    : new NextResponse("Forbidden", { status: 403 });
+  return applyLocalBrowserSecurityHeaders(response) as NextResponse;
+}
+
+function configuredBoundaryDenied(request: NextRequest, message: string): NextResponse {
+  const response = request.nextUrl.pathname.startsWith("/api/")
+    ? NextResponse.json({ error: message }, { status: 403 })
+    : new NextResponse("Forbidden", { status: 403 });
+  response.headers.set("Cache-Control", "private, no-store");
+  response.headers.set("X-Frame-Options", "DENY");
+  response.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+  return response;
+}
 
 function loginRedirect(request: NextRequest, error?: string): NextResponse {
   const url = new URL("/auth/login", request.url);

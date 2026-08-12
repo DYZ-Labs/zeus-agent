@@ -189,6 +189,7 @@ describe("understanding history backfill", () => {
       facetEdit: {
         statement: "Give me important decisions in writing.",
         machineEffect: "deprioritize",
+        structuredCondition: null,
       },
     });
 

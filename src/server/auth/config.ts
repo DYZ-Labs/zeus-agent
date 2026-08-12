@@ -4,35 +4,28 @@ import { z } from "zod";
 
 import type { AuthMode } from "@/lib/auth-types";
 
+function isExactHttpOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "https:" || url.protocol === "http:") &&
+      url.pathname === "/" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
 const AuthEnvironment = z
   .object({
-    url: z.string().url().refine((value) => {
-      const url = new URL(value);
-      return (
-        (url.protocol === "https:" || url.protocol === "http:") &&
-        url.pathname === "/" &&
-        !url.username &&
-        !url.password &&
-        !url.search &&
-        !url.hash
-      );
-    }),
+    url: z.string().url().refine(isExactHttpOrigin),
     publishableKey: z.string().min(1),
     ownerEmail: z.string().trim().toLowerCase().email(),
-    siteUrl: z
-      .string()
-      .url()
-      .refine((value) => {
-        const url = new URL(value);
-        return (
-          (url.protocol === "https:" || url.protocol === "http:") &&
-          url.pathname === "/" &&
-          !url.username &&
-          !url.password &&
-          !url.search &&
-          !url.hash
-        );
-      }),
+    siteUrl: z.string().url().refine(isExactHttpOrigin),
   })
   .strict();
 

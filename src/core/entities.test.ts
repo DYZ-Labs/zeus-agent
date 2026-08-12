@@ -19,7 +19,24 @@ import {
   upsertEntity,
 } from "./entities";
 import { factsForEntity, recordFact } from "./facts";
-import { createCommitment, getCommitment } from "./intentions";
+import { createCommitment, createGoal, getCommitment, getGoal } from "./intentions";
+import {
+  createProject,
+  getProject,
+  getProjectByEntityId,
+  projectEvents,
+  recordProjectProgress,
+} from "./projects";
+import {
+  activeWorkAuthorization,
+  authorizeWorkPlan,
+  createWorkPlan,
+  getWorkAuthorization,
+  getWorkPlan,
+  listWorkRuns,
+  resumeWorkRun,
+  runWorkPlan,
+} from "./work-plans";
 
 let db: Db;
 
@@ -154,6 +171,153 @@ describe("merging", () => {
 
     expect(getCommitment(db, commitment.id)?.owner_entity_id).toBe(canonical.id);
     expect(getCommitment(db, commitment.id)?.owner_name).toBe("Sam Rivera");
+  });
+
+  it("re-points a project lifecycle when only the duplicate entity owns one", () => {
+    const duplicate = upsertEntity(db, { name: "Apollo", kind: "project" });
+    const canonical = upsertEntity(db, { name: "Project Apollo", kind: "project" });
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "Apollo is an active project.");
+    const project = createProject(db, {
+      entityId: duplicate.id,
+      status: "active",
+      sourceMessageId: source.id,
+    });
+
+    mergeEntities(db, duplicate.id, canonical.id);
+
+    expect(getProjectByEntityId(db, duplicate.id)).toBeNull();
+    expect(getProjectByEntityId(db, canonical.id)).toMatchObject({
+      id: project.id,
+      entity_name: "Project Apollo",
+      status: "active",
+      source_message_id: source.id,
+    });
+    expect(projectEvents(db, project.id)).toMatchObject([
+      { event_type: "created", source_message_id: source.id },
+    ]);
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("combines project lifecycles while invalidating hash-bound plan scope", async () => {
+    const canonical = upsertEntity(db, { name: "Project Apollo", kind: "project" });
+    const duplicate = upsertEntity(db, { name: "Apollo Initiative", kind: "project" });
+    const conversation = createConversation(db);
+    const canonicalSource = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "Project Apollo is planned.",
+    );
+    const duplicateSource = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "The Apollo Initiative is active.",
+    );
+    const progressSource = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "Apollo finished discovery and is 40 percent complete.",
+    );
+    const canonicalProject = createProject(db, {
+      entityId: canonical.id,
+      sourceMessageId: canonicalSource.id,
+    });
+    const duplicateProject = createProject(db, {
+      entityId: duplicate.id,
+      status: "active",
+      sourceMessageId: duplicateSource.id,
+    });
+    recordProjectProgress(db, duplicateProject.id, {
+      summary: "Discovery complete",
+      percent: 0.4,
+      sourceMessageId: progressSource.id,
+      sourceKind: "message",
+    });
+    const goal = createGoal(db, {
+      title: "Ship Apollo",
+      projectId: duplicateProject.id,
+      sourceMessageId: duplicateSource.id,
+    });
+    const commitment = createCommitment(db, {
+      title: "Draft the Apollo brief",
+      projectId: duplicateProject.id,
+      sourceMessageId: duplicateSource.id,
+    });
+    const workPlan = createWorkPlan(db, {
+      proposal: {
+        objective: "Draft Apollo brief",
+        steps: [{
+          title: "Draft brief",
+          instruction: "Prepare the brief in the local store.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+        completion_criteria: ["A local draft is ready"],
+        limits: {
+          max_model_tool_calls: 4,
+          max_retries_per_step: 1,
+          max_duration_seconds: 300,
+        },
+      },
+      sourceMessageId: duplicateSource.id,
+      sourceProjectId: duplicateProject.id,
+      origin: "explicit_request",
+    });
+    const authorization = authorizeWorkPlan(db, workPlan.plan.id, {
+      planHash: workPlan.plan.plan_hash,
+      authorizationKind: "explicit_request",
+      allowedEffects: ["prepare_local"],
+      maxModelToolCalls: 4,
+      maxRetriesPerStep: 1,
+      maxDurationSeconds: 300,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      sourceMessageId: duplicateSource.id,
+    });
+    const run = await runWorkPlan(db, workPlan.plan.id);
+    expect(run.status).toBe("paused");
+    expect(activeWorkAuthorization(db, workPlan.plan.id)?.id).toBe(authorization.id);
+
+    mergeEntities(db, duplicate.id, canonical.id);
+
+    expect(getProject(db, duplicateProject.id)).toBeNull();
+    expect(getProject(db, canonicalProject.id)).toMatchObject({
+      entity_id: canonical.id,
+      status: "active",
+      progress_summary: "Discovery complete",
+      progress_percent: 0.4,
+      source_message_id: canonicalSource.id,
+    });
+    expect(projectEvents(db, canonicalProject.id)).toMatchObject([
+      { event_type: "created", source_message_id: canonicalSource.id },
+      { event_type: "created", source_message_id: duplicateSource.id },
+      { event_type: "progress", source_message_id: progressSource.id },
+    ]);
+    expect(getGoal(db, goal.id)?.project_id).toBe(canonicalProject.id);
+    expect(getCommitment(db, commitment.id)?.project_id).toBe(canonicalProject.id);
+    expect(
+      db
+        .prepare<[number], { source_project_id: number | null }>(
+          "SELECT source_project_id FROM work_plan WHERE id = ?",
+        )
+        .get(workPlan.plan.id)?.source_project_id,
+    ).toBe(canonicalProject.id);
+    expect(getWorkPlan(db, workPlan.plan.id)?.plan.status).toBe("paused");
+    expect(activeWorkAuthorization(db, workPlan.plan.id)).toBeNull();
+    expect(getWorkAuthorization(db, authorization.id)?.revoked_at).not.toBeNull();
+    expect(listWorkRuns(db, workPlan.plan.id)[0]).toMatchObject({
+      id: run.id,
+      status: "paused",
+      error_code: "scope_invalidated",
+    });
+
+    const resumed = await resumeWorkRun(db, run.id);
+    expect(resumed).toMatchObject({ status: "paused", error_code: "plan_hash_changed" });
+    expect(activeWorkAuthorization(db, workPlan.plan.id)).toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
   });
 
   it("reconciles duplicate and conflicting live facts after a merge", () => {

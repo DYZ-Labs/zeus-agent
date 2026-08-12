@@ -16,13 +16,18 @@ function source(text: string): number {
   return appendMessage(db, conversation.id, "user", text).id;
 }
 
-function facetPayload(statement: string, condition: string | null = null) {
+function facetPayload(
+  statement: string,
+  condition: string | null = null,
+  structuredCondition: unknown = null,
+) {
   return {
     item: {
       kind: "constraint",
       statement,
       scope: { kind: "domain", label: "work" },
       condition,
+      structured_condition: structuredCondition,
       machine_effect: null,
     },
     entities: [],
@@ -70,6 +75,27 @@ describe("candidate semantic suppression", () => {
       sourceMessageId: source("During recovery, protect quiet mornings."),
     });
 
+    expect(distinct.id).not.toBe(first.id);
+    expect(distinct.status).toBe("pending");
+  });
+
+  it("does not deduplicate materially different typed ambient conditions", () => {
+    const first = createCandidate(db, {
+      kind: "facet",
+      payload: facetPayload("Protect focus time", null, { weekdays: ["mon"] }),
+      reason: "inference",
+      confidence: 0.7,
+      sourceMessageId: source("Protect focus time on Monday."),
+    });
+    resolveCandidate(db, first.id, "rejected");
+
+    const distinct = createCandidate(db, {
+      kind: "facet",
+      payload: facetPayload("Protect focus time", null, { weekdays: ["fri"] }),
+      reason: "inference",
+      confidence: 0.72,
+      sourceMessageId: source("Protect focus time on Friday."),
+    });
     expect(distinct.id).not.toBe(first.id);
     expect(distinct.status).toBe("pending");
   });

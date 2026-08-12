@@ -21,6 +21,13 @@ export type ChatHistoryTurn = {
 type Turn = ChatHistoryTurn & {
   recommendation?: FollowThroughRecommendation;
   recommendationDecision?: RecommendationDecision;
+  workPlan?: {
+    id: number;
+    runId: number;
+    status: string;
+    errorCode: string | null;
+    artifacts: Array<{ id: number; title: string; kind: string }>;
+  };
   /** Set on the assistant turn once the stream closes. */
   receipt?: {
     messageId: number;
@@ -34,6 +41,7 @@ type Turn = ChatHistoryTurn & {
     pendingFacets: number;
     goalsUpdated: number;
     commitmentsUpdated: number;
+    projectsUpdated: number;
     superseded: number;
     failed: boolean;
   };
@@ -153,13 +161,18 @@ export function Chat({
               ),
             );
           } else if (event.type === "done") {
+            const opportunityId = event.opportunityId as number | null;
+            const messageId = event.messageId as number;
+            const opportunityDelivered = opportunityId === null
+              ? true
+              : await recordOpportunityDelivery(opportunityId, "chat", messageId);
             setTurns((prior) =>
               prior.map((turn) =>
                 turn.id === replyId
                   ? {
                       ...turn,
                       receipt: {
-                        messageId: event.messageId as number,
+                        messageId,
                         recalled: event.recalled as number,
                         recalledFacts: event.recalledFacts as number,
                         recalledEpisodes: event.recalledEpisodes as number,
@@ -170,11 +183,16 @@ export function Chat({
                         pendingFacets: event.pendingFacets as number,
                         goalsUpdated: event.goalsUpdated as number,
                         commitmentsUpdated: event.commitmentsUpdated as number,
+                        projectsUpdated: event.projectsUpdated as number,
                         superseded: event.superseded as number,
                         failed: event.extractionFailed as boolean,
                       },
                       recommendation:
-                        (event.recommendation as FollowThroughRecommendation | null) ?? undefined,
+                        opportunityDelivered
+                          ? (event.recommendation as FollowThroughRecommendation | null) ?? undefined
+                          : undefined,
+                      workPlan:
+                        (event.workPlan as Turn["workPlan"] | null) ?? undefined,
                     }
                   : turn,
               ),
@@ -293,6 +311,7 @@ export function Chat({
                             userReason,
                           )
                         }
+                        workPlan={turn.workPlan}
                         pending={status === "streaming" && !turn.receipt}
                       />
                     )}
@@ -322,6 +341,24 @@ export function Chat({
       )}
     </div>
   );
+}
+
+async function recordOpportunityDelivery(
+  opportunityId: number,
+  channel: "chat" | "today",
+  responseMessageId: number | null,
+): Promise<boolean> {
+  try {
+    const response = await fetch(`/api/opportunities/${opportunityId}/delivery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel, responseMessageId }),
+      keepalive: true,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 function Composer({
@@ -427,6 +464,7 @@ function AssistantTurn({
   recommendation,
   recommendationDecision,
   onRecommendationDecision,
+  workPlan,
   pending,
 }: {
   text: string;
@@ -438,6 +476,7 @@ function AssistantTurn({
     decision: RecommendationDecision,
     userReason?: string,
   ) => void;
+  workPlan?: Turn["workPlan"];
   pending: boolean;
 }) {
   return (
@@ -458,9 +497,119 @@ function AssistantTurn({
             onDecision={onRecommendationDecision}
           />
         )}
+        {workPlan && <WorkPlanCard workPlan={workPlan} />}
         {receipt && <Receipt {...receipt} />}
       </div>
     </div>
+  );
+}
+
+function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> }) {
+  const [status, setStatus] = useState(workPlan.status);
+  const [errorCode, setErrorCode] = useState(workPlan.errorCode);
+  const [busy, setBusy] = useState<"resume" | "cancel" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const completed = status === "completed";
+  const closed = completed || status === "cancelled";
+  const canResume = ["queued", "running", "paused"].includes(status);
+
+  async function act(action: "resume" | "cancel") {
+    if (busy) return;
+    setBusy(action);
+    setActionError(null);
+    try {
+      const response = await fetch(`/api/work-runs/${workPlan.runId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const body = (await response.json().catch(() => null)) as {
+        error?: string;
+        run?: { status: string; error_code: string | null };
+      } | null;
+      if (!response.ok || !body?.run) {
+        throw new Error(body?.error ?? "The bounded-work action failed.");
+      }
+      setStatus(body.run.status);
+      setErrorCode(body.run.error_code);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "The bounded-work action failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <aside
+      className="mt-4 rounded-xl border px-4 py-3.5"
+      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+      aria-label="Bounded work plan"
+    >
+      <p
+        className="font-mono text-[0.62rem] uppercase tracking-[0.14em]"
+        style={{ color: "var(--shell-faint)" }}
+      >
+        Bounded work · {status}
+      </p>
+      <p className="mt-2 text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        {completed
+          ? "Zeus completed the authorized read-only research and local preparation steps."
+          : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
+      </p>
+      {!closed && (
+        <div className="mt-3 flex flex-wrap gap-4 text-[0.74rem]">
+          {canResume && (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => void act("resume")}
+              className="font-medium disabled:opacity-50"
+              style={{ color: "var(--shell-accent)" }}
+            >
+              {busy === "resume" ? "Resuming…" : "Resume"}
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => void act("cancel")}
+            className="disabled:opacity-50"
+            style={{ color: "var(--shell-faint)" }}
+          >
+            {busy === "cancel" ? "Cancelling…" : "Cancel"}
+          </button>
+        </div>
+      )}
+      {actionError && (
+        <p className="mt-2 text-[0.72rem]" role="alert" style={{ color: "#f3a6a6" }}>
+          {actionError} Review the exact plan in Today if it needs fresh approval.
+        </p>
+      )}
+      {workPlan.artifacts.length > 0 && (
+        <ul className="mt-2 space-y-1 text-[0.78rem]">
+          {workPlan.artifacts.map((artifact) => (
+            <li key={artifact.id}>
+              <a href={`/work-artifacts/${artifact.id}`} className="underline underline-offset-2">
+                {artifact.title}
+              </a>{" "}
+              <span
+                className="font-mono text-[0.61rem]"
+                style={{ color: "var(--shell-faint)" }}
+              >
+                {artifact.kind.replace(/_/gu, " ")}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <a
+        href="/today#work-plans"
+        className="mt-2 inline-block font-mono text-[0.61rem] underline underline-offset-2"
+        style={{ color: "var(--shell-faint)" }}
+      >
+        review plan and receipts
+      </a>
+    </aside>
   );
 }
 
@@ -603,6 +752,7 @@ function Receipt({
   pendingFacets,
   goalsUpdated,
   commitmentsUpdated,
+  projectsUpdated,
   superseded,
   failed,
 }: NonNullable<Turn["receipt"]>) {
@@ -628,6 +778,7 @@ function Receipt({
         {acceptedFacets > 0 && <span>{acceptedFacets} facets accepted</span>}
         {goalsUpdated > 0 && <span>{goalsUpdated} goals updated</span>}
         {commitmentsUpdated > 0 && <span>{commitmentsUpdated} commitments updated</span>}
+        {projectsUpdated > 0 && <span>{projectsUpdated} projects updated</span>}
         <a href={`/response/${messageId}`} className="underline underline-offset-2" style={{ color: "var(--shell-fg)" }}>
           sources used
         </a>

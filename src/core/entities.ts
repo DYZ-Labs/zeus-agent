@@ -2,6 +2,7 @@ import type { Db } from "./db";
 import { now } from "./db";
 import { SELF_SLUG } from "./migrations";
 import type { Entity, EntityKind } from "./schema";
+import { invalidateWorkPlansForSourceLink } from "./work-plans";
 
 /**
  * Entity resolution. The job here is that "Sarah", "Sarah Chen", and "sarah" are one
@@ -305,6 +306,8 @@ export function mergeEntities(db: Db, sourceId: number, targetId: number): void 
       .all(sourceId, sourceId)
       .map((row) => row.id);
 
+    reconcileMergedProjects(db, sourceId, targetId, target.kind);
+
     db.prepare<[number, number]>(
       "UPDATE fact SET subject_id = ? WHERE subject_id = ?",
     ).run(targetId, sourceId);
@@ -395,6 +398,101 @@ export function mergeEntities(db: Db, sourceId: number, targetId: number): void 
       targetId,
     );
   })();
+}
+
+/**
+ * Reconcile the lifecycle row attached to a project entity before the duplicate
+ * entity is removed. A project is keyed one-to-one to its entity, so the simple
+ * foreign-key update works only when the canonical entity does not already own a
+ * lifecycle. When both sides do, retain the canonical project's stable id, append
+ * both event histories to it, repoint every durable project link, and use the most
+ * recently updated projection as the current view.
+ *
+ * Event rows are intentionally not rewritten or deduplicated: their source messages
+ * and detail snapshots are provenance, including the identity under which an event
+ * was originally recorded.
+ */
+function reconcileMergedProjects(
+  db: Db,
+  sourceEntityId: number,
+  targetEntityId: number,
+  targetKind: EntityKind,
+): void {
+  type ProjectProjection = {
+    id: number;
+    status: string;
+    progress_summary: string | null;
+    progress_percent: number | null;
+    blocked_at: string | null;
+    confidence: number;
+    updated_at: string;
+    closed_at: string | null;
+  };
+  const read = db.prepare<[number], ProjectProjection>(
+    `SELECT id, status, progress_summary, progress_percent, blocked_at,
+            confidence, updated_at, closed_at
+     FROM project WHERE entity_id = ?`,
+  );
+  const sourceProject = read.get(sourceEntityId);
+  if (!sourceProject) return;
+  if (targetKind !== "project") {
+    throw new Error("A project lifecycle can only be merged into a project entity");
+  }
+
+  const targetProject = read.get(targetEntityId);
+  if (!targetProject) {
+    db.prepare<[number, number]>(
+      "UPDATE project SET entity_id = ? WHERE entity_id = ?",
+    ).run(targetEntityId, sourceEntityId);
+    return;
+  }
+
+  db.prepare<[number, number]>(
+    "UPDATE goal SET project_id = ? WHERE project_id = ?",
+  ).run(targetProject.id, sourceProject.id);
+  db.prepare<[number, number]>(
+    "UPDATE commitment SET project_id = ? WHERE project_id = ?",
+  ).run(targetProject.id, sourceProject.id);
+  invalidateWorkPlansForSourceLink(db, "project", sourceProject.id);
+  db.prepare<[number, number]>(
+    "UPDATE work_plan SET source_project_id = ? WHERE source_project_id = ?",
+  ).run(targetProject.id, sourceProject.id);
+  db.prepare<[number, number]>(
+    "UPDATE project_event SET project_id = ? WHERE project_id = ?",
+  ).run(targetProject.id, sourceProject.id);
+
+  const sourceIsNewer =
+    sourceProject.updated_at > targetProject.updated_at ||
+    (sourceProject.updated_at === targetProject.updated_at &&
+      sourceProject.id > targetProject.id);
+  if (sourceIsNewer) {
+    db.prepare<[
+      string,
+      string | null,
+      number | null,
+      string | null,
+      number,
+      string,
+      string | null,
+      number,
+    ]>(
+      `UPDATE project
+       SET status = ?, progress_summary = ?, progress_percent = ?, blocked_at = ?,
+           confidence = ?, updated_at = ?, closed_at = ?
+       WHERE id = ?`,
+    ).run(
+      sourceProject.status,
+      sourceProject.progress_summary,
+      sourceProject.progress_percent,
+      sourceProject.blocked_at,
+      sourceProject.confidence,
+      sourceProject.updated_at,
+      sourceProject.closed_at,
+      targetProject.id,
+    );
+  }
+
+  db.prepare<[number]>("DELETE FROM project WHERE id = ?").run(sourceProject.id);
 }
 
 function reconcileMergedFacts(db: Db, entityId: number): void {

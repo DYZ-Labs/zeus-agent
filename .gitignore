@@ -10,10 +10,28 @@ next-env.d.ts
 *.db-wal
 *.db-shm
 *.sqlite
+*.pre-migration-*.backup
+*.pre-migration-*.backup.tmp
 .zeus/
 
-.env
-.env.local
+.env*
+!.env.example
+
+# Local credentials and private keys must never enter source control.
+*credentials*.json
+*credential*.json
+.npmrc
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Markdown exports contain the same personal data as the database. Repository-local
+# export destinations are intentionally limited to names covered by these rules.
+zeus-export/
+zeus-export-*/
+/.zeus-export*.tmp-*/
+/.zeus-export*.retired-*/
 .DS_Store
 
 # Local embedding model cache

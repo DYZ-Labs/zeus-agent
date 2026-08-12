@@ -4,6 +4,7 @@ import { getMessage } from "./conversations";
 import { embed, loadFacetVectors, nearest } from "./embed";
 import { allowPassage, getPassage } from "./passages";
 import { toFtsQuery } from "./search";
+import { StructuredFacetCondition as StructuredFacetConditionSchema } from "./schema";
 import type {
   FacetEvidence,
   FacetImportance,
@@ -12,6 +13,7 @@ import type {
   FacetScope,
   FacetScopeKind,
   FacetSensitivity,
+  StructuredFacetCondition,
   UnderstandingFacet,
   UnderstandingFacetView,
 } from "./schema";
@@ -50,6 +52,7 @@ export type RecordFacetInput = {
   statement: string;
   scope?: FacetScopeInput;
   condition?: string | null;
+  structuredCondition?: StructuredFacetCondition | null;
   importance?: FacetImportance;
   sensitivity?: FacetSensitivity;
   confidence?: number;
@@ -72,7 +75,7 @@ export type FacetSearchHit = {
 const SELECT_FACET = `
   SELECT f.id, f.kind, f.statement, f.scope_kind, f.scope_label,
          f.scope_entity_id, f.scope_goal_id, f.scope_commitment_id,
-         f.condition_text, f.importance, f.sensitivity, f.confidence,
+         f.condition_text, f.condition_json, f.importance, f.sensitivity, f.confidence,
          f.machine_effect, f.valid_from, f.valid_to, f.superseded_by,
          f.source_message_id, f.created_at, f.updated_at,
          e.name AS scope_entity_name, e.slug AS scope_entity_slug,
@@ -151,12 +154,19 @@ export function recordFacet(db: Db, input: RecordFacetInput): UnderstandingFacet
   }
 
   const scope = scopeColumns(input.scope ?? { kind: "global" });
+  const structuredCondition =
+    input.structuredCondition === undefined || input.structuredCondition === null
+      ? null
+      : StructuredFacetConditionSchema.parse(input.structuredCondition);
+  const conditionJson = structuredCondition ? JSON.stringify(structuredCondition) : null;
   validateScopeTarget(db, input.scope ?? { kind: "global" });
   const duplicate = input.forceNewVersion
     ? null
     : findMatchingLiveFacet(db, {
         kind: input.kind,
         statement,
+        condition_text: input.condition?.trim() || null,
+        condition_json: conditionJson,
         ...scope,
       });
 
@@ -194,6 +204,7 @@ export function recordFacet(db: Db, input: RecordFacetInput): UnderstandingFacet
         number | null,
         number | null,
         string | null,
+        string | null,
         FacetImportance,
         FacetSensitivity,
         number,
@@ -205,10 +216,10 @@ export function recordFacet(db: Db, input: RecordFacetInput): UnderstandingFacet
       ]>(
         `INSERT INTO understanding_facet
            (kind, statement, scope_kind, scope_label, scope_entity_id,
-            scope_goal_id, scope_commitment_id, condition_text, importance,
+            scope_goal_id, scope_commitment_id, condition_text, condition_json, importance,
             sensitivity, confidence, machine_effect, valid_from,
             source_message_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.kind,
@@ -219,6 +230,7 @@ export function recordFacet(db: Db, input: RecordFacetInput): UnderstandingFacet
         scope.scope_goal_id,
         scope.scope_commitment_id,
         input.condition?.trim() || null,
+        conditionJson,
         input.importance ?? "normal",
         input.sensitivity ?? "normal",
         clamp(input.confidence ?? 0.9),
@@ -271,6 +283,10 @@ export function correctFacet(
       ...input,
       kind: input.kind ?? existing.kind,
       scope: input.scope ?? scopeFromFacet(existing),
+      structuredCondition:
+        input.structuredCondition === undefined
+          ? parseStructuredCondition(existing.condition_json)
+          : input.structuredCondition,
       evidenceKind: "correction",
       forceNewVersion: true,
     });
@@ -315,6 +331,35 @@ export function forgetFacet(db: Db, id: number): boolean {
   if (!facet) return false;
   return db.transaction(() => {
     db.prepare<[number]>("DELETE FROM facet_fts WHERE rowid = ?").run(id);
+    db.prepare<[number]>("DELETE FROM facet_embedding WHERE facet_id = ?").run(id);
+    db.prepare<[number]>(
+      "DELETE FROM response_context WHERE item_kind = 'facet' AND item_id = ?",
+    ).run(id);
+    db.prepare<[number]>(
+      "DELETE FROM mcp_recall_audit WHERE item_kind = 'facet' AND item_id = ?",
+    ).run(id);
+    db.prepare<[number, number]>(
+      `DELETE FROM work_plan
+       WHERE id IN (
+         SELECT work_plan_id FROM work_plan_memory_source
+         WHERE source_kind = 'facet' AND source_id = ?
+         UNION
+         SELECT artifact.work_plan_id
+         FROM work_artifact_memory_source memory
+         JOIN work_artifact artifact ON artifact.id = memory.work_artifact_id
+         WHERE memory.source_kind = 'facet' AND memory.source_id = ?
+       )`,
+    ).run(id, id);
+    // A typed machine effect may have shaped a persisted recommendation cycle. Remove
+    // that derived audit snapshot before forgetting the facet so the deleted policy
+    // cannot remain visible through an opportunity trace.
+    db.prepare<[number]>(
+      `DELETE FROM recommendation_cycle
+       WHERE EXISTS (
+         SELECT 1 FROM json_each(recommendation_cycle.applied_facet_ids_json)
+         WHERE CAST(json_each.value AS INTEGER) = ?
+       )`,
+    ).run(id);
     return db.prepare<[number]>("DELETE FROM understanding_facet WHERE id = ?").run(id)
       .changes > 0;
   })();
@@ -452,6 +497,8 @@ function findMatchingLiveFacet(
     scope_entity_id: number | null;
     scope_goal_id: number | null;
     scope_commitment_id: number | null;
+    condition_text: string | null;
+    condition_json: string | null;
   },
 ): UnderstandingFacetView | null {
   return (
@@ -464,11 +511,14 @@ function findMatchingLiveFacet(
         number | null,
         number | null,
         number | null,
+        string | null,
+        string | null,
       ], UnderstandingFacetView>(
         `${SELECT_FACET}
          WHERE f.kind = ? AND lower(f.statement) = lower(?) AND f.scope_kind = ?
            AND f.scope_label IS ? AND f.scope_entity_id IS ?
            AND f.scope_goal_id IS ? AND f.scope_commitment_id IS ?
+           AND f.condition_text IS ? AND f.condition_json IS ?
            AND f.valid_to IS NULL
          LIMIT 1`,
       )
@@ -480,6 +530,8 @@ function findMatchingLiveFacet(
         input.scope_entity_id,
         input.scope_goal_id,
         input.scope_commitment_id,
+        input.condition_text,
+        input.condition_json,
       ) ?? null
   );
 }
@@ -569,4 +621,14 @@ function normalizeDate(value: string | null | undefined): string | null {
   if (!value) return null;
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
+}
+
+function parseStructuredCondition(value: string | null): StructuredFacetCondition | null {
+  if (!value) return null;
+  try {
+    const parsed = StructuredFacetConditionSchema.safeParse(JSON.parse(value) as unknown);
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }

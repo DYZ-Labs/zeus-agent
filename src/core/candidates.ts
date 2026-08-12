@@ -280,6 +280,9 @@ function defaultDedupeKey(kind: CandidateKind, payload: unknown): string {
   const condition = kind === "facet"
     ? semanticSignature(String(record.condition ?? ""))
     : "";
+  const structuredCondition = kind === "facet"
+    ? stableJsonSignature(record.structured_condition ?? null)
+    : "";
   const effect = kind === "facet" ? String(record.machine_effect ?? "none") : "";
   const operation = kind === "fact" || kind === "interest"
     ? String(record.operation ?? "assert")
@@ -287,7 +290,19 @@ function defaultDedupeKey(kind: CandidateKind, payload: unknown): string {
   const lifecycle = kind === "goal" || kind === "commitment"
     ? `${String(record.existing_id ?? "new")}:${String(record.status ?? "")}`
     : "";
-  return `${kind}:${scope}:${condition}:${effect}:${operation}:${lifecycle}:${statement}`;
+  return `${kind}:${scope}:${condition}:${structuredCondition}:${effect}:${operation}:${lifecycle}:${statement}`;
+}
+
+function stableJsonSignature(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJsonSignature).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonSignature(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
 }
 
 /**

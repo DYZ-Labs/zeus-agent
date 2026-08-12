@@ -6,6 +6,7 @@ import { openTestDb } from "./db";
 import { listEntities, resolveEntity, selfEntity } from "./entities";
 import { applyExtraction, extractionContext } from "./extract";
 import { countFacts, factsForEntity, liveFacts } from "./facts";
+import { getProject, projectEvents } from "./projects";
 import { Extraction as ExtractionSchema, type Extraction } from "./schema";
 
 let db: Db;
@@ -96,6 +97,156 @@ describe("applyExtraction", () => {
     // Asking about Acme reaches Sarah — the point of storing the edge.
     const incoming = factsForEntity(db, acme!.id, { includeIncoming: true });
     expect(incoming.map((fact) => fact.subject_name)).toEqual(["Sarah Chen"]);
+  });
+
+  it("applies explicit project progress, blocked, and unblocked facts with provenance", () => {
+    const started = sourceMessage("I am working on Project Apollo.");
+    const created = applyExtraction(
+      db,
+      extraction({
+        entities: [{ name: "Project Apollo", kind: "project", aliases: ["Apollo"] }],
+        facts: [{
+          subject: "self",
+          predicate: "works_on",
+          object: "Project Apollo",
+          object_entity: "Project Apollo",
+          confidence: 0.98,
+          supersedes_previous: false,
+        }],
+      }),
+      started,
+    ).projects[0]!;
+    expect(created.status).toBe("active");
+
+    const progressSource = sourceMessage(
+      "Project Apollo completed discovery and is now 40 percent complete.",
+    );
+    applyExtraction(
+      db,
+      extraction({
+        facts: [{
+          subject: "Project Apollo",
+          predicate: "progress",
+          object: "Discovery completed; 40 percent complete",
+          object_entity: null,
+          confidence: 0.99,
+          supersedes_previous: false,
+        }],
+      }),
+      progressSource,
+    );
+
+    const blockedSource = sourceMessage("Project Apollo is blocked by vendor access.");
+    applyExtraction(
+      db,
+      extraction({
+        facts: [{
+          subject: "Project Apollo",
+          predicate: "status",
+          object: "Blocked by vendor access",
+          object_entity: null,
+          confidence: 0.99,
+          supersedes_previous: false,
+        }],
+      }),
+      blockedSource,
+    );
+    expect(getProject(db, created.id)?.blocked_at).not.toBeNull();
+
+    const unblockedSource = sourceMessage(
+      "Vendor access arrived, so Project Apollo is now unblocked.",
+    );
+    applyExtraction(
+      db,
+      extraction({
+        facts: [{
+          subject: "Project Apollo",
+          predicate: "status",
+          object: "Unblocked after vendor access arrived",
+          object_entity: null,
+          confidence: 0.99,
+          supersedes_previous: true,
+        }],
+      }),
+      unblockedSource,
+    );
+
+    expect(getProject(db, created.id)).toMatchObject({
+      status: "active",
+      progress_summary: "Discovery completed; 40 percent complete",
+      progress_percent: 0.4,
+      blocked_at: null,
+    });
+    expect(projectEvents(db, created.id)).toMatchObject([
+      { event_type: "created", source_message_id: started, source_kind: "message" },
+      { event_type: "progress", source_message_id: progressSource, source_kind: "message" },
+      { event_type: "blocked", source_message_id: blockedSource, source_kind: "message" },
+      { event_type: "unblocked", source_message_id: unblockedSource, source_kind: "message" },
+    ]);
+  });
+
+  it("never changes project status from descriptive facts or partial progress wording", () => {
+    const started = sourceMessage("I am working on Project Atlas.");
+    const project = applyExtraction(
+      db,
+      extraction({
+        entities: [{ name: "Project Atlas", kind: "project", aliases: ["Atlas"] }],
+        facts: [{
+          subject: "self",
+          predicate: "works_on",
+          object: "Project Atlas",
+          object_entity: "Project Atlas",
+          confidence: 0.98,
+          supersedes_previous: false,
+        }],
+      }),
+      started,
+    ).projects[0]!;
+
+    const descriptionSource = sourceMessage(
+      "Project Atlas is a planned migration whose discovery phase is complete.",
+    );
+    applyExtraction(
+      db,
+      extraction({
+        facts: [{
+          subject: "Project Atlas",
+          predicate: "description",
+          object: "A planned migration whose discovery phase is complete",
+          object_entity: null,
+          confidence: 0.98,
+          supersedes_previous: false,
+        }],
+      }),
+      descriptionSource,
+    );
+    expect(getProject(db, project.id)?.status).toBe("active");
+    expect(projectEvents(db, project.id)).toHaveLength(1);
+
+    const partialSource = sourceMessage("Project Atlas is 60 percent complete.");
+    applyExtraction(
+      db,
+      extraction({
+        facts: [{
+          subject: "Project Atlas",
+          predicate: "status",
+          object: "60 percent complete",
+          object_entity: null,
+          confidence: 0.99,
+          supersedes_previous: true,
+        }],
+      }),
+      partialSource,
+    );
+
+    expect(getProject(db, project.id)).toMatchObject({
+      status: "active",
+      progress_percent: 0.6,
+    });
+    expect(projectEvents(db, project.id)).toMatchObject([
+      { event_type: "created", source_message_id: started },
+      { event_type: "progress", source_message_id: partialSource },
+    ]);
   });
 
   it("resolves a later short name to the entity created earlier", () => {
@@ -503,10 +654,15 @@ describe("Extraction schema", () => {
             ...legacy.goals[0],
             priority: { op: "keep" },
             target_at: { op: "clear" },
+            project: { op: "keep" },
           },
         ],
       }).goals[0],
-    ).toMatchObject({ priority: { op: "keep" }, target_at: { op: "clear" } });
+    ).toMatchObject({
+      priority: { op: "keep" },
+      target_at: { op: "clear" },
+      project: { op: "keep" },
+    });
   });
 });
 

@@ -3,9 +3,9 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
-import { deleteAllRecentChatsAction } from "@/app/actions";
+import { deleteAllConversationsAction } from "@/app/actions";
 
-export function DeleteAllRecentChats({ disabled = false }: { disabled?: boolean }) {
+export function DeleteAllConversations({ disabled = false }: { disabled?: boolean }) {
   const router = useRouter();
   const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
@@ -14,11 +14,11 @@ export function DeleteAllRecentChats({ disabled = false }: { disabled?: boolean 
     if (pending) return;
 
     const formData = new FormData();
-    formData.set("confirmation", "delete-all-recent");
+    formData.set("confirmation", "erase-all-sources");
     setPending(true);
 
     try {
-      await deleteAllRecentChatsAction(formData);
+      await deleteAllConversationsAction(formData);
       setConfirming(false);
       router.refresh();
     } finally {
@@ -30,7 +30,7 @@ export function DeleteAllRecentChats({ disabled = false }: { disabled?: boolean 
     <div
       role="group"
       className="flex shrink-0 items-center gap-2"
-      aria-label="Delete all recent chats"
+      aria-label="Permanently delete all source conversations"
     >
       {confirming ? (
         <button
@@ -45,7 +45,7 @@ export function DeleteAllRecentChats({ disabled = false }: { disabled?: boolean 
             color: "#ff6767",
           }}
         >
-          Are you sure?
+          Permanently erase all?
         </button>
       ) : (
         <button

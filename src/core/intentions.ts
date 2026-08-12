@@ -16,6 +16,7 @@ export type GoalInput = {
   status?: GoalStatus;
   priority?: GoalPriority;
   targetAt?: string | null;
+  projectId?: number | null;
   confidence?: number;
   sourceMessageId: number;
   passageId?: number | null;
@@ -26,6 +27,7 @@ export type GoalUpdate = {
   status?: GoalStatus;
   priority?: GoalPriority;
   targetAt?: string | null;
+  projectId?: number | null;
   confidence?: number;
   sourceMessageId?: number | null;
   sourceKind?: "message" | "user_action";
@@ -36,7 +38,7 @@ export function getGoal(db: Db, id: number): Goal | null {
   return (
     db
       .prepare<[number], Goal>(
-        `SELECT id, title, status, priority, target_at, confidence, source_message_id,
+        `SELECT id, title, status, priority, target_at, project_id, confidence, source_message_id,
                 created_at, updated_at, closed_at
          FROM goal WHERE id = ?`,
       )
@@ -51,7 +53,7 @@ export function listGoals(
   const closed = options.includeClosed ? "" : "WHERE status IN ('active','paused')";
   return db
     .prepare<[number], Goal>(
-      `SELECT id, title, status, priority, target_at, confidence, source_message_id,
+      `SELECT id, title, status, priority, target_at, project_id, confidence, source_message_id,
               created_at, updated_at, closed_at
        FROM goal ${closed}
        ORDER BY status = 'active' DESC,
@@ -76,6 +78,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
       duplicate.status === (input.status ?? "active") &&
       duplicate.priority === (input.priority ?? "normal") &&
       duplicate.target_at === target
+      && duplicate.project_id === (input.projectId ?? null)
     ) {
       return duplicate;
     }
@@ -83,6 +86,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
       status: input.status,
       priority: input.priority,
       targetAt: input.targetAt,
+      projectId: input.projectId,
       confidence: input.confidence,
       sourceMessageId: input.sourceMessageId,
       sourceKind: "message",
@@ -98,6 +102,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
         GoalStatus,
         GoalPriority,
         string | null,
+        number | null,
         number,
         number,
         string,
@@ -105,15 +110,16 @@ export function createGoal(db: Db, input: GoalInput): Goal {
         string | null,
       ]>(
         `INSERT INTO goal
-           (title, status, priority, target_at, confidence, source_message_id,
+           (title, status, priority, target_at, project_id, confidence, source_message_id,
             created_at, updated_at, closed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         title,
         status,
         input.priority ?? "normal",
         normalizeDate(input.targetAt),
+        input.projectId ?? null,
         clamp(input.confidence ?? 0.9),
         input.sourceMessageId,
         timestamp,
@@ -131,6 +137,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
         title,
         priority: input.priority ?? "normal",
         target_at: normalizeDate(input.targetAt),
+        project_id: input.projectId ?? null,
         confidence: clamp(input.confidence ?? 0.9),
       },
       input.sourceMessageId,
@@ -151,6 +158,7 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
   const status = update.status ?? existing.status;
   const priority = update.priority ?? existing.priority;
   const targetAt = update.targetAt === undefined ? existing.target_at : normalizeDate(update.targetAt);
+  const projectId = update.projectId === undefined ? existing.project_id : update.projectId;
   const confidence = update.confidence === undefined ? existing.confidence : clamp(update.confidence);
   const timestamp = now();
 
@@ -160,6 +168,7 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
     status === existing.status &&
     priority === existing.priority &&
     targetAt === existing.target_at &&
+    projectId === existing.project_id &&
     confidence === existing.confidence &&
     db
       .prepare<[number, number], { found: number }>(
@@ -176,19 +185,21 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
       GoalStatus,
       GoalPriority,
       string | null,
+      number | null,
       number,
       string,
       string | null,
       number,
     ]>(
       `UPDATE goal
-       SET title = ?, status = ?, priority = ?, target_at = ?, confidence = ?, updated_at = ?, closed_at = ?
+       SET title = ?, status = ?, priority = ?, target_at = ?, project_id = ?, confidence = ?, updated_at = ?, closed_at = ?
        WHERE id = ?`,
     ).run(
       title,
       status,
       priority,
       targetAt,
+      projectId,
       confidence,
       timestamp,
       isGoalClosed(status) ? existing.closed_at ?? timestamp : null,
@@ -207,9 +218,10 @@ export function updateGoal(db: Db, id: number, update: GoalUpdate): Goal | null 
           title: existing.title,
           priority: existing.priority,
           target_at: existing.target_at,
+          project_id: existing.project_id,
           confidence: existing.confidence,
         },
-        after: { title, priority, target_at: targetAt, confidence },
+        after: { title, priority, target_at: targetAt, project_id: projectId, confidence },
       },
       update.sourceMessageId ?? null,
       update.sourceKind ?? (update.sourceMessageId ? "message" : "user_action"),
@@ -273,6 +285,7 @@ export type CommitmentInput = {
   title: string;
   ownerEntityId?: number;
   linkedGoalId?: number | null;
+  projectId?: number | null;
   status?: CommitmentStatus;
   dueAt?: string | null;
   confidence?: number;
@@ -284,6 +297,7 @@ export type CommitmentUpdate = {
   title?: string;
   ownerEntityId?: number;
   linkedGoalId?: number | null;
+  projectId?: number | null;
   status?: CommitmentStatus;
   dueAt?: string | null;
   snoozedUntil?: string | null;
@@ -294,7 +308,7 @@ export type CommitmentUpdate = {
 };
 
 const SELECT_COMMITMENT = `
-  SELECT c.id, c.title, c.owner_entity_id, c.linked_goal_id, c.status,
+  SELECT c.id, c.title, c.owner_entity_id, c.linked_goal_id, c.project_id, c.status,
          c.due_at, c.snoozed_until, c.last_surfaced_at, c.confidence,
          c.source_message_id, c.created_at, c.updated_at, c.closed_at,
          e.name AS owner_name, e.slug AS owner_slug, g.title AS goal_title
@@ -337,11 +351,13 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
       duplicate.status === (input.status ?? "open") &&
       duplicate.due_at === due &&
       duplicate.linked_goal_id === (input.linkedGoalId ?? null)
+      && duplicate.project_id === (input.projectId ?? null)
     ) {
       return duplicate;
     }
     return updateCommitment(db, duplicate.id, {
       linkedGoalId: input.linkedGoalId,
+      projectId: input.projectId,
       status: input.status,
       dueAt: input.dueAt,
       confidence: input.confidence,
@@ -358,6 +374,7 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
         string,
         number,
         number | null,
+        number | null,
         CommitmentStatus,
         string | null,
         number,
@@ -367,14 +384,15 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
         string | null,
       ]>(
         `INSERT INTO commitment
-           (title, owner_entity_id, linked_goal_id, status, due_at, confidence,
+           (title, owner_entity_id, linked_goal_id, project_id, status, due_at, confidence,
             source_message_id, created_at, updated_at, closed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         title,
         ownerId,
         input.linkedGoalId ?? null,
+        input.projectId ?? null,
         status,
         normalizeDate(input.dueAt),
         clamp(input.confidence ?? 0.9),
@@ -394,6 +412,7 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
         title,
         owner_entity_id: ownerId,
         linked_goal_id: input.linkedGoalId ?? null,
+        project_id: input.projectId ?? null,
         due_at: normalizeDate(input.dueAt),
         confidence: clamp(input.confidence ?? 0.9),
       },
@@ -424,6 +443,7 @@ export function updateCommitment(
   const owner = update.ownerEntityId ?? existing.owner_entity_id;
   const linkedGoal =
     update.linkedGoalId === undefined ? existing.linked_goal_id : update.linkedGoalId;
+  const projectId = update.projectId === undefined ? existing.project_id : update.projectId;
   const confidence =
     update.confidence === undefined ? existing.confidence : clamp(update.confidence);
 
@@ -432,6 +452,7 @@ export function updateCommitment(
     title === existing.title &&
     owner === existing.owner_entity_id &&
     linkedGoal === existing.linked_goal_id &&
+    projectId === existing.project_id &&
     status === existing.status &&
     dueAt === existing.due_at &&
     snoozed === existing.snoozed_until &&
@@ -451,6 +472,7 @@ export function updateCommitment(
       string,
       number,
       number | null,
+      number | null,
       CommitmentStatus,
       string | null,
       string | null,
@@ -460,13 +482,14 @@ export function updateCommitment(
       number,
     ]>(
       `UPDATE commitment
-       SET title = ?, owner_entity_id = ?, linked_goal_id = ?, status = ?,
+       SET title = ?, owner_entity_id = ?, linked_goal_id = ?, project_id = ?, status = ?,
            due_at = ?, snoozed_until = ?, confidence = ?, updated_at = ?, closed_at = ?
        WHERE id = ?`,
     ).run(
       title,
       owner,
       linkedGoal,
+      projectId,
       status,
       dueAt,
       snoozed,
@@ -493,6 +516,7 @@ export function updateCommitment(
           title: existing.title,
           owner_entity_id: existing.owner_entity_id,
           linked_goal_id: existing.linked_goal_id,
+          project_id: existing.project_id,
           due_at: existing.due_at,
           snoozed_until: existing.snoozed_until,
           confidence: existing.confidence,
@@ -501,6 +525,7 @@ export function updateCommitment(
           title,
           owner_entity_id: owner,
           linked_goal_id: linkedGoal,
+          project_id: projectId,
           due_at: dueAt,
           snoozed_until: snoozed,
           confidence,
@@ -522,36 +547,6 @@ export function commitmentEvents(db: Db, commitmentId: number): CommitmentEvent[
        FROM commitment_event WHERE commitment_id = ? ORDER BY id`,
     )
     .all(commitmentId);
-}
-
-export function selectNudge(
-  db: Db,
-  query: string,
-  referenceTime: Date = new Date(),
-): CommitmentView | null {
-  const cooldown = referenceTime.getTime() - 7 * 24 * 60 * 60 * 1000;
-  const terms = tokens(query);
-
-  const scored = listCommitments(db, { limit: 500 })
-    .filter((item) => !item.snoozed_until || Date.parse(item.snoozed_until) <= referenceTime.getTime())
-    .filter((item) => !item.last_surfaced_at || Date.parse(item.last_surfaced_at) <= cooldown)
-    .map((item) => {
-      const due = item.due_at ? Date.parse(item.due_at) : null;
-      const overdue = due !== null && due <= referenceTime.getTime();
-      const dueSoon = due !== null && due <= referenceTime.getTime() + 7 * 24 * 60 * 60 * 1000;
-      let overlap = 0;
-      for (const term of tokens(`${item.title} ${item.goal_title ?? ""}`)) {
-        if (terms.has(term)) overlap += 1;
-      }
-      return {
-        item,
-        score: overlap * 10 + (overdue ? 100 : dueSoon && overlap > 0 ? 25 : 0),
-      };
-    })
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || a.item.id - b.item.id);
-
-  return scored[0]?.item ?? null;
 }
 
 export function markCommitmentSurfaced(db: Db, id: number): void {
@@ -620,31 +615,6 @@ function assertPassageMatchesSource(
   if (sourceMessageId === null || messageId !== sourceMessageId) {
     throw new Error(`Evidence passage ${passageId} does not match its intention source`);
   }
-}
-
-function tokens(value: string): Set<string> {
-  const stopwords = new Set([
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "what",
-    "when",
-    "where",
-    "about",
-    "from",
-    "have",
-    "need",
-  ]);
-  return new Set(
-    value
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
-      .split(/\s+/u)
-      .filter((term) => term.length > 2 && !stopwords.has(term)),
-  );
 }
 
 function normalizeDate(value: string | null | undefined): string | null {

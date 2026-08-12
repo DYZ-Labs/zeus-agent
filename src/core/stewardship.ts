@@ -9,8 +9,11 @@ import {
   markCommitmentSurfaced,
   updateCommitment,
 } from "./intentions";
+import { materializeBehavioralPolicySuggestions } from "./personalization";
 import type {
   CommitmentView,
+  EffectKind,
+  EvaluationContext,
   FollowThroughActionKind,
   FollowThroughEvent,
   FollowThroughEventType,
@@ -19,18 +22,39 @@ import type {
   FollowThroughRecommendation,
   FacetMachineEffect,
   Goal,
+  OpportunityDelivery,
+  OpportunityDeliveryChannel,
+  RecommendationCycle,
   StewardshipMode,
   StewardshipSetting,
+  StructuredFacetCondition,
+  TriggerKind,
+  Weekday,
 } from "./schema";
-import { FollowThroughRecommendation as FollowThroughRecommendationSchema } from "./schema";
+import {
+  EvaluationContext as EvaluationContextSchema,
+  FollowThroughRecommendation as FollowThroughRecommendationSchema,
+  StructuredFacetCondition as StructuredFacetConditionSchema,
+} from "./schema";
 
 const DAY = 24 * 60 * 60 * 1000;
+const LOCATION_FRESHNESS = 30 * 60 * 1000;
+export const STEWARDSHIP_POLICY_VERSION = "2";
+
+type ActiveStewardshipMode = Exclude<StewardshipMode, "off">;
 
 export type RecommendationOptions = {
-  referenceTime?: Date;
-  /** A deliberate visit to Today may ask for the best open step even when no interruption is due. */
-  force?: boolean;
   mode?: StewardshipMode;
+  trigger?: TriggerKind;
+  context?: EvaluationContext;
+};
+
+export type EvaluationContextInput = {
+  trigger: TriggerKind;
+  referenceTime?: Date;
+  timezone?: string;
+  locationZone?: string | null;
+  locationObservedAt?: string | null;
 };
 
 export type FollowThroughMetrics = {
@@ -43,6 +67,101 @@ export type FollowThroughMetrics = {
 };
 
 export type FollowThroughDecision = Exclude<FollowThroughEventType, "surfaced">;
+
+/** Build a self-consistent temporal context. Local fields are derived from the instant
+ * and IANA timezone so policy traces do not depend on the caller's locale settings. */
+export function createEvaluationContext(input: EvaluationContextInput): EvaluationContext {
+  const referenceTime = input.referenceTime ?? new Date();
+  if (!Number.isFinite(referenceTime.getTime())) {
+    throw new Error("Evaluation context requires a valid reference time");
+  }
+  const timezone = input.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
+  const local = localParts(referenceTime, timezone);
+  return EvaluationContextSchema.parse({
+    trigger: input.trigger,
+    evaluated_at: referenceTime.toISOString(),
+    timezone,
+    local_weekday: local.weekday,
+    local_time: local.time,
+    daypart: daypartFor(local.time),
+    location_zone: normalizeZone(input.locationZone),
+    location_observed_at: input.locationObservedAt ?? null,
+  });
+}
+
+/** Validate an externally supplied context and recalculate its derived local fields. */
+export function normalizeEvaluationContext(context: EvaluationContext): EvaluationContext {
+  const parsed = EvaluationContextSchema.parse(context);
+  return createEvaluationContext({
+    trigger: parsed.trigger,
+    referenceTime: new Date(parsed.evaluated_at),
+    timezone: parsed.timezone,
+    locationZone: parsed.location_zone,
+    locationObservedAt: parsed.location_observed_at,
+  });
+}
+
+function contextForOptions(options: RecommendationOptions): EvaluationContext {
+  if (options.context) return normalizeEvaluationContext(options.context);
+  return createEvaluationContext({
+    trigger: options.trigger ?? "chat",
+  });
+}
+
+function isExplicitTrigger(
+  trigger: TriggerKind,
+  query: string,
+): boolean {
+  if (trigger === "today" || trigger === "mcp") return true;
+  if (trigger === "worker") return false;
+  return explicitFollowThroughRequest(query);
+}
+
+function explicitFollowThroughRequest(query: string): boolean {
+  return /\b(?:what (?:should|can) i (?:do|work on|focus on)|what(?:'s| is) (?:my )?next (?:step|action)|what next|next action|help me (?:prioriti[sz]e|choose|decide|focus|follow through)|show me (?:my )?(?:priorities|commitments|to[ -]?dos?))\b/iu.test(
+    query,
+  );
+}
+
+function localParts(referenceTime: Date, timezone: string): { weekday: Weekday; time: string } {
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(referenceTime);
+  } catch {
+    throw new Error(`Invalid IANA timezone: ${timezone}`);
+  }
+  const weekdayPart = parts.find((part) => part.type === "weekday")?.value.toLowerCase();
+  const hour = parts.find((part) => part.type === "hour")?.value;
+  const minute = parts.find((part) => part.type === "minute")?.value;
+  const weekday = weekdayPart && isWeekday(weekdayPart) ? weekdayPart : null;
+  if (!weekday || !hour || !minute) {
+    throw new Error(`Could not derive local time for timezone: ${timezone}`);
+  }
+  return { weekday, time: `${hour}:${minute}` };
+}
+
+function isWeekday(value: string): value is Weekday {
+  return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"].includes(value);
+}
+
+function daypartFor(localTime: string): EvaluationContext["daypart"] {
+  const hour = Number(localTime.slice(0, 2));
+  if (hour < 5) return "overnight";
+  if (hour < 12) return "morning";
+  if (hour < 17) return "afternoon";
+  return "evening";
+}
+
+function normalizeZone(value: string | null | undefined): string | null {
+  const normalized = value?.replace(/\s+/gu, " ").trim().toLowerCase() ?? "";
+  return normalized || null;
+}
 
 export function getStewardshipSetting(db: Db): StewardshipSetting {
   const setting = db
@@ -78,24 +197,116 @@ export function recommendNextAction(
   query: string,
   options: RecommendationOptions = {},
 ): FollowThroughRecommendation | null {
-  const referenceTime = options.referenceTime ?? new Date();
+  return evaluateRecommendations(db, query, options).recommendation;
+}
+
+type CandidateScoreTrace = {
+  commitment_id: number;
+  score: number;
+  applied_facet_ids: number[];
+};
+
+type CandidateExclusionTrace = {
+  commitment_id: number;
+  reason:
+    | "off"
+    | "paused_goal"
+    | "snoozed"
+    | "dismissed"
+    | "cooldown"
+    | "facet_blocked"
+    | "closed"
+    | "query_closes_or_defers"
+    | "not_eligible";
+  applied_facet_ids?: number[];
+};
+
+type FacetConditionExclusionTrace = {
+  facet_id: number;
+  reason: "legacy_condition" | "invalid_condition" | "condition_not_met";
+};
+
+type RecommendationExclusionTrace =
+  | CandidateExclusionTrace
+  | FacetConditionExclusionTrace;
+
+type RecommendationEvaluation = {
+  context: EvaluationContext;
+  mode: StewardshipMode;
+  recommendation: FollowThroughRecommendation | null;
+  candidateScores: CandidateScoreTrace[];
+  exclusions: RecommendationExclusionTrace[];
+  appliedFacetIds: number[];
+};
+
+function evaluateRecommendations(
+  db: Db,
+  query: string,
+  options: RecommendationOptions = {},
+): RecommendationEvaluation {
+  const context = contextForOptions(options);
+  const referenceTime = new Date(context.evaluated_at);
   const mode = options.mode ?? getStewardshipSetting(db).mode;
-  const force = options.force ?? false;
+  const explicitlyRequested = isExplicitTrigger(context.trigger, query);
   const commitments = listCommitments(db, { limit: 500 });
   const goals = new Map(
     listGoals(db, { includeClosed: true, limit: 500 }).map((goal) => [goal.id, goal]),
   );
   const terms = tokens(query);
   const me = selfEntity(db);
-  const machineEffects = activeMachineEffects(db);
+  const machineEffectSelection = activeMachineEffects(db, context);
+  const machineEffects = machineEffectSelection.active;
+  const candidateScores: CandidateScoreTrace[] = [];
+  const exclusions: RecommendationExclusionTrace[] = [
+    ...machineEffectSelection.exclusions,
+  ];
+  const ranked: Array<{
+    recommendation: FollowThroughRecommendation;
+    appliedFacetIds: number[];
+  }> = [];
 
-  const ranked = commitments.flatMap((commitment): FollowThroughRecommendation[] => {
+  if (mode === "off" && !explicitlyRequested) {
+    for (const commitment of commitments) {
+      exclusions.push({ commitment_id: commitment.id, reason: "off" });
+    }
+    return {
+      context,
+      mode,
+      recommendation: null,
+      candidateScores,
+      exclusions,
+      appliedFacetIds: [],
+    };
+  }
+
+  const scoringMode: ActiveStewardshipMode = mode === "off" ? "balanced" : mode;
+  for (const commitment of commitments) {
     const goal = commitment.linked_goal_id === null ? null : goals.get(commitment.linked_goal_id) ?? null;
-    if (goal && goal.status !== "active") return [];
-    if (isSnoozed(commitment, referenceTime) || isDismissedWithoutChange(db, commitment)) return [];
-    if (!force && isCoolingDown(commitment, mode, referenceTime)) return [];
+    if (goal && goal.status !== "active") {
+      exclusions.push({ commitment_id: commitment.id, reason: "paused_goal" });
+      continue;
+    }
+    if (isSnoozed(commitment, referenceTime)) {
+      exclusions.push({ commitment_id: commitment.id, reason: "snoozed" });
+      continue;
+    }
+    if (isDismissedWithoutChange(db, commitment)) {
+      exclusions.push({ commitment_id: commitment.id, reason: "dismissed" });
+      continue;
+    }
+    if (!explicitlyRequested && isCoolingDown(commitment, scoringMode, referenceTime)) {
+      exclusions.push({ commitment_id: commitment.id, reason: "cooldown" });
+      continue;
+    }
     const policy = machineEffectFor(machineEffects, commitment, goal, query);
-    if (policy.blocked) return [];
+    if (policy.blocked) {
+      exclusions.push({
+        commitment_id: commitment.id,
+        reason: "facet_blocked",
+        applied_facet_ids: policy.appliedFacetIds,
+      });
+      continue;
+    }
 
     const recommendation = scoreRecommendation({
       commitment,
@@ -103,18 +314,185 @@ export function recommendNextAction(
       allCommitments: commitments,
       terms,
       query,
-      mode,
-      force,
+      mode: scoringMode,
+      explicitlyRequested,
       referenceTime,
       selfEntityId: me.id,
       machineEffectDelta: policy.scoreDelta,
     });
-    return recommendation ? [recommendation] : [];
-  });
+    if (!recommendation) {
+      exclusions.push({
+        commitment_id: commitment.id,
+        reason:
+          overlapCount(terms, `${commitment.title} ${goal?.title ?? ""}`) > 0 &&
+          queryClosesOrDefers(query)
+            ? "query_closes_or_defers"
+            : commitment.status !== "open" && commitment.status !== "waiting"
+              ? "closed"
+              : "not_eligible",
+      });
+      continue;
+    }
+    candidateScores.push({
+      commitment_id: commitment.id,
+      score: recommendation.score,
+      applied_facet_ids: policy.appliedFacetIds,
+    });
+    ranked.push({ recommendation, appliedFacetIds: policy.appliedFacetIds });
+  }
 
-  return ranked.sort(
-    (a, b) => b.score - a.score || a.commitment_id - b.commitment_id,
-  )[0] ?? null;
+  ranked.sort(
+    (a, b) =>
+      b.recommendation.score - a.recommendation.score ||
+      a.recommendation.commitment_id - b.recommendation.commitment_id,
+  );
+  candidateScores.sort((a, b) => b.score - a.score || a.commitment_id - b.commitment_id);
+  const selected = ranked[0] ?? null;
+  return {
+    context,
+    mode,
+    recommendation: selected?.recommendation ?? null,
+    candidateScores,
+    exclusions,
+    appliedFacetIds: selected?.appliedFacetIds ?? [],
+  };
+}
+
+/** Evaluate and persist a complete deterministic trace. The returned cycle id is the
+ * durable opportunity id shared by every eventual delivery channel. */
+export function evaluateOpportunity(
+  db: Db,
+  context: EvaluationContext,
+  query = "",
+  options: { mode?: StewardshipMode; sourceMessageId?: number | null } = {},
+): RecommendationCycle {
+  const sourceMessageId = options.sourceMessageId ?? null;
+  if (sourceMessageId !== null) assertMessageRole(db, sourceMessageId, "user");
+  const evaluation = evaluateRecommendations(db, query, {
+    context,
+    mode: options.mode,
+  });
+  const createdAt = now();
+  const inserted = db
+    .prepare<[
+      string,
+      TriggerKind,
+      string,
+      string,
+      string,
+      string,
+      string,
+      number | null,
+      string | null,
+      number | null,
+      string,
+    ]>(
+      `INSERT INTO recommendation_cycle
+         (policy_version, trigger, context_json, query_text, candidate_scores_json,
+          applied_facet_ids_json, exclusions_json, selected_commitment_id,
+          recommendation_json, source_message_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      STEWARDSHIP_POLICY_VERSION,
+      evaluation.context.trigger,
+      JSON.stringify({
+        ...evaluation.context,
+        stewardship_mode: evaluation.mode,
+        explicitly_requested: isExplicitTrigger(
+          evaluation.context.trigger,
+          query,
+        ),
+      }),
+      query,
+      JSON.stringify(evaluation.candidateScores),
+      JSON.stringify(evaluation.appliedFacetIds),
+      JSON.stringify(evaluation.exclusions),
+      evaluation.recommendation?.commitment_id ?? null,
+      evaluation.recommendation ? JSON.stringify(evaluation.recommendation) : null,
+      sourceMessageId,
+      createdAt,
+    );
+  return getRecommendationCycle(db, Number(inserted.lastInsertRowid))!;
+}
+
+export function getRecommendationCycle(db: Db, id: number): RecommendationCycle | null {
+  return db
+    .prepare<[number], RecommendationCycle>(
+      `SELECT id, policy_version, trigger, context_json, query_text,
+              candidate_scores_json, applied_facet_ids_json, exclusions_json,
+              selected_commitment_id, recommendation_json, source_message_id, created_at
+       FROM recommendation_cycle WHERE id = ?`,
+    )
+    .get(id) ?? null;
+}
+
+export function recommendationForOpportunity(
+  db: Db,
+  opportunityId: number,
+): FollowThroughRecommendation | null {
+  const cycle = getRecommendationCycle(db, opportunityId);
+  if (!cycle?.recommendation_json) return null;
+  return parseRecommendationValue(safelyParseJson(cycle.recommendation_json));
+}
+
+export function listOpportunityDeliveries(
+  db: Db,
+  opportunityId: number,
+): OpportunityDelivery[] {
+  return db
+    .prepare<[number], OpportunityDelivery>(
+      `SELECT id, opportunity_id, channel, response_message_id, delivered_at
+       FROM opportunity_delivery WHERE opportunity_id = ? ORDER BY id`,
+    )
+    .all(opportunityId);
+}
+
+/** Record only a successful channel delivery. Replays are idempotent per channel, and
+ * the first successful channel alone emits the surfaced event/cooldown mutation. */
+export function markOpportunityDelivered(
+  db: Db,
+  opportunityId: number,
+  channel: OpportunityDeliveryChannel,
+  responseMessageId: number | null = null,
+): OpportunityDelivery | null {
+  if (responseMessageId !== null) assertMessageRole(db, responseMessageId, "assistant");
+  const recommendation = recommendationForOpportunity(db, opportunityId);
+  if (!recommendation) return null;
+
+  return db.transaction(() => {
+    db.prepare<[number, OpportunityDeliveryChannel, number | null, string]>(
+      `INSERT OR IGNORE INTO opportunity_delivery
+         (opportunity_id, channel, response_message_id, delivered_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(opportunityId, channel, responseMessageId, now());
+    const delivery = db
+      .prepare<[number, OpportunityDeliveryChannel], OpportunityDelivery>(
+        `SELECT id, opportunity_id, channel, response_message_id, delivered_at
+         FROM opportunity_delivery WHERE opportunity_id = ? AND channel = ?`,
+      )
+      .get(opportunityId, channel);
+    if (!delivery) throw new Error("Opportunity delivery vanished immediately after insert");
+
+    const surfaced = db
+      .prepare<[number], { found: number }>(
+        `SELECT 1 AS found FROM follow_through_event
+         WHERE opportunity_id = ? AND event_type = 'surfaced' LIMIT 1`,
+      )
+      .get(opportunityId);
+    if (!surfaced) {
+      markCommitmentSurfaced(db, recommendation.commitment_id);
+      insertEvent(db, {
+        recommendation,
+        eventType: "surfaced",
+        responseMessageId,
+        opportunityId,
+        sourceMessageId: null,
+        sourceKind: "system",
+      });
+    }
+    return delivery;
+  })();
 }
 
 /** Rebuild a recommendation for an explicit user action on a known commitment. */
@@ -127,38 +505,27 @@ export function recommendationForCommitment(
   const commitment = getCommitment(db, commitmentId);
   if (!commitment) return null;
   const goal = commitment.linked_goal_id === null ? null : getGoal(db, commitment.linked_goal_id);
-  const policy = machineEffectFor(activeMachineEffects(db), commitment, goal, query);
+  const context = createEvaluationContext({ trigger: "today", referenceTime });
+  const policy = machineEffectFor(
+    activeMachineEffects(db, context).active,
+    commitment,
+    goal,
+    query,
+  );
   if (policy.blocked) return null;
+  const configuredMode = getStewardshipSetting(db).mode;
   return scoreRecommendation({
     commitment,
     goal,
     allCommitments: listCommitments(db, { includeClosed: true, limit: 500 }),
     terms: tokens(query),
     query,
-    mode: getStewardshipSetting(db).mode,
-    force: true,
+    mode: configuredMode === "off" ? "balanced" : configuredMode,
+    explicitlyRequested: true,
     referenceTime,
     selfEntityId: selfEntity(db).id,
     machineEffectDelta: policy.scoreDelta,
   });
-}
-
-export function markRecommendationSurfaced(
-  db: Db,
-  recommendation: FollowThroughRecommendation,
-  responseMessageId: number | null,
-): FollowThroughEvent {
-  if (responseMessageId !== null) assertMessageRole(db, responseMessageId, "assistant");
-  return db.transaction(() => {
-    markCommitmentSurfaced(db, recommendation.commitment_id);
-    return insertEvent(db, {
-      recommendation,
-      eventType: "surfaced",
-      responseMessageId,
-      sourceMessageId: null,
-      sourceKind: "system",
-    });
-  })();
 }
 
 export function recordFollowThroughDecision(
@@ -192,7 +559,7 @@ export function recordFollowThroughDecision(
     input.sourceMessageId ?? null,
   );
 
-  return db.transaction(() => {
+  const event = db.transaction(() => {
     let snoozedUntil: string | null = null;
     if (input.decision === "snoozed") {
       snoozedUntil = normalizeFutureDate(input.snoozedUntil) ??
@@ -226,6 +593,11 @@ export function recordFollowThroughDecision(
           : null,
     });
   })();
+  // Only the explicit decision just persisted can contribute here. The aggregator
+  // deliberately excludes surfaced events and silence, and materialization never
+  // creates canonical memory or activates a policy.
+  materializeBehavioralPolicySuggestions(db);
+  return event;
 }
 
 function sourceKindForUserMessage(
@@ -246,12 +618,15 @@ function validatedRecommendationResponse(
 ): number | null {
   if (responseMessageId === null) return null;
   const found = db
-    .prepare<[number, number], { found: number }>(
-      `SELECT 1 AS found FROM follow_through_event
-       WHERE commitment_id = ? AND response_message_id = ? AND event_type = 'surfaced'
+    .prepare<[number, number, number], { found: number }>(
+      `SELECT 1 AS found
+       FROM follow_through_event e
+       LEFT JOIN opportunity_delivery d ON d.opportunity_id = e.opportunity_id
+       WHERE e.commitment_id = ? AND e.event_type = 'surfaced'
+         AND (e.response_message_id = ? OR d.response_message_id = ?)
        LIMIT 1`,
     )
-    .get(commitmentId, responseMessageId);
+    .get(commitmentId, responseMessageId, responseMessageId);
   return found ? responseMessageId : null;
 }
 
@@ -259,7 +634,8 @@ export function listFollowThroughEvents(db: Db, limit = 100): FollowThroughEvent
   return db
     .prepare<[number], FollowThroughEventView>(
       `SELECT e.id, e.commitment_id, e.goal_id, e.event_type, e.reason,
-              e.action_kind, e.detail_json, e.response_message_id,
+              e.action_kind, e.effect_kind, e.detail_json, e.response_message_id,
+              e.opportunity_id,
               e.source_message_id, e.source_kind, e.created_at,
               c.title AS commitment_title, g.title AS goal_title
        FROM follow_through_event e
@@ -276,12 +652,15 @@ export function recommendationsForResponse(
   responseMessageId: number,
 ): FollowThroughRecommendation[] {
   const rows = db
-    .prepare<[number], { detail_json: string | null }>(
-      `SELECT detail_json FROM follow_through_event
-       WHERE response_message_id = ? AND event_type = 'surfaced'
-       ORDER BY id`,
+    .prepare<[number, number], { detail_json: string | null }>(
+      `SELECT DISTINCT e.id, e.detail_json
+       FROM follow_through_event e
+       LEFT JOIN opportunity_delivery d ON d.opportunity_id = e.opportunity_id
+       WHERE e.event_type = 'surfaced'
+         AND (e.response_message_id = ? OR d.response_message_id = ?)
+       ORDER BY e.id`,
     )
-    .all(responseMessageId);
+    .all(responseMessageId, responseMessageId);
   return rows.flatMap((row) => parseRecommendation(row.detail_json));
 }
 
@@ -325,24 +704,136 @@ export function followThroughMetrics(db: Db): FollowThroughMetrics {
 }
 
 type ActiveMachineEffect = {
+  id: number;
   machine_effect: FacetMachineEffect;
   scope_kind: "global" | "domain" | "entity" | "goal" | "commitment";
   scope_label: string | null;
   scope_entity_id: number | null;
   scope_goal_id: number | null;
   scope_commitment_id: number | null;
+  condition_text: string | null;
+  condition_json: string | null;
 };
 
-function activeMachineEffects(db: Db): ActiveMachineEffect[] {
-  return db
+function activeMachineEffects(
+  db: Db,
+  context: EvaluationContext,
+): { active: ActiveMachineEffect[]; exclusions: FacetConditionExclusionTrace[] } {
+  const rows = db
     .prepare<[], ActiveMachineEffect>(
-      `SELECT machine_effect, scope_kind, scope_label, scope_entity_id,
-              scope_goal_id, scope_commitment_id
+      `SELECT id, machine_effect, scope_kind, scope_label, scope_entity_id,
+              scope_goal_id, scope_commitment_id, condition_text, condition_json
        FROM understanding_facet
        WHERE valid_to IS NULL AND machine_effect IS NOT NULL
        ORDER BY id`,
     )
     .all();
+  const active: ActiveMachineEffect[] = [];
+  const exclusions: FacetConditionExclusionTrace[] = [];
+  for (const row of rows) {
+    const condition = parseMachineCondition(row);
+    if (condition.kind === "unconditional") {
+      active.push(row);
+      continue;
+    }
+    if (condition.kind === "legacy") {
+      exclusions.push({ facet_id: row.id, reason: "legacy_condition" });
+      continue;
+    }
+    if (condition.kind === "invalid") {
+      exclusions.push({ facet_id: row.id, reason: "invalid_condition" });
+      continue;
+    }
+    if (structuredFacetConditionMatches(condition.value, context)) {
+      active.push(row);
+    } else {
+      exclusions.push({ facet_id: row.id, reason: "condition_not_met" });
+    }
+  }
+  return { active, exclusions };
+}
+
+function parseMachineCondition(
+  effect: Pick<ActiveMachineEffect, "condition_text" | "condition_json">,
+):
+  | { kind: "unconditional" }
+  | { kind: "legacy" }
+  | { kind: "invalid" }
+  | { kind: "structured"; value: StructuredFacetCondition } {
+  if (effect.condition_json === null) {
+    return effect.condition_text === null ? { kind: "unconditional" } : { kind: "legacy" };
+  }
+  try {
+    const parsed = StructuredFacetConditionSchema.safeParse(JSON.parse(effect.condition_json));
+    return parsed.success
+      ? { kind: "structured", value: parsed.data }
+      : { kind: "invalid" };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
+/** Shared deterministic evaluator for typed facet conditions. Descriptive recall and
+ * machine policy must agree about when a contextual preference is active. */
+export function structuredFacetConditionMatches(
+  condition: StructuredFacetCondition,
+  context: EvaluationContext,
+): boolean {
+  const evaluatedAt = Date.parse(context.evaluated_at);
+  if (
+    condition.expires_at !== undefined &&
+    evaluatedAt >= Date.parse(condition.expires_at)
+  ) {
+    return false;
+  }
+
+  if (condition.zones !== undefined) {
+    const location = freshLocationZone(context);
+    const allowed = new Set(condition.zones.map((zone) => normalizeZone(zone)));
+    if (location === null || !allowed.has(location)) return false;
+  }
+
+  const minute = clockMinute(context.local_time);
+  if (condition.local_time !== undefined) {
+    const start = clockMinute(condition.local_time.start);
+    const end = clockMinute(condition.local_time.end);
+    const inWindow = start < end
+      ? minute >= start && minute < end
+      : minute >= start || minute < end;
+    if (!inWindow) return false;
+    if (condition.weekdays !== undefined) {
+      const effectiveWeekday = start > end && minute < end
+        ? previousWeekday(context.local_weekday)
+        : context.local_weekday;
+      if (!condition.weekdays.includes(effectiveWeekday)) return false;
+    }
+  } else if (
+    condition.weekdays !== undefined &&
+    !condition.weekdays.includes(context.local_weekday)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function freshLocationZone(context: EvaluationContext): string | null {
+  if (context.location_zone === null || context.location_observed_at === null) return null;
+  const evaluatedAt = Date.parse(context.evaluated_at);
+  const observedAt = Date.parse(context.location_observed_at);
+  const age = evaluatedAt - observedAt;
+  if (!Number.isFinite(age) || age < 0 || age > LOCATION_FRESHNESS) return null;
+  return normalizeZone(context.location_zone);
+}
+
+function clockMinute(value: string): number {
+  return Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
+}
+
+function previousWeekday(value: Weekday): Weekday {
+  const days: readonly Weekday[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+  const index = days.indexOf(value);
+  return days[(index + days.length - 1) % days.length]!;
 }
 
 function machineEffectFor(
@@ -350,11 +841,12 @@ function machineEffectFor(
   commitment: CommitmentView,
   goal: Goal | null,
   query: string,
-): { blocked: boolean; scoreDelta: number } {
+): { blocked: boolean; scoreDelta: number; appliedFacetIds: number[] } {
   const targetTerms = tokens(
     `${query} ${commitment.title} ${goal?.title ?? ""}`,
   );
   let scoreDelta = 0;
+  const appliedFacetIds: number[] = [];
   for (const effect of effects) {
     const applies =
       effect.scope_kind === "global" ||
@@ -366,10 +858,17 @@ function machineEffectFor(
       (effect.scope_kind === "domain" &&
         [...tokens(effect.scope_label ?? "")].some((term) => targetTerms.has(term)));
     if (!applies) continue;
-    if (effect.machine_effect === "block") return { blocked: true, scoreDelta: 0 };
+    appliedFacetIds.push(effect.id);
+    if (effect.machine_effect === "block") {
+      return { blocked: true, scoreDelta: 0, appliedFacetIds };
+    }
     scoreDelta += effect.machine_effect === "boost" ? 40 : -40;
   }
-  return { blocked: false, scoreDelta: Math.max(-80, Math.min(80, scoreDelta)) };
+  return {
+    blocked: false,
+    scoreDelta: Math.max(-80, Math.min(80, scoreDelta)),
+    appliedFacetIds,
+  };
 }
 
 type ScoreInput = {
@@ -378,8 +877,8 @@ type ScoreInput = {
   allCommitments: readonly CommitmentView[];
   terms: Set<string>;
   query: string;
-  mode: StewardshipMode;
-  force: boolean;
+  mode: ActiveStewardshipMode;
+  explicitlyRequested: boolean;
   referenceTime: Date;
   selfEntityId: number;
   machineEffectDelta: number;
@@ -415,7 +914,7 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
   const conflict = conflictCount > 0;
 
   const severelyOverdue = daysToDue !== null && daysToDue <= -3;
-  const eligible = input.force ||
+  const eligible = input.explicitlyRequested ||
     (input.mode === "quiet"
       ? overlap > 0 || severelyOverdue
       : overlap > 0 || overdue || dueSoon || conflict || stale || (waiting && ageDays >= 14));
@@ -449,6 +948,7 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
               ? "stale"
               : "priority";
   const actionKind = actionKindFor(commitment);
+  const effectKind = effectKindFor(commitment, actionKind);
   const why = rationale({
     commitment,
     goal,
@@ -459,10 +959,8 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
     daysToDue,
     usedGoalDate: commitmentDue === null && goalDue !== null,
   });
-  const suggestedAction = actionFor(actionKind, commitment.title);
-  const requiresConfirmation = ["draft", "schedule", "remind", "coordinate"].includes(
-    actionKind,
-  );
+  const suggestedAction = actionFor(actionKind, effectKind, commitment.title);
+  const requiresConfirmation = requiresEffectConfirmation(effectKind);
   const chatPrompt = [
     `Help me follow through on “${commitment.title}”.`,
     suggestedAction,
@@ -482,6 +980,7 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
     due_at: commitment.due_at,
     reason,
     action_kind: actionKind,
+    effect_kind: effectKind,
     why,
     suggested_action: suggestedAction,
     chat_prompt: chatPrompt,
@@ -547,7 +1046,53 @@ function actionKindFor(commitment: CommitmentView): FollowThroughActionKind {
   return "plan";
 }
 
-function actionFor(kind: FollowThroughActionKind, title: string): string {
+function effectKindFor(
+  commitment: CommitmentView,
+  actionKind: FollowThroughActionKind,
+): EffectKind {
+  const title = commitment.title.toLowerCase();
+  if (
+    /\b(?:buy|purchase|order|pay|checkout|subscribe|renew|book (?:a |an |the )?(?:flight|hotel|table|ticket)|reserve (?:a |an |the )?(?:room|table|ticket))\b/u.test(
+      title,
+    )
+  ) {
+    return "purchase";
+  }
+  if (/\b(?:publish|post|upload|submit|deploy|delete|remove|cancel|unsubscribe|register|enroll|apply|sign[ -]?up|rsvp|vote|transfer|change (?:an? |the )?(?:account|setting|subscription))\b/u.test(title)) {
+    return "modify_external";
+  }
+  if (actionKind === "schedule" || actionKind === "remind") return "schedule";
+  if (
+    commitment.status === "waiting" ||
+    commitment.owner_slug !== "self" ||
+    /\b(?:send|email|message|reply|text|call|ask|contact|coordinate|follow up|follow-up)\b/u.test(
+      title,
+    )
+  ) {
+    return "send";
+  }
+  if (actionKind === "research") return "web_read";
+  if (/\b(?:remember|recall|review (?:my )?(?:memory|history|notes?))\b/u.test(title)) {
+    return "memory_read";
+  }
+  return "prepare_local";
+}
+
+function requiresEffectConfirmation(effectKind: EffectKind): boolean {
+  return !["memory_read", "web_read", "prepare_local"].includes(effectKind);
+}
+
+function actionFor(
+  kind: FollowThroughActionKind,
+  effectKind: EffectKind,
+  title: string,
+): string {
+  if (effectKind === "purchase") {
+    return `Compare options for “${title}” and stop before any booking, order, or payment.`;
+  }
+  if (effectKind === "modify_external") {
+    return `Prepare and review the exact change for “${title}” without applying it externally.`;
+  }
   if (kind === "draft") return `Prepare a draft for “${title}” and review it before anything is sent.`;
   if (kind === "schedule") return `Find a workable time for “${title}” and confirm before changing any calendar.`;
   if (kind === "research") return `Research “${title}” and return a short, decision-ready shortlist.`;
@@ -564,6 +1109,7 @@ function insertEvent(
     responseMessageId: number | null;
     sourceMessageId: number | null;
     sourceKind: FollowThroughEvent["source_kind"];
+    opportunityId?: number | null;
     extraDetail?: unknown;
   },
 ): FollowThroughEvent {
@@ -580,16 +1126,19 @@ function insertEvent(
       FollowThroughEventType,
       FollowThroughReason,
       FollowThroughActionKind,
+      EffectKind,
       string,
+      number | null,
       number | null,
       number | null,
       FollowThroughEvent["source_kind"],
       string,
     ]>(
       `INSERT INTO follow_through_event
-         (commitment_id, goal_id, event_type, reason, action_kind, detail_json,
-          response_message_id, source_message_id, source_kind, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (commitment_id, goal_id, event_type, reason, action_kind, effect_kind,
+          detail_json, response_message_id, opportunity_id, source_message_id,
+          source_kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.recommendation.commitment_id,
@@ -597,8 +1146,10 @@ function insertEvent(
       input.eventType,
       input.recommendation.reason,
       input.recommendation.action_kind,
+      input.recommendation.effect_kind,
       JSON.stringify(detail),
       input.responseMessageId,
+      input.opportunityId ?? null,
       input.sourceMessageId,
       input.sourceKind,
       now(),
@@ -606,7 +1157,8 @@ function insertEvent(
   const event = db
     .prepare<[number], FollowThroughEvent>(
       `SELECT id, commitment_id, goal_id, event_type, reason, action_kind,
-              detail_json, response_message_id, source_message_id, source_kind, created_at
+              effect_kind, detail_json, response_message_id, opportunity_id,
+              source_message_id, source_kind, created_at
        FROM follow_through_event WHERE id = ?`,
     )
     .get(Number(inserted.lastInsertRowid));
@@ -632,11 +1184,37 @@ function parseRecommendation(detailJson: string | null): FollowThroughRecommenda
   if (!detailJson) return [];
   try {
     const detail = JSON.parse(detailJson) as { recommendation?: unknown };
-    const parsed = FollowThroughRecommendationSchema.safeParse(detail.recommendation);
-    return parsed.success ? [parsed.data] : [];
+    const recommendation = parseRecommendationValue(detail.recommendation);
+    return recommendation ? [recommendation] : [];
   } catch {
     return [];
   }
+}
+
+function parseRecommendationValue(value: unknown): FollowThroughRecommendation | null {
+  const parsed = FollowThroughRecommendationSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  if (!value || typeof value !== "object" || !("action_kind" in value)) return null;
+  const legacy = value as Record<string, unknown>;
+  const actionKind = legacy.action_kind;
+  const effectKind: EffectKind | null = actionKind === "research"
+    ? "web_read"
+    : actionKind === "schedule"
+      ? "schedule"
+      : actionKind === "remind"
+        ? "modify_external"
+        : actionKind === "coordinate" || actionKind === "draft"
+          ? "send"
+          : actionKind === "plan"
+            ? "prepare_local"
+            : null;
+  if (effectKind === null) return null;
+  const upgraded = FollowThroughRecommendationSchema.safeParse({
+    ...legacy,
+    effect_kind: effectKind,
+    requires_confirmation: requiresEffectConfirmation(effectKind),
+  });
+  return upgraded.success ? upgraded.data : null;
 }
 
 function isSnoozed(commitment: CommitmentView, referenceTime: Date): boolean {
@@ -647,7 +1225,7 @@ function isSnoozed(commitment: CommitmentView, referenceTime: Date): boolean {
 
 function isCoolingDown(
   commitment: CommitmentView,
-  mode: StewardshipMode,
+  mode: ActiveStewardshipMode,
   referenceTime: Date,
 ): boolean {
   if (!commitment.last_surfaced_at) return false;
@@ -727,6 +1305,14 @@ function normalizeFutureDate(value: string | null | undefined): string | null {
 function normalizeUserReason(value: string | null | undefined): string | null {
   const normalized = value?.replace(/\s+/gu, " ").trim().slice(0, 500) ?? "";
   return normalized || null;
+}
+
+function safelyParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
 }
 
 function assertMessageRole(db: Db, messageId: number, role: "user" | "assistant"): void {

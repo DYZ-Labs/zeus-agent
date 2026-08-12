@@ -14,7 +14,11 @@ vi.mock("@/server/auth/supabase", () => ({
   createSupabaseServerClient: vi.fn(),
 }));
 
-import { authorizeSupabaseUser, getOwnerAccess } from "./access";
+import {
+  authorizeSupabaseUser,
+  getBrowserOwnerAccess,
+  getOwnerAccess,
+} from "./access";
 import { getAuthConfiguration } from "./config";
 import { safeNextPath } from "./paths";
 
@@ -128,6 +132,44 @@ describe("auth downgrade protection", () => {
 
     expect(access.canAccessPrivateData).toBe(false);
     expect(access.db).toBeNull();
+  });
+});
+
+describe("browser access boundary", () => {
+  it("rejects a hostile local browser origin before opening the owner store", async () => {
+    const request = new Request("http://attacker.example/api/chat", {
+      method: "POST",
+      headers: {
+        host: "attacker.example",
+        origin: "http://attacker.example",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+
+    const access = await getBrowserOwnerAccess(request, "private-mutation");
+
+    expect(access).toMatchObject({
+      state: "forbidden_origin",
+      canAccessPrivateData: false,
+      db: null,
+    });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("preserves a fail-closed configuration error ahead of origin details", async () => {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+    process.env.NEXT_PUBLIC_SITE_URL = "not-an-origin";
+    const access = await getBrowserOwnerAccess(
+      new Request("http://attacker.example/api/chat", { method: "POST" }),
+      "private-mutation",
+    );
+
+    expect(access).toMatchObject({
+      state: "misconfigured",
+      canAccessPrivateData: false,
+      db: null,
+    });
+    expect(mocks.getDb).not.toHaveBeenCalled();
   });
 });
 

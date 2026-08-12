@@ -17,11 +17,16 @@ import {
 import { deleteConversationWithMemory } from "./retention";
 import { MIGRATIONS } from "./migrations";
 import { allowWholeMessagePassage } from "./passages";
-import { recalledForResponse } from "./response-context";
+import { listBehavioralPolicySuggestions } from "./personalization";
 import {
+  createEvaluationContext,
+  evaluateOpportunity,
   followThroughMetrics,
+  getRecommendationCycle,
   listFollowThroughEvents,
-  markRecommendationSurfaced,
+  listOpportunityDeliveries,
+  markOpportunityDelivered,
+  recommendationForOpportunity,
   recommendationsForResponse,
   recommendNextAction,
   recordFollowThroughDecision,
@@ -36,6 +41,26 @@ afterEach(() => {
 function source(db: ReturnType<typeof openTestDb>, content = "This matters to me.") {
   const conversation = createConversation(db);
   return appendMessage(db, conversation.id, "user", content);
+}
+
+function explicitContext(referenceTime: Date = new Date()) {
+  return createEvaluationContext({ trigger: "today", timezone: "UTC", referenceTime });
+}
+
+function surfaceNext(
+  db: ReturnType<typeof openTestDb>,
+  responseMessageId: number | null = null,
+) {
+  const cycle = evaluateOpportunity(db, explicitContext());
+  const recommendation = recommendationForOpportunity(db, cycle.id);
+  if (!recommendation) throw new Error("Expected a recommendation to surface");
+  markOpportunityDelivered(
+    db,
+    cycle.id,
+    responseMessageId === null ? "today" : "chat",
+    responseMessageId,
+  );
+  return recommendation;
 }
 
 describe("follow-through selection", () => {
@@ -59,7 +84,7 @@ describe("follow-through selection", () => {
       sourceMessageId: message.id,
       passageIds: [evidence.id],
     });
-    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(first.id);
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_id).toBe(first.id);
 
     recordFacet(db, {
       kind: "decision_criterion",
@@ -69,7 +94,7 @@ describe("follow-through selection", () => {
       sourceMessageId: message.id,
       passageIds: [evidence.id],
     });
-    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(second.id);
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_id).toBe(second.id);
 
     recordFacet(db, {
       kind: "boundary",
@@ -79,7 +104,7 @@ describe("follow-through selection", () => {
       sourceMessageId: message.id,
       passageIds: [evidence.id],
     });
-    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(first.id);
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_id).toBe(first.id);
   });
 
   it("uses explicit goal priority and suppresses commitments linked to paused goals", () => {
@@ -106,9 +131,9 @@ describe("follow-through selection", () => {
       sourceMessageId: message.id,
     });
 
-    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(call.id);
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_id).toBe(call.id);
     updateGoal(db, high.id, { status: "paused", sourceKind: "user_action" });
-    expect(recommendNextAction(db, "", { force: true })?.commitment_title).toBe(
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_title).toBe(
       "Sort old receipts",
     );
   });
@@ -145,8 +170,9 @@ describe("follow-through selection", () => {
       title: "Schedule Maya's birthday dinner",
       sourceMessageId: message.id,
     });
-    const schedule = recommendNextAction(db, "", { force: true });
+    const schedule = recommendNextAction(db, "", { context: explicitContext() });
     expect(schedule?.action_kind).toBe("schedule");
+    expect(schedule?.effect_kind).toBe("schedule");
     expect(schedule?.requires_confirmation).toBe(true);
     expect(schedule?.suggested_action).toMatch(/confirm before changing any calendar/u);
 
@@ -154,10 +180,36 @@ describe("follow-through selection", () => {
       title: "Research pottery gifts",
       sourceKind: "user_action",
     });
-    const research = recommendNextAction(db, "", { force: true });
+    const research = recommendNextAction(db, "", { context: explicitContext() });
     expect(research?.action_kind).toBe("research");
+    expect(research?.effect_kind).toBe("web_read");
     expect(research?.requires_confirmation).toBe(false);
     expect(research?.chat_prompt).toMatch(/do not send, schedule, purchase/u);
+
+    updateCommitment(db, research!.commitment_id, {
+      title: "Buy pottery gifts",
+      sourceKind: "user_action",
+    });
+    const purchase = recommendNextAction(db, "", { context: explicitContext() });
+    expect(purchase?.effect_kind).toBe("purchase");
+    expect(purchase?.requires_confirmation).toBe(true);
+    expect(purchase?.suggested_action).toMatch(/stop before any booking, order, or payment/u);
+
+    updateCommitment(db, purchase!.commitment_id, {
+      title: "Delete the event listing",
+      sourceKind: "user_action",
+    });
+    const externalChange = recommendNextAction(db, "", { context: explicitContext() });
+    expect(externalChange?.effect_kind).toBe("modify_external");
+    expect(externalChange?.requires_confirmation).toBe(true);
+
+    updateCommitment(db, externalChange!.commitment_id, {
+      title: "Register for the conference",
+      sourceKind: "user_action",
+    });
+    const registration = recommendNextAction(db, "", { context: explicitContext() });
+    expect(registration?.effect_kind).toBe("modify_external");
+    expect(registration?.requires_confirmation).toBe(true);
   });
 
   it("does not recommend an item in the turn where the user closes or defers it", () => {
@@ -173,9 +225,206 @@ describe("follow-through selection", () => {
     expect(recommendNextAction(db, "Not now on the case study")).toBeNull();
     expect(recommendNextAction(db, "Help me finish the case study")).not.toBeNull();
   });
+
+  it("keeps off mode silent except for explicit user-invoked triggers", () => {
+    const db = openTestDb();
+    const message = source(db, "I need to write a launch brief.");
+    const commitment = createCommitment(db, {
+      title: "Write the launch brief",
+      sourceMessageId: message.id,
+    });
+    setStewardshipMode(db, "off");
+
+    expect(recommendNextAction(db, "launch brief")).toBeNull();
+    expect(recommendNextAction(db, "What should I focus on?")?.commitment_id).toBe(
+      commitment.id,
+    );
+    expect(
+      recommendNextAction(db, "", {
+        context: createEvaluationContext({ trigger: "today", timezone: "UTC" }),
+      })?.commitment_id,
+    ).toBe(commitment.id);
+    expect(
+      recommendNextAction(db, "", {
+        context: createEvaluationContext({ trigger: "mcp", timezone: "UTC" }),
+      })?.commitment_id,
+    ).toBe(commitment.id);
+    expect(
+      recommendNextAction(db, "What should I focus on?", {
+        context: createEvaluationContext({ trigger: "worker", timezone: "UTC" }),
+      }),
+    ).toBeNull();
+  });
+
+  it("applies structured conditions with overnight weekdays and fresh coarse zones", () => {
+    const db = openTestDb();
+    const message = source(db, "I need to write the brief and prepare the demo.");
+    const first = createCommitment(db, {
+      title: "Write the brief",
+      sourceMessageId: message.id,
+    });
+    const second = createCommitment(db, {
+      title: "Prepare the demo",
+      sourceMessageId: message.id,
+    });
+    const evidence = allowWholeMessagePassage(db, message.id);
+    const facet = recordFacet(db, {
+      kind: "decision_criterion",
+      statement: "Prioritize the demo late on Monday when I am at home",
+      scope: { kind: "commitment", commitmentId: second.id },
+      condition: "late on Monday at home",
+      machineEffect: "boost",
+      sourceMessageId: message.id,
+      passageIds: [evidence.id],
+    });
+    db.prepare<[string, number]>(
+      "UPDATE understanding_facet SET condition_json = ? WHERE id = ?",
+    ).run(
+      JSON.stringify({
+        weekdays: ["mon"],
+        local_time: { start: "22:00", end: "02:00" },
+        zones: ["Home"],
+        expires_at: "2030-01-01T00:00:00.000Z",
+      }),
+      facet.id,
+    );
+
+    const mondayNight = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2024-01-01T17:00:00.000Z"),
+      timezone: "Asia/Singapore",
+      locationZone: " home ",
+      locationObservedAt: "2024-01-01T16:50:00.000Z",
+    });
+    expect(mondayNight.local_weekday).toBe("tue");
+    expect(mondayNight.local_time).toBe("01:00");
+    expect(recommendNextAction(db, "", { context: mondayNight })?.commitment_id).toBe(
+      second.id,
+    );
+
+    const afterWindow = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2024-01-01T19:00:00.000Z"),
+      timezone: "Asia/Singapore",
+      locationZone: "home",
+      locationObservedAt: "2024-01-01T18:55:00.000Z",
+    });
+    expect(recommendNextAction(db, "", { context: afterWindow })?.commitment_id).toBe(
+      first.id,
+    );
+
+    const staleLocation = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2024-01-01T17:00:00.000Z"),
+      timezone: "Asia/Singapore",
+      locationZone: "home",
+      locationObservedAt: "2024-01-01T16:29:59.000Z",
+    });
+    expect(recommendNextAction(db, "", { context: staleLocation })?.commitment_id).toBe(
+      first.id,
+    );
+
+    db.prepare<[string, number]>(
+      "UPDATE understanding_facet SET condition_json = ? WHERE id = ?",
+    ).run(
+      JSON.stringify({ expires_at: mondayNight.evaluated_at }),
+      facet.id,
+    );
+    expect(recommendNextAction(db, "", { context: mondayNight })?.commitment_id).toBe(
+      first.id,
+    );
+  });
+
+  it("derives local policy time across a daylight-saving transition", () => {
+    const before = createEvaluationContext({
+      trigger: "worker",
+      referenceTime: new Date("2024-03-10T06:30:00.000Z"),
+      timezone: "America/New_York",
+    });
+    const after = createEvaluationContext({
+      trigger: "worker",
+      referenceTime: new Date("2024-03-10T07:30:00.000Z"),
+      timezone: "America/New_York",
+    });
+
+    expect(before).toMatchObject({ local_weekday: "sun", local_time: "01:30" });
+    expect(after).toMatchObject({ local_weekday: "sun", local_time: "03:30" });
+  });
+
+  it("keeps legacy and invalid conditional machine effects inactive", () => {
+    const db = openTestDb();
+    const message = source(db, "I need to write the brief and prepare the demo.");
+    const first = createCommitment(db, {
+      title: "Write the brief",
+      sourceMessageId: message.id,
+    });
+    const second = createCommitment(db, {
+      title: "Prepare the demo",
+      sourceMessageId: message.id,
+    });
+    const evidence = allowWholeMessagePassage(db, message.id);
+    const facet = recordFacet(db, {
+      kind: "decision_criterion",
+      statement: "Prioritize the demo in the evening",
+      scope: { kind: "commitment", commitmentId: second.id },
+      condition: "in the evening",
+      machineEffect: "boost",
+      sourceMessageId: message.id,
+      passageIds: [evidence.id],
+    });
+    const context = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2024-01-01T18:00:00.000Z"),
+      timezone: "UTC",
+    });
+
+    expect(recommendNextAction(db, "", { context })?.commitment_id).toBe(first.id);
+    db.prepare<[string, number]>(
+      "UPDATE understanding_facet SET condition_json = ? WHERE id = ?",
+    ).run(
+      JSON.stringify({ local_time: { start: "18:00", end: "18:00" } }),
+      facet.id,
+    );
+    expect(recommendNextAction(db, "", { context })?.commitment_id).toBe(first.id);
+
+    const cycle = evaluateOpportunity(db, context);
+    expect(JSON.parse(cycle.exclusions_json)).toContainEqual({
+      facet_id: facet.id,
+      reason: "invalid_condition",
+    });
+  });
 });
 
 describe("user control and outcomes", () => {
+  it("materializes a pending review suggestion after three explicit feedback events", () => {
+    const db = openTestDb();
+    const message = source(db);
+    const commitment = createCommitment(db, {
+      title: "Research archive providers",
+      sourceMessageId: message.id,
+    });
+    surfaceNext(db);
+
+    for (let index = 0; index < 3; index += 1) {
+      recordFollowThroughDecision(db, {
+        commitmentId: commitment.id,
+        decision: "dismissed",
+      });
+      expect(listBehavioralPolicySuggestions(db)).toHaveLength(index === 2 ? 1 : 0);
+    }
+
+    expect(listBehavioralPolicySuggestions(db)[0]).toMatchObject({
+      status: "pending",
+      event_type: "dismissed",
+      allowed_interruption_change: "suppress_only",
+      evidence_event_ids: expect.arrayContaining(
+        listFollowThroughEvents(db)
+          .filter((event) => event.event_type === "dismissed")
+          .map((event) => event.id),
+      ),
+    });
+  });
+
   it("stores only reasons the user actually authors", () => {
     const db = openTestDb();
     const message = source(db);
@@ -183,11 +432,7 @@ describe("user control and outcomes", () => {
       title: "Send the note",
       sourceMessageId: message.id,
     });
-    markRecommendationSurfaced(
-      db,
-      recommendNextAction(db, "", { force: true })!,
-      null,
-    );
+    surfaceNext(db);
     const dismissed = recordFollowThroughDecision(db, {
       commitmentId: commitment.id,
       decision: "dismissed",
@@ -215,8 +460,7 @@ describe("user control and outcomes", () => {
       dueAt: "2029-12-20",
       sourceMessageId: message.id,
     });
-    const recommendation = recommendNextAction(db, "")!;
-    markRecommendationSurfaced(db, recommendation, null);
+    surfaceNext(db);
     expect(recommendNextAction(db, "send note")).toBeNull();
 
     recordFollowThroughDecision(db, {
@@ -225,7 +469,9 @@ describe("user control and outcomes", () => {
       snoozedUntil: "2030-01-10",
     });
     expect(
-      recommendNextAction(db, "", { force: true, referenceTime: new Date("2030-01-09") }),
+      recommendNextAction(db, "", {
+        context: explicitContext(new Date("2030-01-09")),
+      }),
     ).toBeNull();
 
     vi.setSystemTime(new Date("2030-01-11T09:00:00.000Z"));
@@ -233,14 +479,14 @@ describe("user control and outcomes", () => {
       commitmentId: commitment.id,
       decision: "dismissed",
     });
-    expect(recommendNextAction(db, "", { force: true })).toBeNull();
+    expect(recommendNextAction(db, "", { context: explicitContext() })).toBeNull();
 
     vi.setSystemTime(new Date("2030-01-12T09:00:00.000Z"));
     updateCommitment(db, commitment.id, {
       title: "Send the revised overdue note",
       sourceKind: "user_action",
     });
-    expect(recommendNextAction(db, "", { force: true })?.commitment_id).toBe(commitment.id);
+    expect(recommendNextAction(db, "", { context: explicitContext() })?.commitment_id).toBe(commitment.id);
   });
 
   it("records progress, control, and regret as append-only events", () => {
@@ -253,8 +499,7 @@ describe("user control and outcomes", () => {
       dueAt: "2020-01-01",
       sourceMessageId: user.id,
     });
-    const recommendation = recommendNextAction(db, "")!;
-    markRecommendationSurfaced(db, recommendation, assistant.id);
+    surfaceNext(db, assistant.id);
     recordFollowThroughDecision(db, {
       commitmentId: commitment.id,
       decision: "accepted",
@@ -308,12 +553,132 @@ describe("user control and outcomes", () => {
       sourceMessageId: later.id,
       sourceKind: "message",
     });
-    markRecommendationSurfaced(db, recommendNextAction(db, "")!, assistant.id);
+    surfaceNext(db, assistant.id);
     expect(listFollowThroughEvents(db)).toHaveLength(1);
 
     deleteConversationWithMemory(db, original.id);
-    expect(getCommitment(db, commitment.id)?.source_message_id).toBe(later.id);
+    expect(getCommitment(db, commitment.id)).toBeNull();
     expect(listFollowThroughEvents(db)).toEqual([]);
+  });
+});
+
+describe("opportunity audit and delivery", () => {
+  it("persists a reproducible cycle before delivery and surfaces it exactly once", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const user = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "I need to research workspace options.",
+    );
+    const assistant = appendMessage(db, conversation.id, "assistant", "Here is the result.");
+    const commitment = createCommitment(db, {
+      title: "Research workspace options",
+      sourceMessageId: user.id,
+    });
+    const context = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2030-01-07T09:00:00.000Z"),
+      timezone: "UTC",
+    });
+
+    const cycle = evaluateOpportunity(db, context, "workspace");
+    expect(cycle.policy_version).toBe("2");
+    expect(cycle.selected_commitment_id).toBe(commitment.id);
+    expect(getRecommendationCycle(db, cycle.id)).toEqual(cycle);
+    expect(recommendationForOpportunity(db, cycle.id)).toMatchObject({
+      commitment_id: commitment.id,
+      effect_kind: "web_read",
+      requires_confirmation: false,
+    });
+    expect(JSON.parse(cycle.context_json)).toMatchObject({
+      trigger: "today",
+      timezone: "UTC",
+      stewardship_mode: "balanced",
+      explicitly_requested: true,
+    });
+    expect(JSON.parse(cycle.candidate_scores_json)).toEqual([
+      expect.objectContaining({ commitment_id: commitment.id }),
+    ]);
+    expect(JSON.parse(cycle.applied_facet_ids_json)).toEqual([]);
+    expect(listOpportunityDeliveries(db, cycle.id)).toEqual([]);
+    expect(followThroughMetrics(db).surfaced).toBe(0);
+    expect(getCommitment(db, commitment.id)?.last_surfaced_at).toBeNull();
+
+    const firstDelivery = markOpportunityDelivered(db, cycle.id, "chat", assistant.id);
+    expect(firstDelivery).toMatchObject({
+      opportunity_id: cycle.id,
+      channel: "chat",
+      response_message_id: assistant.id,
+    });
+    expect(followThroughMetrics(db).surfaced).toBe(1);
+    expect(getCommitment(db, commitment.id)?.last_surfaced_at).not.toBeNull();
+
+    const duplicate = markOpportunityDelivered(db, cycle.id, "chat", assistant.id);
+    expect(duplicate?.id).toBe(firstDelivery?.id);
+    markOpportunityDelivered(db, cycle.id, "macos");
+    expect(listOpportunityDeliveries(db, cycle.id).map((delivery) => delivery.channel)).toEqual([
+      "chat",
+      "macos",
+    ]);
+    expect(followThroughMetrics(db).surfaced).toBe(1);
+    expect(listFollowThroughEvents(db)).toEqual([
+      expect.objectContaining({
+        event_type: "surfaced",
+        effect_kind: "web_read",
+        opportunity_id: cycle.id,
+      }),
+    ]);
+  });
+
+  it("does not deliver an empty cycle or accept a user message as a chat receipt", () => {
+    const db = openTestDb();
+    const context = createEvaluationContext({
+      trigger: "today",
+      referenceTime: new Date("2030-01-07T09:00:00.000Z"),
+      timezone: "UTC",
+    });
+    const empty = evaluateOpportunity(db, context);
+    expect(empty.selected_commitment_id).toBeNull();
+    expect(markOpportunityDelivered(db, empty.id, "today")).toBeNull();
+    expect(listOpportunityDeliveries(db, empty.id)).toEqual([]);
+
+    const user = source(db, "I need to prepare a brief.");
+    createCommitment(db, { title: "Prepare a brief", sourceMessageId: user.id });
+    const cycle = evaluateOpportunity(db, context);
+    expect(() => markOpportunityDelivered(db, cycle.id, "chat", user.id)).toThrow(
+      /stored assistant message/u,
+    );
+    expect(listOpportunityDeliveries(db, cycle.id)).toEqual([]);
+  });
+
+  it("links later response delivery to the same surfaced opportunity", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const user = appendMessage(db, conversation.id, "user", "I need to prepare a brief.");
+    const assistant = appendMessage(db, conversation.id, "assistant", "Let us prepare it.");
+    const commitment = createCommitment(db, {
+      title: "Prepare a brief",
+      sourceMessageId: user.id,
+    });
+    const cycle = evaluateOpportunity(
+      db,
+      createEvaluationContext({ trigger: "today", timezone: "UTC" }),
+    );
+
+    markOpportunityDelivered(db, cycle.id, "today");
+    markOpportunityDelivered(db, cycle.id, "chat", assistant.id);
+    expect(recommendationsForResponse(db, assistant.id)[0]?.commitment_id).toBe(
+      commitment.id,
+    );
+    const accepted = recordFollowThroughDecision(db, {
+      commitmentId: commitment.id,
+      decision: "accepted",
+      responseMessageId: assistant.id,
+    });
+    expect(accepted?.response_message_id).toBe(assistant.id);
+    expect(followThroughMetrics(db).surfaced).toBe(1);
   });
 });
 
@@ -361,9 +726,13 @@ describe("priority history and response context", () => {
     );
 
     db.exec(MIGRATIONS[4]!.sql);
-    const recalled = recalledForResponse(db, 2);
-    expect(recalled[0]?.kind).toBe("goal");
-    expect(recalled[0]?.kind === "goal" ? recalled[0].goal.priority : null).toBe("normal");
+    const snapshot = db
+      .prepare("SELECT snapshot_json FROM response_context WHERE assistant_message_id = 2")
+      .get() as { snapshot_json: string };
+    expect(JSON.parse(snapshot.snapshot_json)).toMatchObject({
+      kind: "goal",
+      goal: { priority: "normal" },
+    });
     db.close();
   });
 

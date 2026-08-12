@@ -25,7 +25,6 @@ import {
   listCommitments,
   listGoals,
   markCommitmentSurfaced,
-  selectNudge,
   updateCommitment,
   updateGoal,
 } from "./intentions";
@@ -39,6 +38,7 @@ import {
   responseSelectionsForResponse,
 } from "./response-context";
 import type { ExtractedFact, Extraction } from "./schema";
+import { recommendNextAction } from "./stewardship";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -261,16 +261,20 @@ describe("goals, commitments, and nudges", () => {
       sourceMessageId: source.id,
     });
 
-    expect(selectNudge(db, "unrelated question")?.id).toBe(commitment.id);
+    expect(
+      recommendNextAction(db, "unrelated question", { trigger: "today" })?.commitment_id,
+    ).toBe(commitment.id);
     markCommitmentSurfaced(db, commitment.id);
-    expect(selectNudge(db, "launch deck")).toBeNull();
+    expect(recommendNextAction(db, "launch deck")).toBeNull();
     expect(commitmentEvents(db, commitment.id).at(-1)?.event_type).toBe("surfaced");
     createCommitment(db, {
       title: "Book the dentist",
       sourceMessageId: source.id,
     });
-    expect(selectNudge(db, "unrelated question")).toBeNull();
-    expect(selectNudge(db, "dentist appointment")?.title).toBe("Book the dentist");
+    expect(recommendNextAction(db, "unrelated question")).toBeNull();
+    expect(
+      recommendNextAction(db, "dentist appointment")?.commitment_title,
+    ).toBe("Book the dentist");
   });
 });
 
@@ -447,7 +451,7 @@ describe("episodic recall and source deletion", () => {
     ]);
   });
 
-  it("rehomes open loops to a later sourced event", () => {
+  it("does not rehome deleted intention text to a later referential update", () => {
     const db = openTestDb();
     const originalConversation = createConversation(db, { title: "Original intent" });
     const updateConversation = createConversation(db, { title: "Intent update" });
@@ -505,10 +509,8 @@ describe("episodic recall and source deletion", () => {
     );
 
     deleteConversationWithMemory(db, originalConversation.id);
-    expect(listGoals(db)[0]?.source_message_id).toBe(update.id);
-    expect(listGoals(db)[0]?.status).toBe("paused");
-    expect(listCommitments(db)[0]?.source_message_id).toBe(update.id);
-    expect(listCommitments(db)[0]?.status).toBe("waiting");
+    expect(listGoals(db)).toEqual([]);
+    expect(listCommitments(db)).toEqual([]);
   });
 });
 

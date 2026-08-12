@@ -291,13 +291,18 @@ function RecentChatLink({
   onDeleted: () => void;
 }) {
   const [pending, setPending] = useState(false);
+  const [confirming, setConfirming] = useState(false);
 
   async function deleteChat() {
     if (pending) return;
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
 
     setPending(true);
     try {
-      await deleteConversationFromHistoryAction(chat.id, "delete");
+      await deleteConversationFromHistoryAction(chat.id, "erase-source");
       onDeleted();
     } finally {
       setPending(false);
@@ -320,17 +325,19 @@ function RecentChatLink({
       </Link>
       <button
         type="button"
-        aria-label={`Delete ${chat.title}`}
-        title="Delete"
+        aria-label={confirming
+          ? `Confirm permanently deleting ${chat.title}`
+          : `Permanently delete ${chat.title}`}
+        title={confirming ? "Click again to permanently delete" : "Delete source permanently"}
         disabled={pending}
         onClick={() => void deleteChat()}
-        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${
+        className={`absolute right-1 top-0.5 flex h-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${confirming ? "w-12" : "w-7"} ${
           active
             ? "opacity-100"
             : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
         }`}
       >
-        <TrashIcon />
+        {confirming ? <span className="text-[10px] font-semibold">Sure?</span> : <TrashIcon />}
       </button>
     </li>
   );
@@ -399,7 +406,7 @@ export function ChatHistoryItem({
 
     setPending(true);
     try {
-      await deleteConversationFromHistoryAction(chat.id, "delete");
+      await deleteConversationFromHistoryAction(chat.id, "erase-source");
       setState("closed");
       onDeleted();
     } finally {
@@ -492,9 +499,9 @@ export function ChatHistoryItem({
         >
           {state === "deleting" ? (
             <div className="p-2">
-              <p className="text-sm font-medium leading-5">Remove this chat from history?</p>
+              <p className="text-sm font-medium leading-5">Permanently delete this source?</p>
               <p className="mt-1 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-                Its messages and saved details will stay stored.
+                Its messages will be erased. Details with no other evidence will also be removed.
               </p>
               <div className="mt-3 flex justify-end gap-2">
                 <button
@@ -512,7 +519,7 @@ export function ChatHistoryItem({
                   className="h-8 rounded-lg px-2.5 text-xs font-medium disabled:opacity-50"
                   style={{ background: "#7f1d1d", color: "#ffffff" }}
                 >
-                  {pending ? "Removing…" : "Remove"}
+                  {pending ? "Deleting…" : "Delete permanently"}
                 </button>
               </div>
             </div>
@@ -538,7 +545,7 @@ export function ChatHistoryItem({
                 style={{ color: "#ff6767" }}
               >
                 <TrashIcon />
-                Remove from history
+                Delete source permanently
               </button>
             </>
           )}

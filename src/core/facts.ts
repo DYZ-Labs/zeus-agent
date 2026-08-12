@@ -619,6 +619,21 @@ export function forgetFact(db: Db, id: number): boolean {
     db.prepare<[number]>(
       "DELETE FROM response_context WHERE item_kind = 'fact' AND item_id = ?",
     ).run(id);
+    db.prepare<[number]>(
+      "DELETE FROM mcp_recall_audit WHERE item_kind = 'fact' AND item_id = ?",
+    ).run(id);
+    db.prepare<[number, number]>(
+      `DELETE FROM work_plan
+       WHERE id IN (
+         SELECT work_plan_id FROM work_plan_memory_source
+         WHERE source_kind = 'fact' AND source_id = ?
+         UNION
+         SELECT artifact.work_plan_id
+         FROM work_artifact_memory_source memory
+         JOIN work_artifact artifact ON artifact.id = memory.work_artifact_id
+         WHERE memory.source_kind = 'fact' AND memory.source_id = ?
+       )`,
+    ).run(id, id);
     db.prepare<[number]>("UPDATE fact SET superseded_by = NULL WHERE superseded_by = ?").run(id);
     const result = db.prepare<[number]>("DELETE FROM fact WHERE id = ?").run(id);
     return result.changes > 0;

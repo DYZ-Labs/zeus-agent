@@ -2,13 +2,19 @@ import Link from "next/link";
 
 import { followThroughDecisionAction } from "@/app/actions";
 import { PageHeader } from "@/components/page-header";
+import { OpportunityDeliveryReceipt } from "@/components/opportunity-delivery-receipt";
 import { Plans } from "@/components/plans";
+import { WorkPlansPanel, type WorkPlanPanelItem } from "@/components/work-plans-panel";
+import { buildEvaluationContextForTrigger, resolveTodayOpportunity } from "@/core/ambient";
 import { hasCredentials } from "@/core/openai";
 import type { FollowThroughRecommendation } from "@/core/schema";
 import {
-  recommendationForCommitment,
-  recommendNextAction,
-} from "@/core/stewardship";
+  getWorkPlan,
+  listToolReceipts,
+  listWorkArtifacts,
+  listWorkPlans,
+} from "@/core/work-plans";
+import { evaluateOpportunity, recommendationForOpportunity } from "@/core/stewardship";
 import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
@@ -16,14 +22,28 @@ export const dynamic = "force-dynamic";
 export default async function TodayPage({
   searchParams,
 }: {
-  searchParams: Promise<{ focus?: string; show?: string }>;
+  searchParams: Promise<{ show?: string }>;
 }) {
   const db = await requireOwnerPageDb();
   const params = await searchParams;
-  const focus = Number(params.focus);
-  const recommendation = Number.isInteger(focus) && focus > 0
-    ? recommendationForCommitment(db, focus)
-    : recommendNextAction(db, "", { force: true });
+  const todayContext = buildEvaluationContextForTrigger(db, "today");
+  const cycle = resolveTodayOpportunity(db, todayContext) ?? evaluateOpportunity(db, todayContext);
+  const recommendation = recommendationForOpportunity(db, cycle.id);
+  const workItems: WorkPlanPanelItem[] = listWorkPlans(db, { includeClosed: true, limit: 30 })
+    .map((plan) => {
+      const detail = getWorkPlan(db, plan.id);
+      return detail
+        ? {
+            plan: detail.plan,
+            steps: detail.steps,
+            latestRun: detail.latestRun,
+            artifacts: listWorkArtifacts(db, { planId: plan.id }),
+            receipts: detail.latestRun ? listToolReceipts(db, detail.latestRun.id) : [],
+            needsReauthorization: detail.authorization === null,
+          }
+        : null;
+    })
+    .filter((item): item is WorkPlanPanelItem => item !== null);
 
   return (
     <div className="flex h-full flex-col lg:min-h-0">
@@ -40,7 +60,10 @@ export default async function TodayPage({
 
         <section className="mt-8 max-w-[54rem]">
           {recommendation ? (
-            <RecommendationCard recommendation={recommendation} canChat={hasCredentials()} />
+            <>
+              <OpportunityDeliveryReceipt opportunityId={cycle.id} />
+              <RecommendationCard recommendation={recommendation} canChat={hasCredentials()} />
+            </>
           ) : (
             <div
               className="rounded-xl border border-dashed px-5 py-8"
@@ -56,6 +79,7 @@ export default async function TodayPage({
         </section>
 
         <Plans db={db} showCompleted={params.show === "completed"} />
+        <WorkPlansPanel items={workItems} canExecute={hasCredentials()} />
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { recordCoarseLocation, updateAmbientSetting } from "./ambient";
 import {
   buildContext,
   coreFacts,
@@ -277,6 +278,34 @@ describe("context assembly", () => {
     expect(context.plan.budget_tokens).toBe(500);
     expect(context.plan.estimated_tokens).toBeLessThanOrEqual(500);
     expect(interactionTokens).toBeLessThanOrEqual(120);
+  });
+
+  it("applies typed location conditions consistently to descriptive personalization", async () => {
+    updateAmbientSetting(db, { locationConsent: true });
+    recordCoarseLocation(db, "office", new Date());
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "At the office, keep replies concise.");
+    const passage = ensureEvidencePassage(db, {
+      messageId: source.id,
+      quote: source.content,
+      sensitivity: "normal",
+      recallStatus: "allowed",
+    });
+    const facet = recordFacet(db, {
+      kind: "communication_style",
+      statement: "Prefers concise replies",
+      scope: { kind: "global" },
+      structuredCondition: { zones: ["office"] },
+      sourceMessageId: source.id,
+      passageIds: [passage.id],
+    });
+
+    const atOffice = await buildContext(db, "Explain the result", { queryVector: null });
+    expect(atOffice.facets.map((item) => item.id)).toContain(facet.id);
+
+    recordCoarseLocation(db, "home", new Date());
+    const atHome = await buildContext(db, "Explain the result", { queryVector: null });
+    expect(atHome.facets.map((item) => item.id)).not.toContain(facet.id);
   });
 
   it("persists immutable facet selection reasons, paths, and scores", async () => {

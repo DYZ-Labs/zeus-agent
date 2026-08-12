@@ -39,6 +39,16 @@ import {
   updateCommitment,
   updateGoal,
 } from "./intentions";
+import {
+  createProject,
+  getProject,
+  getProjectByEntityId,
+  listProjects,
+  markProjectBlocked,
+  markProjectUnblocked,
+  recordProjectProgress,
+  updateProject,
+} from "./projects";
 import type {
   CandidateReason,
   CommitmentView,
@@ -50,6 +60,7 @@ import type {
   ExtractedEntity,
   ExtractedGoal,
   ExtractedGoalLink,
+  ExtractedProjectLink,
   ExtractedFacetScope,
   Extraction,
   FactView,
@@ -57,6 +68,8 @@ import type {
   Goal,
   Message,
   ParsedExtraction,
+  ProjectStatus,
+  ProjectView,
   UnderstandingFacetView,
 } from "./schema";
 import { Extraction as ExtractionSchema, SELF_REF } from "./schema";
@@ -81,7 +94,7 @@ Only the user's statements can be evidence. Every extracted item must cite the n
 
 A fact is worth extracting when it is likely to remain useful in six months: names, relationships, roles, locations, preferences, ongoing projects, values, and topics the user explicitly follows. Passing states and details of the current chat are not durable facts.
 
-Goals are outcomes the user wants to achieve. Commitments are concrete promises, next actions, or things the user is waiting on. Do not also encode goals or commitments as generic facts. Use an existing ID when the user updates, completes, pauses, abandons, waits on, or cancels an item from the supplied lists.
+Goals are outcomes the user wants to achieve. Commitments are concrete promises, next actions, or things the user is waiting on. Projects are named efforts with their own lifecycle. Do not also encode goals or commitments as generic facts. Use an existing ID when the user updates, completes, pauses, abandons, waits on, or cancels an item from the supplied lists. When a goal or commitment belongs to a project, set its project patch using an existing project ID or a project entity name declared in this output.
 
 Mutable goal and commitment details use patches. For an existing item, use keep when the user did not mention that detail, set only when the user supplied a replacement, and clear only when the user explicitly removed it. Never translate an omitted detail into clear. For a new item, set details the user supplied and clear details that have no initial value. Clearing goal priority resets it to normal; clearing commitment owner resets it to self. To link a commitment to an existing goal, set linked_goal with kind id. When it belongs to a goal first created in the same output, set linked_goal with kind title and the exact new goal title.
 
@@ -89,7 +102,7 @@ Declare every named person who owns a commitment in entities. Use "self" for the
 
 Extract nothing rather than noise. Do not fill missing owners, dates, or motives. Mark an item inferred when interpretation is required, ambiguous when a material detail is unclear, sensitive for health, finance, legal, intimate identity, credentials, or private secrets, and assistant_only when the user never stated or endorsed it.
 
-Facets are contextual whole-person understanding: values, decision criteria, constraints, preferences, motivations, routines, communication or working styles, boundaries, capacity patterns, skills, and relationship dynamics. Do not diagnose the user or assign personality labels. A direct clear non-sensitive facet may be accepted; every inferred pattern remains a proposal. A recurring pattern needs exact evidence from at least two distinct user messages. Emit at most one inferred facet. Set machine_effect only when the user explicitly asks Zeus to boost, deprioritize, or block recommendations in that scope.
+Facets are contextual whole-person understanding: values, decision criteria, constraints, preferences, motivations, routines, communication or working styles, boundaries, capacity patterns, skills, and relationship dynamics. Do not diagnose the user or assign personality labels. A direct clear non-sensitive facet may be accepted; every inferred pattern remains a proposal. A recurring pattern needs exact evidence from at least two distinct user messages. Emit at most one inferred facet. Set machine_effect only when the user explicitly asks Zeus to boost, deprioritize, or block recommendations in that scope. When the user explicitly supplies weekdays, a local-time window, a named location zone, or an expiry, encode it in structured_condition; never infer ambient conditions.
 If a proposed facet appears to contradict accepted understanding supplied below, mark it ambiguous rather than resolving the conflict yourself.
 
 Classify every USER EVIDENCE source in source_assessments. Copy each sensitive excerpt exactly. When uncertain, mark the source uncertain; never call it normal merely because no memory item was extracted.
@@ -115,6 +128,11 @@ export type ExtractionContext = {
     status: string;
     priority: string;
     target_at: string | null;
+  }[];
+  activeProjects: readonly {
+    id: number;
+    name: string;
+    status: string;
   }[];
   openCommitments: readonly {
     id: number;
@@ -161,6 +179,11 @@ export function extractionContext(
     status: goal.status,
     priority: goal.priority,
     target_at: goal.target_at,
+  }));
+  const activeProjects = listProjects(db, { limit: 30 }).map((project) => ({
+    id: project.id,
+    name: project.entity_name,
+    status: project.status,
   }));
   const openCommitments = listCommitments(db, { limit: 50 }).map((commitment) => ({
     id: commitment.id,
@@ -211,6 +234,7 @@ export function extractionContext(
     knownPredicates,
     knownEntities,
     activeGoals,
+    activeProjects,
     openCommitments,
     currentFacts,
     acceptedFacets,
@@ -288,6 +312,7 @@ function renderBoundedKnownContext(
   appendList("Existing predicates", context.knownPredicates);
   appendList("Entities already known", context.knownEntities);
   appendList("Active goals (use IDs for updates)", context.activeGoals);
+  appendList("Active projects (use IDs for links)", context.activeProjects);
   appendList("Open commitments (use IDs for updates)", context.openCommitments);
   appendList("Current facts (reuse exact values for retractions)", context.currentFacts);
   appendList("Accepted understanding (do not duplicate)", context.acceptedFacets);
@@ -412,6 +437,7 @@ export type ApplyResult = {
   facts: FactView[];
   goals: Goal[];
   commitments: CommitmentView[];
+  projects: ProjectView[];
   facets: UnderstandingFacetView[];
   candidates: CandidateView[];
   supersededIds: number[];
@@ -484,6 +510,7 @@ export function emptyApplyResult(): ApplyResult {
     facts: [],
     goals: [],
     commitments: [],
+    projects: [],
     facets: [],
     candidates: [],
     supersededIds: [],
@@ -549,6 +576,7 @@ export function applyExtraction(
       applyGoal(
         db,
         goal,
+        parsed.entities,
         sourceMessageId,
         result,
         options.forceAccept ?? false,
@@ -929,12 +957,255 @@ function applyFact(
       ? (recomputeFactEvidenceAggregates(db, written.fact.id) ?? written.fact)
       : written.fact,
   );
+  if (itemSourceId !== null) {
+    ensureProjectsFromAcceptedFact(db, {
+      subject,
+      objectEntity,
+      predicate,
+      object,
+      sourceMessageId: itemSourceId,
+      passageId: passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
+      confidence: fact.confidence,
+      result,
+    });
+  }
   result.supersededIds.push(...written.supersededIds);
+}
+
+function ensureProjectsFromAcceptedFact(
+  db: Db,
+  input: {
+    subject: { id: number; kind: string };
+    objectEntity: { id: number; kind: string } | null;
+    predicate: string;
+    object: string;
+    sourceMessageId: number;
+    passageId: number | null;
+    confidence: number;
+    result: ApplyResult;
+  },
+): void {
+  const candidates = [
+    ...new Map(
+      [input.subject, input.objectEntity]
+        .filter(
+          (entity): entity is { id: number; kind: string } => entity?.kind === "project",
+        )
+        .map((entity) => [entity.id, entity]),
+    ).values(),
+  ];
+  for (const entity of candidates) {
+    const existing = getProjectByEntityId(db, entity.id);
+    const lifecycle = projectLifecycleFromFact(
+      entity.id === input.subject.id,
+      input.predicate,
+      input.object,
+    );
+    let project: ProjectView | null;
+    if (!existing) {
+      project = createProject(db, {
+        entityId: entity.id,
+        status: lifecycle.status ?? "planned",
+        confidence: input.confidence,
+        sourceMessageId: input.sourceMessageId,
+        passageId: input.passageId,
+      });
+    } else if (
+      lifecycle.status !== null && lifecycle.status !== existing.status
+    ) {
+      project = updateProject(db, existing.id, {
+        status: lifecycle.status,
+        confidence: input.confidence,
+        sourceMessageId: input.sourceMessageId,
+        sourceKind: "message",
+        passageId: input.passageId,
+      });
+    } else {
+      project = existing;
+    }
+
+    if (project && lifecycle.progress) {
+      project = recordProjectProgress(db, project.id, {
+        summary: lifecycle.progress.summary,
+        percent: lifecycle.progress.percent,
+        sourceMessageId: input.sourceMessageId,
+        sourceKind: "message",
+        passageId: input.passageId,
+      });
+    }
+    if (project && lifecycle.blockage === "blocked") {
+      project = markProjectBlocked(db, project.id, {
+        reason: lifecycle.blockageDetail,
+        sourceMessageId: input.sourceMessageId,
+        sourceKind: "message",
+        passageId: input.passageId,
+      });
+    } else if (project && lifecycle.blockage === "unblocked") {
+      project = markProjectUnblocked(db, project.id, {
+        resolution: lifecycle.blockageDetail,
+        sourceMessageId: input.sourceMessageId,
+        sourceKind: "message",
+        passageId: input.passageId,
+      });
+    }
+    if (project && !input.result.projects.some((item) => item.id === project.id)) {
+      input.result.projects.push(project);
+    }
+  }
+}
+
+type ProjectLifecycleFact = {
+  status: ProjectStatus | null;
+  progress: { summary?: string; percent?: number } | null;
+  blockage: "blocked" | "unblocked" | null;
+  blockageDetail?: string;
+};
+
+const PROJECT_STATUS_PREDICATES = new Set([
+  "status",
+  "project_status",
+  "lifecycle_status",
+  "state",
+]);
+const PROJECT_PROGRESS_PREDICATES = new Set([
+  "progress",
+  "project_progress",
+  "progress_summary",
+  "progress_percent",
+  "completion_percent",
+  "percent_complete",
+]);
+const PROJECT_BLOCKED_PREDICATES = new Set([
+  "blocked",
+  "is_blocked",
+  "project_blocked",
+  "blocked_by",
+  "blocker",
+  "project_blocker",
+]);
+const PROJECT_UNBLOCKED_PREDICATES = new Set([
+  "unblocked",
+  "is_unblocked",
+  "project_unblocked",
+  "blocker_resolved",
+  "blockage_resolved",
+]);
+const ACTIVE_PROJECT_RELATIONSHIPS = new Set([
+  "works_on",
+  "working_on",
+  "builds",
+  "building",
+  "develops",
+  "developing",
+  "leads",
+  "manages",
+]);
+
+function projectLifecycleFromFact(
+  projectIsSubject: boolean,
+  predicate: string,
+  object: string,
+): ProjectLifecycleFact {
+  const normalizedPredicate = normalizeLifecyclePredicate(predicate);
+  const normalizedObject = object.toLowerCase().replace(/\s+/gu, " ").trim();
+  const statusPredicate = PROJECT_STATUS_PREDICATES.has(normalizedPredicate);
+  const progressPredicate = PROJECT_PROGRESS_PREDICATES.has(normalizedPredicate);
+
+  let status: ProjectStatus | null = null;
+  if (projectIsSubject && statusPredicate) {
+    status = explicitProjectStatus(normalizedObject);
+  } else if (!projectIsSubject && ACTIVE_PROJECT_RELATIONSHIPS.has(normalizedPredicate)) {
+    status = "active";
+  }
+
+  let progress: ProjectLifecycleFact["progress"] = null;
+  if (projectIsSubject && (progressPredicate || (statusPredicate && hasExplicitProgress(object)))) {
+    const percent = progressPercentFromFact(normalizedPredicate, object);
+    const summary = object.replace(/\s+/gu, " ").trim();
+    if (summary || percent !== undefined) {
+      progress = {
+        ...(summary ? { summary } : {}),
+        ...(percent === undefined ? {} : { percent }),
+      };
+    }
+  }
+
+  const blockage = projectIsSubject
+    ? projectBlockageFromFact(normalizedPredicate, normalizedObject, statusPredicate)
+    : null;
+  return {
+    status,
+    progress,
+    blockage,
+    ...(blockage === null ? {} : { blockageDetail: object.replace(/\s+/gu, " ").trim() }),
+  };
+}
+
+function normalizeLifecyclePredicate(predicate: string): string {
+  return predicate.trim().toLowerCase().replace(/[\s-]+/gu, "_");
+}
+
+function explicitProjectStatus(object: string): ProjectStatus | null {
+  // Partial completion is progress, not a transition to the completed lifecycle.
+  // Blocked/unblocked wording is handled independently below and, by itself, matches
+  // none of these statuses.
+  if (/\b(?:abandoned|cancelled|canceled|stopped)\b/u.test(object)) return "abandoned";
+  if (/\b(?:paused|on hold|waiting)\b/u.test(object)) return "paused";
+  if (/\b(?:active|in progress|underway|started)\b/u.test(object)) return "active";
+  if (/\b(?:planned|planning|proposed|idea)\b/u.test(object)) return "planned";
+  if (/\b(?:completed|complete|done|finished|shipped|launched)\b/u.test(object)) {
+    if (hasExplicitProgress(object) && progressPercentFromFact("status", object) !== 1) return null;
+    return "completed";
+  }
+  return null;
+}
+
+function projectBlockageFromFact(
+  predicate: string,
+  object: string,
+  statusPredicate: boolean,
+): ProjectLifecycleFact["blockage"] {
+  if (PROJECT_UNBLOCKED_PREDICATES.has(predicate)) return "unblocked";
+  if (PROJECT_BLOCKED_PREDICATES.has(predicate)) {
+    if (/^(?:false|no|none|not blocked|unblocked|clear|cleared|resolved)$/u.test(object)) {
+      return "unblocked";
+    }
+    return "blocked";
+  }
+  if (!statusPredicate) return null;
+  if (/\b(?:unblocked|not blocked|no longer blocked|blocker resolved|blockage resolved)\b/u.test(object)) {
+    return "unblocked";
+  }
+  return /\bblocked\b/u.test(object) ? "blocked" : null;
+}
+
+function hasExplicitProgress(object: string): boolean {
+  return /\b\d{1,3}(?:\.\d+)?\s*(?:%|percent)\b/iu.test(object) ||
+    /\b(?:halfway|quarter complete|three quarters complete)\b/iu.test(object);
+}
+
+function progressPercentFromFact(predicate: string, object: string): number | undefined {
+  const percentage = object.match(/\b(\d{1,3}(?:\.\d+)?)\s*(?:%|percent)\b/iu);
+  if (percentage) {
+    const value = Number(percentage[1]);
+    return Number.isFinite(value) && value >= 0 && value <= 100 ? value / 100 : undefined;
+  }
+  const normalized = object.toLowerCase().replace(/\s+/gu, " ").trim();
+  if (/\bthree quarters complete\b/u.test(normalized)) return 0.75;
+  if (/\bhalfway\b/u.test(normalized)) return 0.5;
+  if (/\bquarter complete\b/u.test(normalized)) return 0.25;
+  if (PROJECT_PROGRESS_PREDICATES.has(predicate)) {
+    if (/^(?:complete|completed|done|finished)$/u.test(normalized)) return 1;
+    const numeric = Number(normalized);
+    if (Number.isFinite(numeric) && numeric >= 0 && numeric <= 1) return numeric;
+  }
+  return undefined;
 }
 
 function applyGoal(
   db: Db,
   goal: ParsedExtraction["goals"][number],
+  declarations: readonly ExtractedEntity[],
   sourceMessageId: number | null,
   result: ApplyResult,
   forceAccept: boolean,
@@ -978,7 +1249,7 @@ function applyGoal(
       result,
       createCandidate(db, {
         kind: "goal",
-        payload: candidateEnvelope(goal, []),
+        payload: candidateEnvelope(goal, declarations),
         reason,
         reasons,
         confidence: goal.confidence,
@@ -997,12 +1268,50 @@ function applyGoal(
           : undefined
         : undefined;
   const targetAt = patchToNullableUpdate(goal.target_at);
+  const project = goal.project.op === "set"
+    ? resolveOrCreateProjectLink(
+        db,
+        goal.project.value,
+        declarations,
+        itemSourceId,
+        passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
+        goal.confidence,
+      )
+    : null;
+  if (goal.project.op === "set" && !project) {
+    if (!forceAccept) {
+      appendPendingCandidate(
+        result,
+        createCandidate(db, {
+          kind: "goal",
+          payload: candidateEnvelope(goal, declarations),
+          reason: "ambiguous",
+          confidence: goal.confidence,
+          sourceMessageId: itemSourceId,
+          passageIds: passages.map((passage) => passage.id),
+        }),
+      );
+      return;
+    }
+    throw new Error("Cannot accept a goal with an unknown project");
+  }
+  if (project && !result.projects.some((item) => item.id === project.id)) {
+    result.projects.push(project);
+  }
+  const projectId = goal.project.op === "keep"
+    ? existing
+      ? undefined
+      : null
+    : goal.project.op === "clear"
+      ? null
+      : project?.id;
   const applied = existing
     ? updateGoal(db, existing.id, {
         title: goal.title,
         status: goal.status,
         priority,
         targetAt,
+        projectId,
         confidence: goal.confidence,
         sourceMessageId: itemSourceId,
         sourceKind: "message",
@@ -1014,6 +1323,7 @@ function applyGoal(
         status: goal.status,
         priority,
         targetAt,
+        projectId,
         confidence: goal.confidence,
         sourceMessageId: itemSourceId,
         passageId:
@@ -1109,6 +1419,44 @@ function applyCommitment(
     return;
   }
 
+  const project = commitment.project.op === "set"
+    ? resolveOrCreateProjectLink(
+        db,
+        commitment.project.value,
+        declarations,
+        itemSourceId,
+        passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
+        commitment.confidence,
+      )
+    : null;
+  if (commitment.project.op === "set" && !project) {
+    if (!forceAccept) {
+      appendPendingCandidate(
+        result,
+        createCandidate(db, {
+          kind: "commitment",
+          payload: candidateEnvelope(commitment, declarations),
+          reason: "ambiguous",
+          confidence: commitment.confidence,
+          sourceMessageId: itemSourceId,
+          passageIds: passages.map((passage) => passage.id),
+        }),
+      );
+      return;
+    }
+    throw new Error("Cannot accept a commitment with an unknown project");
+  }
+  if (project && !result.projects.some((item) => item.id === project.id)) {
+    result.projects.push(project);
+  }
+  const projectId = commitment.project.op === "keep"
+    ? existing
+      ? undefined
+      : null
+    : commitment.project.op === "clear"
+      ? null
+      : project?.id;
+
   const owner =
     requestedOwner === null
       ? null
@@ -1143,6 +1491,7 @@ function applyCommitment(
         title: commitment.title,
         ownerEntityId,
         linkedGoalId,
+        projectId,
         status: commitment.status,
         dueAt,
         confidence: commitment.confidence,
@@ -1155,6 +1504,7 @@ function applyCommitment(
         title: commitment.title,
         ownerEntityId: ownerEntityId ?? selfEntity(db).id,
         linkedGoalId,
+        projectId,
         status: commitment.status,
         dueAt,
         confidence: commitment.confidence,
@@ -1251,6 +1601,7 @@ function applyFacet(
       statement,
       scope,
       condition: facet.condition,
+      structuredCondition: facet.structured_condition,
       importance: facet.importance,
       sensitivity:
         facet.sensitivity === "sensitive" || hasProtectedEvidence(passages)
@@ -1611,6 +1962,7 @@ function unwrapCandidatePayload<T>(payload: unknown): CandidateEnvelope<T> {
 export type FacetCandidateEdit = {
   statement: string;
   machineEffect: "boost" | "deprioritize" | "block" | null;
+  structuredCondition: ExtractedFacet["structured_condition"];
 };
 
 /**
@@ -1663,13 +2015,16 @@ export function acceptCandidate(
           ...evidencedItem,
           statement: statement!,
           machine_effect: options.facetEdit.machineEffect,
+          structured_condition: options.facetEdit.structuredCondition,
         }
       : evidencedItem;
     const originalStatement = evidencedItem.statement.replace(/\s+/gu, " ").trim();
     const wasEdited =
       options.facetEdit !== undefined &&
       (acceptedPayload.statement !== originalStatement ||
-        acceptedPayload.machine_effect !== evidencedItem.machine_effect);
+        acceptedPayload.machine_effect !== evidencedItem.machine_effect ||
+        JSON.stringify(acceptedPayload.structured_condition) !==
+          JSON.stringify(evidencedItem.structured_condition));
     editedPayload = wasEdited ? acceptedPayload : undefined;
     extraction = {
       entities: [...payload.entities],
@@ -1780,6 +2135,26 @@ function resolveLinkedGoal(db: Db, link: ExtractedGoalLink): Goal | null {
   );
 }
 
+function resolveOrCreateProjectLink(
+  db: Db,
+  link: ExtractedProjectLink,
+  declarations: readonly ExtractedEntity[],
+  sourceMessageId: number,
+  passageId: number | null,
+  confidence: number,
+): ProjectView | null {
+  if (link.kind === "id") return getProject(db, link.id);
+  const entity = resolveOrCreateEntity(db, link.name, declarations, sourceMessageId);
+  if (!entity || entity.kind !== "project") return null;
+  return getProjectByEntityId(db, entity.id) ?? createProject(db, {
+    entityId: entity.id,
+    status: "planned",
+    confidence,
+    sourceMessageId,
+    passageId,
+  });
+}
+
 /**
  * Old seeds and pending candidates used nullable scalar fields. Normalize them
  * only at the application boundary; the model-facing schema remains patch-only.
@@ -1789,8 +2164,24 @@ function normalizeExtractionInput(extraction: Extraction): unknown {
     ...extraction,
     goals: (extraction.goals ?? []).map((goal) => {
       const isNew = (goal.existing_id ?? null) === null;
+      const {
+        project_id: projectId,
+        project_name: projectName,
+        ...current
+      } = goal;
+      const project = isFieldPatch(current.project)
+        ? current.project
+        : projectId !== undefined || projectName !== undefined
+          ? projectId !== null && projectId !== undefined
+            ? { op: "set" as const, value: { kind: "id" as const, id: projectId } }
+            : projectName
+              ? { op: "set" as const, value: { kind: "name" as const, name: projectName } }
+              : { op: "clear" as const }
+          : isNew
+            ? { op: "clear" as const }
+            : { op: "keep" as const };
       return {
-        ...goal,
+        ...current,
         existing_id: goal.existing_id ?? null,
         priority: normalizeLegacyPatch(goal.priority, {
           isNew,
@@ -1800,6 +2191,7 @@ function normalizeExtractionInput(extraction: Extraction): unknown {
           isNew,
           nullMeans: "clear",
         }),
+        project,
       };
     }),
     commitments: (extraction.commitments ?? []).map((commitment) => {
@@ -1807,6 +2199,8 @@ function normalizeExtractionInput(extraction: Extraction): unknown {
       const {
         linked_goal_id: linkedGoalId,
         linked_goal_title: linkedGoalTitle,
+        project_id: projectId,
+        project_name: projectName,
         ...current
       } = commitment;
       const linkedGoal = isFieldPatch(current.linked_goal)
@@ -1823,6 +2217,17 @@ function normalizeExtractionInput(extraction: Extraction): unknown {
           : isNew
             ? { op: "clear" as const }
             : { op: "keep" as const };
+      const project = isFieldPatch(current.project)
+        ? current.project
+        : projectId !== undefined || projectName !== undefined
+          ? projectId !== null && projectId !== undefined
+            ? { op: "set" as const, value: { kind: "id" as const, id: projectId } }
+            : projectName
+              ? { op: "set" as const, value: { kind: "name" as const, name: projectName } }
+              : { op: "clear" as const }
+          : isNew
+            ? { op: "clear" as const }
+            : { op: "keep" as const };
       return {
         ...current,
         existing_id: commitment.existing_id ?? null,
@@ -1835,6 +2240,7 @@ function normalizeExtractionInput(extraction: Extraction): unknown {
           isNew,
           nullMeans: "clear",
         }),
+        project,
       };
     }),
   };

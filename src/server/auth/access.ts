@@ -8,6 +8,10 @@ import type { Db } from "@/core/db";
 import type { AccountSummary } from "@/lib/auth-types";
 import { getDb } from "@/server/db";
 import { getAuthConfiguration } from "@/server/auth/config";
+import {
+  checkBrowserBoundary,
+  type BrowserCapability,
+} from "@/server/auth/browser-origin";
 import { createSupabaseServerClient } from "@/server/auth/supabase";
 
 export type OwnerAccessState =
@@ -15,6 +19,7 @@ export type OwnerAccessState =
   | "authorized"
   | "signed_out"
   | "wrong_account"
+  | "forbidden_origin"
   | "misconfigured"
   | "unavailable";
 
@@ -69,6 +74,25 @@ export async function getOwnerAccess(): Promise<OwnerAccess> {
       "Zeus could not verify the account right now. Private memory stayed locked.",
     );
   }
+}
+
+/**
+ * Private HTTP routes must cross both boundaries: an allowed browser origin with an
+ * explicitly declared capability, then the immutable owner-account check.
+ */
+export async function getBrowserOwnerAccess(
+  request: Pick<Request, "headers" | "method" | "url">,
+  capability: BrowserCapability,
+): Promise<OwnerAccess> {
+  const configuration = getAuthConfiguration();
+  // Preserve the more useful fail-closed configuration error; Proxy already blocks
+  // the request, and no store can be opened in this state.
+  if (configuration.mode === "misconfigured") return getOwnerAccess();
+  const boundary = checkBrowserBoundary(request, capability, configuration);
+  if (!boundary.allowed) {
+    return denied("forbidden_origin", boundary.message);
+  }
+  return getOwnerAccess();
 }
 
 /**

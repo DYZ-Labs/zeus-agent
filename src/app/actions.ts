@@ -15,12 +15,11 @@ import {
   processUnderstandingBackfillBatch,
   startUnderstandingBackfill,
 } from "@/core/backfill";
+import { updateAmbientSetting } from "@/core/ambient";
 import {
   appendMessage,
   createConversation,
   getConversation,
-  hideAllConversationsFromHistory,
-  hideConversationFromHistory,
   listConversations,
   setConversationTitle,
 } from "@/core/conversations";
@@ -58,6 +57,22 @@ import {
   ensureEvidencePassage,
   sourceLooksSensitive,
 } from "@/core/passages";
+import {
+  acceptBehavioralPolicySuggestionForReview,
+  dismissBehavioralPolicySuggestion,
+  getBehavioralPolicySuggestion,
+} from "@/core/personalization";
+import {
+  getProject,
+  markProjectBlocked,
+  markProjectUnblocked,
+  recordProjectProgress,
+  updateProject,
+} from "@/core/projects";
+import {
+  deleteAllConversationsWithMemory,
+  deleteConversationWithMemory,
+} from "@/core/retention";
 import type { Db } from "@/core/db";
 import type {
   Cardinality,
@@ -67,8 +82,11 @@ import type {
   FacetMachineEffect,
   GoalPriority,
   GoalStatus,
+  ProjectStatus,
   StewardshipMode,
+  StructuredFacetCondition,
 } from "@/core/schema";
+import { StructuredFacetCondition as StructuredFacetConditionSchema } from "@/core/schema";
 import {
   recommendationForCommitment,
   recordFollowThroughDecision,
@@ -145,12 +163,18 @@ export async function acceptFacetCandidateAction(formData: FormData): Promise<vo
   const id = Number(formData.get("id"));
   const statement = normalizedText(formData.get("statement"), 1_000);
   const machineEffect = parseMachineEffect(formData.get("machineEffect"));
-  if (!Number.isInteger(id) || !statement || machineEffect === undefined) return;
+  const structuredCondition = parseStructuredConditionForm(formData.get("structuredCondition"));
+  if (
+    !Number.isInteger(id) || !statement || machineEffect === undefined ||
+    structuredCondition === undefined
+  ) return;
 
   const db = await requireOwnerDb();
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.kind !== "facet" || candidate.status !== "pending") return;
-  const applied = acceptCandidate(db, id, { facetEdit: { statement, machineEffect } });
+  const applied = acceptCandidate(db, id, {
+    facetEdit: { statement, machineEffect, structuredCondition },
+  });
   if (applied) await embedAppliedMemory(db, applied, candidate.evidence);
   revalidatePath("/understanding");
   revalidatePath("/understanding/backfill");
@@ -172,12 +196,24 @@ export async function correctFacetAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   const statement = normalizedText(formData.get("statement"), 1_000);
   const machineEffect = parseMachineEffect(formData.get("machineEffect"));
-  if (!Number.isInteger(id) || !statement || machineEffect === undefined) return;
+  const structuredCondition = parseStructuredConditionForm(formData.get("structuredCondition"));
+  if (
+    !Number.isInteger(id) || !statement || machineEffect === undefined ||
+    structuredCondition === undefined
+  ) return;
 
   const db = await requireOwnerDb();
   const existing = getFacet(db, id);
   if (!existing || existing.valid_to !== null) return;
-  if (existing.statement === statement && existing.machine_effect === machineEffect) return;
+  const existingCondition = existing.condition_json === null
+    ? null
+    : StructuredFacetConditionSchema.safeParse(
+        JSON.parse(existing.condition_json) as unknown,
+      ).data ?? null;
+  if (
+    existing.statement === statement && existing.machine_effect === machineEffect &&
+    JSON.stringify(existingCondition) === JSON.stringify(structuredCondition)
+  ) return;
   const source = curationMessage(db, `Corrected understanding: ${statement}`);
   const passage = ensureEvidencePassage(db, {
     messageId: source.id,
@@ -192,6 +228,7 @@ export async function correctFacetAction(formData: FormData): Promise<void> {
     sensitivity: existing.sensitivity,
     confidence: 1,
     machineEffect,
+    structuredCondition,
     validFrom: null,
     sourceMessageId: source.id,
     passageIds: [passage.id],
@@ -378,6 +415,79 @@ export async function updateCommitmentStatusAction(formData: FormData): Promise<
   revalidatePath("/today");
 }
 
+export async function updateProjectStatusAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const status = String(formData.get("status") ?? "") as ProjectStatus;
+  if (
+    !Number.isInteger(id) ||
+    !["planned", "active", "paused", "completed", "abandoned"].includes(status)
+  ) return;
+  const db = await requireOwnerDb();
+  const project = getProject(db, id);
+  if (!project || project.status === status) return;
+  const source = curationMessage(db, `Set project "${project.entity_name}" to ${status}.`);
+  updateProject(db, id, {
+    status,
+    sourceMessageId: source.id,
+    sourceKind: "user_action",
+  });
+  revalidatePath("/today");
+}
+
+export async function recordProjectProgressAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const summary = normalizedText(formData.get("summary"), 2_000);
+  const rawPercent = String(formData.get("percent") ?? "").trim();
+  const percent = rawPercent ? Number(rawPercent) / 100 : undefined;
+  if (
+    !Number.isInteger(id) ||
+    (!summary && percent === undefined) ||
+    (percent !== undefined && (!Number.isFinite(percent) || percent < 0 || percent > 1))
+  ) return;
+  const db = await requireOwnerDb();
+  const project = getProject(db, id);
+  if (!project) return;
+  const source = curationMessage(
+    db,
+    `Recorded progress for project "${project.entity_name}"${percent === undefined ? "" : ` at ${Math.round(percent * 100)}%`}${summary ? `: ${summary}` : "."}`,
+  );
+  recordProjectProgress(db, id, {
+    ...(summary ? { summary } : {}),
+    ...(percent === undefined ? {} : { percent }),
+    sourceMessageId: source.id,
+    sourceKind: "user_action",
+  });
+  revalidatePath("/today");
+}
+
+export async function setProjectBlockedAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const blocked = String(formData.get("blocked") ?? "") === "true";
+  const reason = normalizedText(formData.get("reason"), 1_000);
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  const project = getProject(db, id);
+  if (!project || (blocked ? project.blocked_at !== null : project.blocked_at === null)) return;
+  const source = curationMessage(
+    db,
+    `${blocked ? "Marked" : "Cleared"} project "${project.entity_name}" ${blocked ? "as blocked" : "as unblocked"}${reason ? `: ${reason}` : "."}`,
+  );
+  if (blocked) {
+    markProjectBlocked(db, id, {
+      reason,
+      sourceMessageId: source.id,
+      sourceKind: "user_action",
+    });
+  } else {
+    markProjectUnblocked(db, id, {
+      resolution: reason,
+      sourceMessageId: source.id,
+      sourceKind: "user_action",
+    });
+  }
+  revalidatePath("/today");
+}
+
 export async function snoozeCommitmentAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   const until = String(formData.get("until") ?? "");
@@ -399,11 +509,58 @@ export async function snoozeCommitmentAction(formData: FormData): Promise<void> 
 
 export async function setStewardshipModeAction(formData: FormData): Promise<void> {
   const mode = String(formData.get("mode") ?? "") as StewardshipMode;
-  if (!["quiet", "balanced", "proactive"].includes(mode)) return;
+  if (!["off", "quiet", "balanced", "proactive"].includes(mode)) return;
   const db = await requireOwnerDb();
   const source = curationMessage(db, `Set follow-through mode to ${mode}.`);
   setStewardshipMode(db, mode, source.id);
   revalidatePath("/today");
+  revalidatePath("/settings");
+}
+
+export async function updateAmbientSettingAction(formData: FormData): Promise<void> {
+  const timezone = normalizedText(formData.get("timezone"), 100);
+  const quietStart = normalizedText(formData.get("quietStart"), 5);
+  const quietEnd = normalizedText(formData.get("quietEnd"), 5);
+  if (!timezone || !quietStart || !quietEnd) return;
+  const enabled = formData.get("enabled") === "on";
+  const locationConsent = formData.get("locationConsent") === "on";
+  const db = await requireOwnerDb();
+  const source = curationMessage(
+    db,
+    `Set ambient support ${enabled ? "on" : "off"} in ${timezone}, with quiet hours ${quietStart}-${quietEnd}${locationConsent ? " and coarse-zone consent" : " without location consent"}.`,
+  );
+  updateAmbientSetting(db, {
+    enabled,
+    timezone,
+    quietStart,
+    quietEnd,
+    dailyLimit: 1,
+    allowedChannels: ["macos"],
+    locationConsent,
+    sourceMessageId: source.id,
+  });
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
+export async function reviewBehavioralPolicySuggestionAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const decision = String(formData.get("decision") ?? "");
+  if (!Number.isInteger(id) || !["keep_for_review", "dismiss"].includes(decision)) return;
+  const db = await requireOwnerDb();
+  const suggestion = getBehavioralPolicySuggestion(db, id);
+  if (!suggestion || suggestion.status !== "pending") return;
+  const source = curationMessage(
+    db,
+    decision === "keep_for_review"
+      ? `Keep behavioral policy suggestion ${id} for explicit review: ${suggestion.summary}`
+      : `Dismiss behavioral policy suggestion ${id}: ${suggestion.summary}`,
+  );
+  if (decision === "keep_for_review") {
+    acceptBehavioralPolicySuggestionForReview(db, id, source.id);
+  } else {
+    dismissBehavioralPolicySuggestion(db, id, source.id);
+  }
   revalidatePath("/settings");
 }
 
@@ -439,9 +596,15 @@ export async function followThroughDecisionAction(formData: FormData): Promise<v
 export async function deleteConversationAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   const confirmation = String(formData.get("confirmation") ?? "");
-  if (!Number.isInteger(id) || confirmation !== "delete") return;
-  if (!hideConversationFromHistory(await requireOwnerDb(), id)) return;
+  if (!Number.isInteger(id) || confirmation !== "erase-source") return;
+  const db = await requireOwnerDb();
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return;
+  deleteConversationWithMemory(db, id);
   revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
   redirect("/settings#data");
@@ -465,21 +628,29 @@ export async function deleteConversationFromHistoryAction(
   id: number,
   confirmation: string,
 ): Promise<void> {
-  if (!Number.isInteger(id) || confirmation !== "delete") return;
+  if (!Number.isInteger(id) || confirmation !== "erase-source") return;
 
   const db = await requireOwnerDb();
-  if (!hideConversationFromHistory(db, id)) return;
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return;
+  deleteConversationWithMemory(db, id);
   revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }
 
-export async function deleteAllRecentChatsAction(formData: FormData): Promise<void> {
+export async function deleteAllConversationsAction(formData: FormData): Promise<void> {
   const confirmation = String(formData.get("confirmation") ?? "");
-  if (confirmation !== "delete-all-recent") return;
+  if (confirmation !== "erase-all-sources") return;
 
-  hideAllConversationsFromHistory(await requireOwnerDb());
+  deleteAllConversationsWithMemory(await requireOwnerDb());
   revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }
@@ -602,6 +773,18 @@ function parseMachineEffect(value: FormDataEntryValue | null): FacetMachineEffec
   return normalized === "boost" || normalized === "deprioritize" || normalized === "block"
     ? normalized
     : undefined;
+}
+
+function parseStructuredConditionForm(
+  value: FormDataEntryValue | null,
+): StructuredFacetCondition | null | undefined {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) return null;
+  try {
+    return StructuredFacetConditionSchema.parse(JSON.parse(normalized) as unknown);
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizedText(value: FormDataEntryValue | null, limit: number): string {

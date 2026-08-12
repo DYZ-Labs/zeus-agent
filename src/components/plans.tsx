@@ -1,10 +1,13 @@
 import Link from "next/link";
 
 import {
+  recordProjectProgressAction,
+  setProjectBlockedAction,
   setGoalPriorityAction,
   snoozeCommitmentAction,
   updateCommitmentStatusAction,
   updateGoalStatusAction,
+  updateProjectStatusAction,
 } from "@/app/actions";
 import {
   commitmentEvents,
@@ -13,17 +16,22 @@ import {
   listGoals,
 } from "@/core/intentions";
 import type { Db } from "@/core/db";
+import { listProjects, projectEvents } from "@/core/projects";
 import type {
   CommitmentStatus,
   CommitmentView,
   Goal,
   GoalPriority,
   GoalStatus,
+  ProjectStatus,
+  ProjectView,
 } from "@/core/schema";
 
 export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean }) {
   const goals = listGoals(db, { includeClosed: showCompleted, limit: 300 });
   const commitments = listCommitments(db, { includeClosed: showCompleted, limit: 500 });
+  const projects = listProjects(db, { includeClosed: showCompleted, limit: 300 });
+  const projectNames = new Map(projects.map((project) => [project.id, project.entity_name]));
 
   return (
     <section id="plans" className="mt-12 max-w-[54rem] scroll-mt-4 pb-8">
@@ -31,8 +39,8 @@ export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean })
         <div>
           <SectionTitle>Plans</SectionTitle>
           <p className="mt-2 max-w-[62ch] text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-            Goals and commitments are tracked quietly. Come here when you want to correct,
-            pause, or close one.
+            Projects, goals, and commitments are tracked quietly. Come here when you want to
+            record progress, correct status, pause, or close one.
           </p>
         </div>
         <Link
@@ -45,11 +53,29 @@ export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean })
       </div>
 
       <section className="mt-7">
+        <PlanGroupTitle title="Projects" count={projects.length} />
+        {projects.length ? (
+          <ul className="mt-2">
+            {projects.map((project) => (
+              <ProjectRow key={project.id} db={db} project={project} />
+            ))}
+          </ul>
+        ) : (
+          <Empty>Tell Zeus about a project and its lifecycle will appear here.</Empty>
+        )}
+      </section>
+
+      <section className="mt-9">
         <PlanGroupTitle title="Goals" count={goals.length} />
         {goals.length ? (
           <ul className="mt-2">
             {goals.map((goal) => (
-              <GoalRow key={goal.id} db={db} goal={goal} />
+              <GoalRow
+                key={goal.id}
+                db={db}
+                goal={goal}
+                projectName={goal.project_id === null ? null : projectNames.get(goal.project_id) ?? null}
+              />
             ))}
           </ul>
         ) : (
@@ -62,7 +88,12 @@ export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean })
         {commitments.length ? (
           <ul className="mt-2">
             {commitments.map((commitment) => (
-              <CommitmentRow key={commitment.id} db={db} commitment={commitment} />
+              <CommitmentRow
+                key={commitment.id}
+                db={db}
+                commitment={commitment}
+                projectName={commitment.project_id === null ? null : projectNames.get(commitment.project_id) ?? null}
+              />
             ))}
           </ul>
         ) : (
@@ -73,7 +104,103 @@ export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean })
   );
 }
 
-function GoalRow({ db, goal }: { db: Db; goal: Goal }) {
+function ProjectRow({ db, project }: { db: Db; project: ProjectView }) {
+  const events = projectEvents(db, project.id);
+  const actions: ProjectStatus[] =
+    project.status === "planned"
+      ? ["active", "paused", "completed", "abandoned"]
+      : project.status === "active"
+        ? ["paused", "completed", "abandoned"]
+        : project.status === "paused"
+          ? ["active", "completed", "abandoned"]
+          : ["active"];
+
+  return (
+    <li className="border-b py-4" style={{ borderColor: "var(--shell-line)" }}>
+      <div className="flex flex-wrap items-start gap-4">
+        <div className="min-w-0 flex-1">
+          <p className="text-[0.94rem]">{project.entity_name}</p>
+          <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
+            {project.status}
+            {project.progress_percent === null
+              ? ""
+              : ` · ${Math.round(project.progress_percent * 100)}%`}
+            {project.blocked_at ? " · blocked" : ""} ·{" "}
+            <Link href={`/source/${project.source_message_id}`} className="underline underline-offset-2">
+              source
+            </Link>
+          </p>
+          {project.progress_summary && (
+            <p className="mt-1 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+              {project.progress_summary}
+            </p>
+          )}
+        </div>
+        <StatusActions id={project.id} statuses={actions} action={updateProjectStatusAction} />
+      </div>
+
+      {!['completed', 'abandoned'].includes(project.status) && (
+        <form action={recordProjectProgressAction} className="mt-3 flex flex-wrap items-end gap-2 text-[0.7rem]">
+          <input type="hidden" name="id" value={project.id} />
+          <label className="min-w-[14rem] flex-1" style={{ color: "var(--shell-faint)" }}>
+            Progress note
+            <input
+              name="summary"
+              maxLength={2000}
+              placeholder="What changed?"
+              className="mt-1 block min-h-9 w-full rounded-md border px-2.5 text-[0.78rem]"
+              style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+            />
+          </label>
+          <label style={{ color: "var(--shell-faint)" }}>
+            Percent
+            <input
+              name="percent"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              defaultValue={project.progress_percent === null ? "" : Math.round(project.progress_percent * 100)}
+              className="mt-1 block min-h-9 w-20 rounded-md border px-2 text-[0.78rem]"
+              style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+            />
+          </label>
+          <button type="submit" className="min-h-9" style={{ color: "var(--shell-accent)" }}>
+            record
+          </button>
+        </form>
+      )}
+
+      {!['completed', 'abandoned'].includes(project.status) && (
+        <form action={setProjectBlockedAction} className="mt-3 flex flex-wrap items-end gap-2 text-[0.7rem]">
+          <input type="hidden" name="id" value={project.id} />
+          <input type="hidden" name="blocked" value={project.blocked_at ? "false" : "true"} />
+          <label className="min-w-[14rem] flex-1" style={{ color: "var(--shell-faint)" }}>
+            {project.blocked_at ? "Resolution" : "Blocker"} (optional)
+            <input
+              name="reason"
+              maxLength={1000}
+              className="mt-1 block min-h-9 w-full rounded-md border px-2.5 text-[0.78rem]"
+              style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+            />
+          </label>
+          <button type="submit" className="min-h-9" style={{ color: "var(--shell-muted)" }}>
+            {project.blocked_at ? "clear blocker" : "mark blocked"}
+          </button>
+        </form>
+      )}
+
+      <EventHistory
+        events={events.map(
+          (event) =>
+            `${event.created_at.slice(0, 10)} · ${event.event_type}${event.to_status ? ` → ${event.to_status}` : ""}${event.detail_json ? ` · ${event.detail_json}` : ""}`,
+        )}
+      />
+    </li>
+  );
+}
+
+function GoalRow({ db, goal, projectName }: { db: Db; goal: Goal; projectName: string | null }) {
   const events = goalEvents(db, goal.id);
   const actions: GoalStatus[] =
     goal.status === "active"
@@ -89,6 +216,7 @@ function GoalRow({ db, goal }: { db: Db; goal: Goal }) {
           <p className="text-[0.94rem]">{goal.title}</p>
           <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
             {goal.status} · {goal.priority} priority
+            {projectName ? ` · project ${projectName}` : ""}
             {goal.target_at ? ` · target ${goal.target_at.slice(0, 10)}` : ""} ·{" "}
             <Link href={`/source/${goal.source_message_id}`} className="underline underline-offset-2">
               source
@@ -125,7 +253,15 @@ function GoalRow({ db, goal }: { db: Db; goal: Goal }) {
   );
 }
 
-function CommitmentRow({ db, commitment }: { db: Db; commitment: CommitmentView }) {
+function CommitmentRow({
+  db,
+  commitment,
+  projectName,
+}: {
+  db: Db;
+  commitment: CommitmentView;
+  projectName: string | null;
+}) {
   const events = commitmentEvents(db, commitment.id);
   const actions: CommitmentStatus[] =
     commitment.status === "open"
@@ -142,6 +278,7 @@ function CommitmentRow({ db, commitment }: { db: Db; commitment: CommitmentView 
           <p className="mt-1.5 font-mono text-[0.65rem]" style={{ color: "var(--shell-faint)" }}>
             {commitment.status} · owner {commitment.owner_name}
             {commitment.goal_title ? ` · ${commitment.goal_title}` : ""}
+            {projectName ? ` · project ${projectName}` : ""}
             {commitment.due_at ? ` · due ${commitment.due_at.slice(0, 10)}` : ""} ·{" "}
             <Link href={`/source/${commitment.source_message_id}`} className="underline underline-offset-2">
               source

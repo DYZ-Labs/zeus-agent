@@ -24,6 +24,34 @@ export type MessageRecallState = z.infer<typeof MessageRecallState>;
 export const ConversationSource = z.enum(["web", "mcp", "seed"]);
 export type ConversationSource = z.infer<typeof ConversationSource>;
 
+export const McpMutationEventType = z.enum([
+  "approval_requested",
+  "approval_unsupported",
+  "approval_declined",
+  "approval_cancelled",
+  "approval_expired",
+  "approved",
+  "applied",
+  "failed",
+]);
+export type McpMutationEventType = z.infer<typeof McpMutationEventType>;
+
+export const McpMutationEvent = z
+  .object({
+    id: z.number().int(),
+    operation_id: z.string(),
+    tool_name: z.string(),
+    request_hash: z.string().regex(/^[a-f0-9]{64}$/u),
+    target_kind: z.string().nullable(),
+    target_id: z.number().int().positive().nullable(),
+    event_type: McpMutationEventType,
+    source_message_id: z.number().int().positive().nullable(),
+    approval_expires_at: z.string().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type McpMutationEvent = z.infer<typeof McpMutationEvent>;
+
 export const OwnerKind = z.enum(["fact", "message", "entity"]);
 export type OwnerKind = z.infer<typeof OwnerKind>;
 
@@ -54,8 +82,122 @@ export type GoalPriority = z.infer<typeof GoalPriority>;
 export const CommitmentStatus = z.enum(["open", "waiting", "done", "cancelled"]);
 export type CommitmentStatus = z.infer<typeof CommitmentStatus>;
 
-export const StewardshipMode = z.enum(["quiet", "balanced", "proactive"]);
+export const StewardshipMode = z.enum(["off", "quiet", "balanced", "proactive"]);
 export type StewardshipMode = z.infer<typeof StewardshipMode>;
+
+export const TriggerKind = z.enum(["chat", "today", "mcp", "worker"]);
+export type TriggerKind = z.infer<typeof TriggerKind>;
+
+export const EffectKind = z.enum([
+  "memory_read",
+  "web_read",
+  "prepare_local",
+  "send",
+  "schedule",
+  "purchase",
+  "modify_external",
+]);
+export type EffectKind = z.infer<typeof EffectKind>;
+
+export const Weekday = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
+export type Weekday = z.infer<typeof Weekday>;
+
+const LocalClockTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/u, "Expected HH:mm");
+const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+/** Avoid Zod's legacy string.datetime helper, which currently creates a Turbopack
+ * initialization cycle in production SSR bundles. This boundary still requires an
+ * explicit UTC/offset ISO-8601 timestamp and a calendar-valid parsed value. */
+export const IsoDateTime = z.string().refine(
+  (value) => ISO_DATE_TIME.test(value) && Number.isFinite(Date.parse(value)),
+  "Expected an ISO-8601 timestamp with UTC or an explicit offset",
+);
+
+export const StructuredFacetCondition = z
+  .object({
+    weekdays: z.array(Weekday).min(1).max(7).optional(),
+    local_time: z
+      .object({ start: LocalClockTime, end: LocalClockTime })
+      .strict()
+      .refine((value) => value.start !== value.end, "A local-time window must have a duration")
+      .optional(),
+    zones: z.array(z.string().trim().min(1).max(120)).min(1).optional(),
+    expires_at: IsoDateTime.optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.weekdays !== undefined ||
+      value.local_time !== undefined ||
+      value.zones !== undefined ||
+      value.expires_at !== undefined,
+    "At least one structured condition is required",
+  );
+export type StructuredFacetCondition = z.infer<typeof StructuredFacetCondition>;
+
+export const EvaluationContext = z
+  .object({
+    trigger: TriggerKind,
+    evaluated_at: IsoDateTime,
+    timezone: z.string().trim().min(1).max(100),
+    local_weekday: Weekday,
+    local_time: LocalClockTime,
+    daypart: z.enum(["overnight", "morning", "afternoon", "evening"]),
+    location_zone: z.string().trim().min(1).max(120).nullable(),
+    location_observed_at: IsoDateTime.nullable(),
+  })
+  .strict();
+export type EvaluationContext = z.infer<typeof EvaluationContext>;
+
+export const ProjectStatus = z.enum(["planned", "active", "paused", "completed", "abandoned"]);
+export type ProjectStatus = z.infer<typeof ProjectStatus>;
+
+export const ProjectEventType = z.enum([
+  "created",
+  "updated",
+  "status_changed",
+  "progress",
+  "blocked",
+  "unblocked",
+]);
+export type ProjectEventType = z.infer<typeof ProjectEventType>;
+
+export const WorkPlanStatus = z.enum([
+  "proposed",
+  "authorized",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+export type WorkPlanStatus = z.infer<typeof WorkPlanStatus>;
+
+export const WorkStepStatus = z.enum([
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "skipped",
+  "cancelled",
+]);
+export type WorkStepStatus = z.infer<typeof WorkStepStatus>;
+
+export const WorkRunStatus = z.enum([
+  "queued",
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+export type WorkRunStatus = z.infer<typeof WorkRunStatus>;
+
+export const WorkArtifactKind = z.enum(["draft", "comparison", "report", "research_notes"]);
+export type WorkArtifactKind = z.infer<typeof WorkArtifactKind>;
+
+export const ToolReceiptStatus = z.enum(["started", "completed", "failed"]);
+export type ToolReceiptStatus = z.infer<typeof ToolReceiptStatus>;
 
 export const FollowThroughReason = z.enum([
   "overdue",
@@ -87,6 +229,37 @@ export const FollowThroughEventType = z.enum([
   "regretted",
 ]);
 export type FollowThroughEventType = z.infer<typeof FollowThroughEventType>;
+
+export const BehavioralPolicySuggestionKind = z.enum([
+  "temporary_suppression",
+  "confirm_routine",
+]);
+export type BehavioralPolicySuggestionKind = z.infer<
+  typeof BehavioralPolicySuggestionKind
+>;
+
+export const BehavioralPolicyReviewStatus = z.enum([
+  "pending",
+  "accepted_for_review",
+  "dismissed",
+]);
+export type BehavioralPolicyReviewStatus = z.infer<
+  typeof BehavioralPolicyReviewStatus
+>;
+
+export const BehavioralInterruptionChange = z.enum(["none", "suppress_only"]);
+export type BehavioralInterruptionChange = z.infer<
+  typeof BehavioralInterruptionChange
+>;
+
+export const BehavioralPolicySuggestionEventType = z.enum([
+  "materialized",
+  "accepted_for_review",
+  "dismissed",
+]);
+export type BehavioralPolicySuggestionEventType = z.infer<
+  typeof BehavioralPolicySuggestionEventType
+>;
 
 export const FacetKind = z.enum([
   "value",
@@ -262,6 +435,7 @@ export const UnderstandingFacet = z
     scope_goal_id: z.number().int().nullable(),
     scope_commitment_id: z.number().int().nullable(),
     condition_text: z.string().nullable(),
+    condition_json: z.string().nullable(),
     importance: FacetImportance,
     sensitivity: FacetSensitivity,
     confidence: z.number().min(0).max(1),
@@ -307,6 +481,7 @@ export const Goal = z
     status: GoalStatus,
     priority: GoalPriority,
     target_at: z.string().nullable(),
+    project_id: z.number().int().nullable(),
     confidence: z.number().min(0).max(1),
     source_message_id: z.number().int(),
     created_at: z.string(),
@@ -338,6 +513,7 @@ export const Commitment = z
     title: z.string(),
     owner_entity_id: z.number().int(),
     linked_goal_id: z.number().int().nullable(),
+    project_id: z.number().int().nullable(),
     status: CommitmentStatus,
     due_at: z.string().nullable(),
     snoozed_until: z.string().nullable(),
@@ -384,6 +560,38 @@ export const StewardshipSetting = z
   .strict();
 export type StewardshipSetting = z.infer<typeof StewardshipSetting>;
 
+export const RecommendationCycle = z
+  .object({
+    id: z.number().int(),
+    policy_version: z.string(),
+    trigger: TriggerKind,
+    context_json: z.string(),
+    query_text: z.string(),
+    candidate_scores_json: z.string(),
+    applied_facet_ids_json: z.string(),
+    exclusions_json: z.string(),
+    selected_commitment_id: z.number().int().nullable(),
+    recommendation_json: z.string().nullable(),
+    source_message_id: z.number().int().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type RecommendationCycle = z.infer<typeof RecommendationCycle>;
+
+export const OpportunityDeliveryChannel = z.enum(["chat", "today", "mcp", "macos"]);
+export type OpportunityDeliveryChannel = z.infer<typeof OpportunityDeliveryChannel>;
+
+export const OpportunityDelivery = z
+  .object({
+    id: z.number().int(),
+    opportunity_id: z.number().int(),
+    channel: OpportunityDeliveryChannel,
+    response_message_id: z.number().int().nullable(),
+    delivered_at: z.string(),
+  })
+  .strict();
+export type OpportunityDelivery = z.infer<typeof OpportunityDelivery>;
+
 export const FollowThroughRecommendation = z
   .object({
     commitment_id: z.number().int(),
@@ -395,6 +603,7 @@ export const FollowThroughRecommendation = z
     due_at: z.string().nullable(),
     reason: FollowThroughReason,
     action_kind: FollowThroughActionKind,
+    effect_kind: EffectKind,
     why: z.string(),
     suggested_action: z.string(),
     chat_prompt: z.string(),
@@ -412,6 +621,8 @@ export const FollowThroughEvent = z
     event_type: FollowThroughEventType,
     reason: FollowThroughReason,
     action_kind: FollowThroughActionKind,
+    effect_kind: EffectKind,
+    opportunity_id: z.number().int().nullable(),
     detail_json: z.string().nullable(),
     response_message_id: z.number().int().nullable(),
     source_message_id: z.number().int().nullable(),
@@ -426,6 +637,326 @@ export const FollowThroughEventView = FollowThroughEvent.extend({
   goal_title: z.string().nullable(),
 }).strict();
 export type FollowThroughEventView = z.infer<typeof FollowThroughEventView>;
+
+/**
+ * A non-canonical proposal to review a possible behavioral policy. The proposal is
+ * evidence-linked audit data, never a fact, facet, routine, or active machine effect.
+ */
+export const BehavioralPolicySuggestion = z
+  .object({
+    id: z.number().int(),
+    pattern_key: z.string(),
+    event_type: z.enum(["dismissed", "snoozed", "completed", "regretted"]),
+    action_kind: FollowThroughActionKind,
+    kind: BehavioralPolicySuggestionKind,
+    summary: z.string(),
+    allowed_interruption_change: BehavioralInterruptionChange,
+    minimum_evidence_count: z.number().int().min(2),
+    created_at: z.string(),
+  })
+  .strict();
+export type BehavioralPolicySuggestion = z.infer<typeof BehavioralPolicySuggestion>;
+
+export const BehavioralPolicySuggestionEvent = z
+  .object({
+    id: z.number().int(),
+    suggestion_id: z.number().int(),
+    event_type: BehavioralPolicySuggestionEventType,
+    detail_json: z.string().nullable(),
+    source_message_id: z.number().int().nullable(),
+    source_kind: z.enum(["system", "message", "user_action"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type BehavioralPolicySuggestionEvent = z.infer<
+  typeof BehavioralPolicySuggestionEvent
+>;
+
+export const BehavioralPolicySuggestionView = BehavioralPolicySuggestion.extend({
+  status: BehavioralPolicyReviewStatus,
+  evidence_event_ids: z.array(z.number().int()),
+  events: z.array(BehavioralPolicySuggestionEvent),
+}).strict();
+export type BehavioralPolicySuggestionView = z.infer<
+  typeof BehavioralPolicySuggestionView
+>;
+
+export const Project = z
+  .object({
+    id: z.number().int(),
+    entity_id: z.number().int(),
+    status: ProjectStatus,
+    progress_summary: z.string().nullable(),
+    progress_percent: z.number().min(0).max(1).nullable(),
+    blocked_at: z.string().nullable(),
+    confidence: z.number().min(0).max(1),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+    closed_at: z.string().nullable(),
+  })
+  .strict();
+export type Project = z.infer<typeof Project>;
+
+export const ProjectView = Project.extend({
+  entity_name: z.string(),
+  entity_slug: z.string(),
+}).strict();
+export type ProjectView = z.infer<typeof ProjectView>;
+
+export const ProjectEvent = z
+  .object({
+    id: z.number().int(),
+    project_id: z.number().int(),
+    event_type: ProjectEventType,
+    from_status: ProjectStatus.nullable(),
+    to_status: ProjectStatus.nullable(),
+    detail_json: z.string().nullable(),
+    source_message_id: z.number().int().nullable(),
+    passage_id: z.number().int().nullable(),
+    source_kind: z.enum(["message", "user_action"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type ProjectEvent = z.infer<typeof ProjectEvent>;
+
+export const WorkPlan = z
+  .object({
+    id: z.number().int(),
+    objective: z.string(),
+    status: WorkPlanStatus,
+    plan_hash: z.string(),
+    hash_version: z.number().int().min(2).max(3),
+    allowed_effects_json: z.string(),
+    completion_criteria_json: z.string(),
+    max_steps: z.number().int().min(1).max(12),
+    max_model_tool_calls: z.number().int().min(1).max(20),
+    max_retries_per_step: z.number().int().min(0).max(2),
+    max_duration_seconds: z.number().int().min(1).max(900),
+    source_message_id: z.number().int(),
+    source_goal_id: z.number().int().nullable(),
+    source_commitment_id: z.number().int().nullable(),
+    source_project_id: z.number().int().nullable(),
+    origin: z.enum(["explicit_request", "surfaced_proposal"]),
+    created_at: z.string(),
+    updated_at: z.string(),
+    completed_at: z.string().nullable(),
+  })
+  .strict();
+export type WorkPlan = z.infer<typeof WorkPlan>;
+
+export const WorkPlanMemorySourceKind = z.enum(["fact", "facet"]);
+export type WorkPlanMemorySourceKind = z.infer<typeof WorkPlanMemorySourceKind>;
+
+/** Immutable generation-time snapshot of one canonical personalization item. */
+export const WorkPlanMemorySource = z
+  .object({
+    work_plan_id: z.number().int(),
+    source_kind: WorkPlanMemorySourceKind,
+    source_id: z.number().int(),
+    included_in_prompt: z.number().int().min(0).max(1),
+    exclusion_reason: z.string().nullable(),
+    snapshot_json: z.string(),
+  })
+  .strict();
+export type WorkPlanMemorySource = z.infer<typeof WorkPlanMemorySource>;
+
+/** Exact local/ambient context and accepted-conflict trace used during planning. */
+export const WorkPlanGenerationContext = z
+  .object({
+    work_plan_id: z.number().int(),
+    evaluation_context_json: z.string(),
+    conflict_snapshot_json: z.string(),
+    created_at: z.string(),
+  })
+  .strict();
+export type WorkPlanGenerationContext = z.infer<typeof WorkPlanGenerationContext>;
+
+export const WorkStep = z
+  .object({
+    id: z.number().int(),
+    work_plan_id: z.number().int(),
+    position: z.number().int().positive(),
+    title: z.string(),
+    instruction: z.string(),
+    effect_kind: EffectKind,
+    status: WorkStepStatus,
+    attempt_count: z.number().int().nonnegative(),
+    started_at: z.string().nullable(),
+    completed_at: z.string().nullable(),
+    error_code: z.string().nullable(),
+    error_message: z.string().nullable(),
+  })
+  .strict();
+export type WorkStep = z.infer<typeof WorkStep>;
+
+export const WorkAuthorization = z
+  .object({
+    id: z.number().int(),
+    work_plan_id: z.number().int(),
+    plan_hash: z.string(),
+    authorization_kind: z.enum(["explicit_request", "user_approval"]),
+    allowed_effects_json: z.string(),
+    max_model_tool_calls: z.number().int().min(1).max(20),
+    max_retries_per_step: z.number().int().min(0).max(2),
+    max_duration_seconds: z.number().int().min(1).max(900),
+    expires_at: z.string(),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    revoked_at: z.string().nullable(),
+  })
+  .strict();
+export type WorkAuthorization = z.infer<typeof WorkAuthorization>;
+
+export const WorkRun = z
+  .object({
+    id: z.number().int(),
+    work_plan_id: z.number().int(),
+    authorization_id: z.number().int(),
+    plan_hash: z.string(),
+    status: WorkRunStatus,
+    model_call_count: z.number().int().nonnegative(),
+    tool_call_count: z.number().int().nonnegative(),
+    checkpoint_step_id: z.number().int().nullable(),
+    started_at: z.string(),
+    updated_at: z.string(),
+    deadline_at: z.string(),
+    runner_token: z.string().nullable(),
+    runner_lease_until: z.string().nullable(),
+    completed_at: z.string().nullable(),
+    error_code: z.string().nullable(),
+    error_message: z.string().nullable(),
+  })
+  .strict();
+export type WorkRun = z.infer<typeof WorkRun>;
+
+export const WorkArtifact = z
+  .object({
+    id: z.number().int(),
+    work_plan_id: z.number().int(),
+    work_run_id: z.number().int(),
+    work_step_id: z.number().int().nullable(),
+    kind: WorkArtifactKind,
+    title: z.string(),
+    content: z.string(),
+    citations_json: z.string(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type WorkArtifact = z.infer<typeof WorkArtifact>;
+
+export const WorkArtifactSource = z
+  .object({
+    work_artifact_id: z.number().int(),
+    source_message_id: z.number().int(),
+  })
+  .strict();
+export type WorkArtifactSource = z.infer<typeof WorkArtifactSource>;
+
+export const WorkArtifactMemorySource = z
+  .object({
+    work_artifact_id: z.number().int(),
+    source_kind: WorkPlanMemorySourceKind,
+    source_id: z.number().int(),
+    snapshot_json: z.string(),
+  })
+  .strict();
+export type WorkArtifactMemorySource = z.infer<typeof WorkArtifactMemorySource>;
+
+export const ToolReceipt = z
+  .object({
+    id: z.number().int(),
+    work_run_id: z.number().int(),
+    work_step_id: z.number().int().nullable(),
+    tool_name: z.enum(["memory_recall", "web_search", "local_artifact"]),
+    effect_kind: z.enum(["memory_read", "web_read", "prepare_local"]),
+    call_index: z.number().int().positive(),
+    input_json: z.string(),
+    output_json: z.string().nullable(),
+    citations_json: z.string(),
+    status: ToolReceiptStatus,
+    error_code: z.string().nullable(),
+    error_message: z.string().nullable(),
+    idempotency_key: z.string(),
+    started_at: z.string(),
+    completed_at: z.string().nullable(),
+  })
+  .strict();
+export type ToolReceipt = z.infer<typeof ToolReceipt>;
+
+export const WorkStepDefinition = z
+  .object({
+    title: z.string().trim().min(1).max(200),
+    instruction: z.string().trim().min(1).max(4000),
+    effect_kind: EffectKind,
+    depends_on: z.array(z.number().int().positive()).default([]),
+  })
+  .strict();
+export type WorkStepDefinition = z.infer<typeof WorkStepDefinition>;
+
+export const WorkPlanProposal = z
+  .object({
+    objective: z.string().trim().min(1).max(2000),
+    steps: z.array(WorkStepDefinition).min(1).max(12),
+    allowed_effects: z.array(EffectKind).min(1),
+    completion_criteria: z.array(z.string().trim().min(1).max(1000)).min(1),
+    limits: z
+      .object({
+        max_model_tool_calls: z.number().int().min(1).max(20).default(20),
+        max_retries_per_step: z.number().int().min(0).max(2).default(2),
+        max_duration_seconds: z.number().int().min(1).max(900).default(900),
+      })
+      .strict(),
+  })
+  .strict();
+export type WorkPlanProposal = z.infer<typeof WorkPlanProposal>;
+
+export const AmbientSetting = z
+  .object({
+    id: z.literal(1),
+    enabled: z.number().int().min(0).max(1),
+    timezone: z.string(),
+    quiet_start: LocalClockTime,
+    quiet_end: LocalClockTime,
+    daily_limit: z.literal(1),
+    channels_json: z.string(),
+    location_consent: z.number().int().min(0).max(1),
+    source_message_id: z.number().int().nullable(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type AmbientSetting = z.infer<typeof AmbientSetting>;
+
+export const CoarseLocation = z
+  .object({
+    id: z.literal(1),
+    zone_id: z.string(),
+    observed_at: z.string(),
+    expires_at: z.string(),
+    created_at: z.string(),
+  })
+  .strict();
+export type CoarseLocation = z.infer<typeof CoarseLocation>;
+
+export const AmbientDeliveryAttempt = z
+  .object({
+    id: z.number().int(),
+    opportunity_id: z.number().int(),
+    channel: z.literal("macos"),
+    local_day: z.string(),
+    claim_slot: z.string().nullable(),
+    lease_token: z.string(),
+    status: z.enum(["claimed", "succeeded", "failed", "unknown"]),
+    leased_until: z.string(),
+    notifier_started_at: z.string(),
+    completed_at: z.string().nullable(),
+    error_code: z.string().nullable(),
+    delivery_id: z.number().int().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type AmbientDeliveryAttempt = z.infer<typeof AmbientDeliveryAttempt>;
 
 /** A fact joined to the names it references — what the UI and prompt builder consume. */
 export const FactView = Fact.extend({
@@ -572,6 +1103,18 @@ export const ExtractedFact = z
   .strict();
 export type ExtractedFact = z.input<typeof ExtractedFact>;
 
+export const ExtractedProjectLink = z.discriminatedUnion("kind", [
+  z
+    .object({ kind: z.literal("id"), id: z.number().int() })
+    .strict()
+    .describe("An existing project from the supplied active-project list."),
+  z
+    .object({ kind: z.literal("name"), name: z.string().min(1) })
+    .strict()
+    .describe("A named project entity declared in this extraction."),
+]);
+export type ExtractedProjectLink = z.infer<typeof ExtractedProjectLink>;
+
 export const ExtractedGoal = z
   .object({
     existing_id: z
@@ -589,6 +1132,9 @@ export const ExtractedGoal = z
     target_at: FieldPatchSchema(z.string()).describe(
       "For an update, keep unless the user changes the target; set to a user-supplied ISO date/time; clear only when the user removes it. For a new goal, set when supplied and otherwise clear.",
     ),
+    project: FieldPatchSchema(ExtractedProjectLink).describe(
+      "For an update, keep unless the project link changes; set by existing project ID or a declared project entity name; clear only when the user removes the link. For a new goal, set when linked and otherwise clear.",
+    ),
     evidence: z.array(ExtractionEvidence).default([]),
     confidence: z.number().describe("Confidence that the user expressed this goal or update."),
     ...TrustFields,
@@ -596,9 +1142,12 @@ export const ExtractedGoal = z
   .strict();
 type ModelExtractedGoal = z.input<typeof ExtractedGoal>;
 /** Also accepts the former nullable fields at the deterministic apply boundary. */
-export type ExtractedGoal = Omit<ModelExtractedGoal, "priority" | "target_at"> & {
+export type ExtractedGoal = Omit<ModelExtractedGoal, "priority" | "target_at" | "project"> & {
   priority?: ModelExtractedGoal["priority"] | GoalPriority | null;
   target_at?: ModelExtractedGoal["target_at"] | string | null;
+  project?: ModelExtractedGoal["project"];
+  project_id?: number | null;
+  project_name?: string | null;
 };
 
 export const ExtractedGoalLink = z.discriminatedUnion("kind", [
@@ -632,6 +1181,9 @@ export const ExtractedCommitment = z
     due_at: FieldPatchSchema(z.string()).describe(
       "For an update, keep unless the due date changes; set to a user-supplied ISO date/time; clear only when the user removes it. For a new commitment, set when supplied and otherwise clear.",
     ),
+    project: FieldPatchSchema(ExtractedProjectLink).describe(
+      "For an update, keep unless the project link changes; set by existing project ID or a declared project entity name; clear only when the user removes the link. For a new commitment, set when linked and otherwise clear.",
+    ),
     evidence: z.array(ExtractionEvidence).default([]),
     confidence: z.number().describe("Confidence that the user expressed this commitment or update."),
     ...TrustFields,
@@ -641,13 +1193,16 @@ type ModelExtractedCommitment = z.input<typeof ExtractedCommitment>;
 /** Also accepts the former owner/link/date fields at the deterministic apply boundary. */
 export type ExtractedCommitment = Omit<
   ModelExtractedCommitment,
-  "owner" | "linked_goal" | "due_at"
+  "owner" | "linked_goal" | "due_at" | "project"
 > & {
   owner?: ModelExtractedCommitment["owner"] | string;
   linked_goal?: ModelExtractedCommitment["linked_goal"];
   linked_goal_id?: number | null;
   linked_goal_title?: string | null;
   due_at?: ModelExtractedCommitment["due_at"] | string | null;
+  project?: ModelExtractedCommitment["project"];
+  project_id?: number | null;
+  project_name?: string | null;
 };
 
 export const ExtractedFacetScope = z.discriminatedUnion("kind", [
@@ -667,6 +1222,11 @@ export const ExtractedFacet = z
       .describe("A concise, corrigible statement in the user's terms; never a diagnosis or personality label."),
     scope: ExtractedFacetScope,
     condition: z.string().nullable().default(null),
+    structured_condition: StructuredFacetCondition.nullable()
+      .default(null)
+      .describe(
+        "Typed weekday, local-time, named-zone, or expiry conditions. Use only details the user explicitly supplied.",
+      ),
     importance: FacetImportance.default("normal"),
     machine_effect: FacetMachineEffect.nullable()
       .default(null)
@@ -773,6 +1333,7 @@ export const RecallItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("episode"), episode: EpisodeHit }).strict(),
   z.object({ kind: z.literal("goal"), goal: Goal }).strict(),
   z.object({ kind: z.literal("commitment"), commitment: CommitmentView }).strict(),
+  z.object({ kind: z.literal("project"), project: ProjectView }).strict(),
   z
     .object({
       kind: z.literal("facet"),

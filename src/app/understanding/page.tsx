@@ -228,6 +228,7 @@ function FacetCandidateRow({ candidate }: { candidate: CandidateView }) {
   const scope = candidateScope(payload);
   const reasons = candidateReasons(candidate);
   const conflict = conflictPreview(envelope) ?? conflictPreview(payload);
+  const structuredCondition = payload.structured_condition ?? null;
   const origin = candidate.origin;
 
   return (
@@ -278,6 +279,26 @@ function FacetCandidateRow({ candidate }: { candidate: CandidateView }) {
             {conflict}
           </div>
         )}
+
+        <label
+          htmlFor={`candidate-condition-${candidate.id}`}
+          className="mt-3 block font-mono text-[0.63rem]"
+          style={{ color: "var(--shell-faint)" }}
+        >
+          structured condition JSON (blank means unconditional)
+        </label>
+        <textarea
+          id={`candidate-condition-${candidate.id}`}
+          name="structuredCondition"
+          defaultValue={structuredCondition === null ? "" : JSON.stringify(structuredCondition, null, 2)}
+          rows={3}
+          className="mt-1 w-full resize-y rounded-md border px-3 py-2 font-mono text-[0.72rem] leading-5"
+          style={{
+            background: "var(--shell-panel)",
+            borderColor: "var(--shell-line-strong)",
+            color: "var(--shell-fg)",
+          }}
+        />
 
         <CandidateEvidence candidate={candidate} />
 

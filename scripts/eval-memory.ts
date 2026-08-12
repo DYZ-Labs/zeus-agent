@@ -12,6 +12,7 @@ import { acceptCandidate, applyExtraction } from "../src/core/extract";
 import { liveFacts } from "../src/core/facts";
 import { listCommitments, listGoals } from "../src/core/intentions";
 import {
+  createEvaluationContext,
   recommendNextAction,
   recordFollowThroughDecision,
 } from "../src/core/stewardship";
@@ -119,7 +120,9 @@ recordFollowThroughDecision(db, {
   decision: "dismissed",
 });
 assert.equal(
-  recommendNextAction(db, "portfolio", { force: true }),
+  recommendNextAction(db, "portfolio", {
+    context: createEvaluationContext({ trigger: "today", timezone: "UTC" }),
+  }),
   null,
   "dismissed recommendation surfaced again without a commitment change",
 );

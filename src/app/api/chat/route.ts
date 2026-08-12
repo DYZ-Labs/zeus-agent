@@ -3,7 +3,7 @@ import { z } from "zod";
 import { streamTurn } from "@/core/chat";
 import { createConversation, getConversation } from "@/core/conversations";
 import { MissingCredentialsError, RefusedError, hasCredentials } from "@/core/openai";
-import { getOwnerAccess } from "@/server/auth/access";
+import { getBrowserOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,11 +27,18 @@ const Body = z
  * memory changing rather than having to trust that it did.
  */
 export async function POST(request: Request): Promise<Response> {
-  const access = await getOwnerAccess();
+  const access = await getBrowserOwnerAccess(request, "private-mutation");
   if (!access.canAccessPrivateData) {
     return Response.json(
       { error: access.message },
-      { status: access.state === "signed_out" ? 401 : access.state === "wrong_account" ? 403 : 503 },
+      {
+        status:
+          access.state === "signed_out"
+            ? 401
+            : access.state === "wrong_account" || access.state === "forbidden_origin"
+              ? 403
+              : 503,
+      },
     );
   }
 
@@ -77,11 +84,13 @@ export async function POST(request: Request): Promise<Response> {
             (result.learned?.facts.length ?? 0) +
             (result.learned?.goals.length ?? 0) +
             (result.learned?.commitments.length ?? 0) +
+            (result.learned?.projects.length ?? 0) +
             (result.learned?.facets.length ?? 0),
           acceptedFacets: result.learned?.facets.length ?? 0,
           learned: result.learned?.facts.length ?? 0,
           goalsUpdated: result.learned?.goals.length ?? 0,
           commitmentsUpdated: result.learned?.commitments.length ?? 0,
+          projectsUpdated: result.learned?.projects.length ?? 0,
           pending: result.learned?.candidates.length ?? 0,
           pendingFacets:
             result.learned?.candidates.filter(
@@ -89,6 +98,22 @@ export async function POST(request: Request): Promise<Response> {
             ).length ?? 0,
           superseded: result.learned?.supersededIds.length ?? 0,
           recommendation: result.context.recommendation,
+          opportunityId: result.context.recommendation
+            ? result.context.opportunityId
+            : null,
+          workPlan: result.work
+            ? {
+                id: result.work.planId,
+                runId: result.work.run.id,
+                status: result.work.run.status,
+                errorCode: result.work.run.error_code,
+                artifacts: result.work.artifacts.map((artifact) => ({
+                  id: artifact.id,
+                  title: artifact.title,
+                  kind: artifact.kind,
+                })),
+              }
+            : null,
           extractionFailed: result.learned === null,
         });
       } catch (error) {
