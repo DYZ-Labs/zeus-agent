@@ -51,6 +51,10 @@ describe("Chat guest experience", () => {
     expect(screen.getByRole("button", { name: "Log in" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign up" })).toBeInTheDocument();
 
+    expect(screen.queryByText("Log in to chat")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Temporary chats are available after login and are never saved."),
+    ).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Temporary chat" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Temporary chat/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/Nothing from this chat is saved/i)).not.toBeInTheDocument();
@@ -140,6 +144,24 @@ describe("Chat durable experience", () => {
     expect(screen.getByText("Nothing from this chat is saved")).toBeInTheDocument();
     expect(screen.getByText(/No saved memory is read/i)).toBeInTheDocument();
     expect(screen.queryByText(PRIVACY_NOTE)).not.toBeInTheDocument();
+  });
+});
+
+describe("Chat blocked experience", () => {
+  it("does not show the login-required chat notice", () => {
+    render(
+      <Chat
+        hasCredentials
+        accessMode="blocked"
+        showAuthActions
+      />,
+    );
+
+    expect(screen.queryByText("Log in to chat")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Temporary chats are available after login and are never saved."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message Zeus" })).toBeDisabled();
   });
 });
 

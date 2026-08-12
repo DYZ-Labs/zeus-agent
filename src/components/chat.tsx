@@ -379,9 +379,7 @@ export function Chat({
       {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[16vh] pt-20">
-            {!canUseChat
-              ? <LoginRequiredNotice />
-              : !hasCredentials && <AvailabilityNotice guest={guest} />}
+            {canUseChat && !hasCredentials && <AvailabilityNotice guest={guest} />}
             {showWelcome
               ? <Welcome onChoose={chooseStarter} onSkip={() => { setShowWelcome(false); updateOnboarding("complete"); }} />
               : <EmptyState accessMode={accessMode} mode={mode} onChoose={chooseStarter} />}
@@ -400,9 +398,7 @@ export function Chat({
           >
             <div className={`mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 md:px-6 ${showAuthActions ? "pt-16" : "pt-6"}`}>
               {durable && mode === "temporary" && <TemporaryBanner />}
-              {!canUseChat
-                ? <LoginRequiredNotice />
-                : !hasCredentials && <AvailabilityNotice guest={guest} />}
+              {canUseChat && !hasCredentials && <AvailabilityNotice guest={guest} />}
               <ol className="space-y-8 py-4">
                 {turns.map((turn, index) => (
                   <li key={turn.id}>
@@ -712,10 +708,6 @@ function ErrorNotice({ message, onRetry }: { message: string; onRetry: () => voi
 
 function AvailabilityNotice({ guest }: { guest: boolean }) {
   return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Chat is temporarily unavailable</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>{guest ? "Try again later." : "Saved details and data controls are still available."}</p></div>;
-}
-
-function LoginRequiredNotice() {
-  return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Log in to chat</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>Temporary chats are available after login and are never saved.</p></div>;
 }
 
 function GuestAuthActions() {
