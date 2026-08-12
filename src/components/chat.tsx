@@ -3,7 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 
 import { AuthTrigger } from "@/components/auth-trigger";
-import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
+import {
+  CHAT_UPDATED_EVENT,
+  NEW_CHAT_EVENT,
+  type ChatUpdatedDetail,
+} from "@/components/chat-events";
 import {
   receiptSummaryParts,
   type ChatReceipt,
@@ -137,7 +141,11 @@ export function Chat({
             const nextConversationId = event.conversationId;
             if (typeof nextConversationId === "number") {
               conversationId.current = nextConversationId;
-              window.dispatchEvent(new Event(CHAT_UPDATED_EVENT));
+              window.dispatchEvent(
+                new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
+                  detail: { conversationId: nextConversationId },
+                }),
+              );
             }
           } else if (event.type === "delta") {
             const chunk = event.text as string;

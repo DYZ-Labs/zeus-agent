@@ -9,7 +9,11 @@ import {
   renameConversationAction,
 } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
-import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
+import {
+  CHAT_UPDATED_EVENT,
+  NEW_CHAT_EVENT,
+  type ChatUpdatedDetail,
+} from "@/components/chat-events";
 import type { RecentChat } from "@/core/conversations";
 import type { AccountSummary, AuthMode } from "@/lib/auth-types";
 
@@ -40,13 +44,26 @@ export function Nav({
   const searchParams = useSearchParams();
   const [isOpen, setIsOpen] = useState(true);
   const requestedConversationId = Number(searchParams.get("conversation"));
-  const activeConversationId =
+  const routedConversationId =
     pathname === "/" && Number.isInteger(requestedConversationId) && requestedConversationId > 0
       ? requestedConversationId
       : null;
+  const [activeConversationId, setActiveConversationId] = useState<number | null>(
+    routedConversationId,
+  );
+  const routeSelectionKey = `${pathname}:${routedConversationId ?? "new"}`;
+  const [trackedRouteSelectionKey, setTrackedRouteSelectionKey] = useState(routeSelectionKey);
+  if (trackedRouteSelectionKey !== routeSelectionKey) {
+    setTrackedRouteSelectionKey(routeSelectionKey);
+    setActiveConversationId(routedConversationId);
+  }
 
   useEffect(() => {
-    function refreshRecentChats() {
+    function refreshRecentChats(event: Event) {
+      const detail = (event as CustomEvent<ChatUpdatedDetail>).detail;
+      if (Number.isInteger(detail?.conversationId) && detail.conversationId > 0) {
+        setActiveConversationId(detail.conversationId);
+      }
       router.refresh();
     }
 
@@ -55,6 +72,7 @@ export function Nav({
   }, [router]);
 
   function startNewChat() {
+    setActiveConversationId(null);
     if (pathname === "/") {
       window.dispatchEvent(new Event(NEW_CHAT_EVENT));
       router.replace("/");
@@ -63,8 +81,9 @@ export function Nav({
     router.push("/");
   }
 
-  function finishConversationChange(deletedId?: number) {
+  function finishRecentChatDeletion(deletedId: number) {
     if (deletedId === activeConversationId) {
+      setActiveConversationId(null);
       window.dispatchEvent(new Event(NEW_CHAT_EVENT));
       router.replace("/");
       return;
@@ -189,44 +208,46 @@ export function Nav({
             active={pathname.startsWith(link.href)}
           />
         ))}
-        <span className="shrink-0 lg:hidden">
-          {account ? (
+        {account ? (
+          <span className="shrink-0 lg:hidden">
             <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
-          ) : (
-            <span className="flex gap-0.5">
+          </span>
+        ) : (
+          <>
+            <span className="shrink-0 lg:hidden">
               <CompactNavLink
                 href="/settings"
                 label="Settings"
                 icon="settings"
                 active={pathname.startsWith("/settings")}
               />
+            </span>
+            <span className="shrink-0 lg:hidden">
               <CompactLoginLink authMode={authMode} />
             </span>
-          )}
-        </span>
+          </>
+        )}
       </div>
 
-      <section className="mt-5 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
-        <h2
-          id="recent-chats-heading"
-          className="h-8 shrink-0 px-2.5 text-xs font-semibold leading-8"
-          style={{ color: "var(--shell-faint)" }}
-        >
-          Recents
-        </h2>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-4">
+      <section className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
+        <div className="flex h-8 items-center px-2.5">
+          <h2
+            id="recent-chats-heading"
+            className="text-xs font-semibold leading-5"
+            style={{ color: "var(--shell-faint)" }}
+          >
+            Recents
+          </h2>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {initialRecentChats.length > 0 ? (
-            <ul>
+            <ul className="space-y-0.5">
               {initialRecentChats.map((chat) => (
-                <ChatHistoryItem
+                <RecentChatLink
                   key={chat.id}
                   chat={chat}
                   active={activeConversationId === chat.id}
-                  menuPlacement="below"
-                  onOpen={() => undefined}
-                  onChanged={() => finishConversationChange()}
-                  onDeleted={() => finishConversationChange(chat.id)}
-                  hideActions
+                  onDeleted={() => finishRecentChatDeletion(chat.id)}
                 />
               ))}
             </ul>
@@ -239,23 +260,78 @@ export function Nav({
       </section>
 
       <div className="mt-auto hidden lg:block">
-        <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
-          {account ? (
-            <AccountLink account={account} active={pathname.startsWith("/settings")} />
-          ) : (
-            <>
-              <NavLink
-                href="/settings"
-                label="Settings"
-                icon="settings"
-                active={pathname.startsWith("/settings")}
-              />
+        {account ? (
+          <AccountLink account={account} active={pathname.startsWith("/settings")} />
+        ) : (
+          <>
+            <NavLink
+              href="/settings"
+              label="Settings"
+              icon="settings"
+              active={pathname.startsWith("/settings")}
+            />
+            <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
               <GuestSidebarCta authMode={authMode} />
-            </>
-          )}
-        </div>
+            </div>
+          </>
+        )}
       </div>
     </nav>
+  );
+}
+
+function RecentChatLink({
+  chat,
+  active,
+  onDeleted,
+}: {
+  chat: RecentChat;
+  active: boolean;
+  onDeleted: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+
+  async function deleteChat() {
+    if (pending) return;
+
+    setPending(true);
+    try {
+      await deleteConversationFromHistoryAction(chat.id, "delete");
+      onDeleted();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <li className="group relative">
+      <Link
+        href={`/?conversation=${chat.id}`}
+        title={chat.title}
+        aria-current={active ? "page" : undefined}
+        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 pr-9 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
+        style={{
+          background: active ? "var(--shell-elevated)" : undefined,
+          color: "var(--shell-fg)",
+        }}
+      >
+        <span className="truncate">{chat.title}</span>
+      </Link>
+      <button
+        type="button"
+        aria-label={`Delete ${chat.title}`}
+        title="Delete"
+        disabled={pending}
+        onClick={() => void deleteChat()}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${
+          active
+            ? "opacity-100"
+            : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+        }`}
+      >
+        <TrashIcon />
+      </button>
+    </li>
   );
 }
 
@@ -266,7 +342,6 @@ export function ChatHistoryItem({
   onOpen,
   onChanged,
   onDeleted,
-  hideActions = false,
 }: {
   chat: RecentChat;
   active: boolean;
@@ -274,7 +349,6 @@ export function ChatHistoryItem({
   onOpen: () => void;
   onChanged: () => void;
   onDeleted: () => void;
-  hideActions?: boolean;
 }) {
   const containerRef = useRef<HTMLLIElement>(null);
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
@@ -384,9 +458,7 @@ export function ChatHistoryItem({
         title={title}
         aria-current={active ? "page" : undefined}
         onClick={onOpen}
-        className={`flex h-9 min-w-0 items-center rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] ${
-          hideActions ? "w-full" : "pr-9"
-        }`}
+        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 pr-9 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
         style={{
           background: active ? "var(--shell-elevated)" : undefined,
           color: "var(--shell-fg)",
@@ -394,24 +466,22 @@ export function ChatHistoryItem({
       >
         <span className="truncate">{title}</span>
       </Link>
-      {!hideActions && (
-        <button
-          type="button"
-          aria-label={`Chat options for ${title}`}
-          aria-expanded={state !== "closed"}
-          disabled={pending}
-          onClick={() => setState((current) => (current === "closed" ? "menu" : "closed"))}
-          className={`absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-50 ${
-            active || state !== "closed"
-              ? "opacity-100"
-              : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
-          }`}
-        >
-          <MoreIcon />
-        </button>
-      )}
+      <button
+        type="button"
+        aria-label={`Chat options for ${title}`}
+        aria-expanded={state !== "closed"}
+        disabled={pending}
+        onClick={() => setState((current) => (current === "closed" ? "menu" : "closed"))}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-50 ${
+          active || state !== "closed"
+            ? "opacity-100"
+            : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+        }`}
+      >
+        <MoreIcon />
+      </button>
 
-      {!hideActions && state !== "closed" && (
+      {state !== "closed" && (
         <div
           role="menu"
           className={`absolute right-1 z-30 w-52 rounded-xl border p-1.5 shadow-2xl ${

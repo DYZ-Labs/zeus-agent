@@ -258,29 +258,15 @@ function DataControlsSettings({ recentChatCount }: { recentChatCount: number }) 
     <section className="px-5 py-5 sm:px-6 sm:py-6">
       <h1 className="text-lg font-semibold leading-6">Data controls</h1>
       <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
-        Manage which chats appear in Recents and chat history.
+        Manage which chats appear in Recents and Search chats.
       </p>
 
       <div className="mt-5 border-y" style={{ borderColor: "var(--shell-line)" }}>
-        <div className="flex min-h-16 items-center justify-between gap-4 py-3">
-          <div className="min-w-0">
-            <p className="text-sm leading-5">Chats in history</p>
-            <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-              Removing a chat from history does not delete its messages or saved details.
-            </p>
-          </div>
-          <span className="shrink-0 text-sm" style={{ color: "var(--shell-muted)" }}>
-            {recentChatCount}
-          </span>
-        </div>
-        <div
-          className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-t py-3"
-          style={{ borderColor: "var(--shell-line)" }}
-        >
+        <div className="flex min-h-16 flex-wrap items-center justify-between gap-3 py-3">
           <div className="min-w-0 flex-1">
             <p className="text-sm leading-5">Delete all recent chats</p>
             <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-              Removes chats from Recents and chat history only. Everything stored stays intact.
+              Removes every chat from Recents and Search chats without deleting stored messages or saved details.
             </p>
           </div>
           <DeleteAllRecentChats disabled={recentChatCount === 0} />

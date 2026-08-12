@@ -66,7 +66,7 @@ export function listChatHistory(db: Db, limit = 500): Conversation[] {
          AND NOT EXISTS (
            SELECT 1 FROM conversation_history_state h WHERE h.conversation_id = c.id
          )
-       ORDER BY c.updated_at DESC
+       ORDER BY c.updated_at DESC, c.id DESC
        LIMIT ?`,
     )
     .all(limit);
@@ -94,7 +94,7 @@ export function listRecentChats(db: Db, limit = 12): RecentChat[] {
            SELECT 1 FROM conversation_history_state h WHERE h.conversation_id = c.id
          )
          AND EXISTS (SELECT 1 FROM message m WHERE m.conversation_id = c.id)
-       ORDER BY c.updated_at DESC
+       ORDER BY c.updated_at DESC, c.id DESC
        LIMIT ?`,
     )
     .all(limit);
