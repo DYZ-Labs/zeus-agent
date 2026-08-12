@@ -280,10 +280,21 @@ export function Chat({
       {!hasVisibleTurns && showAuthActions && <GuestAuthActions />}
       {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
-          <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[12vh] pt-20">
+          <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[24vh] pt-20 lg:pb-[27vh]">
             {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
-            <EmptyState requiresLogin={!canAccessPrivateData} />
-            {composer}
+            <div className="relative w-full">
+              <EmptyState />
+              {composer}
+              {!canAccessPrivateData && (
+                <p
+                  className="absolute inset-x-0 top-full mx-auto mt-3 max-w-[28rem] text-center text-sm leading-5"
+                  style={{ color: "var(--shell-muted)" }}
+                >
+                  Log in to start a private conversation with the personal AI that remembers what
+                  matters.
+                </p>
+              )}
+            </div>
           </div>
         </div>
       ) : (
@@ -390,7 +401,7 @@ function Composer({
         event.preventDefault();
         void onSend();
       }}
-      className={centered ? "mt-7 w-full" : "shrink-0 px-3 pb-2 pt-3 md:px-5"}
+      className={centered ? "mt-9 w-full" : "shrink-0 px-3 pb-2 pt-3 md:px-5"}
       style={{ background: "var(--shell-bg)" }}
     >
       <div className="mx-auto w-full max-w-[48rem]">
@@ -796,17 +807,12 @@ function Receipt({
   );
 }
 
-function EmptyState({ requiresLogin }: { requiresLogin: boolean }) {
+function EmptyState() {
   return (
     <div className="w-full text-center">
       <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">
         What can I help with?
       </h1>
-      {requiresLogin && (
-        <p className="mx-auto mt-2 max-w-[28rem] text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
-          Log in to start a private conversation with the personal AI that remembers what matters.
-        </p>
-      )}
     </div>
   );
 }
