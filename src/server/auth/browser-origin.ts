@@ -43,8 +43,15 @@ export function checkBrowserBoundary(
     // authority is the browser-controlled value relevant to DNS rebinding.
     expectedOrigin = `http://${host}`;
   } else {
-    expectedOrigin = new URL(configuration.siteUrl).origin;
-    if (target.origin !== expectedOrigin) return forbidden();
+    const configuredSite = new URL(configuration.siteUrl);
+    expectedOrigin = configuredSite.origin;
+
+    // Next can normalize the server-side request URL to an internal authority (for
+    // example `localhost`) even though the browser connected to the exact configured
+    // origin. The HTTP Host is the browser-facing authority in that case. Requiring
+    // it to match the configured site keeps DNS rebinding and preview hosts out while
+    // allowing same-origin Server Action posts to reach the auth flow.
+    if (request.headers.get("host") !== configuredSite.host) return forbidden();
   }
 
   const fetchSite = request.headers.get("sec-fetch-site")?.toLowerCase() ?? null;

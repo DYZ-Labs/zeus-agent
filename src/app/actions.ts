@@ -1,5 +1,7 @@
 "use server";
 
+import { createHash } from "node:crypto";
+
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
@@ -17,12 +19,16 @@ import {
 } from "@/core/backfill";
 import { updateAmbientSetting } from "@/core/ambient";
 import {
+  archiveConversation,
   appendMessage,
   createConversation,
   getConversation,
   listConversations,
+  restoreConversationToHistory,
   setConversationTitle,
 } from "@/core/conversations";
+import { recordUserCurationMessage } from "@/core/curation";
+import type { DeletionImpact, ResourceId } from "@/core/contracts";
 import {
   deleteEmbedding,
   embedFacet,
@@ -70,9 +76,11 @@ import {
   updateProject,
 } from "@/core/projects";
 import {
-  deleteAllConversationsWithMemory,
-  deleteConversationWithMemory,
+  conversationDeletionImpact,
+  clearZeusData,
+  deleteConversationWithMemoryIf,
 } from "@/core/retention";
+import { numericResourceId, resourceId } from "@/core/resource-id";
 import type { Db } from "@/core/db";
 import type {
   Cardinality,
@@ -93,6 +101,7 @@ import {
   setStewardshipMode,
 } from "@/core/stewardship";
 import { requireOwnerDb } from "@/server/auth/access";
+import { labsEnabled } from "@/server/labs";
 
 /**
  * Curation actions.
@@ -137,13 +146,20 @@ export async function editFactAction(formData: FormData): Promise<void> {
   revalidatePath("/memory");
 }
 
-export async function acceptCandidateAction(formData: FormData): Promise<void> {
+export async function acceptCandidateAction(
+  formData: FormData,
+  editedText?: string,
+): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
   const db = await requireOwnerDb();
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.status !== "pending") return;
-  const applied = acceptCandidate(db, id);
+  const applied = acceptCandidate(
+    db,
+    id,
+    editedText ? { textEdit: { text: editedText } } : undefined,
+  );
   if (applied) {
     await embedAppliedMemory(db, applied, candidate.evidence);
   }
@@ -330,7 +346,9 @@ export async function answerReflectionAction(formData: FormData): Promise<void> 
 }
 
 export async function startBackfillAction(): Promise<void> {
-  startUnderstandingBackfill(await requireOwnerDb());
+  const db = await requireOwnerDb();
+  if (!labsEnabled(db)) return;
+  startUnderstandingBackfill(db);
   revalidatePath("/understanding/backfill");
 }
 
@@ -338,6 +356,7 @@ export async function processBackfillAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
   const db = await requireOwnerDb();
+  if (!labsEnabled(db)) return;
   if (!getUnderstandingBackfillJob(db, id)) return;
   await processUnderstandingBackfillBatch(db, id);
   revalidatePath("/understanding/backfill");
@@ -348,6 +367,7 @@ export async function acceptBackfillBatchAction(formData: FormData): Promise<voi
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
   const db = await requireOwnerDb();
+  if (!labsEnabled(db)) return;
   const accepted = acceptEligibleBackfillFacets(db, id);
   await embedAppliedMemory(
     db,
@@ -360,10 +380,10 @@ export async function acceptBackfillBatchAction(formData: FormData): Promise<voi
 }
 
 export async function updateGoalStatusAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
+  const id = publicOrLegacyId(formData.get("id"), "goal");
   const status = String(formData.get("status") ?? "") as GoalStatus;
   if (
-    !Number.isInteger(id) ||
+    id === null ||
     !["active", "paused", "achieved", "abandoned"].includes(status)
   ) return;
   const db = await requireOwnerDb();
@@ -395,9 +415,9 @@ export async function setGoalPriorityAction(formData: FormData): Promise<void> {
 }
 
 export async function updateCommitmentStatusAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
+  const id = publicOrLegacyId(formData.get("id"), "commitment");
   const status = String(formData.get("status") ?? "") as CommitmentStatus;
-  if (!Number.isInteger(id) || !["open", "waiting", "done", "cancelled"].includes(status)) {
+  if (id === null || !["open", "waiting", "done", "cancelled"].includes(status)) {
     return;
   }
   const db = await requireOwnerDb();
@@ -416,10 +436,10 @@ export async function updateCommitmentStatusAction(formData: FormData): Promise<
 }
 
 export async function updateProjectStatusAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
+  const id = publicOrLegacyId(formData.get("id"), "project");
   const status = String(formData.get("status") ?? "") as ProjectStatus;
   if (
-    !Number.isInteger(id) ||
+    id === null ||
     !["planned", "active", "paused", "completed", "abandoned"].includes(status)
   ) return;
   const db = await requireOwnerDb();
@@ -525,6 +545,7 @@ export async function updateAmbientSettingAction(formData: FormData): Promise<vo
   const enabled = formData.get("enabled") === "on";
   const locationConsent = formData.get("locationConsent") === "on";
   const db = await requireOwnerDb();
+  if (!labsEnabled(db)) return;
   const source = curationMessage(
     db,
     `Set ambient support ${enabled ? "on" : "off"} in ${timezone}, with quiet hours ${quietStart}-${quietEnd}${locationConsent ? " and coarse-zone consent" : " without location consent"}.`,
@@ -548,6 +569,7 @@ export async function reviewBehavioralPolicySuggestionAction(formData: FormData)
   const decision = String(formData.get("decision") ?? "");
   if (!Number.isInteger(id) || !["keep_for_review", "dismiss"].includes(decision)) return;
   const db = await requireOwnerDb();
+  if (!labsEnabled(db)) return;
   const suggestion = getBehavioralPolicySuggestion(db, id);
   if (!suggestion || suggestion.status !== "pending") return;
   const source = curationMessage(
@@ -594,25 +616,27 @@ export async function followThroughDecisionAction(formData: FormData): Promise<v
 }
 
 export async function deleteConversationAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
+  const id = numericResourceId(String(formData.get("id") ?? ""), "conversation");
   const confirmation = String(formData.get("confirmation") ?? "");
-  if (!Number.isInteger(id) || confirmation !== "erase-source") return;
+  const previewKey = String(formData.get("previewKey") ?? "");
+  if (id === null || confirmation !== "delete-permanently" || !previewKey) return;
   const db = await requireOwnerDb();
-  const conversation = getConversation(db, id);
-  if (!conversation || conversation.title === "Memory curation") return;
-  deleteConversationWithMemory(db, id);
-  revalidatePath("/", "layout");
-  revalidatePath("/memory");
-  revalidatePath("/today");
-  revalidatePath("/understanding");
-  revalidatePath("/conversations");
-  revalidatePath("/settings");
+  const deleted = deleteConversationWithMemoryIf(db, id, () => {
+    const preview = deletionPreview(db, id);
+    return preview?.confirmationKey === previewKey;
+  });
+  if (!deleted) return;
+  revalidateConversationSurfaces();
   redirect("/settings#data");
 }
 
-export async function renameConversationAction(id: number, title: string): Promise<void> {
+export async function renameConversationAction(
+  idValue: number | string,
+  title: string,
+): Promise<void> {
+  const id = numericResourceId(idValue, "conversation");
   const normalizedTitle = title.replace(/\s+/gu, " ").trim().slice(0, 100);
-  if (!Number.isInteger(id) || !normalizedTitle) return;
+  if (id === null || !normalizedTitle) return;
 
   const db = await requireOwnerDb();
   const conversation = getConversation(db, id);
@@ -626,27 +650,88 @@ export async function renameConversationAction(id: number, title: string): Promi
 
 export async function deleteConversationFromHistoryAction(
   id: number,
-  confirmation: string,
+  _confirmation: string,
 ): Promise<void> {
-  if (!Number.isInteger(id) || confirmation !== "erase-source") return;
-
+  // Transitional safety for older sidebar clients: the ordinary history action is
+  // non-destructive even if they still send the former deletion confirmation string.
   const db = await requireOwnerDb();
   const conversation = getConversation(db, id);
   if (!conversation || conversation.title === "Memory curation") return;
-  deleteConversationWithMemory(db, id);
+  archiveConversation(db, id);
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
-  revalidatePath("/today");
-  revalidatePath("/understanding");
   revalidatePath("/conversations");
-  revalidatePath("/settings");
+}
+
+export async function archiveConversationAction(idValue: string): Promise<boolean> {
+  const id = numericResourceId(idValue, "conversation");
+  if (id === null) return false;
+  const db = await requireOwnerDb();
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return false;
+  const archived = archiveConversation(db, id);
+  revalidatePath("/", "layout");
+  revalidatePath("/conversations");
+  return archived;
+}
+
+export async function restoreConversationAction(idValue: string): Promise<boolean> {
+  const id = numericResourceId(idValue, "conversation");
+  if (id === null) return false;
+  const db = await requireOwnerDb();
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return false;
+  const restored = restoreConversationToHistory(db, id);
+  revalidatePath("/", "layout");
+  revalidatePath("/conversations");
+  return restored;
+}
+
+export type ConversationDeletionPreview = {
+  conversationId: ResourceId;
+  title: string;
+  impact: DeletionImpact;
+  confirmationKey: string;
+};
+
+export type PermanentConversationDeletionResult =
+  | { status: "deleted" }
+  | { status: "not_found" }
+  | { status: "changed"; preview: ConversationDeletionPreview };
+
+export async function previewConversationDeletionAction(
+  idValue: string,
+): Promise<ConversationDeletionPreview | null> {
+  const id = numericResourceId(idValue, "conversation");
+  if (id === null) return null;
+  return deletionPreview(await requireOwnerDb(), id);
+}
+
+export async function permanentlyDeleteConversationAction(
+  idValue: string,
+  confirmationKey: string,
+): Promise<PermanentConversationDeletionResult> {
+  const id = numericResourceId(idValue, "conversation");
+  if (id === null || !confirmationKey) return { status: "not_found" };
+  const db = await requireOwnerDb();
+  let checkedPreview: ConversationDeletionPreview | null = null;
+  const deleted = deleteConversationWithMemoryIf(db, id, () => {
+    checkedPreview = deletionPreview(db, id);
+    return checkedPreview?.confirmationKey === confirmationKey;
+  });
+  if (!deleted) {
+    if (!checkedPreview) return { status: "not_found" };
+    return { status: "changed", preview: checkedPreview };
+  }
+
+  revalidateConversationSurfaces();
+  return { status: "deleted" };
 }
 
 export async function deleteAllConversationsAction(formData: FormData): Promise<void> {
   const confirmation = String(formData.get("confirmation") ?? "");
   if (confirmation !== "erase-all-sources") return;
 
-  deleteAllConversationsWithMemory(await requireOwnerDb());
+  clearZeusData(await requireOwnerDb());
   revalidatePath("/", "layout");
   revalidatePath("/memory");
   revalidatePath("/today");
@@ -742,14 +827,48 @@ export async function setSummaryAction(formData: FormData): Promise<void> {
   if (slug) revalidatePath(`/entity/${slug}`);
 }
 
+function deletionPreview(db: Db, id: number): ConversationDeletionPreview | null {
+  const conversation = getConversation(db, id);
+  if (!conversation || conversation.title === "Memory curation") return null;
+  const impact = conversationDeletionImpact(db, id);
+  const title = conversation.title?.trim() || `Conversation ${id}`;
+  // Bind the confirmation to the complete committed SQLite state. This is
+  // intentionally conservative: any concurrent source, evidence, job, or audit
+  // mutation requires a fresh preview instead of silently deleting more than shown.
+  const storeRevision = createHash("sha256").update(db.serialize()).digest("hex");
+  const confirmationKey = createHash("sha256")
+    .update(JSON.stringify({ id, title, updatedAt: conversation.updated_at, impact, storeRevision }))
+    .digest("hex");
+  return {
+    conversationId: resourceId("conversation", id),
+    title,
+    impact,
+    confirmationKey,
+  };
+}
+
+function publicOrLegacyId(
+  value: FormDataEntryValue | null,
+  kind: "commitment" | "goal" | "project",
+): number | null {
+  const raw = typeof value === "string" ? value : "";
+  const opaque = numericResourceId(raw, kind);
+  if (opaque !== null) return opaque;
+  const legacy = Number(raw);
+  return Number.isInteger(legacy) && legacy > 0 ? legacy : null;
+}
+
+function revalidateConversationSurfaces(): void {
+  revalidatePath("/", "layout");
+  revalidatePath("/memory");
+  revalidatePath("/today");
+  revalidatePath("/understanding");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
+}
+
 function curationMessage(db: Db, content: string) {
-  const conversation =
-    listConversations(db, 100).find((entry) => entry.title === "Memory curation") ??
-    createConversation(db, { title: "Memory curation", source: "web" });
-  return appendMessage(db, conversation.id, "user", content, {
-    origin: "user_action",
-    recallState: "blocked",
-  });
+  return recordUserCurationMessage(db, content);
 }
 
 const FACET_KIND_VALUES = new Set<FacetKind>([

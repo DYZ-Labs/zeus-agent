@@ -23,6 +23,59 @@ type FeatureExtractor = (
   options: { pooling: "mean"; normalize: boolean },
 ) => Promise<{ data: Float32Array | number[]; dims: number[] }>;
 
+/**
+ * Immutable identity for one claimed durable memory job.
+ *
+ * Embedding generation awaits local model work, so an explicit source/account deletion
+ * can remove the job and its canonical rows while the model is still running. Guarded
+ * writes prove, in the same SQLite statement as the insert/update, that the original
+ * lease and source-backed resource still exist. A reused numeric resource id alone is
+ * therefore never enough to receive a stale vector.
+ */
+export type MemoryJobEmbeddingGuard = Readonly<{
+  jobId: string;
+  conversationId: number;
+  sourceMessageId: number;
+  assistantMessageId: number;
+  promptVersion: string;
+  jobCreatedAt: string;
+  startedAt: string;
+}>;
+
+/** Identity captured before asynchronous model work. Unguarded/manual/reindex paths
+ * still need to prove that the exact resource they embedded survived the await; a
+ * numeric row id can be reused after explicit erasure. */
+type ResourceEmbeddingGuard =
+  | Readonly<{
+      kind: "fact";
+      id: number;
+      createdAt: string;
+      subjectId: number;
+      predicate: string;
+      object: string;
+    }>
+  | Readonly<{
+      kind: "message";
+      id: number;
+      conversationId: number;
+      createdAt: string;
+      content: string;
+    }>
+  | Readonly<{
+      kind: "passage";
+      id: number;
+      messageId: number;
+      createdAt: string;
+      text: string;
+    }>
+  | Readonly<{
+      kind: "facet";
+      id: number;
+      sourceMessageId: number;
+      createdAt: string;
+      statement: string;
+    }>;
+
 let pipelinePromise: Promise<FeatureExtractor | null> | null = null;
 
 export function embeddingsDisabled(): boolean {
@@ -110,7 +163,49 @@ export function putEmbedding(
   ownerKind: OwnerKind,
   ownerId: number,
   vector: Float32Array,
-): void {
+  guard?: MemoryJobEmbeddingGuard,
+): boolean {
+  if (guard) {
+    const resourcePredicate = ownerKind === "fact"
+      ? `EXISTS (
+           SELECT 1 FROM fact resource
+           JOIN fact_evidence evidence ON evidence.fact_id = resource.id
+           WHERE resource.id = ?
+             AND evidence.source_message_id = job.source_message_id
+         )`
+      : ownerKind === "message"
+        ? `EXISTS (
+             SELECT 1 FROM message resource
+             WHERE resource.id = ?
+               AND resource.id = job.source_message_id
+               AND resource.conversation_id = job.conversation_id
+               AND resource.role = 'user'
+           )`
+        : null;
+    if (!resourcePredicate) return false;
+
+    const inserted = db.prepare(
+      `INSERT INTO embedding (owner_kind, owner_id, vec, dim, model, created_at)
+       SELECT ?, ?, ?, ?, ?, ?
+       FROM memory_job job
+       WHERE ${memoryJobLeasePredicate()}
+         AND ${resourcePredicate}
+       ON CONFLICT (owner_kind, owner_id)
+       DO UPDATE SET vec = excluded.vec, dim = excluded.dim,
+                     model = excluded.model, created_at = excluded.created_at`,
+    ).run(
+      ownerKind,
+      ownerId,
+      toBlob(vector),
+      vector.length,
+      EMBEDDING_MODEL,
+      now(),
+      ...memoryJobLeaseValues(guard),
+      ownerId,
+    );
+    return inserted.changes > 0;
+  }
+
   db.prepare<[OwnerKind, number, Buffer, number, string, string]>(
     `INSERT INTO embedding (owner_kind, owner_id, vec, dim, model, created_at)
      VALUES (?, ?, ?, ?, ?, ?)
@@ -118,6 +213,44 @@ export function putEmbedding(
      DO UPDATE SET vec = excluded.vec, dim = excluded.dim,
                    model = excluded.model, created_at = excluded.created_at`,
   ).run(ownerKind, ownerId, toBlob(vector), vector.length, EMBEDDING_MODEL, now());
+  return true;
+}
+
+function putEmbeddingForResource(
+  db: Db,
+  guard: Extract<ResourceEmbeddingGuard, { kind: "fact" | "message" }>,
+  vector: Float32Array,
+): boolean {
+  const predicate = guard.kind === "fact"
+    ? `EXISTS (
+         SELECT 1 FROM fact resource
+         WHERE resource.id = ? AND resource.created_at = ?
+           AND resource.subject_id = ? AND resource.predicate = ? AND resource.object = ?
+       )`
+    : `EXISTS (
+         SELECT 1 FROM message resource
+         WHERE resource.id = ? AND resource.conversation_id = ?
+           AND resource.created_at = ? AND resource.content = ? AND resource.role = 'user'
+       )`;
+  const identity = guard.kind === "fact"
+    ? [guard.id, guard.createdAt, guard.subjectId, guard.predicate, guard.object]
+    : [guard.id, guard.conversationId, guard.createdAt, guard.content];
+  const inserted = db.prepare(
+    `INSERT INTO embedding (owner_kind, owner_id, vec, dim, model, created_at)
+     SELECT ?, ?, ?, ?, ?, ? WHERE ${predicate}
+     ON CONFLICT (owner_kind, owner_id)
+     DO UPDATE SET vec = excluded.vec, dim = excluded.dim,
+                   model = excluded.model, created_at = excluded.created_at`,
+  ).run(
+    guard.kind,
+    guard.id,
+    toBlob(vector),
+    vector.length,
+    EMBEDDING_MODEL,
+    now(),
+    ...identity,
+  );
+  return inserted.changes > 0;
 }
 
 export function deleteEmbedding(db: Db, ownerKind: OwnerKind, ownerId: number): void {
@@ -148,8 +281,7 @@ export function loadPassageVectors(db: Db): StoredVector[] {
          AND NOT EXISTS (
            SELECT 1 FROM candidate_evidence ce
            JOIN memory_candidate mc ON mc.id = ce.candidate_id
-           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-             AND mc.status IN ('pending','rejected')
+           WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
          )`,
     )
     .all(EMBEDDING_MODEL)
@@ -205,23 +337,35 @@ export function nearest(
 }
 
 /** Embed and store one fact. Silently no-ops when semantic search is unavailable. */
-export async function embedFact(db: Db, factId: number, text: string): Promise<boolean> {
+export async function embedFact(
+  db: Db,
+  factId: number,
+  text: string,
+  guard?: MemoryJobEmbeddingGuard,
+): Promise<boolean> {
+  const resource = guard ? null : factEmbeddingGuard(db, factId);
+  if (!guard && !resource) return false;
   const vector = await embed(text);
   if (!vector) return false;
-  putEmbedding(db, "fact", factId, vector);
-  return true;
+  return guard
+    ? putEmbedding(db, "fact", factId, vector, guard)
+    : putEmbeddingForResource(db, resource!, vector);
 }
 
 /** User-authored messages become episodic memory. Assistant text is never evidence. */
-export async function embedMessage(db: Db, messageId: number, text: string): Promise<boolean> {
-  const role = db
-    .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
-    .get(messageId)?.role;
-  if (role !== "user") return false;
+export async function embedMessage(
+  db: Db,
+  messageId: number,
+  text: string,
+  guard?: MemoryJobEmbeddingGuard,
+): Promise<boolean> {
+  const resource = guard ? null : messageEmbeddingGuard(db, messageId);
+  if (!guard && !resource) return false;
   const vector = await embed(text);
   if (!vector) return false;
-  putEmbedding(db, "message", messageId, vector);
-  return true;
+  return guard
+    ? putEmbedding(db, "message", messageId, vector, guard)
+    : putEmbeddingForResource(db, resource!, vector);
 }
 
 /** Embed an allowed immutable source passage without exposing neighbouring text. */
@@ -229,7 +373,9 @@ export async function embedPassage(
   db: Db,
   passageId: number,
   text: string,
+  guard?: MemoryJobEmbeddingGuard,
 ): Promise<boolean> {
+  const resource = guard ? null : passageEmbeddingGuard(db, passageId);
   const allowed = db
     .prepare<[number], { found: number }>(
       `SELECT 1 AS found FROM evidence_passage p
@@ -237,41 +383,243 @@ export async function embedPassage(
          AND NOT EXISTS (
            SELECT 1 FROM candidate_evidence ce
            JOIN memory_candidate mc ON mc.id = ce.candidate_id
-           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-             AND mc.status IN ('pending','rejected')
+           WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
          )`,
     )
     .get(passageId);
-  if (!allowed) return false;
+  if (!allowed || (!guard && !resource)) return false;
   const vector = await embed(text);
   if (!vector) return false;
-  db.prepare<[number, Buffer, number, string, string]>(
+  if (guard) {
+    const inserted = db.prepare(
+      `INSERT INTO passage_embedding (passage_id, vec, dim, model, created_at)
+       SELECT passage.id, ?, ?, ?, ?
+       FROM memory_job job
+       JOIN evidence_passage passage ON passage.id = ?
+       WHERE ${memoryJobLeasePredicate()}
+         AND passage.message_id = job.source_message_id
+         AND passage.recall_status = 'allowed'
+         AND NOT EXISTS (
+           SELECT 1 FROM candidate_evidence candidate_evidence
+           JOIN memory_candidate candidate
+             ON candidate.id = candidate_evidence.candidate_id
+           WHERE candidate_evidence.passage_id = passage.id
+             AND candidate.status IN ('pending','rejected')
+         )
+       ON CONFLICT (passage_id) DO UPDATE SET
+         vec = excluded.vec, dim = excluded.dim,
+         model = excluded.model, created_at = excluded.created_at`,
+    ).run(
+      toBlob(vector),
+      vector.length,
+      EMBEDDING_MODEL,
+      now(),
+      passageId,
+      ...memoryJobLeaseValues(guard),
+    );
+    return inserted.changes > 0;
+  }
+  const inserted = db.prepare(
     `INSERT INTO passage_embedding (passage_id, vec, dim, model, created_at)
-     VALUES (?, ?, ?, ?, ?)
+     SELECT passage.id, ?, ?, ?, ?
+     FROM evidence_passage passage
+     WHERE passage.id = ? AND passage.message_id = ?
+       AND passage.created_at = ? AND passage.text = ?
+       AND passage.recall_status = 'allowed'
+       AND NOT EXISTS (
+         SELECT 1 FROM candidate_evidence candidate_evidence
+         JOIN memory_candidate candidate ON candidate.id = candidate_evidence.candidate_id
+         WHERE candidate_evidence.passage_id = passage.id
+           AND candidate.status IN ('pending','rejected')
+       )
      ON CONFLICT (passage_id) DO UPDATE SET
        vec = excluded.vec, dim = excluded.dim,
        model = excluded.model, created_at = excluded.created_at`,
-  ).run(passageId, toBlob(vector), vector.length, EMBEDDING_MODEL, now());
-  return true;
+  ).run(
+    toBlob(vector),
+    vector.length,
+    EMBEDDING_MODEL,
+    now(),
+    resource!.id,
+    resource!.messageId,
+    resource!.createdAt,
+    resource!.text,
+  );
+  return inserted.changes > 0;
 }
 
-export async function embedFacet(db: Db, facetId: number, text: string): Promise<boolean> {
+export async function embedFacet(
+  db: Db,
+  facetId: number,
+  text: string,
+  guard?: MemoryJobEmbeddingGuard,
+): Promise<boolean> {
+  const resource = guard ? null : facetEmbeddingGuard(db, facetId);
   const current = db
     .prepare<[number], { found: number }>(
       "SELECT 1 AS found FROM understanding_facet WHERE id = ? AND valid_to IS NULL",
     )
     .get(facetId);
-  if (!current) return false;
+  if (!current || (!guard && !resource)) return false;
   const vector = await embed(text);
   if (!vector) return false;
-  db.prepare<[number, Buffer, number, string, string]>(
+  if (guard) {
+    const inserted = db.prepare(
+      `INSERT INTO facet_embedding (facet_id, vec, dim, model, created_at)
+       SELECT facet.id, ?, ?, ?, ?
+       FROM memory_job job
+       JOIN understanding_facet facet ON facet.id = ?
+       WHERE ${memoryJobLeasePredicate()}
+         AND facet.valid_to IS NULL
+         AND EXISTS (
+           SELECT 1 FROM facet_evidence evidence
+           JOIN evidence_passage passage ON passage.id = evidence.passage_id
+           WHERE evidence.facet_id = facet.id
+             AND passage.message_id = job.source_message_id
+         )
+       ON CONFLICT (facet_id) DO UPDATE SET
+         vec = excluded.vec, dim = excluded.dim,
+         model = excluded.model, created_at = excluded.created_at`,
+    ).run(
+      toBlob(vector),
+      vector.length,
+      EMBEDDING_MODEL,
+      now(),
+      facetId,
+      ...memoryJobLeaseValues(guard),
+    );
+    return inserted.changes > 0;
+  }
+  const inserted = db.prepare(
     `INSERT INTO facet_embedding (facet_id, vec, dim, model, created_at)
-     VALUES (?, ?, ?, ?, ?)
+     SELECT facet.id, ?, ?, ?, ?
+     FROM understanding_facet facet
+     WHERE facet.id = ? AND facet.source_message_id = ?
+       AND facet.created_at = ? AND facet.statement = ? AND facet.valid_to IS NULL
      ON CONFLICT (facet_id) DO UPDATE SET
        vec = excluded.vec, dim = excluded.dim,
        model = excluded.model, created_at = excluded.created_at`,
-  ).run(facetId, toBlob(vector), vector.length, EMBEDDING_MODEL, now());
-  return true;
+  ).run(
+    toBlob(vector),
+    vector.length,
+    EMBEDDING_MODEL,
+    now(),
+    resource!.id,
+    resource!.sourceMessageId,
+    resource!.createdAt,
+    resource!.statement,
+  );
+  return inserted.changes > 0;
+}
+
+function factEmbeddingGuard(
+  db: Db,
+  id: number,
+): Extract<ResourceEmbeddingGuard, { kind: "fact" }> | null {
+  const row = db.prepare<
+    [number],
+    { created_at: string; subject_id: number; predicate: string; object: string }
+  >("SELECT created_at, subject_id, predicate, object FROM fact WHERE id = ?").get(id);
+  return row
+    ? {
+        kind: "fact",
+        id,
+        createdAt: row.created_at,
+        subjectId: row.subject_id,
+        predicate: row.predicate,
+        object: row.object,
+      }
+    : null;
+}
+
+function messageEmbeddingGuard(
+  db: Db,
+  id: number,
+): Extract<ResourceEmbeddingGuard, { kind: "message" }> | null {
+  const row = db.prepare<
+    [number],
+    { conversation_id: number; created_at: string; content: string; role: string }
+  >(
+    "SELECT conversation_id, created_at, content, role FROM message WHERE id = ?",
+  ).get(id);
+  return row?.role === "user"
+    ? {
+        kind: "message",
+        id,
+        conversationId: row.conversation_id,
+        createdAt: row.created_at,
+        content: row.content,
+      }
+    : null;
+}
+
+function passageEmbeddingGuard(
+  db: Db,
+  id: number,
+): Extract<ResourceEmbeddingGuard, { kind: "passage" }> | null {
+  const row = db.prepare<
+    [number],
+    { message_id: number; created_at: string; text: string }
+  >("SELECT message_id, created_at, text FROM evidence_passage WHERE id = ?").get(id);
+  return row
+    ? { kind: "passage", id, messageId: row.message_id, createdAt: row.created_at, text: row.text }
+    : null;
+}
+
+function facetEmbeddingGuard(
+  db: Db,
+  id: number,
+): Extract<ResourceEmbeddingGuard, { kind: "facet" }> | null {
+  const row = db.prepare<
+    [number],
+    { source_message_id: number; created_at: string; statement: string }
+  >(
+    "SELECT source_message_id, created_at, statement FROM understanding_facet WHERE id = ?",
+  ).get(id);
+  return row
+    ? {
+        kind: "facet",
+        id,
+        sourceMessageId: row.source_message_id,
+        createdAt: row.created_at,
+        statement: row.statement,
+      }
+    : null;
+}
+
+function memoryJobLeasePredicate(): string {
+  return `job.id = ?
+          AND job.conversation_id = ?
+          AND job.source_message_id = ?
+          AND job.assistant_message_id = ?
+          AND job.prompt_version = ?
+          AND job.created_at = ?
+          AND job.status = 'running'
+          AND job.started_at = ?
+          AND EXISTS (
+            SELECT 1 FROM message source
+            WHERE source.id = job.source_message_id
+              AND source.conversation_id = job.conversation_id
+              AND source.role = 'user'
+          )
+          AND EXISTS (
+            SELECT 1 FROM message response
+            WHERE response.id = job.assistant_message_id
+              AND response.conversation_id = job.conversation_id
+              AND response.role = 'assistant'
+          )`;
+}
+
+function memoryJobLeaseValues(guard: MemoryJobEmbeddingGuard): readonly unknown[] {
+  return [
+    guard.jobId,
+    guard.conversationId,
+    guard.sourceMessageId,
+    guard.assistantMessageId,
+    guard.promptVersion,
+    guard.jobCreatedAt,
+    guard.startedAt,
+  ];
 }
 
 /** Facts with no current-model embedding — the backlog `reindex` works through. */
@@ -324,8 +672,7 @@ export function passagesMissingEmbeddings(
          AND NOT EXISTS (
            SELECT 1 FROM candidate_evidence ce
            JOIN memory_candidate mc ON mc.id = ce.candidate_id
-           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-             AND mc.status IN ('pending','rejected')
+           WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
          )
        ORDER BY p.id LIMIT ?`,
     )

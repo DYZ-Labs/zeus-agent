@@ -1,5 +1,9 @@
 import type { Db } from "./db";
 import { now, purgeManagedMigrationBackups } from "./db";
+import {
+  DeletionImpact as DeletionImpactSchema,
+  type DeletionImpact,
+} from "./contracts";
 import { forgetFact, recomputeFactEvidenceAggregates } from "./facts";
 import { pruneBehavioralPolicySuggestions } from "./personalization";
 import { invalidateWorkPlansForSourceLink } from "./work-plans";
@@ -199,6 +203,235 @@ export function conversationDependencies(db: Db, conversationId: number): Conver
         )
         .get(...messageIds)?.count ?? 0,
   };
+}
+
+/** Consumer-facing summary for the mandatory deletion preview. This deliberately
+ * collapses the detailed retention model into plain categories while the deletion
+ * implementation continues to use the complete dependency graph above. */
+export function conversationDeletionImpact(db: Db, conversationId: number): DeletionImpact {
+  const dependencies = conversationDependencies(db, conversationId);
+  const messageIds = idsForConversation(db, conversationId);
+  const sourceAuditRecords = countSourceAuditRecords(db, messageIds);
+
+  return DeletionImpactSchema.parse({
+    messages: dependencies.messages,
+    removedMemories: dependencies.factsOnlyHere + dependencies.facetsOnlyHere,
+    retainedSharedMemories:
+      dependencies.factsWithOtherEvidence + dependencies.facetsWithOtherEvidence,
+    affectedPlans:
+      dependencies.goals + dependencies.commitments + dependencies.projects +
+      dependencies.workPlans,
+    affectedAuditRecords:
+      dependencies.candidates + dependencies.followThroughEvents +
+      dependencies.behavioralPolicySuggestions + dependencies.passages +
+      dependencies.backfillItems + sourceAuditRecords,
+  });
+}
+
+function countSourceAuditRecords(db: Db, messageIds: readonly number[]): number {
+  if (messageIds.length === 0) return 0;
+  const placeholders = messageIds.map(() => "?").join(",");
+  const count = (sql: string, values: readonly number[] = messageIds): number =>
+    db.prepare<number[], { count: number }>(sql).get(...values)?.count ?? 0;
+
+  let total = 0;
+  total += count(
+    `SELECT COUNT(*) AS count FROM extraction_run
+     WHERE focus_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM candidate_resolution_event
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    responseContextDeletionCountSql(placeholders),
+    responseContextDeletionCountValues(messageIds),
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM mcp_mutation_event
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM memory_job
+     WHERE source_message_id IN (${placeholders})
+        OR assistant_message_id IN (${placeholders})`,
+    [...messageIds, ...messageIds],
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM entity_evidence
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM entity_alias_evidence
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM recommendation_cycle
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM opportunity_delivery
+     WHERE response_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM fact_evidence
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  total += count(
+    `SELECT COUNT(*) AS count FROM facet_event
+     WHERE source_message_id IN (${placeholders})`,
+  );
+  for (const table of ["goal_event", "commitment_event", "project_event"] as const) {
+    total += count(
+      `SELECT COUNT(*) AS count FROM ${table}
+       WHERE source_message_id IN (${placeholders})`,
+    );
+  }
+  total += countMcpRecallRecords(db, messageIds);
+  return total;
+}
+
+function responseContextDeletionCountSql(placeholders: string): string {
+  return `SELECT COUNT(*) AS count FROM response_context context
+    WHERE context.assistant_message_id IN (${placeholders})
+       OR (context.item_kind = 'episode' AND (
+         json_extract(context.snapshot_json, '$.episode.message.id') IN (${placeholders})
+         OR context.item_id IN (${placeholders})
+       ))
+       OR (context.item_kind = 'fact' AND context.item_id IN (
+         SELECT DISTINCT fact.id FROM fact
+         LEFT JOIN fact_evidence evidence ON evidence.fact_id = fact.id
+         WHERE fact.source_message_id IN (${placeholders})
+            OR evidence.source_message_id IN (${placeholders})
+       ))
+       OR (context.item_kind = 'facet' AND context.item_id IN (
+         SELECT DISTINCT facet.id FROM understanding_facet facet
+         LEFT JOIN facet_evidence evidence ON evidence.facet_id = facet.id
+         LEFT JOIN evidence_passage passage ON passage.id = evidence.passage_id
+         LEFT JOIN facet_event event ON event.facet_id = facet.id
+         WHERE facet.source_message_id IN (${placeholders})
+            OR passage.message_id IN (${placeholders})
+            OR event.source_message_id IN (${placeholders})
+       ))
+       OR (context.item_kind = 'goal' AND context.item_id IN (
+         SELECT DISTINCT goal.id FROM goal
+         LEFT JOIN goal_event event ON event.goal_id = goal.id
+         WHERE goal.source_message_id IN (${placeholders})
+            OR event.source_message_id IN (${placeholders})
+       ))
+       OR (context.item_kind = 'commitment' AND context.item_id IN (
+         SELECT DISTINCT commitment.id FROM commitment
+         LEFT JOIN commitment_event event ON event.commitment_id = commitment.id
+         WHERE commitment.source_message_id IN (${placeholders})
+            OR event.source_message_id IN (${placeholders})
+       ))
+       OR (context.item_kind = 'project' AND context.item_id IN (
+         SELECT DISTINCT project.id FROM project
+         LEFT JOIN project_event event ON event.project_id = project.id
+         LEFT JOIN evidence_passage passage ON passage.id = event.passage_id
+         WHERE project.source_message_id IN (${placeholders})
+            OR event.source_message_id IN (${placeholders})
+            OR passage.message_id IN (${placeholders})
+       ))`;
+}
+
+function responseContextDeletionCountValues(messageIds: readonly number[]): number[] {
+  // Keep this exact order/count aligned with responseContextDeletionCountSql.
+  return Array.from({ length: 15 }, () => [...messageIds]).flat();
+}
+
+/** Count immutable MCP receipts that the evidence-aware deletion path invalidates.
+ * These rows have polymorphic item ids rather than message foreign keys, so relying
+ * on cascades would make the preview under-report what permanent deletion removes. */
+function countMcpRecallRecords(db: Db, messageIds: readonly number[]): number {
+  if (messageIds.length === 0) return 0;
+  const placeholders = messageIds.map(() => "?").join(",");
+  const values: number[] = [];
+  const withMessages = (sql: string, repetitions = 1): string => {
+    for (let index = 0; index < repetitions; index += 1) values.push(...messageIds);
+    return sql.replaceAll("$MESSAGES", placeholders);
+  };
+  const clauses = [
+    withMessages(
+      `(item_kind = 'episode' AND (
+         json_extract(snapshot_json, '$.source_message_id') IN ($MESSAGES)
+         OR json_extract(snapshot_json, '$.message.id') IN ($MESSAGES)
+         OR json_extract(snapshot_json, '$.episode.message.id') IN ($MESSAGES)
+         OR item_id IN ($MESSAGES)
+       ))`,
+      4,
+    ),
+    withMessages(
+      `(item_kind = 'fact' AND item_id IN (
+         SELECT DISTINCT f.id FROM fact f
+         LEFT JOIN fact_evidence evidence ON evidence.fact_id = f.id
+         WHERE f.source_message_id IN ($MESSAGES)
+            OR evidence.source_message_id IN ($MESSAGES)
+       ))`,
+      2,
+    ),
+    withMessages(
+      `(item_kind = 'candidate' AND item_id IN (
+         SELECT DISTINCT candidate.id FROM memory_candidate candidate
+         LEFT JOIN candidate_evidence evidence ON evidence.candidate_id = candidate.id
+         LEFT JOIN evidence_passage passage ON passage.id = evidence.passage_id
+         WHERE candidate.source_message_id IN ($MESSAGES)
+            OR passage.message_id IN ($MESSAGES)
+       ))`,
+      2,
+    ),
+    withMessages(
+      `(item_kind = 'facet' AND item_id IN (
+         SELECT DISTINCT facet.id FROM understanding_facet facet
+         LEFT JOIN facet_evidence evidence ON evidence.facet_id = facet.id
+         LEFT JOIN evidence_passage passage ON passage.id = evidence.passage_id
+         LEFT JOIN facet_event event ON event.facet_id = facet.id
+         WHERE facet.source_message_id IN ($MESSAGES)
+            OR passage.message_id IN ($MESSAGES)
+            OR event.source_message_id IN ($MESSAGES)
+       ))`,
+      3,
+    ),
+    withMessages(
+      `(item_kind = 'goal' AND item_id IN (
+         SELECT DISTINCT goal.id FROM goal
+         LEFT JOIN goal_event event ON event.goal_id = goal.id
+         WHERE goal.source_message_id IN ($MESSAGES)
+            OR event.source_message_id IN ($MESSAGES)
+       ))`,
+      2,
+    ),
+    withMessages(
+      `(item_kind = 'commitment' AND item_id IN (
+         SELECT DISTINCT commitment.id FROM commitment
+         LEFT JOIN commitment_event event ON event.commitment_id = commitment.id
+         WHERE commitment.source_message_id IN ($MESSAGES)
+            OR event.source_message_id IN ($MESSAGES)
+       ))`,
+      2,
+    ),
+  ];
+  if (hasTable(db, "project")) {
+    clauses.push(
+      withMessages(
+        `(item_kind = 'project' AND item_id IN (
+           SELECT DISTINCT project.id FROM project
+           LEFT JOIN project_event event ON event.project_id = project.id
+           LEFT JOIN evidence_passage passage ON passage.id = event.passage_id
+           WHERE project.source_message_id IN ($MESSAGES)
+              OR event.source_message_id IN ($MESSAGES)
+              OR passage.message_id IN ($MESSAGES)
+         ))`,
+        3,
+      ),
+    );
+  }
+  return db
+    .prepare<number[], { count: number }>(
+      `SELECT COUNT(DISTINCT id) AS count FROM mcp_recall_audit
+       WHERE ${clauses.join(" OR ")}`,
+    )
+    .get(...values)?.count ?? 0;
 }
 
 /**
@@ -453,7 +686,24 @@ export function deleteConversationWithMemory(
   db: Db,
   conversationId: number,
 ): ConversationDependencies {
-  const dependencies = deleteConversationRowsWithMemory(db, conversationId);
+  const dependencies = deleteConversationWithMemoryIf(db, conversationId, () => true);
+  if (!dependencies) throw new Error("Conversation deletion precondition unexpectedly failed");
+  return dependencies;
+}
+
+/** Reserve the SQLite writer before rechecking a destructive-action token and keep
+ * that reservation through deletion. This closes the preview/delete race across the
+ * web process, MCP process, and local worker without weakening the second confirm. */
+export function deleteConversationWithMemoryIf(
+  db: Db,
+  conversationId: number,
+  precondition: () => boolean,
+): ConversationDependencies | null {
+  const dependencies = db.transaction(() => {
+    if (!precondition()) return null;
+    return deleteConversationRowsWithMemory(db, conversationId);
+  }).immediate();
+  if (!dependencies) return null;
   finalizeExplicitErasure(db);
   return dependencies;
 }
@@ -889,6 +1139,112 @@ export function deleteAllConversationsWithMemory(db: Db): number {
   return conversationIds.length;
 }
 
+/**
+ * Permanently reset the personal store while preserving only the schema, built-in
+ * predicate registry, and (when present) the account binding. Unlike source-only
+ * deletion, this also removes source-less legacy rows, derived audit state, custom
+ * predicates, personalization, location, and experimental work artifacts.
+ */
+export function clearZeusData(db: Db): number {
+  const conversationIds = db
+    .prepare<[], { id: number }>("SELECT id FROM conversation ORDER BY id")
+    .all()
+    .map((row) => row.id);
+
+  db.transaction(() => {
+    for (const conversationId of conversationIds) {
+      deleteConversationRowsWithMemory(db, conversationId);
+    }
+
+    // Explicitly clear source-less and legacy records. Most source-backed rows have
+    // already gone through the evidence-aware path above; these statements make the
+    // reset complete even for records created by older releases or interrupted jobs.
+    db.exec(`
+      DELETE FROM behavioral_policy_suggestion;
+      DELETE FROM ambient_delivery_attempt;
+      DELETE FROM opportunity_delivery;
+      DELETE FROM follow_through_event;
+      DELETE FROM recommendation_cycle;
+      DELETE FROM work_plan;
+      DELETE FROM response_context;
+      DELETE FROM mcp_recall_audit;
+      DELETE FROM mcp_mutation_event;
+      DELETE FROM memory_job;
+      DELETE FROM understanding_backfill_job;
+      DELETE FROM memory_candidate;
+      DELETE FROM understanding_facet;
+      DELETE FROM commitment;
+      DELETE FROM goal;
+      DELETE FROM project;
+      DELETE FROM fact;
+      DELETE FROM evidence_passage;
+      DELETE FROM extraction_run;
+      DELETE FROM coarse_location;
+      DELETE FROM embedding;
+      DELETE FROM passage_embedding;
+      DELETE FROM facet_embedding;
+      DELETE FROM fact_fts;
+      DELETE FROM message_fts;
+      DELETE FROM passage_fts;
+      DELETE FROM facet_fts;
+      DELETE FROM entity_evidence;
+      DELETE FROM entity_alias_evidence;
+    `);
+
+    const self = db
+      .prepare<[], { id: number }>("SELECT id FROM entity WHERE slug = 'self'")
+      .get();
+    if (!self) throw new Error("The Zeus self entity is missing");
+    const timestamp = now();
+    db.prepare<[string, number]>(
+      `UPDATE entity
+       SET name = 'You', summary = 'The user Zeus exists to know.',
+           updated_at = ?
+       WHERE id = ?`,
+    ).run(timestamp, self.id);
+    db.prepare<[number]>("DELETE FROM entity_alias WHERE entity_id = ?").run(self.id);
+    const insertAlias = db.prepare<[number, string, string]>(
+      "INSERT INTO entity_alias (entity_id, alias, created_at) VALUES (?, ?, ?)",
+    );
+    for (const alias of ["me", "i", "myself"] as const) {
+      insertAlias.run(self.id, alias, timestamp);
+    }
+    db.prepare<[number]>("DELETE FROM entity WHERE id != ?").run(self.id);
+
+    const builtInPredicates = [
+      "works_at", "job_title", "lives_in", "birthday", "timezone",
+      "relationship_to_user", "status", "likes", "dislikes", "knows",
+      "works_on", "cares_about", "goal", "prefers", "note",
+    ] as const;
+    const predicatePlaceholders = builtInPredicates.map(() => "?").join(",");
+    db.prepare<string[]>(
+      `DELETE FROM predicate WHERE name NOT IN (${predicatePlaceholders})`,
+    ).run(...builtInPredicates);
+
+    db.prepare<[string]>(
+      `UPDATE stewardship_setting
+       SET mode = 'balanced', source_message_id = NULL, updated_at = ?
+       WHERE id = 1`,
+    ).run(timestamp);
+    db.prepare<[string]>(
+      `UPDATE ambient_setting
+       SET enabled = 0, timezone = 'UTC', quiet_start = '22:00', quiet_end = '08:00',
+           daily_limit = 1, channels_json = '["macos"]', location_consent = 0,
+           source_message_id = NULL, updated_at = ?
+       WHERE id = 1`,
+    ).run(timestamp);
+    db.prepare<[string]>(
+      `UPDATE experience_setting
+       SET remembering_mode = 'automatic', onboarding_status = 'welcome',
+           labs_enabled = 0, updated_at = ?
+       WHERE id = 1`,
+    ).run(timestamp);
+  })();
+
+  finalizeExplicitErasure(db);
+  return conversationIds.length;
+}
+
 function reopenAfterSoleCorrectionDeletion(
   db: Db,
   fact: {
@@ -1063,15 +1419,12 @@ function deleteOrRehomeProjects(
     ).run(project.id);
 
     if (messageIds.includes(project.source_message_id)) {
-      const replacement = db
-        .prepare<[number, ...number[]], { source_message_id: number }>(
-          `SELECT source_message_id FROM project_event
-           WHERE project_id = ?
-             AND source_message_id IS NOT NULL
-             AND source_message_id NOT IN (${placeholders})
-           ORDER BY id LIMIT 1`,
-        )
-        .get(project.id, ...messageIds);
+      const replacement = survivingProjectIdentitySource(
+        db,
+        project.id,
+        messageIds,
+        placeholders,
+      );
       if (!replacement) {
         invalidateWorkPlansForSourceLink(db, "project", project.id);
         db.prepare<[number]>("DELETE FROM project WHERE id = ?").run(project.id);
@@ -1103,6 +1456,71 @@ function deleteOrRehomeProjects(
       db.prepare<[number]>("DELETE FROM project WHERE id = ?").run(project.id);
     }
   }
+}
+
+/** A lifecycle event can say only "it is active now". That is evidence for a status
+ * transition, but not for the named project identity inherited from a deleted source.
+ * Rehome the project root only to an independently evidenced identity/name mention. */
+function survivingProjectIdentitySource(
+  db: Db,
+  projectId: number,
+  deletedMessageIds: readonly number[],
+  placeholders: string,
+): { source_message_id: number } | null {
+  const project = db
+    .prepare<[number], { entity_id: number; entity_name: string }>(
+      `SELECT project.entity_id, entity.name AS entity_name
+       FROM project JOIN entity ON entity.id = project.entity_id
+       WHERE project.id = ?`,
+    )
+    .get(projectId);
+  if (!project) return null;
+
+  const recorded = db
+    .prepare<[number, ...number[]], { source_message_id: number }>(
+      `SELECT source_message_id FROM (
+         SELECT source_message_id, created_at FROM entity_evidence
+         WHERE entity_id = ? AND source_message_id NOT IN (${placeholders})
+         UNION ALL
+         SELECT source_message_id, created_at FROM entity_alias_evidence
+         WHERE entity_id = ? AND source_message_id NOT IN (${placeholders})
+       )
+       ORDER BY created_at, source_message_id LIMIT 1`,
+    )
+    .get(
+      project.entity_id,
+      ...deletedMessageIds,
+      project.entity_id,
+      ...deletedMessageIds,
+    );
+  if (recorded) return recorded;
+
+  // Compatibility for early local project rows created before entity-evidence
+  // writes were universal: a surviving user message that explicitly names the
+  // project (or one of its aliases) is still real supporting evidence.
+  return db
+    .prepare<[number, ...number[]], { source_message_id: number }>(
+      `SELECT event.source_message_id
+       FROM project_event event
+       JOIN message source ON source.id = event.source_message_id
+       JOIN project ON project.id = event.project_id
+       JOIN entity ON entity.id = project.entity_id
+       WHERE event.project_id = ?
+         AND event.source_message_id IS NOT NULL
+         AND event.source_message_id NOT IN (${placeholders})
+         AND source.role = 'user'
+         AND (
+           instr(lower(source.content), lower(entity.name)) > 0
+           OR EXISTS (
+             SELECT 1 FROM entity_alias alias
+             WHERE alias.entity_id = entity.id
+               AND length(alias.alias) >= 3
+               AND instr(lower(source.content), lower(alias.alias)) > 0
+           )
+         )
+       ORDER BY event.id LIMIT 1`,
+    )
+    .get(projectId, ...deletedMessageIds) ?? null;
 }
 
 /**

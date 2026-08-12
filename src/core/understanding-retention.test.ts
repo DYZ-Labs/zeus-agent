@@ -10,7 +10,7 @@ import { recordResponseContext } from "./context";
 import { appendMessage, createConversation, getConversation } from "./conversations";
 import { openTestDb } from "./db";
 import { toBlob } from "./embed";
-import { upsertEntity } from "./entities";
+import { getEntity, upsertEntity, upsertEntityWithEvidence } from "./entities";
 import { searchEpisodes } from "./episodes";
 import {
   closeFacet,
@@ -447,6 +447,45 @@ describe("claim-level retention", () => {
     deleteConversationWithMemory(db, survivingConversation.id);
     expect(getProject(db, project.id)).toBeNull();
     expect(getGoal(db, goal.id)?.project_id).toBeNull();
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("does not rehome a named project to a pronoun-only status event", () => {
+    const db = openTestDb();
+    const identityConversation = createConversation(db, { title: "Project identity" });
+    const statusConversation = createConversation(db, { title: "Later status" });
+    const identitySource = appendMessage(
+      db,
+      identityConversation.id,
+      "user",
+      "Project Nightjar is planned.",
+    );
+    const statusSource = appendMessage(
+      db,
+      statusConversation.id,
+      "user",
+      "It is active now.",
+    );
+    const entity = upsertEntityWithEvidence(db, {
+      name: "Project Nightjar",
+      kind: "project",
+      sourceMessageId: identitySource.id,
+    });
+    const project = createProject(db, {
+      entityId: entity.id,
+      sourceMessageId: identitySource.id,
+    });
+    updateProject(db, project.id, {
+      status: "active",
+      sourceMessageId: statusSource.id,
+      sourceKind: "message",
+    });
+
+    deleteConversationWithMemory(db, identityConversation.id);
+
+    expect(getProject(db, project.id)).toBeNull();
+    expect(getEntity(db, entity.id)).toBeNull();
+    expect(getConversation(db, statusConversation.id)).not.toBeNull();
     expect(db.pragma("foreign_key_check")).toEqual([]);
   });
 

@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
 import {
+  archiveConversation,
   appendMessage,
+  conversationHistoryCounts,
+  conversationHistoryItems,
   createConversation,
   getConversation,
   hideAllConversationsFromHistory,
@@ -10,6 +13,7 @@ import {
   listChatHistory,
   listRecentChats,
   messagesIn,
+  restoreConversationToHistory,
 } from "./conversations";
 import { openTestDb } from "./db";
 import { MIGRATIONS } from "./migrations";
@@ -51,10 +55,55 @@ describe("recent chats", () => {
     expect(listChatHistory(db).map((chat) => chat.id)).toEqual([visible.id]);
     expect(getConversation(db, hidden.id)).not.toBeNull();
     expect(messagesIn(db, hidden.id)).toHaveLength(1);
+    expect(conversationHistoryItems(db, { visibility: "archived" })).toMatchObject([
+      { id: hidden.id, title: "Hidden chat", archivedAt: expect.any(String) },
+    ]);
+    expect(conversationHistoryCounts(db)).toEqual({ active: 1, archived: 1 });
 
-    expect(hideAllConversationsFromHistory(db)).toBe(1);
+    expect(restoreConversationToHistory(db, hidden.id)).toBe(true);
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([visible.id, hidden.id]);
+    expect(conversationHistoryCounts(db)).toEqual({ active: 2, archived: 0 });
+
+    expect(hideAllConversationsFromHistory(db)).toBe(2);
     expect(listChatHistory(db)).toEqual([]);
     expect(getConversation(db, visible.id)).not.toBeNull();
+  });
+
+  it("searches full message text and keeps archived results in their own view", () => {
+    const db = openTestDb();
+    const messageMatch = createConversation(db, { title: "Quarterly planning" });
+    const titleMatch = createConversation(db, { title: "Orchid notes" });
+    const archived = createConversation(db, { title: "Older research" });
+    const unrelated = createConversation(db, { title: "Dinner" });
+    appendMessage(
+      db,
+      messageMatch.id,
+      "user",
+      "We should compare the cobalt supplier proposals before Friday.",
+    );
+    appendMessage(db, titleMatch.id, "user", "This body does not contain the flower name.");
+    appendMessage(db, archived.id, "user", "The archived cobalt decision is still evidence.");
+    appendMessage(db, unrelated.id, "user", "Book a table near home.");
+    archiveConversation(db, archived.id);
+
+    expect(conversationHistoryItems(db, { query: "cobalt" })).toMatchObject([
+      {
+        id: messageMatch.id,
+        matchingMessage: "We should compare the cobalt supplier proposals before Friday.",
+      },
+    ]);
+    expect(conversationHistoryItems(db, { query: "orchid" })).toMatchObject([
+      { id: titleMatch.id, matchingMessage: null },
+    ]);
+    expect(
+      conversationHistoryItems(db, { visibility: "archived", query: "cobalt" }),
+    ).toMatchObject([
+      {
+        id: archived.id,
+        matchingMessage: "The archived cobalt decision is still evidence.",
+      },
+    ]);
+    expect(() => conversationHistoryItems(db, { query: `" OR NOT ( )` })).not.toThrow();
   });
 
   it("limits the sidebar to the 12 newest chats with deterministic tie ordering", () => {

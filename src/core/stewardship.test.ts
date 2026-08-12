@@ -30,6 +30,7 @@ import {
   recommendationsForResponse,
   recommendNextAction,
   recordFollowThroughDecision,
+  recordFollowThroughFeedback,
   setStewardshipMode,
 } from "./stewardship";
 
@@ -448,6 +449,35 @@ describe("user control and outcomes", () => {
       userReason: "   ",
     });
     expect(JSON.parse(blank?.detail_json ?? "{}").decision).toBeUndefined();
+  });
+
+  it("appends optional feedback without recording a second control decision", () => {
+    const db = openTestDb();
+    const message = source(db);
+    const commitment = createCommitment(db, {
+      title: "Send the note",
+      sourceMessageId: message.id,
+    });
+    surfaceNext(db);
+    recordFollowThroughDecision(db, {
+      commitmentId: commitment.id,
+      decision: "dismissed",
+    });
+
+    const feedback = recordFollowThroughFeedback(db, {
+      commitmentId: commitment.id,
+      decision: "dismissed",
+      userReason: "The timing is wrong this week.",
+    });
+
+    expect(feedback).not.toBeNull();
+    expect(JSON.parse(feedback?.detail_json ?? "{}")).toMatchObject({
+      decision: {
+        feedback_only: true,
+        user_reason: "The timing is wrong this week.",
+      },
+    });
+    expect(followThroughMetrics(db).controlsExercised).toBe(1);
   });
 
   it("honors cooldowns, snoozes, and dismissals until the commitment changes", () => {

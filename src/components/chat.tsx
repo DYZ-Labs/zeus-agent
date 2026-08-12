@@ -1,41 +1,34 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { AuthTrigger } from "@/components/auth-trigger";
+import { setOnboardingStatusAction } from "@/app/experience-actions";
 import {
   CHAT_UPDATED_EVENT,
   NEW_CHAT_EVENT,
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
-import {
-  receiptSummaryParts,
-  type ChatReceipt,
-} from "@/components/chat-receipt";
-import type { FollowThroughRecommendation } from "@/core/schema";
+import type {
+  ChatMode,
+  MemoryActivityItem,
+  MemoryJobView,
+  OnboardingStatus,
+  ResourceId,
+} from "@/core/contracts";
+import type { ChatHydrationTurn } from "@/core/chat-hydration";
 
-type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
-
-export type ChatHistoryTurn = {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-};
+export type ChatHistoryTurn = ChatHydrationTurn;
 
 type Turn = ChatHistoryTurn & {
-  recommendation?: FollowThroughRecommendation;
-  recommendationDecision?: RecommendationDecision;
-  workPlan?: {
-    id: number;
-    runId: number;
-    status: string;
-    errorCode: string | null;
-    artifacts: Array<{ id: number; title: string; kind: string }>;
-  };
-  /** Set on the assistant turn once the stream closes. */
-  receipt?: ChatReceipt & {
-    projectsUpdated: number;
-  };
+  responseId?: ResourceId | null;
+  recalled?: number;
+  memory?: MemoryJobView;
+  memoryJobId?: ResourceId | null;
+  memoryError?: string | null;
 };
 
 type Status = "idle" | "streaming" | "error";
@@ -48,6 +41,7 @@ export function Chat({
   initialPrompt,
   initialTurns = [],
   initialConversationId,
+  onboardingStatus = "complete",
 }: {
   hasCredentials: boolean;
   canAccessPrivateData: boolean;
@@ -55,170 +49,64 @@ export function Chat({
   showAuthActions: boolean;
   initialPrompt?: string;
   initialTurns?: ChatHistoryTurn[];
-  initialConversationId?: number;
+  initialConversationId?: ResourceId;
+  onboardingStatus?: OnboardingStatus;
 }) {
   const [turns, setTurns] = useState<Turn[]>(canAccessPrivateData ? initialTurns : []);
   const [input, setInput] = useState(initialPrompt ?? "");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
-  const conversationId = useRef<number | null>(initialConversationId ?? null);
+  const [mode, setMode] = useState<ChatMode>(
+    canAccessPrivateData ? "standard" : "temporary",
+  );
+  const [showWelcome, setShowWelcome] = useState(
+    canAccessPrivateData && onboardingStatus === "welcome" && initialTurns.length === 0,
+  );
+  const [onboarding, setOnboarding] = useState<OnboardingStatus>(onboardingStatus);
+  const conversationId = useRef<ResourceId | null>(initialConversationId ?? null);
   const activeRequest = useRef<AbortController | null>(null);
+  const activeReplyId = useRef<string | null>(null);
+  const backgroundRequests = useRef(new Set<AbortController>());
+  const polledJobIds = useRef(new Set<ResourceId>());
+  const shouldFollowOutput = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const memoryRequests = backgroundRequests.current;
     function startNewChat() {
       activeRequest.current?.abort();
+      for (const request of memoryRequests) request.abort();
+      memoryRequests.clear();
       activeRequest.current = null;
+      activeReplyId.current = null;
       conversationId.current = null;
       setTurns([]);
       setInput("");
+      setMode(canAccessPrivateData ? "standard" : "temporary");
       setStatus("idle");
       setError(null);
-      requestAnimationFrame(() => {
-        if (!textareaRef.current) return;
-        textareaRef.current.style.height = "auto";
-        textareaRef.current.focus();
-      });
+      requestAnimationFrame(() => textareaRef.current?.focus());
     }
-
     window.addEventListener(NEW_CHAT_EVENT, startNewChat);
     return () => {
       window.removeEventListener(NEW_CHAT_EVENT, startNewChat);
       activeRequest.current?.abort();
       activeRequest.current = null;
+      for (const request of memoryRequests) request.abort();
+      memoryRequests.clear();
     };
-  }, []);
+  }, [canAccessPrivateData]);
 
   useEffect(() => {
-    if (turns.length === 0) return;
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (turns.length > 0 && shouldFollowOutput.current) {
+      endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }
   }, [turns]);
 
-  async function send() {
-    const text = input.trim();
-    if (!text || status === "streaming" || !hasCredentials || !canUseChat) return;
-
-    const replyId = crypto.randomUUID();
-    setTurns((prior) => [
-      ...prior,
-      { id: crypto.randomUUID(), role: "user", text },
-      { id: replyId, role: "assistant", text: "" },
-    ]);
-    setInput("");
-    setError(null);
-    setStatus("streaming");
-    if (textareaRef.current) textareaRef.current.style.height = "auto";
-
-    const request = new AbortController();
-    activeRequest.current = request;
-
-    try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          canAccessPrivateData
-            ? { input: text, conversationId: conversationId.current }
-            : { input: text, history: boundedGuestHistory(turns) },
-        ),
-        signal: request.signal,
-      });
-
-      if (!response.ok || !response.body) {
-        const detail = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(detail?.error ?? `Request failed (${response.status})`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as Record<string, unknown>;
-
-          if (event.type === "meta") {
-            const nextConversationId = event.conversationId;
-            if (typeof nextConversationId === "number") {
-              conversationId.current = nextConversationId;
-              window.dispatchEvent(
-                new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
-                  detail: { conversationId: nextConversationId },
-                }),
-              );
-            }
-          } else if (event.type === "delta") {
-            const chunk = event.text as string;
-            setTurns((prior) =>
-              prior.map((turn) =>
-                turn.id === replyId ? { ...turn, text: turn.text + chunk } : turn,
-              ),
-            );
-          } else if (event.type === "done") {
-            if (event.guest === true) continue;
-
-            const opportunityId = event.opportunityId as number | null;
-            const messageId = event.messageId as number;
-            const opportunityDelivered = opportunityId === null
-              ? true
-              : await recordOpportunityDelivery(opportunityId, "chat", messageId);
-            setTurns((prior) =>
-              prior.map((turn) =>
-                turn.id === replyId
-                  ? {
-                      ...turn,
-                      receipt: {
-                        messageId,
-                        recalled: event.recalled as number,
-                        recalledFacts: event.recalledFacts as number,
-                        recalledEpisodes: event.recalledEpisodes as number,
-                        recalledFacets: event.recalledFacets as number,
-                        accepted: event.accepted as number,
-                        acceptedFacets: event.acceptedFacets as number,
-                        pending: event.pending as number,
-                        pendingFacets: event.pendingFacets as number,
-                        goalsUpdated: event.goalsUpdated as number,
-                        commitmentsUpdated: event.commitmentsUpdated as number,
-                        projectsUpdated: event.projectsUpdated as number,
-                        superseded: event.superseded as number,
-                        failed: event.extractionFailed as boolean,
-                      },
-                      recommendation:
-                        opportunityDelivered
-                          ? (event.recommendation as FollowThroughRecommendation | null) ?? undefined
-                          : undefined,
-                      workPlan:
-                        (event.workPlan as Turn["workPlan"] | null) ?? undefined,
-                    }
-                  : turn,
-              ),
-            );
-          } else if (event.type === "error") {
-            throw new Error(event.message as string);
-          }
-        }
-      }
-
-      if (!request.signal.aborted) setStatus("idle");
-    } catch (caught) {
-      if (request.signal.aborted) return;
-      setError(caught instanceof Error ? caught.message : "Something went wrong.");
-      setStatus("error");
-    } finally {
-      if (activeRequest.current === request) activeRequest.current = null;
-    }
-  }
-
   function chooseStarter(prompt: string) {
+    setShowWelcome(false);
+    if (onboarding === "welcome") updateOnboarding("first_chat");
     setInput(prompt);
     requestAnimationFrame(() => {
       if (!textareaRef.current) return;
@@ -227,121 +115,307 @@ export function Chat({
     });
   }
 
-  async function respondToRecommendation(
-    turnId: string,
-    recommendation: FollowThroughRecommendation,
-    decision: RecommendationDecision,
-    responseMessageId: number | null,
-    userReason?: string,
-  ) {
+  const updateOnboarding = useCallback((next: OnboardingStatus) => {
+    if (
+      !canAccessPrivateData ||
+      onboarding === next ||
+      onboardingRank(next) <= onboardingRank(onboarding)
+    ) return;
+    setOnboarding(next);
+    const formData = new FormData();
+    formData.set("status", next);
+    void setOnboardingStatusAction(formData).catch(() => undefined);
+  }, [canAccessPrivateData, onboarding]);
+
+  function selectMode(next: ChatMode) {
+    if (next === mode || status === "streaming" || (!canAccessPrivateData && next === "standard")) return;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
+    activeReplyId.current = null;
+    for (const request of backgroundRequests.current) request.abort();
+    backgroundRequests.current.clear();
+    conversationId.current = null;
+    setMode(next);
+    setTurns([]);
+    setError(null);
+    setStatus("idle");
+  }
+
+  function stop() {
+    const replyId = activeReplyId.current;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
+    activeReplyId.current = null;
+    if (replyId) {
+      // A stopped partial response is never stored by the server. Remove only that
+      // unsaved bubble so the visible transcript remains identical after refresh.
+      setTurns((current) => current.filter((turn) => turn.id !== replyId));
+    }
+    setStatus("idle");
+    setError(null);
+  }
+
+  async function retry(assistantIndex?: number) {
+    const searchBefore = assistantIndex === undefined
+      ? turns
+      : turns.slice(0, assistantIndex);
+    const sourceUser = [...searchBefore].reverse().find((turn) => turn.role === "user");
+    if (!sourceUser || status === "streaming") return;
+    // A retry is a new visible attempt. Keeping both attempts prevents the browser
+    // from hiding transcript rows that remain durably stored on refresh.
+    await send(sourceUser.text);
+  }
+
+  async function send(forcedText?: string, historyOverride?: Turn[]) {
+    const text = (forcedText ?? input).trim();
+    if (!text || status === "streaming" || !hasCredentials || !canUseChat) return;
+
+    setShowWelcome(false);
+    const priorTurns = historyOverride ?? turns;
+    const replyId = crypto.randomUUID();
+    const userTurn: Turn = { id: crypto.randomUUID(), role: "user", text };
+    setTurns([...priorTurns, userTurn, { id: replyId, role: "assistant", text: "" }]);
+    setInput("");
+    setError(null);
+    setStatus("streaming");
+    activeReplyId.current = replyId;
+    shouldFollowOutput.current = true;
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+
+    const request = new AbortController();
+    activeRequest.current = request;
     try {
-      const response = await fetch("/api/follow-through", {
+      const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          commitmentId: recommendation.commitment_id,
-          decision,
-          responseMessageId,
-          ...(userReason?.trim() ? { userReason: userReason.trim() } : {}),
+          input: text,
+          mode,
+          ...(mode === "standard"
+            ? { conversationId: conversationId.current }
+            : { temporaryHistory: boundedBrowserHistory(priorTurns) }),
         }),
+        signal: request.signal,
       });
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
         const detail = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(detail?.error ?? "Could not record that choice.");
+        throw new Error(chatRequestError(response.status, detail?.error));
       }
-      setTurns((prior) =>
-        prior.map((turn) =>
-          turn.id === turnId ? { ...turn, recommendationDecision: decision } : turn,
-        ),
-      );
-      if (decision === "accepted") chooseStarter(recommendation.chat_prompt);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line) as Record<string, unknown>;
+          if (event.type === "conversation" && typeof event.conversationId === "string") {
+            conversationId.current = event.conversationId;
+            window.dispatchEvent(
+              new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
+                detail: { conversationId: event.conversationId },
+              }),
+            );
+          } else if (event.type === "text_delta" && typeof event.text === "string") {
+            setTurns((current) => current.map((turn) =>
+              turn.id === replyId ? { ...turn, text: turn.text + event.text } : turn,
+            ));
+          } else if (event.type === "response_complete") {
+            const responseId = typeof event.responseId === "string" ? event.responseId : null;
+            const memoryJobId = typeof event.memoryJobId === "string" ? event.memoryJobId : null;
+            const recalled = typeof event.recalled === "number" ? event.recalled : 0;
+            const memoryError = typeof event.memoryError === "string" ? event.memoryError : null;
+            setTurns((current) => current.map((turn) =>
+              turn.id === replyId
+                ? { ...turn, responseId, memoryJobId, recalled, memoryError }
+                : turn,
+            ));
+            setStatus("idle");
+            if (memoryJobId) {
+              startMemoryPoll(replyId, memoryJobId);
+            }
+          } else if (event.type === "error") {
+            throw new Error(typeof event.message === "string" ? event.message : "Something went wrong.");
+          }
+        }
+      }
+      if (!request.signal.aborted) setStatus("idle");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not record that choice.");
+      if (request.signal.aborted) {
+        setTurns((current) => current.filter((turn) => turn.id !== replyId));
+        return;
+      }
+      setTurns((current) => current.filter((turn) => turn.id !== replyId));
+      setError(caught instanceof Error ? caught.message : "Something went wrong.");
+      setStatus("error");
+    } finally {
+      if (activeRequest.current === request) activeRequest.current = null;
+      if (activeReplyId.current === replyId) activeReplyId.current = null;
+    }
+  }
+
+  const pollMemoryJob = useCallback(async (
+    turnId: string,
+    jobId: ResourceId,
+    signal: AbortSignal,
+  ) => {
+    for (let attempt = 0; attempt < 120 && !signal.aborted; attempt += 1) {
+      if (attempt > 0) await delay(Math.min(1_000 + attempt * 250, 4_000), signal);
+      if (signal.aborted) return;
+      try {
+        const response = await fetch(`/api/memory-jobs/${encodeURIComponent(jobId)}`, {
+          cache: "no-store",
+          signal,
+        });
+        if (!response.ok) throw new Error("Memory status is unavailable.");
+        const body = (await response.json()) as { job: MemoryJobView | null };
+        if (!body.job) throw new Error("Memory status is unavailable.");
+        setTurns((current) => current.map((turn) =>
+          turn.id === turnId ? { ...turn, memory: body.job ?? undefined } : turn,
+        ));
+        if (body.job.status === "completed" || body.job.status === "failed") {
+          if (body.job.items.length > 0 && onboarding !== "complete") {
+            updateOnboarding("complete");
+          }
+          if (conversationId.current) {
+            window.dispatchEvent(
+              new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
+                detail: { conversationId: conversationId.current },
+              }),
+            );
+          }
+          return;
+        }
+      } catch (caught) {
+        if (signal.aborted) return;
+        setTurns((current) => current.map((turn) =>
+          turn.id === turnId
+            ? { ...turn, memoryError: caught instanceof Error ? caught.message : "Memory status is unavailable." }
+            : turn,
+        ));
+        return;
+      }
+    }
+  }, [onboarding, updateOnboarding]);
+
+  const startMemoryPoll = useCallback((turnId: string, jobId: ResourceId) => {
+    if (polledJobIds.current.has(jobId)) return;
+    polledJobIds.current.add(jobId);
+    const memoryRequest = new AbortController();
+    backgroundRequests.current.add(memoryRequest);
+    void pollMemoryJob(turnId, jobId, memoryRequest.signal).finally(() => {
+      backgroundRequests.current.delete(memoryRequest);
+    });
+  }, [pollMemoryJob]);
+
+  useEffect(() => {
+    for (const turn of initialTurns as Turn[]) {
+      if (
+        turn.role === "assistant" &&
+        turn.memoryJobId &&
+        (!turn.memory || turn.memory.status === "pending" || turn.memory.status === "running")
+      ) {
+        startMemoryPoll(turn.id, turn.memoryJobId);
+      }
+    }
+  }, [initialTurns, startMemoryPoll]);
+
+  async function undoMemory(turnId: string, jobId: ResourceId) {
+    try {
+      const response = await fetch(`/api/memory-jobs/${encodeURIComponent(jobId)}/undo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const body = (await response.json().catch(() => null)) as { job?: MemoryJobView; error?: string } | null;
+      if (body?.job) {
+        setTurns((current) => current.map((turn) =>
+          turn.id === turnId ? { ...turn, memory: body.job, memoryError: null } : turn,
+        ));
+      }
+      if (!response.ok || !body?.job) {
+        throw new Error(body?.error ?? "That save cannot be undone safely.");
+      }
+    } catch (caught) {
+      setTurns((current) => current.map((turn) =>
+        turn.id === turnId
+          ? { ...turn, memoryError: caught instanceof Error ? caught.message : "That save cannot be undone safely." }
+          : turn,
+      ));
     }
   }
 
   const hasVisibleTurns = turns.length > 0;
-  const canSend =
-    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canUseChat;
+  const canSend = Boolean(input.trim()) && status !== "streaming" && hasCredentials && canUseChat;
   const composer = (
     <Composer
       input={input}
       onInputChange={setInput}
-      onSend={send}
+      onSend={() => send()}
+      onStop={stop}
+      onModeChange={selectMode}
       textareaRef={textareaRef}
       status={status}
       canSend={canSend}
       hasCredentials={hasCredentials}
       canUseChat={canUseChat}
       centered={!hasVisibleTurns}
+      mode={mode}
+      canSwitchMode={canAccessPrivateData}
     />
   );
 
   return (
-    <div
-      className="relative flex h-full min-h-0 flex-col"
-      style={{ background: "var(--shell-bg)" }}
-    >
+    <div className="relative flex h-full min-h-0 flex-col" style={{ background: "var(--shell-bg)" }}>
       {showAuthActions && <GuestAuthActions />}
       {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
-          <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[24vh] pt-20 lg:pb-[27vh]">
-            {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
-            <EmptyState />
+          <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[16vh] pt-20">
+            {!canUseChat
+              ? <LoginRequiredNotice />
+              : canAccessPrivateData && !hasCredentials && <AvailabilityNotice />}
+            {showWelcome ? <Welcome onChoose={chooseStarter} onSkip={() => { setShowWelcome(false); updateOnboarding("complete"); }} /> : <EmptyState mode={mode} onChoose={chooseStarter} />}
             {composer}
           </div>
         </div>
       ) : (
         <>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            <div
-              className={`mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 md:px-6 ${
-                showAuthActions ? "pt-16" : "pt-6"
-              }`}
-            >
-              {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
+          <div
+            className="min-h-0 flex-1 overflow-y-auto"
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              shouldFollowOutput.current =
+                element.scrollHeight - element.scrollTop - element.clientHeight < 120;
+            }}
+          >
+            <div className={`mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 md:px-6 ${showAuthActions ? "pt-16" : "pt-6"}`}>
+              {mode === "temporary" && <TemporaryBanner />}
+              {!canUseChat
+                ? <LoginRequiredNotice />
+                : canAccessPrivateData && !hasCredentials && <AvailabilityNotice />}
               <ol className="space-y-8 py-4">
-                {turns.map((turn) => (
+                {turns.map((turn, index) => (
                   <li key={turn.id}>
                     {turn.role === "user" ? (
                       <UserTurn text={turn.text} />
                     ) : (
                       <AssistantTurn
-                        text={turn.text}
-                        receipt={turn.receipt}
-                        recommendation={turn.recommendation}
-                        recommendationDecision={turn.recommendationDecision}
-                        onRecommendationDecision={(recommendation, decision, userReason) =>
-                          respondToRecommendation(
-                            turn.id,
-                            recommendation,
-                            decision,
-                            turn.receipt?.messageId ?? null,
-                            userReason,
-                          )
-                        }
-                        workPlan={turn.workPlan}
-                        pending={status === "streaming" && !turn.receipt}
+                        turn={turn}
+                        pending={status === "streaming" && index === turns.length - 1}
+                        onRetry={() => void retry(index)}
+                        onUndo={() => turn.memoryJobId && void undoMemory(turn.id, turn.memoryJobId)}
+                        temporary={mode === "temporary"}
                       />
                     )}
                   </li>
                 ))}
               </ol>
-
-              {error && (
-                <p
-                  role="alert"
-                  className="mt-5 rounded-xl border px-4 py-3 text-[0.86rem]"
-                  style={{
-                    background: "var(--shell-panel)",
-                    borderColor: "var(--shell-line-strong)",
-                    color: "var(--shell-muted)",
-                  }}
-                >
-                  {error}
-                </p>
-              )}
-
+              {error && <ErrorNotice message={error} onRetry={() => void retry()} />}
               <div ref={endRef} />
             </div>
           </div>
@@ -352,64 +426,57 @@ export function Chat({
   );
 }
 
-async function recordOpportunityDelivery(
-  opportunityId: number,
-  channel: "chat" | "today",
-  responseMessageId: number | null,
-): Promise<boolean> {
-  try {
-    const response = await fetch(`/api/opportunities/${opportunityId}/delivery`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel, responseMessageId }),
-      keepalive: true,
-    });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
 function Composer({
   input,
   onInputChange,
   onSend,
+  onStop,
+  onModeChange,
   textareaRef,
   status,
   canSend,
   hasCredentials,
   canUseChat,
   centered,
+  mode,
+  canSwitchMode,
 }: {
   input: string;
   onInputChange: (value: string) => void;
   onSend: () => Promise<void>;
+  onStop: () => void;
+  onModeChange: (mode: ChatMode) => void;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   status: Status;
   canSend: boolean;
   hasCredentials: boolean;
   canUseChat: boolean;
   centered: boolean;
+  mode: ChatMode;
+  canSwitchMode: boolean;
 }) {
-  const inputLabel = "Message Zeus";
-
   return (
     <form
-      onSubmit={(event) => {
-        event.preventDefault();
-        void onSend();
-      }}
-      className={centered ? "mt-9 w-full" : "shrink-0 px-3 pb-2 pt-3 md:px-5"}
+      onSubmit={(event) => { event.preventDefault(); void onSend(); }}
+      className={centered ? "mt-7 w-full" : "shrink-0 px-3 pt-3 [padding-bottom:max(0.5rem,env(safe-area-inset-bottom))] md:px-5"}
       style={{ background: "var(--shell-bg)" }}
     >
       <div className="mx-auto w-full max-w-[48rem]">
-        <div
-          className="flex items-end gap-2 rounded-[26px] border px-3 py-2 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]"
-          style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
-        >
-          <label htmlFor="chat-input" className="sr-only">
-            {inputLabel}
-          </label>
+        <div className="mb-2 flex items-center justify-between gap-3 px-1 text-xs" style={{ color: "var(--shell-faint)" }}>
+          <button
+            type="button"
+            disabled={status === "streaming" || !canSwitchMode}
+            onClick={() => onModeChange(mode === "temporary" ? "standard" : "temporary")}
+            aria-pressed={mode === "temporary"}
+            className="rounded-full border px-3 py-1.5 disabled:opacity-50"
+            style={{ borderColor: mode === "temporary" ? "var(--shell-accent)" : "var(--shell-line-strong)", color: mode === "temporary" ? "var(--shell-accent)" : undefined }}
+          >
+            {mode === "temporary" ? "Temporary chat on" : "Temporary chat"}
+          </button>
+          {mode === "temporary" && <span>Nothing from this chat is saved</span>}
+        </div>
+        <div className="flex items-end gap-2 rounded-[26px] border px-3 py-2" style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}>
+          <label htmlFor="chat-input" className="sr-only">Message Zeus</label>
           <textarea
             ref={textareaRef}
             id="chat-input"
@@ -425,28 +492,192 @@ function Composer({
                 void onSend();
               }
             }}
-            placeholder={inputLabel}
+            placeholder="Message Zeus"
             className="max-h-[200px] min-h-9 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-[0.95rem] leading-6 outline-none disabled:cursor-not-allowed disabled:opacity-50"
-            style={{ color: "var(--shell-fg)", outline: "none" }}
+            style={{ color: "var(--shell-fg)" }}
           />
-          <button
-            type="submit"
-            disabled={!canSend}
-            aria-label={status === "streaming" ? "Response in progress" : "Send message"}
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed"
-            style={{
-              background: canSend ? "var(--shell-accent)" : "var(--shell-elevated)",
-              color: canSend ? "#000000" : "var(--shell-faint)",
-            }}
-          >
-            <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="2.2">
-              <path d="M12 19V5m0 0-5 5m5-5 5 5" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
+          {status === "streaming" ? (
+            <button type="button" onClick={onStop} aria-label="Stop response" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full" style={{ background: "var(--shell-elevated)" }}>
+              <span aria-hidden className="h-3 w-3 rounded-[2px]" style={{ background: "var(--shell-fg)" }} />
+            </button>
+          ) : (
+            <button type="submit" disabled={!canSend} aria-label="Send message" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full disabled:cursor-not-allowed" style={{ background: canSend ? "var(--shell-accent)" : "var(--shell-elevated)", color: canSend ? "#000" : "var(--shell-faint)" }}>
+              <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M12 19V5m0 0-5 5m5-5 5 5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            </button>
+          )}
         </div>
       </div>
     </form>
   );
+}
+
+function AssistantTurn({ turn, pending, onRetry, onUndo, temporary }: { turn: Turn; pending: boolean; onRetry: () => void; onUndo: () => void; temporary: boolean }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(turn.text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  }
+  return (
+    <div className="flex gap-4">
+      <AssistantMark />
+      <div className="min-w-0 flex-1 pt-0.5">
+        <div aria-live="polite" aria-busy={pending}>
+          {turn.text ? <Markdown text={turn.text} /> : pending && <ThinkingIndicator />}
+        </div>
+        {turn.text && !pending && (
+          <div className="mt-2 flex items-center gap-4 text-xs" style={{ color: "var(--shell-faint)" }}>
+            <button type="button" onClick={() => void copy()}>{copied ? "Copied" : "Copy"}</button>
+            <button type="button" onClick={onRetry}>Retry</button>
+          </div>
+        )}
+        {!temporary && (
+          <ActivityReceipt
+            turn={turn}
+            onUndo={onUndo}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Markdown({ text }: { text: string }) {
+  return (
+    <div className="chat-markdown text-[0.95rem] leading-7" style={{ color: "var(--shell-fg)" }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => <a href={safeHref(href)} rel="noreferrer" target="_blank" className="underline underline-offset-4">{children}</a>,
+          p: ({ children }) => <p className="mb-4 last:mb-0">{children}</p>,
+          ul: ({ children }) => <ul className="mb-4 list-disc space-y-1 pl-6">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-4 list-decimal space-y-1 pl-6">{children}</ol>,
+          pre: ({ children }) => <pre className="my-4 overflow-x-auto rounded-xl border p-4 text-sm" style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}>{children}</pre>,
+          code: ({ children }) => <code className="rounded bg-white/[0.06] px-1 py-0.5 font-mono text-[0.88em]">{children}</code>,
+          blockquote: ({ children }) => <blockquote className="my-4 border-l-2 pl-4" style={{ borderColor: "var(--shell-line-strong)", color: "var(--shell-muted)" }}>{children}</blockquote>,
+          img: () => null,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function ActivityReceipt({ turn, onUndo }: { turn: Turn; onUndo: () => void }) {
+  const job = turn.memory;
+  const used = turn.recalled ?? 0;
+  const saved = job?.items.filter((item) => item.change === "saved" || item.change === "updated") ?? [];
+  const review = job?.items.filter((item) => item.change === "needs_review") ?? [];
+  const hasSavedPlans = saved.some((item) => item.kind === "plan");
+  const hasSavedMemory = saved.some((item) => item.kind !== "plan");
+  const hasSummary = used > 0 || saved.length > 0 || review.length > 0;
+  if (!turn.responseId && !turn.memoryJobId && !turn.memoryError && !hasSummary) return null;
+  return (
+    <div aria-live="polite" className="mt-3 text-xs" style={{ color: "var(--shell-faint)" }}>
+      {hasSummary && (
+        <div className="flex flex-wrap gap-x-4 gap-y-1">
+          {used > 0 && <span>Used {used} remembered {plural(used, "detail")}</span>}
+          {saved.length > 0 && <span>Saved {saved.length} {plural(saved.length, "detail")}</span>}
+          {review.length > 0 && <Link href="/about-you?view=review" className="underline underline-offset-3">{review.length} needs review</Link>}
+        </div>
+      )}
+      {job && (job.status === "pending" || job.status === "running") && (
+        <p role="status" className="mt-2">Checking what may be worth remembering…</p>
+      )}
+      {job?.status === "completed" && job.items.length > 0 && (
+        <details open className="mt-2 rounded-lg border px-3 py-2.5" style={{ borderColor: "var(--shell-line)" }}>
+          <summary className="cursor-pointer font-medium" style={{ color: "var(--shell-muted)" }}>Memory updated</summary>
+          <ul className="mt-2 space-y-1.5">
+            {job.items.map((item) => <MemoryChange key={`${item.id}:${item.change}`} item={item} />)}
+          </ul>
+          <div className="mt-3 flex flex-wrap gap-4">
+            {job.canUndo && !job.undone && <button type="button" onClick={onUndo} className="underline underline-offset-3">Undo last save</button>}
+            {!job.canUndo && hasSavedMemory && <Link href="/about-you" className="underline underline-offset-3">Review or correct details</Link>}
+            {!job.canUndo && hasSavedPlans && <Link href="/today#plans" className="underline underline-offset-3">Review plans</Link>}
+            {job.undone && <span>Save undone</span>}
+          </div>
+        </details>
+      )}
+      {(turn.memoryError || job?.status === "failed") && <p role="status" className="mt-2" style={{ color: "#ff9b9b" }}>{turn.memoryError ?? job?.error ?? "Memory could not be updated."}</p>}
+      {turn.responseId && <Link href={`/response/${turn.responseId}`} className="mt-2 inline-block underline underline-offset-3">Why Zeus said this</Link>}
+    </div>
+  );
+}
+
+function MemoryChange({ item }: { item: MemoryActivityItem }) {
+  const prefix = item.change === "needs_review" ? "Review" : item.change === "updated" ? "Updated" : "Saved";
+  const href = item.change === "needs_review"
+    ? `/about-you?view=review#${item.id}`
+    : item.kind === "plan"
+      ? `/today#${item.id}`
+      : `/about-you#${item.id}`;
+  return <li><span className="font-medium" style={{ color: "var(--shell-muted)" }}>{prefix}:</span>{" "}<Link href={href} className="underline decoration-transparent underline-offset-3 hover:decoration-current">{item.label}</Link></li>;
+}
+
+function Welcome({ onChoose, onSkip }: { onChoose: (prompt: string) => void; onSkip: () => void }) {
+  return (
+    <section className="mx-auto w-full max-w-[40rem] text-center" aria-labelledby="welcome-heading">
+      <p className="text-xs font-medium uppercase tracking-[0.14em]" style={{ color: "var(--shell-accent)" }}>Welcome to Zeus</p>
+      <h1 id="welcome-heading" className="mt-3 text-3xl font-semibold tracking-tight">Help that remembers—with you in control.</h1>
+      <p className="mx-auto mt-4 max-w-[36rem] text-sm leading-6" style={{ color: "var(--shell-muted)" }}>
+        Zeus can remember clear, non-sensitive details, help you follow through, and always show why. You can review, correct, remove, or turn remembering off at any time.
+      </p>
+      <p className="mt-3 text-xs" style={{ color: "var(--shell-faint)" }}>Helpful suggestions are on by default. Zeus offers at most one at a time.</p>
+      <StarterButtons onChoose={onChoose} />
+      <button type="button" onClick={onSkip} className="mt-5 text-sm underline underline-offset-4" style={{ color: "var(--shell-faint)" }}>Skip introduction</button>
+    </section>
+  );
+}
+
+function EmptyState({ mode, onChoose }: { mode: ChatMode; onChoose: (prompt: string) => void }) {
+  return (
+    <div className="w-full text-center">
+      <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">{mode === "temporary" ? "Temporary chat" : "What can I help with?"}</h1>
+      {mode === "temporary" ? <p className="mt-3 text-sm" style={{ color: "var(--shell-muted)" }}>No saved memory is read. This conversation disappears when you refresh or leave.</p> : <StarterButtons onChoose={onChoose} />}
+    </div>
+  );
+}
+
+function StarterButtons({ onChoose }: { onChoose: (prompt: string) => void }) {
+  const starters = ["Help me think through something", "Remember what I’m working on", "Show me how memory works"];
+  return <div className="mt-6 flex flex-wrap justify-center gap-2">{starters.map((starter) => <button type="button" key={starter} onClick={() => onChoose(starter)} className="rounded-full border px-3.5 py-2 text-sm hover:bg-white/[0.05]" style={{ borderColor: "var(--shell-line-strong)" }}>{starter}</button>)}</div>;
+}
+
+function TemporaryBanner() {
+  return <p role="status" className="mt-3 rounded-xl border px-4 py-3 text-sm" style={{ borderColor: "var(--shell-line-strong)", color: "var(--shell-muted)" }}>Temporary chat: no saved memory is read, and this conversation is not stored.</p>;
+}
+
+function UserTurn({ text }: { text: string }) {
+  return <div className="flex justify-end"><p className="max-w-[85%] whitespace-pre-wrap rounded-[20px] px-4 py-2.5 text-[0.95rem] leading-6" style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}>{text}</p></div>;
+}
+
+function AssistantMark() {
+  return <span aria-hidden className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[0.68rem] font-bold" style={{ background: "var(--shell-accent)", color: "#000" }}>Z</span>;
+}
+
+function ThinkingIndicator() {
+  return <span role="status" aria-label="Thinking" className="inline-flex h-7 items-center gap-1.5">{[0, 150, 300].map((delayMs) => <span key={delayMs} aria-hidden className="h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: "var(--shell-muted)", animationDelay: `${delayMs}ms` }} />)}</span>;
+}
+
+function ErrorNotice({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return <div role="alert" className="mt-5 flex items-center justify-between gap-4 rounded-xl border px-4 py-3 text-sm" style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)", color: "var(--shell-muted)" }}><span>{message}</span><button type="button" onClick={onRetry} className="shrink-0 underline underline-offset-3">Retry</button></div>;
+}
+
+function AvailabilityNotice() {
+  return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Chat is temporarily unavailable</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>Saved details and data controls are still available.</p></div>;
+}
+
+function LoginRequiredNotice() {
+  return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Log in to chat</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>Temporary chats are available after login and are never saved.</p></div>;
+}
+
+function GuestAuthActions() {
+  return <nav aria-label="Account access" className="absolute right-0 top-0 z-10 flex h-16 items-center gap-2 px-4 sm:px-5"><AuthTrigger intent="login" className="flex h-9 items-center rounded-full px-4 text-sm font-medium" style={{ background: "var(--shell-accent)", color: "#000" }}>Log in</AuthTrigger><AuthTrigger intent="signup" className="flex h-9 items-center rounded-full border px-4 text-sm font-medium" style={{ borderColor: "var(--shell-line-strong)" }}>Sign up</AuthTrigger></nav>;
 }
 
 function resizeComposer(element: HTMLTextAreaElement) {
@@ -454,445 +685,51 @@ function resizeComposer(element: HTMLTextAreaElement) {
   element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
 }
 
-function boundedGuestHistory(turns: readonly Turn[]): Array<{
-  role: "user" | "assistant";
-  content: string;
-}> {
+function boundedBrowserHistory(turns: readonly Turn[]): Array<{ role: "user" | "assistant"; content: string }> {
   const history: Array<{ role: "user" | "assistant"; content: string }> = [];
-  let remainingCharacters = 20_000;
-
+  let remaining = 20_000;
   for (const turn of turns.slice(-20).reverse()) {
     const content = turn.text.trim().slice(0, 4_000);
-    if (!content || remainingCharacters === 0) continue;
-    const boundedContent = content.slice(0, remainingCharacters);
-    history.unshift({ role: turn.role, content: boundedContent });
-    remainingCharacters -= boundedContent.length;
+    if (!content || remaining === 0) continue;
+    const bounded = content.slice(0, remaining);
+    history.unshift({ role: turn.role, content: bounded });
+    remaining -= bounded.length;
   }
-
   return history;
 }
 
-function UserTurn({ text }: { text: string }) {
-  return (
-    <div className="flex justify-end">
-      <p
-        className="max-w-[85%] whitespace-pre-wrap rounded-[20px] px-4 py-2.5 text-[0.95rem] leading-6"
-        style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
-      >
-        {text}
-      </p>
-    </div>
-  );
-}
-
-function AssistantTurn({
-  text,
-  receipt,
-  recommendation,
-  recommendationDecision,
-  onRecommendationDecision,
-  workPlan,
-  pending,
-}: {
-  text: string;
-  receipt?: Turn["receipt"];
-  recommendation?: FollowThroughRecommendation;
-  recommendationDecision?: RecommendationDecision;
-  onRecommendationDecision: (
-    recommendation: FollowThroughRecommendation,
-    decision: RecommendationDecision,
-    userReason?: string,
-  ) => void;
-  workPlan?: Turn["workPlan"];
-  pending: boolean;
-}) {
-  return (
-    <div className="flex gap-4">
-      <AssistantMark />
-      <div className="min-w-0 flex-1 pt-0.5">
-        {text ? (
-          <p className="whitespace-pre-wrap text-[0.95rem] leading-7" style={{ color: "var(--shell-fg)" }}>
-            {text}
-          </p>
-        ) : (
-          pending && <ThinkingIndicator />
-        )}
-        {recommendation && (
-          <FollowThroughCard
-            recommendation={recommendation}
-            decision={recommendationDecision}
-            onDecision={onRecommendationDecision}
-          />
-        )}
-        {workPlan && <WorkPlanCard workPlan={workPlan} />}
-        {receipt && <Receipt {...receipt} />}
-      </div>
-    </div>
-  );
-}
-
-function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> }) {
-  const [status, setStatus] = useState(workPlan.status);
-  const [errorCode, setErrorCode] = useState(workPlan.errorCode);
-  const [busy, setBusy] = useState<"resume" | "cancel" | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const completed = status === "completed";
-  const closed = completed || status === "cancelled";
-  const canResume = ["queued", "running", "paused"].includes(status);
-
-  async function act(action: "resume" | "cancel") {
-    if (busy) return;
-    setBusy(action);
-    setActionError(null);
-    try {
-      const response = await fetch(`/api/work-runs/${workPlan.runId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action }),
-      });
-      const body = (await response.json().catch(() => null)) as {
-        error?: string;
-        run?: { status: string; error_code: string | null };
-      } | null;
-      if (!response.ok || !body?.run) {
-        throw new Error(body?.error ?? "The bounded-work action failed.");
-      }
-      setStatus(body.run.status);
-      setErrorCode(body.run.error_code);
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : "The bounded-work action failed.");
-    } finally {
-      setBusy(null);
-    }
+function safeHref(value: string | undefined): string {
+  if (!value) return "#";
+  if (value.startsWith("/") || value.startsWith("#")) return value;
+  try {
+    const url = new URL(value, "https://zeus.invalid");
+    return url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:" ? value : "#";
+  } catch {
+    return "#";
   }
-
-  return (
-    <aside
-      className="mt-4 rounded-xl border px-4 py-3.5"
-      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
-      aria-label="Bounded work plan"
-    >
-      <p
-        className="font-mono text-[0.62rem] uppercase tracking-[0.14em]"
-        style={{ color: "var(--shell-faint)" }}
-      >
-        Bounded work · {status}
-      </p>
-      <p className="mt-2 text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-        {completed
-          ? "Zeus completed the authorized read-only research and local preparation steps."
-          : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
-      </p>
-      {!closed && (
-        <div className="mt-3 flex flex-wrap gap-4 text-[0.74rem]">
-          {canResume && (
-            <button
-              type="button"
-              disabled={busy !== null}
-              onClick={() => void act("resume")}
-              className="font-medium disabled:opacity-50"
-              style={{ color: "var(--shell-accent)" }}
-            >
-              {busy === "resume" ? "Resuming…" : "Resume"}
-            </button>
-          )}
-          <button
-            type="button"
-            disabled={busy !== null}
-            onClick={() => void act("cancel")}
-            className="disabled:opacity-50"
-            style={{ color: "var(--shell-faint)" }}
-          >
-            {busy === "cancel" ? "Cancelling…" : "Cancel"}
-          </button>
-        </div>
-      )}
-      {actionError && (
-        <p className="mt-2 text-[0.72rem]" role="alert" style={{ color: "#f3a6a6" }}>
-          {actionError} Review the exact plan in Today if it needs fresh approval.
-        </p>
-      )}
-      {workPlan.artifacts.length > 0 && (
-        <ul className="mt-2 space-y-1 text-[0.78rem]">
-          {workPlan.artifacts.map((artifact) => (
-            <li key={artifact.id}>
-              <a href={`/work-artifacts/${artifact.id}`} className="underline underline-offset-2">
-                {artifact.title}
-              </a>{" "}
-              <span
-                className="font-mono text-[0.61rem]"
-                style={{ color: "var(--shell-faint)" }}
-              >
-                {artifact.kind.replace(/_/gu, " ")}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-      <a
-        href="/today#work-plans"
-        className="mt-2 inline-block font-mono text-[0.61rem] underline underline-offset-2"
-        style={{ color: "var(--shell-faint)" }}
-      >
-        review plan and receipts
-      </a>
-    </aside>
-  );
 }
 
-function FollowThroughCard({
-  recommendation,
-  decision,
-  onDecision,
-}: {
-  recommendation: FollowThroughRecommendation;
-  decision?: RecommendationDecision;
-  onDecision: (
-    recommendation: FollowThroughRecommendation,
-    decision: RecommendationDecision,
-    userReason?: string,
-  ) => void;
-}) {
-  const [userReason, setUserReason] = useState("");
-  const decisionText =
-    decision === "accepted"
-      ? "Ready in the composer — help is available without acting externally."
-      : decision === "completed"
-        ? "Marked complete."
-        : decision === "snoozed"
-          ? "Snoozed for seven days."
-          : decision === "dismissed"
-            ? "Dismissed. It will stay quiet unless the commitment changes."
-            : null;
-
-  return (
-    <aside
-      className="mt-4 rounded-xl border px-4 py-3.5"
-      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
-      aria-label="Follow-through recommendation"
-    >
-      <p
-        className="font-mono text-[0.62rem] uppercase tracking-[0.14em]"
-        style={{ color: "var(--shell-faint)" }}
-      >
-        Useful next action
-      </p>
-      <p className="mt-2 text-[0.9rem] font-medium">{recommendation.suggested_action}</p>
-      <p className="mt-1.5 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-        {recommendation.why}
-      </p>
-      {recommendation.requires_confirmation && (
-        <p className="mt-2 font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
-          external action requires your confirmation
-        </p>
-      )}
-      {decisionText ? (
-        <p className="mt-3 text-[0.76rem]" style={{ color: "var(--shell-muted)" }}>
-          {decisionText}
-        </p>
-      ) : (
-        <div className="mt-3 text-[0.76rem]">
-          <label className="block max-w-[30rem] text-[0.68rem]" style={{ color: "var(--shell-faint)" }}>
-            Reason (optional; silence is never interpreted)
-            <input
-              value={userReason}
-              onChange={(event) => setUserReason(event.target.value)}
-              maxLength={1000}
-              className="mt-1 block min-h-[34px] w-full rounded-md border px-2.5"
-              style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
-            />
-          </label>
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-          <button
-            type="button"
-            onClick={() => onDecision(recommendation, "accepted", userReason)}
-            className="rounded-md px-3 py-1.5 font-medium"
-            style={{ background: "var(--shell-accent)", color: "#000000" }}
-          >
-            Help me do this
-          </button>
-          <button type="button" onClick={() => onDecision(recommendation, "completed", userReason)}>
-            Already done
-          </button>
-          <button type="button" onClick={() => onDecision(recommendation, "snoozed", userReason)}>
-            Not now
-          </button>
-          <button
-            type="button"
-            onClick={() => onDecision(recommendation, "dismissed", userReason)}
-            style={{ color: "var(--shell-faint)" }}
-          >
-            Not useful
-          </button>
-          </div>
-        </div>
-      )}
-      <div className="mt-2 flex gap-3 font-mono text-[0.61rem]" style={{ color: "var(--shell-faint)" }}>
-        <a href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
-          why this is known
-        </a>
-        <a href="/settings#follow-through" className="underline underline-offset-2">
-          follow-through settings
-        </a>
-      </div>
-    </aside>
-  );
+function chatRequestError(status: number, detail?: string): string {
+  if (status === 401) return "Log in to continue.";
+  if (status === 403) return "This chat is not available for this account.";
+  if (status === 404) return "That saved chat is no longer available.";
+  if (status === 429) return detail || "Chat is busy. Try again shortly.";
+  if (status >= 500) return "Zeus is temporarily unavailable. Try again shortly.";
+  return "That request could not be completed. Try again.";
 }
 
-function AssistantMark() {
-  return (
-    <span
-      aria-hidden
-      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[0.68rem] font-bold"
-      style={{ background: "var(--shell-accent)", color: "#000000" }}
-    >
-      Z
-    </span>
-  );
+function onboardingRank(status: OnboardingStatus): number {
+  return status === "welcome" ? 0 : status === "first_chat" ? 1 : 2;
 }
 
-function ThinkingIndicator() {
-  return (
-    <span role="status" aria-label="Thinking" className="inline-flex h-7 items-center gap-1.5">
-      {[0, 150, 300].map((delay) => (
-        <span
-          key={delay}
-          aria-hidden
-          className="h-1.5 w-1.5 animate-pulse rounded-full"
-          style={{ background: "var(--shell-muted)", animationDelay: `${delay}ms` }}
-        />
-      ))}
-    </span>
-  );
+function plural(count: number, word: string): string {
+  return count === 1 ? word : `${word}s`;
 }
 
-/** The memory changes made by a turn, kept inspectable without crowding the reply. */
-function Receipt({
-  messageId,
-  recalled,
-  recalledFacts,
-  recalledEpisodes,
-  recalledFacets,
-  accepted,
-  acceptedFacets,
-  pending,
-  pendingFacets,
-  goalsUpdated,
-  commitmentsUpdated,
-  projectsUpdated,
-  superseded,
-  failed,
-}: NonNullable<Turn["receipt"]>) {
-  const parts = receiptSummaryParts({
-    messageId,
-    recalled,
-    recalledFacts,
-    recalledEpisodes,
-    recalledFacets,
-    accepted,
-    acceptedFacets,
-    pending,
-    pendingFacets,
-    goalsUpdated,
-    commitmentsUpdated,
-    superseded,
-    failed,
+function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = window.setTimeout(resolve, milliseconds);
+    signal.addEventListener("abort", () => { window.clearTimeout(timer); resolve(); }, { once: true });
   });
-
-  if (parts.length === 0) {
-    return (
-      <a
-        href={`/response/${messageId}`}
-        className="mt-3 inline-block font-mono text-[0.66rem] underline underline-offset-2"
-        style={{ color: "var(--shell-faint)" }}
-      >
-        response sources
-      </a>
-    );
-  }
-
-  return (
-    <details className="mt-3 font-mono text-[0.66rem]" style={{ color: "var(--shell-faint)" }}>
-      <summary className="inline-flex cursor-pointer list-none rounded-md py-1 hover:text-white">
-        {parts.join("  ·  ")}
-      </summary>
-      <div
-        className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 border-l pl-3"
-        style={{ borderColor: "var(--shell-line-strong)" }}
-      >
-        <span>{recalledFacts} facts</span>
-        <span>{recalledEpisodes} passages</span>
-        <span>{recalledFacets} understanding facets</span>
-        {acceptedFacets > 0 && <span>{acceptedFacets} facets accepted</span>}
-        {goalsUpdated > 0 && <span>{goalsUpdated} goals updated</span>}
-        {commitmentsUpdated > 0 && <span>{commitmentsUpdated} commitments updated</span>}
-        {projectsUpdated > 0 && <span>{projectsUpdated} projects updated</span>}
-        <a href={`/response/${messageId}`} className="underline underline-offset-2" style={{ color: "var(--shell-fg)" }}>
-          sources used
-        </a>
-        {(accepted > 0 || pending > 0) && (
-          <a
-            href={pendingFacets > 0 ? "/understanding" : pending > 0 ? "/memory?view=review" : "/memory"}
-            className="underline underline-offset-2"
-            style={{ color: "var(--shell-fg)" }}
-          >
-            {pendingFacets > 0 ? "review understanding" : "review saved details"}
-          </a>
-        )}
-      </div>
-    </details>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="w-full text-center">
-      <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">
-        What can I help with?
-      </h1>
-    </div>
-  );
-}
-
-function GuestAuthActions() {
-  return (
-    <nav
-      aria-label="Account access"
-      className="absolute right-0 top-0 z-10 flex h-16 items-center gap-2 px-4 sm:px-5"
-    >
-      <AuthTrigger
-        intent="login"
-        className="flex h-9 items-center rounded-full px-4 text-sm font-medium transition-opacity hover:opacity-90"
-        style={{ background: "var(--shell-accent)", color: "#000000" }}
-      >
-        Log in
-      </AuthTrigger>
-      <AuthTrigger
-        intent="signup"
-        className="flex h-9 items-center rounded-full border px-4 text-sm font-medium transition-colors hover:bg-white/[0.06]"
-        style={{ borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
-      >
-        Sign up
-      </AuthTrigger>
-    </nav>
-  );
-}
-
-function CredentialsNotice() {
-  return (
-    <div
-      role="status"
-      className="mb-4 rounded-2xl border px-5 py-4"
-      style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}
-    >
-      <p className="text-[0.9rem] font-medium">API key required</p>
-      <p className="mt-1.5 text-[0.82rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-        Chat and extraction need a configured API key in{" "}
-        <code className="font-mono text-[0.76rem]" style={{ color: "var(--shell-fg)" }}>
-          .env.local
-        </code>
-        . Browsing and editing saved details still works without one.
-      </p>
-    </div>
-  );
 }

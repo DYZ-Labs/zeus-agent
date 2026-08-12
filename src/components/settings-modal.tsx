@@ -3,16 +3,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-type SettingsSection = "account" | "follow-through" | "data";
+type SettingsSection = "account" | "memory" | "suggestions" | "data" | "labs";
 
 export function SettingsModal({
   account,
-  followThrough,
+  memory,
+  suggestions,
   dataControls,
+  labs,
 }: {
   account: React.ReactNode;
-  followThrough: React.ReactNode;
+  memory: React.ReactNode;
+  suggestions: React.ReactNode;
   dataControls: React.ReactNode;
+  labs: React.ReactNode;
 }) {
   const router = useRouter();
   const [activeSection, setActiveSection] = useState<SettingsSection>("account");
@@ -39,7 +43,10 @@ export function SettingsModal({
     function syncSectionFromHash() {
       const requestedSection = window.location.hash.slice(1);
       setActiveSection(
-        requestedSection === "follow-through" || requestedSection === "data"
+        requestedSection === "memory" ||
+        requestedSection === "suggestions" ||
+        requestedSection === "data" ||
+        requestedSection === "labs"
           ? requestedSection
           : "account",
       );
@@ -112,7 +119,7 @@ export function SettingsModal({
         aria-modal="true"
         aria-label="Settings"
         tabIndex={-1}
-        className="flex h-full w-full flex-col overflow-hidden border text-sm leading-5 shadow-2xl sm:h-[560px] sm:max-h-[calc(100vh-3rem)] sm:w-[680px] sm:max-w-[calc(100vw-3rem)] sm:flex-row sm:rounded-2xl"
+        className="flex h-full w-full flex-col overflow-hidden border text-sm leading-5 shadow-2xl sm:h-[620px] sm:max-h-[calc(100vh-3rem)] sm:w-[760px] sm:max-w-[calc(100vw-3rem)] sm:flex-row sm:rounded-2xl"
         style={{
           background: "var(--shell-panel)",
           borderColor: "var(--shell-line-strong)",
@@ -149,10 +156,22 @@ export function SettingsModal({
               onSelect={() => selectSection("account")}
             />
             <SettingsSectionButton
-              label="Follow-through"
+              label="Remembering"
+              icon={<MemoryIcon />}
+              active={activeSection === "memory"}
+              onSelect={() => selectSection("memory")}
+            />
+            <SettingsSectionButton
+              label="Suggestions"
               icon={<FollowThroughIcon />}
-              active={activeSection === "follow-through"}
-              onSelect={() => selectSection("follow-through")}
+              active={activeSection === "suggestions"}
+              onSelect={() => selectSection("suggestions")}
+            />
+            <SettingsSectionButton
+              label="Labs"
+              icon={<LabsIcon />}
+              active={activeSection === "labs"}
+              onSelect={() => selectSection("labs")}
             />
             <SettingsSectionButton
               label="Data controls"
@@ -166,9 +185,13 @@ export function SettingsModal({
         <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           {activeSection === "account"
             ? account
-            : activeSection === "follow-through"
-              ? followThrough
-              : dataControls}
+            : activeSection === "memory"
+              ? memory
+              : activeSection === "suggestions"
+                ? suggestions
+                : activeSection === "data"
+                  ? dataControls
+                  : labs}
         </div>
       </section>
     </div>
@@ -225,6 +248,24 @@ function FollowThroughIcon() {
     <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
       <circle cx="12" cy="12" r="8" />
       <path d="m8.5 12 2.2 2.2 4.8-5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function MemoryIcon() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M7 5.5h8.5A2.5 2.5 0 0 1 18 8v8.5A2.5 2.5 0 0 1 15.5 19H7a2 2 0 0 1-2-2V7.5a2 2 0 0 1 2-2Z" />
+      <path d="M8.5 9h6M8.5 12.5h6M8.5 16h3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function LabsIcon() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M9 3.5h6M10 3.5v5l-5 9A2 2 0 0 0 6.8 20h10.4a2 2 0 0 0 1.8-2.5l-5-9v-5" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M7.5 15h9" strokeLinecap="round" />
     </svg>
   );
 }

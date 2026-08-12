@@ -576,6 +576,7 @@ export function aggregateBehavioralSignals(
        FROM follow_through_event
        WHERE event_type IN ('dismissed','snoozed','completed','regretted')
          AND source_kind IN ('message','user_action')
+         AND COALESCE(json_extract(detail_json, '$.decision.feedback_only'), 0) <> 1
        ORDER BY id DESC
        LIMIT ?`,
     )
@@ -619,8 +620,16 @@ function toBehavioralEvent(row: BehavioralEventRow): ExplicitBehavioralEvent {
   if (row.detail_json !== null) {
     try {
       const detail: unknown = JSON.parse(row.detail_json);
-      if (isRecord(detail) && typeof detail.user_reason === "string") {
-        userReason = detail.user_reason.trim() || null;
+      const decision = isRecord(detail) && isRecord(detail.decision)
+        ? detail.decision
+        : null;
+      const authoredReason = isRecord(detail) && typeof detail.user_reason === "string"
+        ? detail.user_reason
+        : decision && typeof decision.user_reason === "string"
+          ? decision.user_reason
+          : null;
+      if (authoredReason !== null) {
+        userReason = authoredReason.trim() || null;
       }
     } catch {
       // A malformed historical detail is not evidence. Keep the explicit event itself.

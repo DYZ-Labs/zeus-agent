@@ -8,6 +8,7 @@ import {
   resolveCandidate,
 } from "./candidates";
 import type { CandidateView } from "./candidates";
+import { recordUserCurationMessage } from "./curation";
 import { now } from "./db";
 import type { Db } from "./db";
 import {
@@ -81,6 +82,7 @@ import {
   ensureEvidencePassage,
   passagesForMessage,
   sourceLooksSensitive,
+  withholdPassage,
 } from "./passages";
 
 /**
@@ -378,8 +380,7 @@ function relevantAcceptedPassages(
              SELECT 1
              FROM candidate_evidence ce
              JOIN memory_candidate mc ON mc.id = ce.candidate_id
-             WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-               AND mc.status IN ('pending','rejected')
+             WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
            )
          ORDER BY bm25(passage_fts), p.id DESC
          LIMIT ?`,
@@ -531,6 +532,8 @@ export function applyExtraction(
   sourceMessageId: number | null = null,
   options: {
     forceAccept?: boolean;
+    /** Route every otherwise acceptable proposal through the candidate boundary. */
+    forceReview?: boolean;
     requireEvidence?: boolean;
     extractionRunId?: number | null;
     /** Exact user-message IDs present in the bounded model transcript. */
@@ -574,6 +577,7 @@ export function applyExtraction(
         sourceMessageId,
         result,
         options.forceAccept ?? false,
+        options.forceReview ?? false,
         options.requireEvidence ?? false,
         options.extractionRunId ?? null,
         evidencePolicy,
@@ -587,6 +591,7 @@ export function applyExtraction(
         sourceMessageId,
         result,
         options.forceAccept ?? false,
+        options.forceReview ?? false,
         options.requireEvidence ?? false,
         options.extractionRunId ?? null,
         evidencePolicy,
@@ -600,6 +605,7 @@ export function applyExtraction(
         sourceMessageId,
         result,
         options.forceAccept ?? false,
+        options.forceReview ?? false,
         options.requireEvidence ?? false,
         options.extractionRunId ?? null,
         evidencePolicy,
@@ -615,6 +621,7 @@ export function applyExtraction(
         sourceMessageId,
         result,
         options.forceAccept ?? false,
+        options.forceReview ?? false,
         options.requireEvidence ?? false,
         options.extractionRunId ?? null,
         evidencePolicy,
@@ -709,6 +716,7 @@ function applyFact(
   sourceMessageId: number | null,
   result: ApplyResult,
   forceAccept: boolean,
+  forceReview: boolean,
   requireEvidence: boolean,
   extractionRunId: number | null,
   evidencePolicy: EvidenceApplicationPolicy,
@@ -746,6 +754,13 @@ function applyFact(
         false,
         passages,
       );
+  if (forceReview && !forceAccept && preliminaryReasons.length === 0) {
+    // `memory_candidate` predates the consumer "ask before saving" mode and has no
+    // separate reason value for a user preference. Keep the material behind the
+    // same acceptance boundary using its least destructive review reason. The
+    // consumer adapter presents this as "uncertain", never as model inference.
+    preliminaryReasons.push("inference");
+  }
   const preliminaryReason = preliminaryReasons[0] ?? null;
   if (preliminaryReason && itemSourceId !== null) {
     appendPendingCandidate(
@@ -1216,6 +1231,7 @@ function applyGoal(
   sourceMessageId: number | null,
   result: ApplyResult,
   forceAccept: boolean,
+  forceReview: boolean,
   requireEvidence: boolean,
   extractionRunId: number | null,
   evidencePolicy: EvidenceApplicationPolicy,
@@ -1243,6 +1259,7 @@ function applyGoal(
         false,
         passages,
       );
+  if (forceReview && !forceAccept && reasons.length === 0) reasons.push("inference");
   if (
     !forceAccept &&
     (invalidReference || terminalWithoutExisting) &&
@@ -1309,9 +1326,10 @@ function applyGoal(
     ? existing
       ? undefined
       : null
-    : goal.project.op === "clear"
+      : goal.project.op === "clear"
       ? null
       : project?.id;
+  const sourceKind = sourceKindForMessage(db, itemSourceId);
   const applied = existing
     ? updateGoal(db, existing.id, {
         title: goal.title,
@@ -1321,7 +1339,7 @@ function applyGoal(
         projectId,
         confidence: goal.confidence,
         sourceMessageId: itemSourceId,
-        sourceKind: "message",
+        sourceKind,
         passageId:
           passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
       })
@@ -1333,6 +1351,7 @@ function applyGoal(
         projectId,
         confidence: goal.confidence,
         sourceMessageId: itemSourceId,
+        sourceKind,
         passageId:
           passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
       });
@@ -1346,6 +1365,7 @@ function applyCommitment(
   sourceMessageId: number | null,
   result: ApplyResult,
   forceAccept: boolean,
+  forceReview: boolean,
   requireEvidence: boolean,
   extractionRunId: number | null,
   evidencePolicy: EvidenceApplicationPolicy,
@@ -1369,6 +1389,9 @@ function applyCommitment(
         false,
         passages,
       );
+  if (forceReview && !forceAccept && preliminaryReasons.length === 0) {
+    preliminaryReasons.push("inference");
+  }
   const preliminaryReason = preliminaryReasons[0] ?? null;
   if (preliminaryReason) {
     appendPendingCandidate(
@@ -1493,6 +1516,7 @@ function applyCommitment(
   }
 
   const dueAt = patchToNullableUpdate(commitment.due_at);
+  const sourceKind = sourceKindForMessage(db, itemSourceId);
   const applied = existing
     ? updateCommitment(db, existing.id, {
         title: commitment.title,
@@ -1503,7 +1527,7 @@ function applyCommitment(
         dueAt,
         confidence: commitment.confidence,
         sourceMessageId: itemSourceId,
-        sourceKind: "message",
+        sourceKind,
         passageId:
           passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
       })
@@ -1516,6 +1540,7 @@ function applyCommitment(
         dueAt,
         confidence: commitment.confidence,
         sourceMessageId: itemSourceId,
+        sourceKind,
         passageId:
           passages.find((passage) => passage.message_id === itemSourceId)?.id ?? null,
       });
@@ -1529,6 +1554,7 @@ function applyFacet(
   sourceMessageId: number | null,
   result: ApplyResult,
   forceAccept: boolean,
+  forceReview: boolean,
   requireEvidence: boolean,
   extractionRunId: number | null,
   evidencePolicy: EvidenceApplicationPolicy,
@@ -1559,6 +1585,7 @@ function applyFacet(
         false,
         passages,
       );
+  if (forceReview && !forceAccept && reasons.length === 0) reasons.push("inference");
   if (!forceAccept && repeatedPatternMissingSupport && !reasons.includes("inference")) {
     reasons.push("inference");
   }
@@ -1620,7 +1647,7 @@ function applyFacet(
       sourceMessageId: itemSourceId,
       passageIds: passages.map((passage) => passage.id),
       evidenceKind: facet.explicitness === "inferred" ? "pattern_support" : "assertion",
-      sourceKind: "message",
+      sourceKind: sourceKindForMessage(db, itemSourceId),
     }),
   );
   return true;
@@ -1678,6 +1705,16 @@ function withSourceSensitivity<T extends TrustSignal>(
       content,
     );
   return looksSensitive ? { ...signal, sensitivity: "sensitive" } : signal;
+}
+
+function sourceKindForMessage(
+  db: Db,
+  sourceMessageId: number,
+): "message" | "user_action" {
+  const origin = db
+    .prepare<[number], { origin: string }>("SELECT origin FROM message WHERE id = ?")
+    .get(sourceMessageId)?.origin;
+  return origin === "user_action" ? "user_action" : "message";
 }
 
 function sourceHasExplicitChange(db: Db, sourceMessageId: number | null): boolean {
@@ -1972,67 +2009,117 @@ export type FacetCandidateEdit = {
   structuredCondition: ExtractedFacet["structured_condition"];
 };
 
+export type CandidateTextEdit = { text: string };
+
 /**
- * Accepting is an explicit user action, so it bypasses the gate but keeps the source.
- * Facet wording and deterministic effects may be edited at this boundary; the edit is
- * applied to the proposal, never to its immutable evidence or source identity.
+ * Accepting is an explicit user action, so it bypasses the gate. An unedited proposal
+ * keeps its original evidence. An edited proposal receives a new, hidden user-curation
+ * message containing the exact approved claim: the original message remains attached
+ * to the immutable candidate, but is never misrepresented as evidence for new wording.
  */
 export function acceptCandidate(
   db: Db,
   id: number,
-  options: { facetEdit?: FacetCandidateEdit } = {},
+  options: { facetEdit?: FacetCandidateEdit; textEdit?: CandidateTextEdit } = {},
 ): ApplyResult | null {
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.status !== "pending") return null;
   if (options.facetEdit && candidate.kind !== "facet") {
     throw new Error("Only understanding-facet candidates support editable acceptance");
   }
+  if (options.textEdit && candidate.kind === "facet") {
+    throw new Error("Understanding edits must preserve their deterministic controls");
+  }
+  if (options.facetEdit && options.textEdit) {
+    throw new Error("Candidate acceptance can apply only one edit");
+  }
 
   let extraction: Extraction;
-  let editedPayload: ExtractedFacet | undefined;
+  let editedPayload: unknown | undefined;
+  let editedSource: EditedCandidateSource | null = null;
+  const editedText = options.textEdit?.text.replace(/\s+/gu, " ").trim();
+  if (options.textEdit && !editedText) {
+    throw new Error("Accepted wording cannot be empty");
+  }
   if (candidate.kind === "fact" || candidate.kind === "interest") {
     const payload = unwrapCandidatePayload<ExtractedFact>(candidate.payload);
+    const originalObject = payload.item.object.replace(/\s+/gu, " ").trim();
+    const wasEdited = editedText !== undefined && editedText !== originalObject;
+    const acceptedPayload = wasEdited
+      ? {
+          ...payload.item,
+          object: editedText!,
+          object_entity: null,
+          evidence: [],
+        }
+      : withCandidateEvidence(payload.item, candidate.evidence);
+    if (wasEdited) {
+      editedPayload = acceptedPayload;
+      editedSource = editedCandidateSource(candidate.kind, acceptedPayload, payload.entities);
+    }
     extraction = {
       entities: [...payload.entities],
-      facts: [withCandidateEvidence(payload.item, candidate.evidence)],
+      facts: [acceptedPayload],
     };
   } else if (candidate.kind === "goal") {
     const payload = unwrapCandidatePayload<ExtractedGoal>(candidate.payload);
+    const originalTitle = payload.item.title.replace(/\s+/gu, " ").trim();
+    const wasEdited = editedText !== undefined && editedText !== originalTitle;
+    const acceptedPayload = wasEdited
+      ? { ...payload.item, title: editedText!, evidence: [] }
+      : withCandidateEvidence(payload.item, candidate.evidence);
+    if (wasEdited) {
+      editedPayload = acceptedPayload;
+      editedSource = editedCandidateSource(candidate.kind, acceptedPayload, payload.entities);
+    }
     extraction = {
       entities: [...payload.entities],
       facts: [],
-      goals: [withCandidateEvidence(payload.item, candidate.evidence)],
+      goals: [acceptedPayload],
     };
   } else if (candidate.kind === "commitment") {
     const payload = unwrapCandidatePayload<ExtractedCommitment>(candidate.payload);
+    const originalTitle = payload.item.title.replace(/\s+/gu, " ").trim();
+    const wasEdited = editedText !== undefined && editedText !== originalTitle;
+    const acceptedPayload = wasEdited
+      ? { ...payload.item, title: editedText!, evidence: [] }
+      : withCandidateEvidence(payload.item, candidate.evidence);
+    if (wasEdited) {
+      editedPayload = acceptedPayload;
+      editedSource = editedCandidateSource(candidate.kind, acceptedPayload, payload.entities);
+    }
     extraction = {
       entities: [...payload.entities],
       facts: [],
-      commitments: [withCandidateEvidence(payload.item, candidate.evidence)],
+      commitments: [acceptedPayload],
     };
   } else {
     const payload = unwrapCandidatePayload<ExtractedFacet>(candidate.payload);
-    const evidencedItem = withCandidateEvidence(payload.item, candidate.evidence);
-    const statement = options.facetEdit?.statement.replace(/\s+/gu, " ").trim();
-    if (options.facetEdit && !statement) {
+    const facetEdit = options.facetEdit;
+    const statement = facetEdit?.statement.replace(/\s+/gu, " ").trim();
+    if (facetEdit && !statement) {
       throw new Error("Accepted understanding cannot have an empty statement");
     }
-    const acceptedPayload = options.facetEdit
-      ? {
-          ...evidencedItem,
-          statement: statement!,
-          machine_effect: options.facetEdit.machineEffect,
-          structured_condition: options.facetEdit.structuredCondition,
-        }
-      : evidencedItem;
-    const originalStatement = evidencedItem.statement.replace(/\s+/gu, " ").trim();
+    const originalStatement = payload.item.statement.replace(/\s+/gu, " ").trim();
     const wasEdited =
-      options.facetEdit !== undefined &&
-      (acceptedPayload.statement !== originalStatement ||
-        acceptedPayload.machine_effect !== evidencedItem.machine_effect ||
-        JSON.stringify(acceptedPayload.structured_condition) !==
-          JSON.stringify(evidencedItem.structured_condition));
-    editedPayload = wasEdited ? acceptedPayload : undefined;
+      facetEdit !== undefined &&
+      (statement !== originalStatement ||
+        facetEdit.machineEffect !== payload.item.machine_effect ||
+        JSON.stringify(facetEdit.structuredCondition) !==
+          JSON.stringify(payload.item.structured_condition));
+    const acceptedPayload = wasEdited
+      ? {
+          ...payload.item,
+          statement: statement!,
+          machine_effect: facetEdit!.machineEffect,
+          structured_condition: facetEdit!.structuredCondition,
+          evidence: [],
+        }
+      : withCandidateEvidence(payload.item, candidate.evidence);
+    if (wasEdited) {
+      editedPayload = acceptedPayload;
+      editedSource = editedCandidateSource(candidate.kind, acceptedPayload, payload.entities);
+    }
     extraction = {
       entities: [...payload.entities],
       facts: [],
@@ -2041,8 +2128,25 @@ export function acceptCandidate(
   }
 
   return db.transaction(() => {
-    const applied = applyExtraction(db, extraction, candidate.source_message_id, {
+    let applicationSourceId = candidate.source_message_id;
+    let applicationExtraction = extraction;
+    if (editedSource !== null) {
+      const source = recordUserCurationMessage(db, editedSource.content);
+      applicationSourceId = source.id;
+      applicationExtraction = withEditedCandidateEvidence(
+        extraction,
+        candidate.kind,
+        source.id,
+        editedSource.quote,
+      );
+      editedPayload = editedCandidatePayload(applicationExtraction, candidate.kind);
+    }
+
+    const applied = applyExtraction(db, applicationExtraction, applicationSourceId, {
       forceAccept: true,
+      ...(editedSource === null
+        ? {}
+        : { allowedSourceMessageIds: [applicationSourceId] }),
     });
     const materialized =
       applied.facts.length +
@@ -2055,15 +2159,107 @@ export function acceptCandidate(
     if (!resolveCandidate(db, id, "accepted")) {
       throw new Error(`Candidate ${id} changed while it was being accepted`);
     }
-    for (const passage of candidate.evidence) allowPassage(db, passage.id);
+    if (editedSource === null) {
+      for (const passage of candidate.evidence) allowPassage(db, passage.id);
+    } else {
+      for (const passage of candidate.evidence) withholdPassage(db, passage.id);
+    }
     recordCandidateResolution(db, {
       candidateId: id,
       decision: editedPayload === undefined ? "accepted" : "edited_accepted",
       editedPayload,
+      sourceMessageId: editedSource === null ? null : applicationSourceId,
       sourceKind: "user_action",
     });
     return applied;
   })();
+}
+
+type EditedCandidateSource = {
+  content: string;
+  quote: string;
+};
+
+function editedCandidateSource(
+  kind: CandidateView["kind"],
+  item: ExtractedFact | ExtractedGoal | ExtractedCommitment | ExtractedFacet,
+  entities: readonly ExtractedEntity[],
+): EditedCandidateSource {
+  let claim: string;
+  if (kind === "fact" || kind === "interest") {
+    const fact = item as ExtractedFact;
+    const subject = isSelf(fact.subject) ? "me" : fact.subject;
+    claim = `I approved this edited memory. Subject: ${subject}. Relationship: ${fact.predicate.replace(/_/gu, " ")}. Value: ${fact.object}.`;
+  } else if (kind === "goal") {
+    const goal = item as ExtractedGoal;
+    claim = `I approved this edited goal: ${goal.title}. Status: ${goal.status}. Priority: ${fieldPatchSourceText(goal.priority)}. Target: ${fieldPatchSourceText(goal.target_at)}. Project: ${fieldPatchSourceText(goal.project)}.`;
+  } else if (kind === "commitment") {
+    const commitment = item as ExtractedCommitment;
+    claim = `I approved this edited commitment: ${commitment.title}. Status: ${commitment.status}. Owner: ${fieldPatchSourceText(commitment.owner)}. Due: ${fieldPatchSourceText(commitment.due_at)}. Linked goal: ${fieldPatchSourceText(commitment.linked_goal)}. Project: ${fieldPatchSourceText(commitment.project)}.`;
+  } else {
+    const facet = item as ExtractedFacet;
+    claim = `I approved this edited understanding: ${facet.statement}. Scope: ${JSON.stringify(facet.scope)}. Condition: ${facet.condition ?? "none"}. Structured condition: ${JSON.stringify(facet.structured_condition)}. Importance: ${facet.importance}. Recommendation effect: ${facet.machine_effect ?? "none"}.`;
+  }
+
+  const quote = normalizeCurationText(claim);
+  const entityContext = entities.length === 0
+    ? ""
+    : ` Referenced entities in the approved proposal: ${JSON.stringify(entities)}.`;
+  return {
+    content: normalizeCurationText(`${quote}${entityContext}`),
+    quote,
+  };
+}
+
+function fieldPatchSourceText(value: unknown): string {
+  if (value === undefined || value === null) return "not set";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function normalizeCurationText(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
+function withEditedCandidateEvidence(
+  extraction: Extraction,
+  kind: CandidateView["kind"],
+  sourceMessageId: number,
+  quote: string,
+): Extraction {
+  const evidence: ExtractionEvidence[] = [{ source_message_id: sourceMessageId, quote }];
+  if (kind === "fact" || kind === "interest") {
+    return {
+      ...extraction,
+      facts: extraction.facts.map((item) => ({ ...item, evidence })),
+    };
+  }
+  if (kind === "goal") {
+    return {
+      ...extraction,
+      goals: extraction.goals?.map((item) => ({ ...item, evidence })),
+    };
+  }
+  if (kind === "commitment") {
+    return {
+      ...extraction,
+      commitments: extraction.commitments?.map((item) => ({ ...item, evidence })),
+    };
+  }
+  return {
+    ...extraction,
+    facets: extraction.facets?.map((item) => ({ ...item, evidence })),
+  };
+}
+
+function editedCandidatePayload(
+  extraction: Extraction,
+  kind: CandidateView["kind"],
+): unknown {
+  if (kind === "fact" || kind === "interest") return extraction.facts[0];
+  if (kind === "goal") return extraction.goals?.[0];
+  if (kind === "commitment") return extraction.commitments?.[0];
+  return extraction.facets?.[0];
 }
 
 function withCandidateEvidence<T extends { evidence?: readonly ExtractionEvidence[] }>(

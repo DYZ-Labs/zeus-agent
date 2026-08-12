@@ -1422,6 +1422,61 @@ CREATE INDEX mcp_mutation_event_created_idx
 ON mcp_mutation_event(created_at DESC);
 `;
 
+/** Consumer-facing preferences and durable post-response extraction jobs. Jobs use
+ * opaque ids at rest so a browser never needs to receive a local SQLite row key. */
+const CONSUMER_EXPERIENCE = `
+CREATE TABLE experience_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  remembering_mode   TEXT NOT NULL DEFAULT 'automatic'
+                     CHECK (remembering_mode IN ('automatic','confirm','off')),
+  onboarding_status  TEXT NOT NULL DEFAULT 'welcome'
+                     CHECK (onboarding_status IN ('welcome','first_chat','complete')),
+  labs_enabled       INTEGER NOT NULL DEFAULT 0 CHECK (labs_enabled IN (0,1)),
+  updated_at         TEXT NOT NULL
+);
+INSERT INTO experience_setting
+  (id, remembering_mode, onboarding_status, labs_enabled, updated_at)
+VALUES (1, 'automatic', 'welcome', 0, ${NOW});
+
+ALTER TABLE message ADD COLUMN cross_chat_recall_eligible INTEGER NOT NULL DEFAULT 1
+  CHECK (cross_chat_recall_eligible IN (0,1));
+CREATE INDEX message_cross_chat_recall_idx
+ON message(cross_chat_recall_eligible, id)
+WHERE role = 'user';
+
+CREATE TABLE memory_job (
+  id                   TEXT PRIMARY KEY,
+  conversation_id      INTEGER NOT NULL REFERENCES conversation(id) ON DELETE CASCADE,
+  source_message_id    INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  assistant_message_id INTEGER NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+  prompt_version       TEXT NOT NULL,
+  remembering_mode     TEXT NOT NULL
+                       CHECK (remembering_mode IN ('automatic','confirm','off')),
+  status               TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','running','completed','failed')),
+  activity_json        TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(activity_json)),
+  result_json          TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+  error_code           TEXT,
+  created_at           TEXT NOT NULL,
+  started_at           TEXT,
+  completed_at         TEXT,
+  undone_at            TEXT,
+  UNIQUE (source_message_id, prompt_version)
+);
+CREATE INDEX memory_job_conversation_status_idx
+ON memory_job(conversation_id, status, created_at);
+`;
+
+/** Existing local users already know the product; reserve the guided promise screen
+ * for a genuinely empty store while fresh databases remain at `welcome`. */
+const CONSUMER_ONBOARDING_EXISTING_STORES = `
+UPDATE experience_setting
+SET onboarding_status = 'complete', updated_at = ${NOW}
+WHERE id = 1
+  AND onboarding_status = 'welcome'
+  AND EXISTS (SELECT 1 FROM message LIMIT 1);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1443,4 +1498,6 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "018_work_plan_generation_provenance", sql: WORK_PLAN_GENERATION_PROVENANCE },
   { id: "019_work_artifact_memory_provenance", sql: WORK_ARTIFACT_MEMORY_PROVENANCE },
   { id: "020_mcp_mutation_approval", sql: MCP_MUTATION_APPROVAL },
+  { id: "021_consumer_experience", sql: CONSUMER_EXPERIENCE },
+  { id: "022_consumer_onboarding_existing_stores", sql: CONSUMER_ONBOARDING_EXISTING_STORES },
 ];

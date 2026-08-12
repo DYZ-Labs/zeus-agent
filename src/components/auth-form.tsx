@@ -150,8 +150,8 @@ export function AuthForm({
     initialMessage ||
     (!configured
       ? authMode === "local"
-        ? "Supabase login is not configured yet. See .env.example to enable it."
-        : "Supabase login configuration is incomplete."
+        ? "Account access is not available in this edition."
+        : "Account access is temporarily unavailable."
       : "");
   const messageIsSuccess = state.status === "sent";
 
@@ -285,7 +285,7 @@ export function AuthForm({
                 </form>
                 {googleEnabled === false && (
                   <p className="mt-2 text-xs leading-5" style={{ color: "#fca5a5" }}>
-                    Enable Google under Supabase Authentication → Sign In / Providers.
+                    Google sign-in is unavailable. Continue with email instead.
                   </p>
                 )}
               </>

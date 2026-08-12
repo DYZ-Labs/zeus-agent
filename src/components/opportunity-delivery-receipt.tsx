@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect } from "react";
+import type { ResourceId } from "@/core/contracts";
 
-export function OpportunityDeliveryReceipt({ opportunityId }: { opportunityId: number }) {
+export function OpportunityDeliveryReceipt({ opportunityId }: { opportunityId: ResourceId }) {
   useEffect(() => {
     void fetch(`/api/opportunities/${opportunityId}/delivery`, {
       method: "POST",

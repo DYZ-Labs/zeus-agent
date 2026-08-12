@@ -46,7 +46,7 @@ export async function getOwnerAccess(): Promise<OwnerAccess> {
     if (getAppOwner(db)) {
       return denied(
         "misconfigured",
-        "This Zeus store is account-bound. Restore its Supabase configuration to unlock it.",
+        "Account access is temporarily unavailable for this Zeus store.",
       );
     }
     return {
@@ -95,6 +95,55 @@ export async function getBrowserOwnerAccess(
   return getOwnerAccess();
 }
 
+export type StoreFreeChatAccess =
+  | { allowed: true; state: "local" | "authorized" }
+  | {
+      allowed: false;
+      state: "signed_out" | "forbidden_origin" | "misconfigured" | "unavailable";
+      message: string;
+    };
+
+/**
+ * Authorize memory-free chat without opening SQLite.
+ *
+ * Temporary chat must prove a negative: it cannot even inspect owner memory. This
+ * boundary therefore checks the browser origin and, in configured mode, the Supabase
+ * session directly instead of delegating to `getOwnerAccess`, whose owner binding is
+ * stored in SQLite.
+ */
+export async function verifyStoreFreeChatAccess(
+  request: Pick<Request, "headers" | "method" | "url">,
+): Promise<StoreFreeChatAccess> {
+  const configuration = getAuthConfiguration();
+  if (configuration.mode === "misconfigured") {
+    return { allowed: false, state: "misconfigured", message: configuration.message };
+  }
+  const boundary = checkBrowserBoundary(request, "private-mutation", configuration);
+  if (!boundary.allowed) {
+    return { allowed: false, state: "forbidden_origin", message: boundary.message };
+  }
+  if (configuration.mode === "local") return { allowed: true, state: "local" };
+
+  try {
+    const supabase = await createSupabaseServerClient(configuration);
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user) {
+      return {
+        allowed: false,
+        state: "signed_out",
+        message: "Log in to start a temporary chat.",
+      };
+    }
+    return { allowed: true, state: "authorized" };
+  } catch {
+    return {
+      allowed: false,
+      state: "unavailable",
+      message: "Zeus could not verify the account right now.",
+    };
+  }
+}
+
 /**
  * Bind the empty local store only to the configured, verified owner email. Once
  * bound, the immutable Supabase UUID—not mutable email or user metadata—authorizes it.
@@ -105,7 +154,7 @@ export function authorizeSupabaseUser(user: User): OwnerAccess {
     return denied(
       "misconfigured",
       configuration.mode === "local"
-        ? "Supabase login is not configured."
+        ? "Account access is not configured."
         : configuration.message,
     );
   }

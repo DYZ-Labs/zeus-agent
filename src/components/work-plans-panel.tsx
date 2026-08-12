@@ -152,7 +152,7 @@ export function WorkPlansPanel({
       </form>
       {!canExecute && (
         <p className="mt-2 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-          Add an OpenAI API key to generate and run bounded work.
+          This experimental tool is unavailable right now.
         </p>
       )}
       {error && (

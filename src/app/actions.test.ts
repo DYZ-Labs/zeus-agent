@@ -4,6 +4,7 @@ import { createCandidate, getCandidate, listCandidates } from "@/core/candidates
 import {
   appendMessage,
   createConversation,
+  conversationHistoryItems,
   getConversation,
   listChatHistory,
   listConversations,
@@ -11,6 +12,7 @@ import {
 } from "@/core/conversations";
 import { openTestDb } from "@/core/db";
 import { listFacets, recordFacet } from "@/core/facets";
+import { createMemoryJob } from "@/core/memory-jobs";
 import { ensureEvidencePassage } from "@/core/passages";
 
 const actionMocks = vi.hoisted(() => ({
@@ -38,10 +40,15 @@ vi.mock("@/core/embed", async (importOriginal) => {
 
 import {
   acceptFacetCandidateAction,
+  archiveConversationAction,
   answerReflectionAction,
   deleteAllConversationsAction,
   deleteConversationFromHistoryAction,
+  permanentlyDeleteConversationAction,
+  previewConversationDeletionAction,
+  restoreConversationAction,
 } from "./actions";
+import { resourceId } from "@/core/resource-id";
 
 describe("understanding web-action embeddings", () => {
   beforeEach(() => {
@@ -159,12 +166,12 @@ describe("conversation deletion actions", () => {
     expect(actionMocks.redirect).not.toHaveBeenCalled();
   });
 
-  it("permanently erases only the selected source and its solely evidenced details", async () => {
+  it("turns the ordinary history action into a non-destructive archive", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);
-    const deleted = createConversation(db, { title: "Delete me" });
+    const archived = createConversation(db, { title: "Archive me" });
     const preserved = createConversation(db, { title: "Keep me" });
-    const source = appendMessage(db, deleted.id, "user", "I value careful decisions.");
+    const source = appendMessage(db, archived.id, "user", "I value careful decisions.");
     appendMessage(db, preserved.id, "user", "Keep this chat visible.");
     const passage = ensureEvidencePassage(db, {
       messageId: source.id,
@@ -180,14 +187,83 @@ describe("conversation deletion actions", () => {
       confidence: 0.95,
     });
 
-    await deleteConversationFromHistoryAction(deleted.id, "erase-source");
+    await deleteConversationFromHistoryAction(archived.id, "erase-source");
 
-    expect(getConversation(db, deleted.id)).toBeNull();
+    expect(getConversation(db, archived.id)).not.toBeNull();
     expect(getConversation(db, preserved.id)).not.toBeNull();
     expect(listChatHistory(db).map((chat) => chat.id)).toEqual([preserved.id]);
-    expect(messagesIn(db, deleted.id)).toHaveLength(0);
-    expect(listFacets(db)).toHaveLength(0);
+    expect(messagesIn(db, archived.id)).toHaveLength(1);
+    expect(listFacets(db)).toHaveLength(1);
+    expect(conversationHistoryItems(db, { visibility: "archived" })).toMatchObject([
+      { id: archived.id, title: "Archive me" },
+    ]);
     expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/", "layout");
+  });
+
+  it("restores an archived conversation from an opaque browser id", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const conversation = createConversation(db, { title: "Restore me" });
+    appendMessage(db, conversation.id, "user", "Keep the source intact.");
+    const id = resourceId("conversation", conversation.id);
+
+    expect(await archiveConversationAction(id)).toBe(true);
+    expect(listChatHistory(db)).toEqual([]);
+    expect(await restoreConversationAction(id)).toBe(true);
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([conversation.id]);
+    expect(messagesIn(db, conversation.id)).toHaveLength(1);
+  });
+
+  it("requires an impact preview and a second explicit confirmation for erasure", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const conversation = createConversation(db, { title: "Delete after preview" });
+    appendMessage(db, conversation.id, "user", "Delete this exact source.");
+    const id = resourceId("conversation", conversation.id);
+
+    const preview = await previewConversationDeletionAction(id);
+    expect(preview).toMatchObject({
+      conversationId: id,
+      title: "Delete after preview",
+      impact: { messages: 1 },
+    });
+    expect(getConversation(db, conversation.id)).not.toBeNull();
+
+    const changed = await permanentlyDeleteConversationAction(id, "stale-preview-key");
+    expect(changed.status).toBe("changed");
+    expect(getConversation(db, conversation.id)).not.toBeNull();
+
+    const result = await permanentlyDeleteConversationAction(id, preview!.confirmationKey);
+    expect(result).toEqual({ status: "deleted" });
+    expect(getConversation(db, conversation.id)).toBeNull();
+    expect(messagesIn(db, conversation.id)).toEqual([]);
+  });
+
+  it("invalidates a deletion confirmation when a durable dependency is added", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const conversation = createConversation(db, { title: "Job race" });
+    const source = appendMessage(db, conversation.id, "user", "Remember this later.");
+    const assistant = appendMessage(db, conversation.id, "assistant", "I can help with that.");
+    const id = resourceId("conversation", conversation.id);
+    const preview = await previewConversationDeletionAction(id);
+
+    createMemoryJob(db, {
+      id: "preview-race-job",
+      conversationId: conversation.id,
+      sourceMessageId: source.id,
+      assistantMessageId: assistant.id,
+      promptVersion: "test-preview-v1",
+      rememberingMode: "automatic",
+    });
+
+    const changed = await permanentlyDeleteConversationAction(id, preview!.confirmationKey);
+    expect(changed.status).toBe("changed");
+    if (changed.status === "changed") {
+      expect(changed.preview.impact.affectedAuditRecords)
+        .toBeGreaterThan(preview!.impact.affectedAuditRecords);
+    }
+    expect(getConversation(db, conversation.id)).not.toBeNull();
   });
 });
 

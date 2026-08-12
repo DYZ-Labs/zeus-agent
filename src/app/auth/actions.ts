@@ -36,7 +36,7 @@ export async function requestEmailLinkAction(
       message:
         configuration.mode === "misconfigured"
           ? configuration.message
-          : "Supabase login is not configured yet.",
+          : "Account access is not available in this edition.",
     };
   }
 
@@ -89,7 +89,7 @@ export async function startGoogleAuthAction(formData: FormData): Promise<void> {
       `/auth/login?error=${encodeURIComponent(
         configuration.mode === "misconfigured"
           ? configuration.message
-          : "Supabase login is not configured yet.",
+          : "Account access is not available in this edition.",
       )}`,
     );
   }
@@ -132,10 +132,7 @@ export async function logoutAction(): Promise<void> {
 
 function emailAuthErrorMessage(error: AuthError): string {
   if (error.code === "email_address_not_authorized") {
-    return (
-      "Supabase's default email service can only send to members of this project's " +
-      "organization. Add this email under Organization → Team or configure custom SMTP."
-    );
+    return "Email sign-in is not available for this address. Try Google or contact support.";
   }
   if (error.status === 429 || error.code?.includes("rate_limit")) {
     return "Too many email attempts. Wait at least 60 seconds and use only the newest link.";
@@ -143,7 +140,7 @@ function emailAuthErrorMessage(error: AuthError): string {
   if (error.message.toLowerCase().includes("signups not allowed")) {
     return "No Zeus account exists for this email yet. Choose Sign up first.";
   }
-  return error.message;
+  return "Email login could not be started. Try again shortly.";
 }
 
 function googleAuthErrorMessage(error: AuthError | null): string {
@@ -151,7 +148,7 @@ function googleAuthErrorMessage(error: AuthError | null): string {
     error?.message.toLowerCase().includes("provider is not enabled") ||
     error?.message.toLowerCase().includes("unsupported provider")
   ) {
-    return "Google login is not enabled in Supabase. Enable it under Authentication → Sign In / Providers.";
+    return "Google sign-in is unavailable. Continue with email instead.";
   }
   return error?.message ?? "Google login could not be started.";
 }

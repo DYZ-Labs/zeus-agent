@@ -8,6 +8,7 @@ import {
   listWorkRuns,
 } from "@/core/work-plans";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
+import { labsEnabled, labsUnavailableResponse } from "@/server/labs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,6 +21,7 @@ export async function GET(
 ): Promise<Response> {
   const access = await getBrowserOwnerAccess(request, "private-read");
   if (!access.canAccessPrivateData) return denied(access);
+  if (!labsEnabled(access.db)) return labsUnavailableResponse();
   const id = Params.safeParse((await params).id);
   if (!id.success) return Response.json({ error: "Invalid plan id." }, { status: 400 });
   const detail = getWorkPlan(access.db, id.data);
@@ -39,6 +41,7 @@ export async function DELETE(
 ): Promise<Response> {
   const access = await getBrowserOwnerAccess(request, "private-mutation");
   if (!access.canAccessPrivateData) return denied(access);
+  if (!labsEnabled(access.db)) return labsUnavailableResponse();
   const id = Params.safeParse((await params).id);
   if (!id.success) return Response.json({ error: "Invalid plan id." }, { status: 400 });
   const detail = cancelWorkPlan(access.db, id.data);

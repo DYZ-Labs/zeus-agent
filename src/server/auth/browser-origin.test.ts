@@ -87,11 +87,19 @@ describe("configured browser origin boundary", () => {
   it("binds mutations to the configured public origin", () => {
     const allowed = new Request("https://zeus.example/api/chat", {
       method: "POST",
-      headers: { origin: "https://zeus.example", "sec-fetch-site": "same-origin" },
+      headers: {
+        host: "zeus.example",
+        origin: "https://zeus.example",
+        "sec-fetch-site": "same-origin",
+      },
     });
-    const wrongHost = new Request("https://preview.example/api/chat", {
+    const wrongHost = new Request("https://zeus.example/api/chat", {
       method: "POST",
-      headers: { origin: "https://preview.example", "sec-fetch-site": "same-origin" },
+      headers: {
+        host: "preview.example",
+        origin: "https://zeus.example",
+        "sec-fetch-site": "same-origin",
+      },
     });
 
     expect(checkBrowserBoundary(allowed, "private-mutation", CONFIGURED)).toMatchObject({
@@ -100,6 +108,26 @@ describe("configured browser origin boundary", () => {
     expect(checkBrowserBoundary(wrongHost, "private-mutation", CONFIGURED)).toMatchObject({
       allowed: false,
     });
+  });
+
+  it("uses the browser-facing Host when Next normalizes its internal request URL", () => {
+    const configuredLoopback = {
+      ...CONFIGURED,
+      siteUrl: "http://127.0.0.1:3000",
+    };
+    const normalizedByNext = new Request("http://localhost:3000/auth/login", {
+      method: "POST",
+      headers: {
+        host: "127.0.0.1:3000",
+        origin: "http://127.0.0.1:3000",
+        referer: "http://127.0.0.1:3000/auth/login",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+
+    expect(
+      checkBrowserBoundary(normalizedByNext, "private-mutation", configuredLoopback),
+    ).toEqual({ allowed: true, origin: "http://127.0.0.1:3000" });
   });
 });
 

@@ -63,9 +63,7 @@ export function getAuthConfiguration(
   if (!parsed.success) {
     return {
       mode: "misconfigured",
-      message:
-        "Supabase login needs a project URL, publishable key, ZEUS_OWNER_EMAIL, and " +
-        "NEXT_PUBLIC_SITE_URL set to the app origin.",
+      message: "Account access is temporarily unavailable.",
     };
   }
 
@@ -86,7 +84,7 @@ export class AuthConfigurationError extends Error {
   constructor(configuration: Exclude<AuthConfiguration, { mode: "configured" }>) {
     super(
       configuration.mode === "local"
-        ? "Supabase login is not configured."
+        ? "Account access is not configured."
         : configuration.message,
     );
     this.name = "AuthConfigurationError";

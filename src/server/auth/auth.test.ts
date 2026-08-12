@@ -5,19 +5,21 @@ import { openTestDb, type Db } from "@/core/db";
 import { getAppOwner } from "@/core/owner";
 
 const mocks = vi.hoisted(() => ({
+  createSupabaseServerClient: vi.fn(),
   getDb: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
 vi.mock("@/server/db", () => ({ getDb: mocks.getDb }));
 vi.mock("@/server/auth/supabase", () => ({
-  createSupabaseServerClient: vi.fn(),
+  createSupabaseServerClient: mocks.createSupabaseServerClient,
 }));
 
 import {
   authorizeSupabaseUser,
   getBrowserOwnerAccess,
   getOwnerAccess,
+  verifyStoreFreeChatAccess,
 } from "./access";
 import { getAuthConfiguration } from "./config";
 import { safeNextPath } from "./paths";
@@ -169,6 +171,42 @@ describe("browser access boundary", () => {
       canAccessPrivateData: false,
       db: null,
     });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("authorizes local temporary chat without opening the owner store", async () => {
+    const access = await verifyStoreFreeChatAccess(
+      new Request("http://127.0.0.1:3000/api/chat", {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:3000",
+          origin: "http://127.0.0.1:3000",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+    );
+
+    expect(access).toEqual({ allowed: true, state: "local" });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("verifies a configured temporary-chat session without reading owner binding", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: { getUser: vi.fn().mockResolvedValue({ data: { user: user(OWNER_ID, "owner@example.com") }, error: null }) },
+    });
+    const access = await verifyStoreFreeChatAccess(
+      new Request("http://127.0.0.1:3000/api/chat", {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:3000",
+          origin: "http://127.0.0.1:3000",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+    );
+
+    expect(access).toEqual({ allowed: true, state: "authorized" });
     expect(mocks.getDb).not.toHaveBeenCalled();
   });
 });

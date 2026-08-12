@@ -15,7 +15,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const next = authDestinationFromRequest(request);
   const configuration = getAuthConfiguration();
   if (configuration.mode !== "configured") {
-    return authRedirect(request.nextUrl.origin, "Supabase login is not configured.", next);
+    return authRedirect(request.nextUrl.origin, "Account access is not configured.", next);
   }
   if (!code) {
     return authRedirect(configuration.siteUrl, "Google did not return a login code.", next);

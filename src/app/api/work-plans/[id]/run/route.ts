@@ -1,6 +1,7 @@
 import { createSafeWorkExecutor } from "@/core/work-execution";
 import { getWorkPlan, resumeWorkRun, runWorkPlan } from "@/core/work-plans";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
+import { labsEnabled, labsUnavailableResponse } from "@/server/labs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,6 +15,7 @@ export async function POST(
   if (!access.canAccessPrivateData) {
     return Response.json({ error: access.message }, { status: 403 });
   }
+  if (!labsEnabled(access.db)) return labsUnavailableResponse();
   const planId = Number((await params).id);
   if (!Number.isInteger(planId) || planId <= 0) {
     return Response.json({ error: "Invalid plan id." }, { status: 400 });

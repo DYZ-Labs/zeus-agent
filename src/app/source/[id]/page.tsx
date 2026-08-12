@@ -1,12 +1,12 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
-import { FactRow } from "@/components/fact-row";
 import { PageHeader } from "@/components/page-header";
 import { getConversation, getMessage, messagesIn } from "@/core/conversations";
 import { getFacts } from "@/core/facts";
 import { getCommitment, getGoal } from "@/core/intentions";
 import { getPassage } from "@/core/passages";
+import { numericResourceId, resourceId } from "@/core/resource-id";
 import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
@@ -23,14 +23,14 @@ export default async function SourcePage({
   searchParams: Promise<{ passage?: string }>;
 }) {
   const { id } = await params;
-  const messageId = Number(id);
-  if (!Number.isInteger(messageId)) notFound();
+  const messageId = numericResourceId(id, "message");
+  if (messageId === null) notFound();
 
   const db = await requireOwnerPageDb();
   const message = getMessage(db, messageId);
   if (!message) notFound();
-  const passageId = Number((await searchParams).passage);
-  const requestedPassage = Number.isInteger(passageId) ? getPassage(db, passageId) : null;
+  const passageId = numericResourceId((await searchParams).passage, "passage");
+  const requestedPassage = passageId === null ? null : getPassage(db, passageId);
   const passage = requestedPassage?.message_id === messageId ? requestedPassage : null;
 
   const conversation = getConversation(db, message.conversation_id);
@@ -73,17 +73,17 @@ export default async function SourcePage({
     <div className="flex h-full flex-col lg:min-h-0">
       <PageHeader
         eyebrow="source"
-        title={conversation?.title ?? `Conversation ${message.conversation_id}`}
+        title={conversation?.title ?? "Untitled chat"}
         meta={message.created_at.slice(0, 16).replace("T", " ")}
       />
 
       <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
         <Link
-          href="/memory"
-          className="font-mono text-[0.68rem] underline underline-offset-2"
+          href="/about-you"
+          className="text-sm underline underline-offset-4"
           style={{ color: "var(--shell-muted)" }}
         >
-          ← all memory
+          ← About you
         </Link>
 
         {passage && (
@@ -92,10 +92,10 @@ export default async function SourcePage({
             style={{ borderColor: "var(--shell-accent)" }}
           >
             <h2
-              className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
+              className="text-xs font-medium uppercase tracking-[0.12em]"
               style={{ color: "var(--shell-faint)" }}
             >
-              Recalled passage {passage.id} · offsets {passage.start_offset}-{passage.end_offset}
+              Supporting quote
             </h2>
             <p className="mt-2 whitespace-pre-wrap text-[0.92rem]">{passage.text}</p>
           </section>
@@ -104,14 +104,19 @@ export default async function SourcePage({
         {derived.length > 0 && (
           <section className="mt-7">
             <h2
-              className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
+              className="text-xs font-medium uppercase tracking-[0.12em]"
               style={{ color: "var(--shell-faint)" }}
             >
-              Learned from this message
+              Saved from this message
             </h2>
             <ul className="mt-2">
               {derived.map((fact) => (
-                <FactRow key={fact.id} fact={fact} />
+                <li key={fact.id} className="border-b py-3 text-sm" style={{ borderColor: "var(--shell-line)" }}>
+                  <span className="font-medium">{fact.subject_slug === "self" ? "You" : fact.subject_name}</span>{" "}
+                  <span style={{ color: "var(--shell-muted)" }}>{fact.predicate.replace(/_/gu, " ")}</span>{" "}
+                  <span>{fact.object}</span>
+                  {fact.valid_to && <span className="ml-2 text-xs" style={{ color: "var(--shell-faint)" }}>No longer true</span>}
+                </li>
               ))}
             </ul>
           </section>
@@ -120,7 +125,7 @@ export default async function SourcePage({
         {goals.length + commitments.length > 0 && (
           <section className="mt-7">
             <h2
-              className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
+              className="text-xs font-medium uppercase tracking-[0.12em]"
               style={{ color: "var(--shell-faint)" }}
             >
               Plan changes from this message
@@ -128,28 +133,28 @@ export default async function SourcePage({
             <ul className="mt-2 space-y-2 text-[0.9rem]">
               {goals.map((goal) => (
                 <li key={`goal-${goal.id}`}>
-                  goal · {goal.title} · {goal.status} · {goal.priority} priority
+                  Goal: {goal.title} · {goal.status.replace(/_/gu, " ")}
                 </li>
               ))}
               {commitments.map((commitment) => (
                 <li key={`commitment-${commitment.id}`}>
-                  commitment · {commitment.title} · {commitment.status}
+                  Plan: {commitment.title} · {commitment.status.replace(/_/gu, " ")}
                 </li>
               ))}
             </ul>
             <Link
               href="/today#plans"
-              className="mt-3 inline-block font-mono text-[0.67rem] underline underline-offset-2"
+              className="mt-3 inline-block text-sm underline underline-offset-4"
               style={{ color: "var(--shell-accent)" }}
             >
-              review plans
+              Review your plans
             </Link>
           </section>
         )}
 
         <section className="mt-9">
           <h2
-            className="font-mono text-[0.65rem] uppercase tracking-[0.14em]"
+            className="text-xs font-medium uppercase tracking-[0.12em]"
             style={{ color: "var(--shell-faint)" }}
           >
             Transcript
@@ -160,7 +165,7 @@ export default async function SourcePage({
               return (
                 <li
                   key={entry.id}
-                  id={`m${entry.id}`}
+                  id={resourceId("message", entry.id)}
                   className="flex gap-3.5 border-l-2 py-1 pl-3"
                   style={{
                     borderColor: isSource ? "var(--shell-accent)" : "transparent",

@@ -106,6 +106,38 @@ describe("evidence and trust gating", () => {
     expect(getFact(db, accepted!.supersededIds[0]!)?.valid_to).not.toBeNull();
   });
 
+  it("keeps an edited fact acceptance source-backed and auditable", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const lisbon = appendMessage(db, conversation.id, "user", "I live in Lisbon.");
+    const proposedSource = appendMessage(db, conversation.id, "user", "I live in Berlin.");
+    applyExtraction(db, extraction({ facts: [fact()] }), lisbon.id);
+    const proposed = applyExtraction(
+      db,
+      extraction({ facts: [fact({ object: "Berlin" })] }),
+      proposedSource.id,
+    );
+
+    const accepted = acceptCandidate(db, proposed.candidates[0]!.id, {
+      textEdit: { text: "Copenhagen" },
+    });
+
+    expect(accepted?.facts[0]?.object).toBe("Copenhagen");
+    expect(accepted?.facts[0]?.source_message_id).not.toBe(proposedSource.id);
+    expect(
+      db.prepare<
+        [number],
+        { decision: string; edited_payload_json: string | null; source_message_id: number | null }
+      >(
+        `SELECT decision, edited_payload_json, source_message_id FROM candidate_resolution_event
+         WHERE candidate_id = ? ORDER BY id DESC LIMIT 1`,
+      ).get(proposed.candidates[0]!.id),
+    ).toMatchObject({
+      decision: "edited_accepted",
+      source_message_id: accepted?.facts[0]?.source_message_id,
+    });
+  });
+
   it("does not trust a model change hint without change language from the user", () => {
     const db = openTestDb();
     const conversation = createConversation(db);

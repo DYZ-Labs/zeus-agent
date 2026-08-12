@@ -2,6 +2,8 @@ import "server-only";
 
 import { migrate, openDb, type Db } from "@/core/db";
 import { MIGRATIONS } from "@/core/migrations";
+import { assertSqliteDeploymentSafe } from "@/server/deployment";
+import { wakeMemoryJobRunner } from "@/server/memory-job-runner";
 
 /**
  * One database handle per server process.
@@ -15,6 +17,7 @@ const globalForDb = globalThis as unknown as {
 };
 
 export function getDb(): Db {
+  assertSqliteDeploymentSafe();
   const latestMigrationId = MIGRATIONS.at(-1)?.id;
 
   if (!globalForDb.zeusDb) {
@@ -27,5 +30,8 @@ export function getDb(): Db {
     globalForDb.zeusLatestMigrationId = latestMigrationId;
   }
 
+  // Every local server entrypoint passes through this handle, so process restart and
+  // stale-job recovery do not depend on the originating chat tab being reopened.
+  wakeMemoryJobRunner(globalForDb.zeusDb);
   return globalForDb.zeusDb;
 }

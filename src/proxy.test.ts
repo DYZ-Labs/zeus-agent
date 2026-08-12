@@ -77,6 +77,23 @@ describe("local proxy boundary", () => {
 });
 
 describe("configured proxy mutation boundary", () => {
+  it("allows a same-origin server action when Next exposes an internal request URL", async () => {
+    const response = await proxy(
+      new NextRequest("http://localhost:3000/auth/login", {
+        method: "POST",
+        headers: {
+          host: "zeus.example",
+          origin: "https://zeus.example",
+          referer: "https://zeus.example/auth/login",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+  });
+
   it("rejects a cross-origin server action before session handling", async () => {
     const response = await proxy(
       new NextRequest("https://zeus.example/settings", {

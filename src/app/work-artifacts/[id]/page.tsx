@@ -2,8 +2,10 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { PageHeader } from "@/components/page-header";
+import { resourceId } from "@/core/resource-id";
 import { getWorkArtifact, getWorkPlan, getWorkRun, listToolReceipts } from "@/core/work-plans";
 import { requireOwnerPageDb } from "@/server/auth/access";
+import { labsEnabled } from "@/server/labs";
 
 export const dynamic = "force-dynamic";
 
@@ -15,6 +17,7 @@ export default async function WorkArtifactPage({
   const id = Number((await params).id);
   if (!Number.isInteger(id) || id <= 0) notFound();
   const db = await requireOwnerPageDb();
+  if (!labsEnabled(db)) notFound();
   const artifact = getWorkArtifact(db, id);
   if (!artifact) notFound();
   const detail = getWorkPlan(db, artifact.work_plan_id);
@@ -47,8 +50,8 @@ export default async function WorkArtifactPage({
                       {citation.title ?? citation.url}
                     </a>
                   ) : citation.messageId ? (
-                    <Link href={`/source/${citation.messageId}`} className="underline underline-offset-2">
-                      Zeus source message {citation.messageId}
+                    <Link href={`/source/${resourceId("message", citation.messageId)}`} className="underline underline-offset-2">
+                      Zeus source message
                     </Link>
                   ) : (
                     "Recorded source"

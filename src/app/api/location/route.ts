@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getFreshCoarseLocation, recordCoarseLocation } from "@/core/ambient";
 import { IsoDateTime } from "@/core/schema";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
+import { labsEnabled, labsUnavailableResponse } from "@/server/labs";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,12 +18,14 @@ const Body = z
 export async function GET(request: Request): Promise<Response> {
   const access = await getBrowserOwnerAccess(request, "private-read");
   if (!access.canAccessPrivateData) return denied(access);
+  if (!labsEnabled(access.db)) return labsUnavailableResponse();
   return Response.json({ location: getFreshCoarseLocation(access.db) });
 }
 
 export async function POST(request: Request): Promise<Response> {
   const access = await getBrowserOwnerAccess(request, "private-mutation");
   if (!access.canAccessPrivateData) return denied(access);
+  if (!labsEnabled(access.db)) return labsUnavailableResponse();
   const parsed = Body.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return Response.json(

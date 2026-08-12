@@ -5,10 +5,11 @@ import { useState } from "react";
 
 import { deleteAllConversationsAction } from "@/app/actions";
 
-export function DeleteAllConversations({ disabled = false }: { disabled?: boolean }) {
+export function DeleteAllConversations({ disabled = false, label = "Delete" }: { disabled?: boolean; label?: string }) {
   const router = useRouter();
   const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function confirmDelete() {
     if (pending) return;
@@ -16,11 +17,14 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
     const formData = new FormData();
     formData.set("confirmation", "erase-all-sources");
     setPending(true);
+    setError(null);
 
     try {
       await deleteAllConversationsAction(formData);
       setConfirming(false);
       router.refresh();
+    } catch {
+      setError("Zeus data could not be cleared. Try again.");
     } finally {
       setPending(false);
     }
@@ -30,7 +34,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
     <div
       role="group"
       className="flex shrink-0 items-center gap-2"
-      aria-label="Permanently delete all source conversations"
+      aria-label="Permanently erase all Zeus data"
     >
       {confirming ? (
         <button
@@ -45,7 +49,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             color: "#ff6767",
           }}
         >
-          Permanently erase all?
+          Erase all Zeus data?
         </button>
       ) : (
         <button
@@ -63,9 +67,10 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
             color: "#ff6767",
           }}
         >
-          Delete
+          {label}
         </button>
       )}
+      {error && <span role="alert" className="max-w-48 text-xs" style={{ color: "#ff8585" }}>{error}</span>}
     </div>
   );
 }

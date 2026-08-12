@@ -5,7 +5,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 
 import {
-  deleteConversationFromHistoryAction,
+  archiveConversationAction,
   renameConversationAction,
 } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
@@ -14,41 +14,50 @@ import {
   NEW_CHAT_EVENT,
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
-import type { RecentChat } from "@/core/conversations";
+import type { ResourceId } from "@/core/contracts";
+import { numericResourceId, resourceId } from "@/core/resource-id";
 import type { AccountSummary, AuthMode } from "@/lib/auth-types";
 
 const PRIMARY_LINKS = [
+  { href: "/", label: "Chat", icon: "chat" },
   { href: "/today", label: "Today", icon: "today" },
-  { href: "/memory", label: "Memory", icon: "memory" },
-  { href: "/understanding", label: "Understanding", icon: "understanding" },
+  { href: "/about-you", label: "About you", icon: "about" },
 ] as const;
 
-const COMPACT_LINKS = [
-  { href: "/conversations", label: "Search chats", icon: "search" },
-  ...PRIMARY_LINKS,
-] as const;
+export type RecentChatDto = {
+  id: ResourceId;
+  title: string;
+};
 
-type IconName = (typeof COMPACT_LINKS)[number]["icon"] | "settings";
+type IconName = (typeof PRIMARY_LINKS)[number]["icon"] | "search" | "settings";
 
 export function Nav({
   initialRecentChats,
   authMode,
   account,
+  reviewCount = 0,
 }: {
-  initialRecentChats: RecentChat[];
+  initialRecentChats: RecentChatDto[];
   authMode: AuthMode;
   account: AccountSummary | null;
+  reviewCount?: number;
 }) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [isOpen, setIsOpen] = useState(true);
-  const requestedConversationId = Number(searchParams.get("conversation"));
+  const requestedConversationNumber = numericResourceId(
+    searchParams.get("conversation"),
+    "conversation",
+  );
+  const requestedConversationId = requestedConversationNumber === null
+    ? null
+    : resourceId("conversation", requestedConversationNumber);
   const routedConversationId =
-    pathname === "/" && Number.isInteger(requestedConversationId) && requestedConversationId > 0
+    pathname === "/" && requestedConversationId !== null
       ? requestedConversationId
       : null;
-  const [activeConversationId, setActiveConversationId] = useState<number | null>(
+  const [activeConversationId, setActiveConversationId] = useState<ResourceId | null>(
     routedConversationId,
   );
   const routeSelectionKey = `${pathname}:${routedConversationId ?? "new"}`;
@@ -61,8 +70,12 @@ export function Nav({
   useEffect(() => {
     function refreshRecentChats(event: Event) {
       const detail = (event as CustomEvent<ChatUpdatedDetail>).detail;
-      if (Number.isInteger(detail?.conversationId) && detail.conversationId > 0) {
-        setActiveConversationId(detail.conversationId);
+      const updatedConversationNumber = numericResourceId(
+        detail?.conversationId,
+        "conversation",
+      );
+      if (updatedConversationNumber !== null) {
+        setActiveConversationId(resourceId("conversation", updatedConversationNumber));
       }
       router.refresh();
     }
@@ -81,8 +94,8 @@ export function Nav({
     router.push("/");
   }
 
-  function finishRecentChatDeletion(deletedId: number) {
-    if (deletedId === activeConversationId) {
+  function finishRecentChatArchive(archivedId: ResourceId) {
+    if (archivedId === activeConversationId) {
       setActiveConversationId(null);
       window.dispatchEvent(new Event(NEW_CHAT_EVENT));
       router.replace("/");
@@ -127,15 +140,22 @@ export function Nav({
           <NewChatIcon />
         </button>
 
-        {COMPACT_LINKS.map((link) => (
+        {PRIMARY_LINKS.map((link) => (
           <CompactNavLink
             key={link.href}
             href={link.href}
             label={link.label}
             icon={link.icon}
-            active={pathname.startsWith(link.href)}
+            active={primaryLinkActive(pathname, link.href)}
+            badge={link.href === "/about-you" ? reviewCount : 0}
           />
         ))}
+        <CompactNavLink
+          href="/conversations"
+          label="Search chats"
+          icon="search"
+          active={pathname.startsWith("/conversations")}
+        />
 
         <div className="hidden flex-1 lg:block" />
         {account ? (
@@ -193,21 +213,24 @@ export function Nav({
           </SidebarIconSlot>
           <span className="truncate">New chat</span>
         </button>
-        <NavLink
-          href="/conversations"
-          label="Search chats"
-          icon="search"
-          active={pathname.startsWith("/conversations")}
-        />
         {PRIMARY_LINKS.map((link) => (
           <NavLink
             key={link.href}
             href={link.href}
             label={link.label}
             icon={link.icon}
-            active={pathname.startsWith(link.href)}
+            active={primaryLinkActive(pathname, link.href)}
+            badge={link.href === "/about-you" ? reviewCount : 0}
           />
         ))}
+        <span className="shrink-0 lg:hidden">
+          <CompactNavLink
+            href="/conversations"
+            label="Search chats"
+            icon="search"
+            active={pathname.startsWith("/conversations")}
+          />
+        </span>
         {account ? (
           <span className="shrink-0 lg:hidden">
             <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
@@ -229,7 +252,20 @@ export function Nav({
         )}
       </div>
 
-      <section className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
+      <section
+        className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex"
+        aria-labelledby="recent-chats-heading"
+      >
+        <Link
+          href="/conversations"
+          className="mb-2 grid h-9 w-full shrink-0 grid-cols-[1.25rem_minmax(0,1fr)] items-center gap-2.5 rounded-lg border px-2.5 text-sm leading-5 transition-colors hover:bg-white/[0.06]"
+          style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+        >
+          <SidebarIconSlot>
+            <NavIcon name="search" />
+          </SidebarIconSlot>
+          <span className="truncate">Search chats</span>
+        </Link>
         <div className="flex h-8 items-center px-2.5">
           <h2
             id="recent-chats-heading"
@@ -247,7 +283,7 @@ export function Nav({
                   key={chat.id}
                   chat={chat}
                   active={activeConversationId === chat.id}
-                  onDeleted={() => finishRecentChatDeletion(chat.id)}
+                  onArchived={() => finishRecentChatArchive(chat.id)}
                 />
               ))}
             </ul>
@@ -283,26 +319,20 @@ export function Nav({
 function RecentChatLink({
   chat,
   active,
-  onDeleted,
+  onArchived,
 }: {
-  chat: RecentChat;
+  chat: RecentChatDto;
   active: boolean;
-  onDeleted: () => void;
+  onArchived: () => void;
 }) {
   const [pending, setPending] = useState(false);
-  const [confirming, setConfirming] = useState(false);
 
-  async function deleteChat() {
+  async function archiveChat() {
     if (pending) return;
-    if (!confirming) {
-      setConfirming(true);
-      return;
-    }
-
     setPending(true);
     try {
-      await deleteConversationFromHistoryAction(chat.id, "erase-source");
-      onDeleted();
+      await archiveConversationAction(chat.id);
+      onArchived();
     } finally {
       setPending(false);
     }
@@ -324,19 +354,17 @@ function RecentChatLink({
       </Link>
       <button
         type="button"
-        aria-label={confirming
-          ? `Confirm permanently deleting ${chat.title}`
-          : `Permanently delete ${chat.title}`}
-        title={confirming ? "Click again to permanently delete" : "Delete source permanently"}
+        aria-label={`Archive ${chat.title}`}
+        title="Archive chat"
         disabled={pending}
-        onClick={() => void deleteChat()}
-        className={`absolute right-1 top-0.5 flex h-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${confirming ? "w-12" : "w-7"} ${
+        onClick={() => void archiveChat()}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-50 ${
           active
             ? "opacity-100"
             : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
         }`}
       >
-        {confirming ? <span className="text-[10px] font-semibold">Sure?</span> : <TrashIcon />}
+        <ArchiveIcon />
       </button>
     </li>
   );
@@ -348,19 +376,19 @@ export function ChatHistoryItem({
   menuPlacement,
   onOpen,
   onChanged,
-  onDeleted,
+  onArchived,
 }: {
-  chat: RecentChat;
+  chat: RecentChatDto;
   active: boolean;
   menuPlacement: "above" | "below";
   onOpen: () => void;
   onChanged: () => void;
-  onDeleted: () => void;
+  onArchived: () => void;
 }) {
   const containerRef = useRef<HTMLLIElement>(null);
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState(chat.title);
-  const [state, setState] = useState<"closed" | "menu" | "renaming" | "deleting">("closed");
+  const [state, setState] = useState<"closed" | "menu" | "renaming">("closed");
   const [pending, setPending] = useState(false);
 
   const title = titleOverride ?? chat.title;
@@ -400,14 +428,14 @@ export function ChatHistoryItem({
     }
   }
 
-  async function deleteChat() {
+  async function archiveChat() {
     if (pending) return;
 
     setPending(true);
     try {
-      await deleteConversationFromHistoryAction(chat.id, "erase-source");
+      await archiveConversationAction(chat.id);
       setState("closed");
-      onDeleted();
+      onArchived();
     } finally {
       setPending(false);
     }
@@ -496,58 +524,28 @@ export function ChatHistoryItem({
           }`}
           style={{ background: "var(--shell-elevated)", borderColor: "var(--shell-line-strong)" }}
         >
-          {state === "deleting" ? (
-            <div className="p-2">
-              <p className="text-sm font-medium leading-5">Permanently delete this source?</p>
-              <p className="mt-1 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-                Its messages will be erased. Details with no other evidence will also be removed.
-              </p>
-              <div className="mt-3 flex justify-end gap-2">
-                <button
-                  type="button"
-                  disabled={pending}
-                  onClick={() => setState("menu")}
-                  className="h-8 rounded-lg px-2.5 text-xs hover:bg-white/[0.06]"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  disabled={pending}
-                  onClick={() => void deleteChat()}
-                  className="h-8 rounded-lg px-2.5 text-xs font-medium disabled:opacity-50"
-                  style={{ background: "#7f1d1d", color: "#ffffff" }}
-                >
-                  {pending ? "Deleting…" : "Delete permanently"}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setDraftTitle(title);
-                  setState("renaming");
-                }}
-                className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm hover:bg-white/[0.07]"
-              >
-                <RenameIcon />
-                Rename
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => setState("deleting")}
-                className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm hover:bg-white/[0.07]"
-                style={{ color: "#ff6767" }}
-              >
-                <TrashIcon />
-                Delete source permanently
-              </button>
-            </>
-          )}
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setDraftTitle(title);
+              setState("renaming");
+            }}
+            className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm hover:bg-white/[0.07]"
+          >
+            <RenameIcon />
+            Rename
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={pending}
+            onClick={() => void archiveChat()}
+            className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm hover:bg-white/[0.07] disabled:cursor-wait disabled:opacity-50"
+          >
+            <ArchiveIcon />
+            {pending ? "Archiving…" : "Archive"}
+          </button>
         </div>
       )}
     </li>
@@ -559,11 +557,13 @@ function NavLink({
   label,
   icon,
   active,
+  badge = 0,
 }: {
   href: string;
   label: string;
   icon: IconName;
   active: boolean;
+  badge?: number;
 }) {
   return (
     <Link
@@ -578,7 +578,10 @@ function NavLink({
       <SidebarIconSlot>
         <NavIcon name={icon} />
       </SidebarIconSlot>
-      <span className="truncate">{label}</span>
+      <span className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate">{label}</span>
+        {badge > 0 && <ReviewBadge count={badge} />}
+      </span>
     </Link>
   );
 }
@@ -588,34 +591,63 @@ function CompactNavLink({
   label,
   icon,
   active,
+  badge = 0,
 }: {
   href: string;
   label: string;
   icon: IconName;
   active: boolean;
+  badge?: number;
 }) {
   return (
     <Link
       href={href}
-      aria-label={label}
-      title={label}
+      aria-label={badge > 0 ? `${label}, ${badge} to review` : label}
+      title={badge > 0 ? `${label} (${badge} to review)` : label}
       aria-current={active ? "page" : undefined}
-      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+      className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
       style={{
         color: active ? "var(--shell-fg)" : "var(--shell-muted)",
         background: active ? "var(--shell-elevated)" : undefined,
       }}
     >
       <NavIcon name={icon} />
+      {badge > 0 && (
+        <span
+          aria-hidden
+          className="absolute right-0.5 top-0.5 h-2 w-2 rounded-full"
+          style={{
+            background: "var(--shell-accent)",
+            boxShadow: "0 0 0 2px var(--shell-sidebar)",
+          }}
+        />
+      )}
     </Link>
   );
+}
+
+function ReviewBadge({ count }: { count: number }) {
+  return (
+    <span
+      aria-label={`${count} to review`}
+      className="min-w-5 shrink-0 rounded-full px-1.5 text-center text-[0.65rem] font-semibold leading-5"
+      style={{ background: "var(--shell-accent)", color: "#000000" }}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
+function primaryLinkActive(pathname: string, href: string): boolean {
+  if (href === "/") return pathname === "/";
+  return pathname === href || pathname.startsWith(`${href}/`);
 }
 
 function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
   const configured = authMode === "configured";
   const description =
     authMode === "misconfigured"
-      ? "Account access needs Supabase configuration."
+      ? "Account access is temporarily unavailable."
       : "Your personal AI that remembers what matters.";
 
   return (
@@ -761,6 +793,23 @@ function NewChatIcon() {
 }
 
 function NavIcon({ name }: { name: IconName }) {
+  if (name === "chat") {
+    return (
+      <svg
+        aria-hidden
+        viewBox="0 0 24 24"
+        className="h-5 w-5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+      >
+        <path
+          d="M5.5 5h13A2.5 2.5 0 0 1 21 7.5v7a2.5 2.5 0 0 1-2.5 2.5H11l-5.5 3v-3A2.5 2.5 0 0 1 3 14.5v-7A2.5 2.5 0 0 1 5.5 5Z"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  }
   if (name === "search") {
     return (
       <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -777,20 +826,11 @@ function NavIcon({ name }: { name: IconName }) {
       </svg>
     );
   }
-  if (name === "memory") {
+  if (name === "about") {
     return (
       <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
         <path d="M8 5.5a3 3 0 0 1 5.4-1.8A3.2 3.2 0 0 1 18 6.6a3.5 3.5 0 0 1 1 6.7A3.5 3.5 0 0 1 15.5 18H14a3 3 0 0 1-5.5.6A3.5 3.5 0 0 1 5 13.2a3.5 3.5 0 0 1 3-6.7Z" strokeLinecap="round" strokeLinejoin="round" />
         <path d="M12 5v14M8 9h4M12 14h4" strokeLinecap="round" />
-      </svg>
-    );
-  }
-  if (name === "understanding") {
-    return (
-      <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
-        <circle cx="8" cy="9" r="3" />
-        <circle cx="16" cy="9" r="3" />
-        <path d="M3.8 19a4.2 4.2 0 0 1 8.4 0M11.8 19a4.2 4.2 0 0 1 8.4 0M10.5 12.5l3-3" strokeLinecap="round" />
       </svg>
     );
   }
@@ -824,10 +864,10 @@ function RenameIcon() {
   );
 }
 
-function TrashIcon() {
+function ArchiveIcon() {
   return (
     <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M4 7.5h16v12H4zM3 4.5h18v3H3zM9.5 12h5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

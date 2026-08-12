@@ -196,12 +196,14 @@ describe("understanding history backfill", () => {
     expect(applied?.facets[0]).toMatchObject({
       statement: "Give me important decisions in writing.",
       machine_effect: "deprioritize",
-      source_message_id: source.id,
     });
+    expect(applied?.facets[0]?.source_message_id).not.toBe(source.id);
     expect(evidenceForFacet(db, applied!.facets[0]!.id)[0]).toMatchObject({
-      source_message_id: source.id,
-      quote: source.content,
+      source_message_id: applied?.facets[0]?.source_message_id,
     });
+    expect(evidenceForFacet(db, applied!.facets[0]!.id)[0]?.quote).toContain(
+      "Give me important decisions in writing.",
+    );
     expect(
       db.prepare<[number], { decision: string; edited_payload_json: string | null }>(
         `SELECT decision, edited_payload_json FROM candidate_resolution_event

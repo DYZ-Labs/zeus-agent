@@ -75,7 +75,7 @@ describe("startGoogleAuthAction", () => {
     );
   });
 
-  it("explains when Google is disabled in Supabase", async () => {
+  it("explains in consumer language when Google is unavailable", async () => {
     mocks.signInWithOAuth.mockResolvedValue({
       data: { url: null },
       error: { message: "Unsupported provider: provider is not enabled" },
@@ -88,7 +88,7 @@ describe("startGoogleAuthAction", () => {
     await expect(startGoogleAuthAction(form(""))).rejects.toBe(redirected);
 
     expect(mocks.redirect).toHaveBeenCalledWith(
-      expect.stringContaining("Google%20login%20is%20not%20enabled%20in%20Supabase"),
+      expect.stringContaining("Google%20sign-in%20is%20unavailable"),
     );
     expect(mocks.cookieSet).not.toHaveBeenCalled();
   });
@@ -122,7 +122,7 @@ describe("requestEmailLinkAction", () => {
 
     expect(result).toEqual({
       status: "error",
-      message: "Supabase login is not configured yet.",
+      message: "Account access is not available in this edition.",
     });
     expect(mocks.createSupabaseServerClient).not.toHaveBeenCalled();
   });

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { notFound } from "next/navigation";
 
 import {
   acceptBackfillBatchAction,
@@ -7,6 +8,7 @@ import {
 } from "@/app/actions";
 import { PageHeader } from "@/components/page-header";
 import { requireOwnerPageDb } from "@/server/auth/access";
+import { labsEnabled } from "@/server/labs";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +39,7 @@ type CandidateCounts = {
 
 export default async function UnderstandingBackfillPage() {
   const db = await requireOwnerPageDb();
+  if (!labsEnabled(db)) notFound();
   const job = db
     .prepare<[], BackfillJob>(
       `SELECT id, status, conversation_count, message_count, processed_count,

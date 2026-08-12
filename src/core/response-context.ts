@@ -163,8 +163,7 @@ function passageBlockedByCandidate(db: Db, passageId: number): boolean {
         `SELECT 1 AS found
          FROM candidate_evidence ce
          JOIN memory_candidate mc ON mc.id = ce.candidate_id
-         WHERE ce.passage_id = ? AND mc.kind = 'facet'
-           AND mc.status IN ('pending','rejected')
+         WHERE ce.passage_id = ? AND mc.status IN ('pending','rejected')
          LIMIT 1`,
       )
       .get(passageId),

@@ -600,6 +600,49 @@ export function recordFollowThroughDecision(
   return event;
 }
 
+/**
+ * Append optional rationale after a Later/Not relevant choice was already saved.
+ * This is deliberately not another control decision: it does not touch commitment
+ * state or count toward behavioral patterns.
+ */
+export function recordFollowThroughFeedback(
+  db: Db,
+  input: {
+    commitmentId: number;
+    decision: "snoozed" | "dismissed";
+    userReason: string;
+  },
+): FollowThroughEvent | null {
+  const userReason = normalizeUserReason(input.userReason);
+  const commitment = getCommitment(db, input.commitmentId);
+  if (!userReason || !commitment) return null;
+  const prior = db
+    .prepare<[number, "snoozed" | "dismissed"], { id: number }>(
+      `SELECT id FROM follow_through_event
+       WHERE commitment_id = ? AND event_type = ?
+         AND COALESCE(json_extract(detail_json, '$.decision.feedback_only'), 0) <> 1
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(input.commitmentId, input.decision);
+  if (!prior) return null;
+  const recommendation =
+    latestRecommendationSnapshot(db, input.commitmentId) ??
+    recommendationForCommitment(db, input.commitmentId);
+  if (!recommendation) return null;
+  return insertEvent(db, {
+    recommendation,
+    eventType: input.decision,
+    responseMessageId: null,
+    sourceMessageId: null,
+    sourceKind: "user_action",
+    extraDetail: {
+      feedback_only: true,
+      relates_to_event_id: prior.id,
+      user_reason: userReason,
+    },
+  });
+}
+
 function sourceKindForUserMessage(
   db: Db,
   sourceMessageId: number | null,
@@ -669,6 +712,7 @@ export function followThroughMetrics(db: Db): FollowThroughMetrics {
     .prepare<[], { event_type: FollowThroughEventType; count: number }>(
       `SELECT event_type, COUNT(*) AS count
        FROM follow_through_event
+       WHERE COALESCE(json_extract(detail_json, '$.decision.feedback_only'), 0) <> 1
        GROUP BY event_type`,
     )
     .all();

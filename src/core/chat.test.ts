@@ -39,7 +39,7 @@ vi.mock("./extract", () => ({
 }));
 
 import { isExplicitBoundedWorkRequest, streamTurn } from "./chat";
-import { createConversation, messagesIn } from "./conversations";
+import { appendMessage, createConversation, messagesIn } from "./conversations";
 import { openTestDb } from "./db";
 
 beforeEach(() => {
@@ -86,7 +86,7 @@ describe("streamTurn cancellation", () => {
       { signal: controller.signal },
     );
     expect(messagesIn(db, conversation.id)).toMatchObject([
-      { role: "user", content: "Stop this turn" },
+      { role: "user", content: "Stop this turn", recall_state: "blocked" },
     ]);
     expect(mocks.assertResponseComplete).not.toHaveBeenCalled();
     expect(mocks.recordResponseContext).not.toHaveBeenCalled();
@@ -112,7 +112,7 @@ describe("streamTurn cancellation", () => {
     expect(mocks.openaiStream).not.toHaveBeenCalled();
   });
 
-  it("cancels extraction before it can apply memory writes", async () => {
+  it("returns as soon as the assistant response is persisted without starting extraction", async () => {
     const db = openTestDb();
     const conversation = createConversation(db);
     const controller = new AbortController();
@@ -122,29 +122,108 @@ describe("streamTurn cancellation", () => {
       output_text: "The completed assistant reply",
     });
     mocks.startExtractionRun.mockReturnValue({ id: 11 });
-    mocks.extract.mockImplementation(async () => {
-      controller.abort();
-      return {};
+    const result = await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "Remember this after the reply",
+      signal: controller.signal,
     });
-
-    await expect(
-      streamTurn(db, {
-        conversationId: conversation.id,
-        input: "Remember this unless I leave",
-        signal: controller.signal,
-      }),
-    ).rejects.toMatchObject({ name: "AbortError" });
 
     const storedMessages = messagesIn(db, conversation.id);
     expect(storedMessages).toMatchObject([
-      { role: "user", content: "Remember this unless I leave" },
+      { role: "user", content: "Remember this after the reply" },
       { role: "assistant", content: "The completed assistant reply" },
     ]);
     expect(storedMessages[0]?.recall_state).toBe("unclassified");
-    expect(mocks.extract).toHaveBeenCalledWith(
-      expect.objectContaining({ signal: controller.signal }),
+    expect(result.userMessage.id).toBe(storedMessages[0]?.id);
+    expect(mocks.extract).not.toHaveBeenCalled();
+    expect(mocks.startExtractionRun).not.toHaveBeenCalled();
+  });
+
+  it("persists a memory-off transcript without reading or tracing saved memory", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.finalResponse.mockResolvedValue({
+      status: "completed",
+      output: [],
+      output_text: "Transcript-only answer",
+    });
+
+    const result = await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "Do not use or retain this across chats",
+      rememberingMode: "off",
+    });
+
+    expect(result.context).toBeNull();
+    expect(mocks.buildContext).not.toHaveBeenCalled();
+    expect(mocks.recordResponseContext).not.toHaveBeenCalled();
+    expect(messagesIn(db, conversation.id)).toMatchObject([
+      { role: "user", recall_state: "blocked", cross_chat_recall_eligible: 0 },
+      { role: "assistant", recall_state: "blocked", cross_chat_recall_eligible: 0 },
+    ]);
+    expect(mocks.openaiStream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.arrayContaining([
+          expect.objectContaining({
+            role: "user",
+            content: expect.stringContaining("No saved memory"),
+          }),
+        ]),
+      }),
+      expect.any(Object),
     );
-    expect(mocks.finishExtractionRun).toHaveBeenCalledWith(db, 11, "failed", "AbortError");
+  });
+
+  it("keeps prior turns in a memory-off conversation while withholding saved memory", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    appendMessage(db, conversation.id, "user", "My first thought", {
+      recallState: "blocked",
+      crossChatRecallEligible: false,
+    });
+    appendMessage(db, conversation.id, "assistant", "A first answer", {
+      crossChatRecallEligible: false,
+    });
+    mocks.finalResponse.mockResolvedValue({
+      status: "completed",
+      output: [],
+      output_text: "A continuing answer",
+    });
+
+    await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "Continue that thought",
+      rememberingMode: "off",
+    });
+
+    expect(mocks.openaiStream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.arrayContaining([
+          { role: "user", content: "My first thought" },
+          { role: "assistant", content: "A first answer" },
+        ]),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("does not execute bounded work while Labs is off", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.finalResponse.mockResolvedValue({
+      status: "completed",
+      output: [],
+      output_text: "An ordinary answer",
+    });
+
+    const result = await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "Research backup providers and draft a recommendation.",
+      labsEnabled: false,
+    });
+
+    expect(result.work).toBeNull();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_plan").get()).toEqual({ count: 0 });
   });
 });
 

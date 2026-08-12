@@ -362,6 +362,7 @@ export const Message = z
     created_at: z.string(),
     origin: MessageOrigin,
     recall_state: MessageRecallState,
+    cross_chat_recall_eligible: z.union([z.literal(0), z.literal(1)]),
   })
   .strict();
 export type Message = z.infer<typeof Message>;

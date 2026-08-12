@@ -1,6 +1,7 @@
 import { MODEL, assertResponseComplete, openai } from "./openai";
 import { appendMessage, recentMessages } from "./conversations";
 import type { Db } from "./db";
+import type { RememberingMode } from "./contracts";
 import {
   buildContext,
   recordResponseContext,
@@ -12,7 +13,6 @@ import {
   embedFacet,
   embedMessage,
   embedPassage,
-  putEmbedding,
 } from "./embed";
 import {
   applyExtraction,
@@ -52,10 +52,10 @@ The final user input may also contain a <work_result> block from an explicitly a
 Keep responses focused and brief. Lead with the answer; supporting detail comes after. A simple question gets direct prose, not unnecessary structure.`;
 
 export type TurnResult = {
+  userMessage: Message;
   message: Message;
   hits: SearchHit[];
-  context: MemoryContext;
-  learned: ApplyResult | null;
+  context: MemoryContext | null;
   work: {
     planId: number;
     run: WorkRun;
@@ -68,68 +68,96 @@ export type StreamTurnOptions = {
   input: string;
   onDelta?: (text: string) => void;
   historyLimit?: number;
+  rememberingMode?: RememberingMode;
+  /** Experimental bounded-work execution is a Labs-only capability. */
+  labsEnabled?: boolean;
   signal?: AbortSignal;
 };
 
 export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<TurnResult> {
   options.signal?.throwIfAborted();
-  const userMessage = appendMessage(db, options.conversationId, "user", options.input);
-
-  const work = await maybeExecuteBoundedWork(db, userMessage);
-
-  const context = await buildContext(db, options.input, {
-    excludeMessageIds: [userMessage.id],
-    querySourceMessageId: userMessage.id,
+  const rememberingMode = options.rememberingMode ?? "automatic";
+  const memoryEnabled = rememberingMode !== "off";
+  const userMessage = appendMessage(db, options.conversationId, "user", options.input, {
+    recallState: memoryEnabled ? "unclassified" : "blocked",
+    crossChatRecallEligible: memoryEnabled,
   });
-  options.signal?.throwIfAborted();
-  if (context.queryVector) putEmbedding(db, "message", userMessage.id, context.queryVector);
-  const history = recentMessages(db, options.conversationId, options.historyLimit ?? 20);
-  const priorTurns = history.filter((message) => message.id !== userMessage.id);
 
-  const stream = openai().responses.stream(
-    {
-      model: MODEL,
-      max_output_tokens: 8000,
-      reasoning: { effort: "high" },
-      instructions: SYSTEM_PROMPT,
-      input: [
-        ...priorTurns.map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
-        {
-          role: "user" as const,
-          content: `${renderMemoryBlock(context)}${work ? `\n\n${renderWorkResult(work)}` : ""}\n\n${options.input}`,
-        },
-      ],
-      store: false,
-    },
-    { signal: options.signal },
-  );
+  try {
 
-  if (options.onDelta) {
-    stream.on("response.output_text.delta", (event) => {
-      if (!options.signal?.aborted) options.onDelta?.(event.delta);
+    const work = memoryEnabled && options.labsEnabled === true
+      ? await maybeExecuteBoundedWork(db, userMessage)
+      : null;
+
+    const context = memoryEnabled
+      ? await buildContext(db, options.input, {
+          excludeMessageIds: [userMessage.id],
+          querySourceMessageId: userMessage.id,
+        })
+      : null;
+    options.signal?.throwIfAborted();
+    const history = recentMessages(db, options.conversationId, options.historyLimit ?? 20);
+    const priorTurns = history.filter((message) => message.id !== userMessage.id);
+
+    const stream = openai().responses.stream(
+      {
+        model: MODEL,
+        max_output_tokens: 8000,
+        reasoning: { effort: "high" },
+        instructions: SYSTEM_PROMPT,
+        input: [
+          ...priorTurns.map((message) => ({
+            role: message.role,
+            content: message.content,
+          })),
+          {
+            role: "user" as const,
+            content: `${context ? renderMemoryBlock(context) : NO_MEMORY_BLOCK}${work ? `\n\n${renderWorkResult(work)}` : ""}\n\n${options.input}`,
+          },
+        ],
+        store: false,
+      },
+      { signal: options.signal },
+    );
+
+    if (options.onDelta) {
+      stream.on("response.output_text.delta", (event) => {
+        if (!options.signal?.aborted) options.onDelta?.(event.delta);
+      });
+    }
+    const final = await stream.finalResponse();
+    // The SDK normally rejects finalResponse on abort. This explicit boundary also
+    // covers a completion/abort race before any assistant-authored state is stored.
+    options.signal?.throwIfAborted();
+    assertResponseComplete(final);
+    options.signal?.throwIfAborted();
+
+    const reply = final.output_text;
+    const assistantMessage = appendMessage(db, options.conversationId, "assistant", reply, {
+      crossChatRecallEligible: memoryEnabled,
     });
+    if (context) recordResponseContext(db, assistantMessage.id, context.plan);
+
+    // Extraction is now a durable memory job claimed after response completion. Keeping
+    // it out of this boundary means a successful answer never waits for model extraction
+    // or indexing, and a client disconnect after completion cannot cancel memory midway.
+    return {
+      userMessage,
+      message: assistantMessage,
+      hits: context?.hits ?? [],
+      context,
+      work,
+    };
+  } catch (error) {
+    // A stopped or failed answer creates no visible memory job or change notice. Keep
+    // its transcript for the user, but permanently exclude the source from implicit
+    // recall/backfill so it cannot become memory later without an explicit action.
+    safelyBlockRecall(db, userMessage.id);
+    throw error;
   }
-  const final = await stream.finalResponse();
-  // The SDK normally rejects finalResponse on abort. This explicit boundary also
-  // covers a completion/abort race before any assistant-authored state is stored.
-  options.signal?.throwIfAborted();
-  assertResponseComplete(final);
-  options.signal?.throwIfAborted();
-
-  const reply = final.output_text;
-  const assistantMessage = appendMessage(db, options.conversationId, "assistant", reply);
-  recordResponseContext(db, assistantMessage.id, context.plan);
-
-  // Extraction sees bounded preceding discourse through the current user message.
-  // The newly generated reply is intentionally excluded: it cannot be evidence and
-  // including it only increases the chance of assistant-authored suggestions leaking.
-  const learned = await learnFrom(db, history.slice(-13), userMessage.id, options.signal);
-
-  return { message: assistantMessage, hits: context.hits, context, learned, work };
 }
+
+const NO_MEMORY_BLOCK = `<memory>\nNo saved memory, episodic recall, understanding, plans, or follow-through suggestions are available for this turn. Use only this conversation transcript.\n</memory>`;
 
 async function maybeExecuteBoundedWork(
   db: Db,

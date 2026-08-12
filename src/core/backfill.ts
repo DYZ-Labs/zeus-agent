@@ -103,6 +103,7 @@ export function startUnderstandingBackfill(
        WHERE m.role = 'user'
          AND m.origin = 'conversation'
          AND m.recall_state = 'unclassified'
+         AND m.cross_chat_recall_eligible = 1
          AND COALESCE(c.title, '') != 'Memory curation'
        ORDER BY m.id`,
     )
@@ -500,7 +501,8 @@ function boundedBackfillContext(db: Db, focusMessageId: number): Message[] {
   if (!focus) throw new Error(`Backfill source message ${focusMessageId} no longer exists`);
   const rows = db
     .prepare<[number, number], Message>(
-      `SELECT id, conversation_id, role, content, created_at, origin, recall_state
+      `SELECT id, conversation_id, role, content, created_at, origin, recall_state,
+              cross_chat_recall_eligible
        FROM message
        WHERE conversation_id = ? AND id <= ? AND origin = 'conversation'
        ORDER BY id DESC

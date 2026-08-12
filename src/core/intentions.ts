@@ -19,6 +19,7 @@ export type GoalInput = {
   projectId?: number | null;
   confidence?: number;
   sourceMessageId: number;
+  sourceKind?: "message" | "user_action";
   passageId?: number | null;
 };
 
@@ -89,7 +90,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
       projectId: input.projectId,
       confidence: input.confidence,
       sourceMessageId: input.sourceMessageId,
-      sourceKind: "message",
+      sourceKind: input.sourceKind ?? "message",
     }) ?? duplicate;
   }
 
@@ -141,7 +142,7 @@ export function createGoal(db: Db, input: GoalInput): Goal {
         confidence: clamp(input.confidence ?? 0.9),
       },
       input.sourceMessageId,
-      "message",
+      input.sourceKind ?? "message",
       input.passageId ?? null,
     );
     return getGoal(db, id);
@@ -290,6 +291,7 @@ export type CommitmentInput = {
   dueAt?: string | null;
   confidence?: number;
   sourceMessageId: number;
+  sourceKind?: "message" | "user_action";
   passageId?: number | null;
 };
 
@@ -362,7 +364,7 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
       dueAt: input.dueAt,
       confidence: input.confidence,
       sourceMessageId: input.sourceMessageId,
-      sourceKind: "message",
+      sourceKind: input.sourceKind ?? "message",
     }) ?? duplicate;
   }
 
@@ -417,7 +419,7 @@ export function createCommitment(db: Db, input: CommitmentInput): CommitmentView
         confidence: clamp(input.confidence ?? 0.9),
       },
       input.sourceMessageId,
-      "message",
+      input.sourceKind ?? "message",
       input.passageId ?? null,
     );
     return getCommitment(db, id);

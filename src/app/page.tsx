@@ -1,6 +1,12 @@
-import { Chat, type ChatHistoryTurn } from "@/components/chat";
-import { getConversation, messagesIn } from "@/core/conversations";
+import { Chat } from "@/components/chat";
+import {
+  hydrateConversationTurns,
+  type ChatHydrationTurn,
+} from "@/core/chat-hydration";
+import { getConversation } from "@/core/conversations";
+import { getExperienceSettings } from "@/core/experience";
 import { hasCredentials } from "@/core/openai";
+import { numericResourceId, resourceId } from "@/core/resource-id";
 import { getOwnerAccess } from "@/server/auth/access";
 import { redirect } from "next/navigation";
 
@@ -24,33 +30,31 @@ export default async function ChatPage({
     redirect(`/auth/confirm?code=${encodeURIComponent(params.code)}`);
   }
   if (params.error || params.error_code) {
-    redirect("/auth/login?error=Supabase%20could%20not%20complete%20authentication.");
+    redirect("/auth/login?error=Account%20login%20could%20not%20be%20completed.");
   }
   const prompt = params.prompt?.slice(0, 4_000);
-  const requestedConversationId = Number(params.conversation);
+  const requestedConversationId = numericResourceId(params.conversation, "conversation");
   const access = await getOwnerAccess();
   const db = access.canAccessPrivateData ? access.db : null;
-  const conversation = db && Number.isInteger(requestedConversationId) && requestedConversationId > 0
+  const conversation = db && requestedConversationId !== null
     ? getConversation(db, requestedConversationId)
     : null;
-  const initialTurns: ChatHistoryTurn[] = conversation && db
-    ? messagesIn(db, conversation.id, 400).map((message) => ({
-        id: `stored-${message.id}`,
-        role: message.role,
-        text: message.content,
-      }))
+  const initialTurns: ChatHydrationTurn[] = conversation && db
+    ? hydrateConversationTurns(db, conversation.id, 400)
     : [];
+  const experience = db ? getExperienceSettings(db) : null;
 
   return (
     <Chat
       key={`${conversation?.id ?? "new"}:${prompt ?? "empty"}`}
       hasCredentials={hasCredentials()}
       canAccessPrivateData={access.canAccessPrivateData}
-      canUseChat={access.canAccessPrivateData || access.state === "signed_out"}
+      canUseChat={access.canAccessPrivateData}
       showAuthActions={access.state !== "authorized"}
       initialPrompt={prompt}
       initialTurns={initialTurns}
-      initialConversationId={conversation?.id}
+      initialConversationId={conversation ? resourceId("conversation", conversation.id) : undefined}
+      onboardingStatus={experience?.onboardingStatus ?? "complete"}
     />
   );
 }

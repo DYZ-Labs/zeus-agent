@@ -4,6 +4,8 @@ import { notFound } from "next/navigation";
 import { PageHeader } from "@/components/page-header";
 import { getMessage } from "@/core/conversations";
 import type { IntentFieldProvenance } from "@/core/context";
+import { getExperienceSettings } from "@/core/experience";
+import { numericResourceId, resourceId } from "@/core/resource-id";
 import {
   responseSelectionsForResponse,
   type ResponseContextSelection,
@@ -19,19 +21,20 @@ export default async function ResponseSourcesPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const id = Number((await params).id);
-  if (!Number.isInteger(id)) notFound();
+  const id = numericResourceId((await params).id, "message");
+  if (id === null) notFound();
   const db = await requireOwnerPageDb();
   const message = getMessage(db, id);
   if (!message || message.role !== "assistant") notFound();
   const selections = responseSelectionsForResponse(db, id);
   const recommendations = recommendationsForResponse(db, id);
+  const labsEnabled = getExperienceSettings(db).labsEnabled;
 
   return (
     <div className="flex h-full flex-col lg:min-h-0">
       <PageHeader
-        title="Response sources"
-        meta={`${selections.length} memory items · ${recommendations.length} follow-through proposal${recommendations.length === 1 ? "" : "s"}`}
+        title="Why Zeus said this"
+        meta={selections.length === 0 ? "No remembered details were used" : `${selections.length} remembered detail${selections.length === 1 ? "" : "s"} used`}
       />
       <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
         <Link href="/" className="font-mono text-[0.68rem] underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
@@ -48,7 +51,7 @@ export default async function ResponseSourcesPage({
         {recommendations.length > 0 && (
           <section className="mt-9">
             <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
-              Follow-through proposal supplied
+            Suggestion shown with this answer
             </h2>
             <ol className="mt-2">
               {recommendations.map((recommendation) => (
@@ -57,10 +60,10 @@ export default async function ResponseSourcesPage({
                   <p className="mt-1.5 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
                     {recommendation.why}
                   </p>
-                  <p className="mt-1.5 font-mono text-[0.63rem]" style={{ color: "var(--shell-faint)" }}>
-                    system proposal · {recommendation.reason.replace(/_/gu, " ")} · not canonical memory ·{" "}
-                    <Link href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
-                      commitment source
+                  <p className="mt-1.5 text-xs" style={{ color: "var(--shell-faint)" }}>
+                    This was a suggestion, not something Zeus saved about you. ·{" "}
+                    <Link href={`/source/${resourceId("message", recommendation.commitment_source_message_id)}`} className="underline underline-offset-2">
+                      Why it was suggested
                     </Link>
                   </p>
                 </li>
@@ -71,7 +74,7 @@ export default async function ResponseSourcesPage({
 
         <section className="mt-9">
           <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
-            Memory supplied to that answer
+            Remembered details used
           </h2>
           {selections.length ? (
             <ol className="mt-2">
@@ -80,6 +83,7 @@ export default async function ResponseSourcesPage({
                   key={key(selection.item)}
                   item={selection.item}
                   selection={selection}
+                  technical={labsEnabled}
                 />
               ))}
             </ol>
@@ -97,9 +101,11 @@ export default async function ResponseSourcesPage({
 function RecallRow({
   item,
   selection,
+  technical,
 }: {
   item: RecallItem;
   selection: ResponseContextSelection;
+  technical: boolean;
 }) {
   let title: string;
   let detail: string;
@@ -107,34 +113,28 @@ function RecallRow({
   let sourcePassage: number | null = null;
   if (item.kind === "fact") {
     title = `${item.fact.subject_slug === "self" ? "You" : item.fact.subject_name} ${item.fact.predicate.replace(/_/gu, " ")} ${item.fact.object}`;
-    detail = `canonical fact · ${item.evidence.length} evidence source${item.evidence.length === 1 ? "" : "s"}`;
+    detail = item.fact.valid_to ? "A detail from your history" : "A saved detail";
     source = item.fact.source_message_id;
   } else if (item.kind === "episode") {
     title = `“${item.episode.excerpt}”`;
-    const passage = item.episode.passage_id === null
-      ? "legacy episode"
-      : `passage ${item.episode.passage_id}`;
-    const offsets = item.episode.start_offset === null || item.episode.end_offset === null
-      ? ""
-      : ` · offsets ${item.episode.start_offset}-${item.episode.end_offset}`;
-    detail = `dated episode · ${item.episode.message.created_at.slice(0, 10)} · ${passage}${offsets}`;
+    detail = `Something you said on ${item.episode.message.created_at.slice(0, 10)}`;
     source = item.episode.message.id;
     sourcePassage = item.episode.passage_id;
   } else if (item.kind === "goal") {
     title = item.goal.title;
-    detail = `goal · ${item.goal.status} · ${item.goal.priority} priority${item.goal.target_at ? ` · target ${item.goal.target_at.slice(0, 10)}` : ""}`;
+    detail = `Goal · ${friendlyStatus(item.goal.status)}${item.goal.target_at ? ` · by ${item.goal.target_at.slice(0, 10)}` : ""}`;
     source = item.goal.source_message_id;
   } else if (item.kind === "commitment") {
     title = item.commitment.title;
-    detail = `commitment · ${item.commitment.status}${item.commitment.due_at ? ` · due ${item.commitment.due_at.slice(0, 10)}` : ""}`;
+    detail = `Plan · ${friendlyStatus(item.commitment.status)}${item.commitment.due_at ? ` · by ${item.commitment.due_at.slice(0, 10)}` : ""}`;
     source = item.commitment.source_message_id;
   } else if (item.kind === "project") {
     title = item.project.entity_name;
-    detail = `project · ${item.project.status}${item.project.progress_percent === null ? "" : ` · ${Math.round(item.project.progress_percent * 100)}% complete`}${item.project.blocked_at ? " · blocked" : ""}`;
+    detail = `Project · ${friendlyStatus(item.project.status)}${item.project.progress_percent === null ? "" : ` · ${Math.round(item.project.progress_percent * 100)}% complete`}${item.project.blocked_at ? " · blocked" : ""}`;
     source = item.project.source_message_id;
   } else {
     title = item.facet.statement;
-    detail = `${item.facet.kind.replace(/_/gu, " ")} facet · ${facetScope(item)} · confidence ${item.facet.confidence.toFixed(2)} · ${item.evidence.length} evidence passage${item.evidence.length === 1 ? "" : "s"}`;
+    detail = `Helpful context${facetScope(item) === "global" ? "" : ` · ${facetScope(item)}`}`;
     source = item.evidence[0]?.source_message_id ?? item.facet.source_message_id;
   }
 
@@ -151,7 +151,7 @@ function RecallRow({
             <>
               {" · "}
               <Link
-                href={`/source/${source}${sourcePassage === null ? "" : `?passage=${sourcePassage}`}`}
+                href={`/source/${resourceId("message", source)}${sourcePassage === null ? "" : `?passage=${resourceId("passage", sourcePassage)}`}`}
                 className="underline underline-offset-2"
               >
                 source
@@ -159,14 +159,16 @@ function RecallRow({
             </>
           )}
         </p>
-        <p className="mt-1 font-mono text-[0.61rem]" style={{ color: "var(--shell-muted)" }}>
-          selected because {selection.reason.replace(/_/gu, " ")}
-          {selection.via.length > 0 ? ` · via ${selection.via.join(" + ")}` : ""}
-          {selection.score > 0 ? ` · score ${selection.score.toFixed(2)}` : ""}
-          {selection.estimated_tokens > 0 ? ` · ~${selection.estimated_tokens} tokens` : ""}
-        </p>
-        {selection.fieldProvenance && (
-          <FieldSources provenance={selection.fieldProvenance} />
+        {technical && (
+          <details className="mt-2 text-xs" style={{ color: "var(--shell-faint)" }}>
+            <summary className="cursor-pointer">Technical details</summary>
+            <p className="mt-1">
+              Selected because {selection.reason.replace(/_/gu, " ")}
+              {selection.via.length > 0 ? ` · via ${selection.via.join(" + ")}` : ""}
+              {selection.score > 0 ? ` · score ${selection.score.toFixed(2)}` : ""}
+            </p>
+            {selection.fieldProvenance && <FieldSources provenance={selection.fieldProvenance} />}
+          </details>
         )}
       </div>
     </li>
@@ -197,7 +199,7 @@ function FieldSources({ provenance }: { provenance: IntentFieldProvenance }) {
             <span>· {source.source_kind.replace(/_/gu, " ")}</span>
           ) : (
             <Link
-              href={`/source/${source.source_message_id}${source.passage_id ? `?passage=${source.passage_id}` : ""}`}
+              href={`/source/${resourceId("message", source.source_message_id)}${source.passage_id ? `?passage=${resourceId("passage", source.passage_id)}` : ""}`}
               className="underline underline-offset-2"
             >
               · source
@@ -215,4 +217,20 @@ function facetScope(item: Extract<RecallItem, { kind: "facet" }>): string {
   if (item.facet.scope_kind === "entity") return item.facet.scope_entity_name ?? "entity";
   if (item.facet.scope_kind === "goal") return item.facet.scope_goal_title ?? "goal";
   return item.facet.scope_commitment_title ?? "commitment";
+}
+
+function friendlyStatus(value: string): string {
+  const labels: Record<string, string> = {
+    abandoned: "Stopped",
+    achieved: "Done",
+    active: "Active",
+    cancelled: "Stopped",
+    completed: "Done",
+    done: "Done",
+    open: "In progress",
+    paused: "Paused",
+    planned: "Planned",
+    waiting: "Waiting on someone",
+  };
+  return labels[value] ?? value.replace(/_/gu, " ");
 }

@@ -21,7 +21,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   const next = authDestinationFromRequest(request);
   const configuration = getAuthConfiguration();
   if (configuration.mode !== "configured") {
-    return authRedirect(request.nextUrl.origin, "Supabase login is not configured.", next);
+    return authRedirect(request.nextUrl.origin, "Account access is not configured.", next);
   }
 
   const supabase = await createSupabaseServerClient(configuration, {

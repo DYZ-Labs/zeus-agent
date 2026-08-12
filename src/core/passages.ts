@@ -143,10 +143,32 @@ export function blockMessageRecall(db: Db, messageId: number): void {
   })();
 }
 
-/** Accepting one candidate unlocks only the exact supporting passage. */
+/**
+ * Accepting one candidate unlocks only the exact supporting passage, and only
+ * after every proposal sharing that passage has been accepted. Pending or rejected
+ * interpretations must never make the underlying episode available by association.
+ */
 export function allowPassage(db: Db, passageId: number): EvidencePassage | null {
   const passage = getPassage(db, passageId);
   if (!passage) return null;
+  const unresolved = db
+    .prepare<[number], { found: number }>(
+      `SELECT 1 AS found
+       FROM candidate_evidence ce
+       JOIN memory_candidate mc ON mc.id = ce.candidate_id
+       WHERE ce.passage_id = ? AND mc.status IN ('pending','rejected')
+       LIMIT 1`,
+    )
+    .get(passageId);
+  if (unresolved) {
+    if (passage.recall_status === "allowed") {
+      db.prepare<[number]>(
+        "UPDATE evidence_passage SET recall_status = 'pending' WHERE id = ?",
+      ).run(passageId);
+      syncPassageIndex(db, passageId, passage.text, "pending");
+    }
+    return getPassage(db, passageId);
+  }
   db.prepare<[number]>(
     "UPDATE evidence_passage SET recall_status = 'allowed' WHERE id = ?",
   ).run(passageId);
@@ -154,6 +176,19 @@ export function allowPassage(db: Db, passageId: number): EvidencePassage | null 
   db.prepare<[number]>("UPDATE message SET recall_state = 'classified' WHERE id = ?").run(
     passage.message_id,
   );
+  return getPassage(db, passageId);
+}
+
+/** Keep one exact claim out of episodic recall without suppressing neighbouring text. */
+export function withholdPassage(db: Db, passageId: number): EvidencePassage | null {
+  const passage = getPassage(db, passageId);
+  if (!passage) return null;
+  if (passage.recall_status !== "blocked") {
+    db.prepare<[number]>(
+      "UPDATE evidence_passage SET recall_status = 'pending' WHERE id = ?",
+    ).run(passageId);
+  }
+  syncPassageIndex(db, passageId, passage.text, "pending");
   return getPassage(db, passageId);
 }
 
@@ -175,8 +210,7 @@ export function reindexPassages(db: Db): number {
          AND NOT EXISTS (
            SELECT 1 FROM candidate_evidence ce
            JOIN memory_candidate mc ON mc.id = ce.candidate_id
-           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-             AND mc.status IN ('pending','rejected')
+           WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
          )
        ORDER BY p.id`,
     )

@@ -60,7 +60,8 @@ export async function searchEpisodes(
   const rows = db
     .prepare<number[], EpisodeRow>(
       `SELECT m.id, m.conversation_id, m.role, m.content, m.created_at,
-              m.origin, m.recall_state, p.id AS passage_id,
+              m.origin, m.recall_state, m.cross_chat_recall_eligible,
+              p.id AS passage_id,
               p.start_offset, p.end_offset, p.text AS passage_text,
               c.title AS conversation_title
        FROM evidence_passage p
@@ -68,11 +69,11 @@ export async function searchEpisodes(
        JOIN conversation c ON c.id = m.conversation_id
        WHERE p.id IN (${placeholders}) AND p.recall_status = 'allowed'
          AND m.role = 'user'
+         AND m.cross_chat_recall_eligible = 1
          AND NOT EXISTS (
            SELECT 1 FROM candidate_evidence ce
            JOIN memory_candidate mc ON mc.id = ce.candidate_id
-           WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-             AND mc.status IN ('pending','rejected')
+           WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
          )
          AND COALESCE(c.title, '') != 'Memory curation'
          AND m.origin IN ('conversation','reflection','backfill')`,
@@ -95,6 +96,7 @@ export async function searchEpisodes(
           created_at: row.created_at,
           origin: row.origin,
           recall_state: row.recall_state,
+          cross_chat_recall_eligible: row.cross_chat_recall_eligible,
         },
         passage_id: row.passage_id,
         start_offset: row.start_offset,
@@ -123,8 +125,7 @@ function lexicalCandidates(db: Db, query: string): number[] {
            AND NOT EXISTS (
              SELECT 1 FROM candidate_evidence ce
              JOIN memory_candidate mc ON mc.id = ce.candidate_id
-             WHERE ce.passage_id = p.id AND mc.kind = 'facet'
-               AND mc.status IN ('pending','rejected')
+             WHERE ce.passage_id = p.id AND mc.status IN ('pending','rejected')
            )
            AND COALESCE(c.title, '') != 'Memory curation'
            AND m.origin IN ('conversation','reflection','backfill')

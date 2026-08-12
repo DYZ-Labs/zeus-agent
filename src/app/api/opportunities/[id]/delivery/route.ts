@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { getRecommendationCycle, markOpportunityDelivered } from "@/core/stewardship";
+import { numericResourceId } from "@/core/resource-id";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
@@ -9,7 +10,7 @@ export const dynamic = "force-dynamic";
 const Body = z
   .object({
     channel: z.enum(["chat", "today"]),
-    responseMessageId: z.number().int().positive().nullable().optional(),
+    responseMessageId: z.string().trim().min(3).max(120).nullable().optional(),
   })
   .strict();
 
@@ -32,9 +33,15 @@ export async function POST(
     );
   }
 
-  const opportunityId = Number((await params).id);
+  const opportunityId = numericResourceId((await params).id, "opportunity");
   const parsed = Body.safeParse(await request.json().catch(() => null));
-  if (!Number.isInteger(opportunityId) || opportunityId <= 0 || !parsed.success) {
+  if (opportunityId === null || !parsed.success) {
+    return Response.json({ error: "Invalid opportunity delivery receipt." }, { status: 400 });
+  }
+  const responseMessageId = parsed.data.responseMessageId
+    ? numericResourceId(parsed.data.responseMessageId, "message")
+    : null;
+  if (parsed.data.responseMessageId && responseMessageId === null) {
     return Response.json({ error: "Invalid opportunity delivery receipt." }, { status: 400 });
   }
   if (!getRecommendationCycle(access.db, opportunityId)) {
@@ -44,10 +51,10 @@ export async function POST(
     access.db,
     opportunityId,
     parsed.data.channel,
-    parsed.data.responseMessageId ?? null,
+    responseMessageId,
   );
   if (!delivery) {
     return Response.json({ error: "Opportunity has no deliverable recommendation." }, { status: 409 });
   }
-  return Response.json({ ok: true, deliveryId: delivery.id });
+  return Response.json({ ok: true });
 }
