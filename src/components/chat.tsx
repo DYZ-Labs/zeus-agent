@@ -1,13 +1,17 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
+import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CHAT_UPDATED_EVENT,
   NEW_CHAT_EVENT,
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
+import {
+  receiptSummaryParts,
+  type ChatReceipt,
+} from "@/components/chat-receipt";
 import type { FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
@@ -29,21 +33,8 @@ type Turn = ChatHistoryTurn & {
     artifacts: Array<{ id: number; title: string; kind: string }>;
   };
   /** Set on the assistant turn once the stream closes. */
-  receipt?: {
-    messageId: number;
-    recalled: number;
-    recalledFacts: number;
-    recalledEpisodes: number;
-    recalledFacets: number;
-    accepted: number;
-    acceptedFacets: number;
-    pending: number;
-    pendingFacets: number;
-    goalsUpdated: number;
-    commitmentsUpdated: number;
+  receipt?: ChatReceipt & {
     projectsUpdated: number;
-    superseded: number;
-    failed: boolean;
   };
 };
 
@@ -52,6 +43,7 @@ type Status = "idle" | "streaming" | "error";
 export function Chat({
   hasCredentials,
   canAccessPrivateData,
+  canUseChat,
   showAuthActions,
   initialPrompt,
   initialTurns = [],
@@ -59,6 +51,7 @@ export function Chat({
 }: {
   hasCredentials: boolean;
   canAccessPrivateData: boolean;
+  canUseChat: boolean;
   showAuthActions: boolean;
   initialPrompt?: string;
   initialTurns?: ChatHistoryTurn[];
@@ -90,7 +83,11 @@ export function Chat({
     }
 
     window.addEventListener(NEW_CHAT_EVENT, startNewChat);
-    return () => window.removeEventListener(NEW_CHAT_EVENT, startNewChat);
+    return () => {
+      window.removeEventListener(NEW_CHAT_EVENT, startNewChat);
+      activeRequest.current?.abort();
+      activeRequest.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -100,7 +97,7 @@ export function Chat({
 
   async function send() {
     const text = input.trim();
-    if (!text || status === "streaming" || !canAccessPrivateData) return;
+    if (!text || status === "streaming" || !hasCredentials || !canUseChat) return;
 
     const replyId = crypto.randomUUID();
     setTurns((prior) => [
@@ -120,7 +117,11 @@ export function Chat({
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: text, conversationId: conversationId.current }),
+        body: JSON.stringify(
+          canAccessPrivateData
+            ? { input: text, conversationId: conversationId.current }
+            : { input: text, history: boundedGuestHistory(turns) },
+        ),
         signal: request.signal,
       });
 
@@ -146,13 +147,15 @@ export function Chat({
           const event = JSON.parse(line) as Record<string, unknown>;
 
           if (event.type === "meta") {
-            const nextConversationId = event.conversationId as number;
-            conversationId.current = nextConversationId;
-            window.dispatchEvent(
-              new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
-                detail: { conversationId: nextConversationId },
-              }),
-            );
+            const nextConversationId = event.conversationId;
+            if (typeof nextConversationId === "number") {
+              conversationId.current = nextConversationId;
+              window.dispatchEvent(
+                new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
+                  detail: { conversationId: nextConversationId },
+                }),
+              );
+            }
           } else if (event.type === "delta") {
             const chunk = event.text as string;
             setTurns((prior) =>
@@ -161,6 +164,8 @@ export function Chat({
               ),
             );
           } else if (event.type === "done") {
+            if (event.guest === true) continue;
+
             const opportunityId = event.opportunityId as number | null;
             const messageId = event.messageId as number;
             const opportunityDelivered = opportunityId === null
@@ -255,9 +260,9 @@ export function Chat({
     }
   }
 
-  const hasVisibleTurns = canAccessPrivateData && turns.length > 0;
+  const hasVisibleTurns = turns.length > 0;
   const canSend =
-    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canAccessPrivateData;
+    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canUseChat;
   const composer = (
     <Composer
       input={input}
@@ -267,7 +272,7 @@ export function Chat({
       status={status}
       canSend={canSend}
       hasCredentials={hasCredentials}
-      canAccessPrivateData={canAccessPrivateData}
+      canUseChat={canUseChat}
       centered={!hasVisibleTurns}
     />
   );
@@ -277,30 +282,23 @@ export function Chat({
       className="relative flex h-full min-h-0 flex-col"
       style={{ background: "var(--shell-bg)" }}
     >
-      {!hasVisibleTurns && showAuthActions && <GuestAuthActions />}
+      {showAuthActions && <GuestAuthActions />}
       {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[24vh] pt-20 lg:pb-[27vh]">
             {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
-            <div className="relative w-full">
-              <EmptyState />
-              {composer}
-              {!canAccessPrivateData && (
-                <p
-                  className="absolute inset-x-0 top-full mx-auto mt-3 max-w-[28rem] text-center text-sm leading-5"
-                  style={{ color: "var(--shell-muted)" }}
-                >
-                  Log in to start a private conversation with the personal AI that remembers what
-                  matters.
-                </p>
-              )}
-            </div>
+            <EmptyState />
+            {composer}
           </div>
         </div>
       ) : (
         <>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 pt-6 md:px-6">
+            <div
+              className={`mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 md:px-6 ${
+                showAuthActions ? "pt-16" : "pt-6"
+              }`}
+            >
               {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
               <ol className="space-y-8 py-4">
                 {turns.map((turn) => (
@@ -380,7 +378,7 @@ function Composer({
   status,
   canSend,
   hasCredentials,
-  canAccessPrivateData,
+  canUseChat,
   centered,
 }: {
   input: string;
@@ -390,10 +388,10 @@ function Composer({
   status: Status;
   canSend: boolean;
   hasCredentials: boolean;
-  canAccessPrivateData: boolean;
+  canUseChat: boolean;
   centered: boolean;
 }) {
-  const inputLabel = canAccessPrivateData ? "Message Zeus" : "Log in to message Zeus";
+  const inputLabel = "Message Zeus";
 
   return (
     <form
@@ -417,8 +415,8 @@ function Composer({
             id="chat-input"
             rows={1}
             value={input}
-            disabled={!hasCredentials || !canAccessPrivateData}
-            autoFocus={centered && hasCredentials && canAccessPrivateData}
+            disabled={!hasCredentials || !canUseChat}
+            autoFocus={centered && hasCredentials && canUseChat}
             onChange={(event) => onInputChange(event.target.value)}
             onInput={(event) => resizeComposer(event.currentTarget)}
             onKeyDown={(event) => {
@@ -454,6 +452,24 @@ function Composer({
 function resizeComposer(element: HTMLTextAreaElement) {
   element.style.height = "auto";
   element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
+}
+
+function boundedGuestHistory(turns: readonly Turn[]): Array<{
+  role: "user" | "assistant";
+  content: string;
+}> {
+  const history: Array<{ role: "user" | "assistant"; content: string }> = [];
+  let remainingCharacters = 20_000;
+
+  for (const turn of turns.slice(-20).reverse()) {
+    const content = turn.text.trim().slice(0, 4_000);
+    if (!content || remainingCharacters === 0) continue;
+    const boundedContent = content.slice(0, remainingCharacters);
+    history.unshift({ role: turn.role, content: boundedContent });
+    remainingCharacters -= boundedContent.length;
+  }
+
+  return history;
 }
 
 function UserTurn({ text }: { text: string }) {
@@ -767,12 +783,33 @@ function Receipt({
   superseded,
   failed,
 }: NonNullable<Turn["receipt"]>) {
-  const parts = [
-    `${recalled} recalled`,
-    failed ? "extraction failed" : `${accepted} accepted`,
-    pending > 0 ? `${pending} pending` : null,
-    superseded > 0 ? `${superseded} superseded` : null,
-  ].filter((part): part is string => part !== null);
+  const parts = receiptSummaryParts({
+    messageId,
+    recalled,
+    recalledFacts,
+    recalledEpisodes,
+    recalledFacets,
+    accepted,
+    acceptedFacets,
+    pending,
+    pendingFacets,
+    goalsUpdated,
+    commitmentsUpdated,
+    superseded,
+    failed,
+  });
+
+  if (parts.length === 0) {
+    return (
+      <a
+        href={`/response/${messageId}`}
+        className="mt-3 inline-block font-mono text-[0.66rem] underline underline-offset-2"
+        style={{ color: "var(--shell-faint)" }}
+      >
+        response sources
+      </a>
+    );
+  }
 
   return (
     <details className="mt-3 font-mono text-[0.66rem]" style={{ color: "var(--shell-faint)" }}>
@@ -823,20 +860,20 @@ function GuestAuthActions() {
       aria-label="Account access"
       className="absolute right-0 top-0 z-10 flex h-16 items-center gap-2 px-4 sm:px-5"
     >
-      <Link
-        href="/auth/login"
+      <AuthTrigger
+        intent="login"
         className="flex h-9 items-center rounded-full px-4 text-sm font-medium transition-opacity hover:opacity-90"
         style={{ background: "var(--shell-accent)", color: "#000000" }}
       >
         Log in
-      </Link>
-      <Link
-        href="/auth/signup"
+      </AuthTrigger>
+      <AuthTrigger
+        intent="signup"
         className="flex h-9 items-center rounded-full border px-4 text-sm font-medium transition-colors hover:bg-white/[0.06]"
         style={{ borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
       >
         Sign up
-      </Link>
+      </AuthTrigger>
     </nav>
   );
 }

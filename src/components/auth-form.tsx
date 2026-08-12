@@ -1,7 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useActionState, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  useActionState,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 import {
   logoutAction,
@@ -24,6 +31,8 @@ export function AuthForm({
   googleEnabled,
   initialMessage,
   blockedAccount,
+  onClose,
+  onIntentChange,
 }: {
   intent: "login" | "signup";
   next: string;
@@ -32,7 +41,11 @@ export function AuthForm({
   googleEnabled: boolean | null;
   initialMessage: string | null;
   blockedAccount: AccountSummary | null;
+  onClose?: () => void;
+  onIntentChange?: (intent: "login" | "signup") => void;
 }) {
+  const router = useRouter();
+  const dialogRef = useRef<HTMLElement>(null);
   const [state, formAction, pending] = useActionState(
     requestEmailLinkAction.bind(null, intent),
     INITIAL_AUTH_ACTION_STATE,
@@ -43,6 +56,18 @@ export function AuthForm({
   const alternateHref =
     next === "/" ? alternatePath : `${alternatePath}?${new URLSearchParams({ next })}`;
   const [originReady, setOriginReady] = useState(canonicalSiteUrl === null);
+
+  const close = useCallback(() => {
+    if (onClose) {
+      onClose();
+      return;
+    }
+    if (window.history.length > 1) {
+      router.back();
+    } else {
+      router.replace("/");
+    }
+  }, [onClose, router]);
 
   useEffect(() => {
     if (!canonicalSiteUrl) return;
@@ -59,131 +84,272 @@ export function AuthForm({
     return undefined;
   }, [canonicalSiteUrl]);
 
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (!dialog) return;
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      (
+        dialog.querySelector<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), a[href]',
+        ) ?? dialog
+      ).focus();
+    });
+
+    function keepFocusInside(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      const focused = document.activeElement;
+      if (event.shiftKey && (focused === first || !dialog.contains(focused))) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && (focused === last || !dialog.contains(focused))) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
+
+    document.addEventListener("keydown", keepFocusInside);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", keepFocusInside);
+      previouslyFocused?.focus();
+    };
+  }, [close]);
+
+  useEffect(() => {
+    if (!originReady) return;
+    const frame = window.requestAnimationFrame(() => {
+      dialogRef.current?.querySelector<HTMLInputElement>("#auth-email")?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [originReady]);
+
+  const message =
+    state.message ||
+    initialMessage ||
+    (!configured
+      ? authMode === "local"
+        ? "Supabase login is not configured yet. See .env.example to enable it."
+        : "Supabase login configuration is incomplete."
+      : "");
+  const messageIsSuccess = state.status === "sent";
+
   return (
-    <div className="h-full w-full overflow-y-auto bg-white text-[#2d2d2d]">
-      <div className="flex min-h-full w-full items-center justify-center px-5 py-10">
-        <div className="w-full max-w-[25rem] text-center" aria-busy={!originReady}>
-        <Link
-          href="/"
-          className="mx-auto inline-flex h-10 items-center gap-2 text-lg font-semibold tracking-[-0.025em]"
-          aria-label="Zeus home"
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4 backdrop-blur-[2px] sm:p-6"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) close();
+      }}
+    >
+      <section
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        aria-busy={!originReady}
+        tabIndex={-1}
+        className="relative flex max-h-[calc(100vh-2rem)] w-full max-w-[400px] flex-col overflow-hidden rounded-2xl border text-sm leading-5 shadow-2xl sm:max-h-[calc(100vh-3rem)]"
+        style={{
+          background: "var(--shell-panel)",
+          borderColor: "var(--shell-line-strong)",
+        }}
+      >
+        <button
+          type="button"
+          onClick={close}
+          aria-label="Close account access"
+          title="Close"
+          className="absolute right-3 top-3 z-10 flex h-9 w-9 cursor-pointer items-center justify-center rounded-lg transition-[background-color,transform] duration-150 hover:bg-white/[0.08] active:scale-95 disabled:pointer-events-none"
+          style={{ color: "var(--shell-fg)" }}
         >
-          <span className="flex h-8 w-8 items-center justify-center rounded-full bg-black text-xs font-bold text-white">
-            Z
-          </span>
-          Zeus
-        </Link>
+          <CloseIcon />
+        </button>
 
-        <h1 className="mt-7 text-[2rem] font-semibold leading-tight tracking-[-0.035em] text-[#202020]">
-          {title}
-        </h1>
-        <p className="mt-3 text-sm leading-5 text-[#6f6f6f]">
-          {intent === "login"
-            ? "Continue to the personal AI that remembers with receipts."
-            : "Give Zeus a verified account for your private memory store."}
-        </p>
-        {!originReady && (
-          <p role="status" className="mt-4 text-sm text-[#6f6f6f]">
-            Opening secure login…
-          </p>
-        )}
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-7 sm:px-8 sm:py-8">
+          <div className="mx-auto w-full max-w-[23rem] text-center">
+            <Link
+              href="/"
+              className="inline-flex rounded-md text-sm font-semibold tracking-[-0.01em] transition-opacity duration-150 hover:opacity-75 active:opacity-60"
+              aria-label="Zeus home"
+            >
+              Zeus
+            </Link>
 
-        {blockedAccount ? (
-          <section className="mt-7 rounded-xl border border-[#d9d9d9] bg-[#f7f7f7] px-4 py-4 text-left">
-            <p className="text-sm font-medium text-[#202020]">Different account detected</p>
-            <p className="mt-1 text-sm leading-5 text-[#6f6f6f]">
-              {blockedAccount.email} is signed in, but it is not linked to this Zeus store.
+            <h1 className="mt-5 text-[1.65rem] font-semibold leading-tight tracking-[-0.035em]">
+              {title}
+            </h1>
+            <p className="mt-2 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+              Continue with email or Google.
             </p>
-            <form action={logoutAction} className="mt-4">
-              <button
-                type="submit"
-                className="h-11 w-full rounded-lg bg-black px-4 text-sm font-medium text-white hover:bg-[#2b2b2b]"
-              >
-                Log out and try another account
-              </button>
-            </form>
-          </section>
-        ) : (
-          <>
-            <form action={formAction} className="mt-8 text-left">
-              <input type="hidden" name="next" value={next} />
-              <label htmlFor="auth-email" className="sr-only">
-                Email address
-              </label>
-              <input
-                id="auth-email"
-                name="email"
-                type="email"
-                autoComplete="email"
-                required
-                autoFocus={originReady}
-                disabled={!configured || !originReady || pending}
-                placeholder="Email address"
-                className="h-[3.25rem] w-full rounded-lg border border-[#b8b8b8] bg-white px-4 text-base text-[#202020] outline-none transition-shadow placeholder:text-[#777] focus:border-[#202020] focus:ring-1 focus:ring-[#202020] disabled:bg-[#f4f4f4]"
-              />
-              <button
-                type="submit"
-                disabled={!configured || !originReady || pending}
-                className="mt-3 h-[3.25rem] w-full rounded-lg bg-black px-4 text-base font-medium text-white transition-colors hover:bg-[#2b2b2b] disabled:cursor-not-allowed disabled:bg-[#aaa]"
-              >
-                {pending ? "Sending…" : "Continue"}
-              </button>
-            </form>
-
-            <div className="my-5 flex items-center gap-3 text-xs uppercase tracking-[0.08em] text-[#8a8a8a]">
-              <span className="h-px flex-1 bg-[#dedede]" />
-              or
-              <span className="h-px flex-1 bg-[#dedede]" />
-            </div>
-
-            <form action={startGoogleAuthAction}>
-              <input type="hidden" name="next" value={next} />
-              <button
-                type="submit"
-                disabled={!configured || !originReady || googleEnabled === false}
-                className="relative flex h-[3.25rem] w-full items-center justify-center rounded-lg border border-[#b8b8b8] bg-white px-12 text-base font-medium text-[#202020] transition-colors hover:bg-[#f7f7f7] disabled:cursor-not-allowed disabled:bg-[#f4f4f4] disabled:text-[#999]"
-              >
-                <GoogleIcon />
-                {googleEnabled === false ? "Google not enabled" : "Continue with Google"}
-              </button>
-            </form>
-            {googleEnabled === false && (
-              <p className="mt-2 text-xs leading-5 text-[#7f1d1d]">
-                Enable Google under Supabase Authentication → Sign In / Providers.
+            {!originReady && (
+              <p role="status" className="mt-4 text-sm" style={{ color: "var(--shell-muted)" }}>
+                Opening secure login…
               </p>
             )}
-          </>
-        )}
 
-        {(initialMessage || state.message || !configured) && !blockedAccount && (
-          <p
-            role="status"
-            className="mt-5 rounded-lg px-3 py-2.5 text-sm leading-5"
-            style={{
-              color: state.status === "sent" ? "#166534" : "#7f1d1d",
-              background: state.status === "sent" ? "#f0fdf4" : "#fef2f2",
-            }}
-          >
-            {state.message ||
-              initialMessage ||
-              (authMode === "local"
-                ? "Supabase login is not configured yet. See .env.example to enable it."
-                : "Supabase login configuration is incomplete.")}
-          </p>
-        )}
+            {blockedAccount ? (
+              <section
+                className="mt-7 rounded-xl border px-4 py-4 text-left"
+                style={{
+                  background: "var(--shell-elevated)",
+                  borderColor: "var(--shell-line-strong)",
+                }}
+              >
+                <p className="text-sm font-medium">Different account detected</p>
+                <p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+                  {blockedAccount.email} is signed in, but it is not linked to this Zeus store.
+                </p>
+                <form action={logoutAction} className="mt-4">
+                  <button
+                    type="submit"
+                    className="h-11 w-full cursor-pointer rounded-lg px-4 text-sm font-medium transition-[filter,transform,opacity] duration-150 hover:brightness-90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:brightness-100 disabled:active:scale-100"
+                    style={{ background: "var(--shell-accent)", color: "#000000" }}
+                  >
+                    Log out and try another account
+                  </button>
+                </form>
+              </section>
+            ) : (
+              <>
+                <form action={formAction} className="mt-6 text-left">
+                  <input type="hidden" name="next" value={next} />
+                  <label htmlFor="auth-email" className="sr-only">
+                    Email address
+                  </label>
+                  <input
+                    id="auth-email"
+                    name="email"
+                    type="email"
+                    autoComplete="email"
+                    required
+                    disabled={!configured || !originReady || pending}
+                    placeholder="Email address"
+                    className="h-12 w-full rounded-none border-0 border-b border-[var(--shell-line-strong)] bg-transparent px-0 text-base text-[var(--shell-fg)] outline-none transition-[border-color,opacity] duration-150 hover:border-[var(--shell-muted)] focus:border-[var(--shell-accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                    style={{ outline: "none" }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={!configured || !originReady || pending}
+                    className="mt-4 h-12 w-full cursor-pointer rounded-lg px-4 text-base font-medium transition-[filter,transform,opacity] duration-150 hover:brightness-90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:brightness-100 disabled:active:scale-100"
+                    style={{ background: "var(--shell-accent)", color: "#000000" }}
+                  >
+                    {pending ? "Sending…" : "Continue"}
+                  </button>
+                </form>
 
-        <p className="mt-7 text-sm text-[#6f6f6f]">
-          {intent === "login" ? "New to Zeus?" : "Already have an account?"}{" "}
-          <Link
-            href={alternateHref}
-            className="font-medium text-[#202020] underline underline-offset-4"
-          >
-            {intent === "login" ? "Sign up" : "Log in"}
-          </Link>
-        </p>
+                <div
+                  className="my-4 flex items-center gap-3 text-xs uppercase tracking-[0.08em]"
+                  style={{ color: "var(--shell-faint)" }}
+                >
+                  <span className="h-px flex-1" style={{ background: "var(--shell-line-strong)" }} />
+                  or
+                  <span className="h-px flex-1" style={{ background: "var(--shell-line-strong)" }} />
+                </div>
+
+                <form action={startGoogleAuthAction}>
+                  <input type="hidden" name="next" value={next} />
+                  <button
+                    type="submit"
+                    disabled={!configured || !originReady || googleEnabled === false}
+                    className="relative flex h-12 w-full cursor-pointer items-center justify-center rounded-lg border px-12 text-base font-medium transition-[filter,transform,opacity] duration-150 hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:brightness-100 disabled:active:scale-100"
+                    style={{
+                      background: "var(--shell-elevated)",
+                      borderColor: "var(--shell-line-strong)",
+                      color: "var(--shell-fg)",
+                    }}
+                  >
+                    <GoogleIcon />
+                    {googleEnabled === false ? "Google not enabled" : "Continue with Google"}
+                  </button>
+                </form>
+                {googleEnabled === false && (
+                  <p className="mt-2 text-xs leading-5" style={{ color: "#fca5a5" }}>
+                    Enable Google under Supabase Authentication → Sign In / Providers.
+                  </p>
+                )}
+              </>
+            )}
+
+            {message && !blockedAccount && (
+              <p
+                role="status"
+                className="mt-5 rounded-lg border px-3 py-2.5 text-sm leading-5"
+                style={{
+                  color: messageIsSuccess ? "#86efac" : "#fca5a5",
+                  background: messageIsSuccess
+                    ? "rgba(22, 101, 52, 0.24)"
+                    : "rgba(127, 29, 29, 0.24)",
+                  borderColor: messageIsSuccess
+                    ? "rgba(134, 239, 172, 0.28)"
+                    : "rgba(252, 165, 165, 0.28)",
+                }}
+              >
+                {message}
+              </p>
+            )}
+
+            <p className="mt-7 text-sm" style={{ color: "var(--shell-muted)" }}>
+              {intent === "login" ? "New to Zeus?" : "Already have an account?"}{" "}
+              {onIntentChange ? (
+                <button
+                  type="button"
+                  onClick={() => onIntentChange(intent === "login" ? "signup" : "login")}
+                  className="cursor-pointer rounded-sm font-medium underline underline-offset-4 transition-opacity duration-150 hover:opacity-75 active:opacity-60"
+                  style={{ color: "var(--shell-fg)" }}
+                >
+                  {intent === "login" ? "Sign up" : "Log in"}
+                </button>
+              ) : (
+                <Link
+                  href={alternateHref}
+                  replace
+                  className="rounded-sm font-medium underline underline-offset-4 transition-opacity duration-150 hover:opacity-75 active:opacity-60"
+                  style={{ color: "var(--shell-fg)" }}
+                >
+                  {intent === "login" ? "Sign up" : "Log in"}
+                </Link>
+              )}
+            </p>
+          </div>
         </div>
-      </div>
+      </section>
     </div>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg
+      aria-hidden
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+    >
+      <path d="m6 6 12 12M18 6 6 18" strokeLinecap="round" />
+    </svg>
   );
 }
 

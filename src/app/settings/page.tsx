@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import {
   followThroughDecisionAction,
   reviewBehavioralPolicySuggestionAction,
@@ -8,10 +10,9 @@ import { logoutAction } from "@/app/auth/actions";
 import { DeleteAllConversations } from "@/components/delete-all-conversations";
 import { CoarseLocationControl } from "@/components/coarse-location-control";
 import { SettingsModal } from "@/components/settings-modal";
-import { listConversations } from "@/core/conversations";
 import { getAmbientSetting, getFreshCoarseLocation } from "@/core/ambient";
+import { listConversations } from "@/core/conversations";
 import { listBehavioralPolicySuggestions } from "@/core/personalization";
-import Link from "next/link";
 import type {
   FollowThroughEventView,
   BehavioralPolicySuggestionView,
@@ -146,14 +147,14 @@ function AuthLinks() {
   return (
     <div className="mt-6 flex flex-wrap items-center gap-3">
       <Link
-        href="/auth/login"
+        href="/auth/login?next=/settings"
         className="rounded-lg px-4 py-2 text-sm font-medium"
         style={{ background: "var(--shell-accent)", color: "#000000" }}
       >
         Log in
       </Link>
       <Link
-        href="/auth/signup"
+        href="/auth/signup?next=/settings"
         className="rounded-lg border px-4 py-2 text-sm font-medium"
         style={{ borderColor: "var(--shell-line-strong)" }}
       >

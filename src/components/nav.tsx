@@ -8,6 +8,7 @@ import {
   deleteConversationFromHistoryAction,
   renameConversationAction,
 } from "@/app/actions";
+import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CHAT_UPDATED_EVENT,
   NEW_CHAT_EVENT,
@@ -89,8 +90,6 @@ export function Nav({
     }
     router.refresh();
   }
-
-  if (pathname === "/auth" || pathname.startsWith("/auth/")) return null;
 
   if (!isOpen) {
     return (
@@ -617,7 +616,7 @@ function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
   const description =
     authMode === "misconfigured"
       ? "Account access needs Supabase configuration."
-      : "Your personal AI that remembers what matters—and shows its sources.";
+      : "Your personal AI that remembers what matters.";
 
   return (
     <section
@@ -630,13 +629,13 @@ function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
       <p className="mt-1 text-xs leading-[1.1rem]" style={{ color: "var(--shell-faint)" }}>
         {description}
       </p>
-      <Link
-        href="/auth/login"
+      <AuthTrigger
+        intent="login"
         className="mt-2.5 flex h-8 w-full items-center justify-center rounded-lg text-sm font-medium transition-opacity hover:opacity-90"
         style={{ background: "var(--shell-accent)", color: "#000000" }}
       >
         {configured ? "Log in" : "Set up login"}
-      </Link>
+      </AuthTrigger>
     </section>
   );
 }
@@ -646,8 +645,8 @@ function AccountLink({ account, active }: { account: AccountSummary; active: boo
 
   return (
     <Link
-      href="/settings#account"
-      aria-label={`Open account settings for ${account.email}`}
+      href="/settings"
+      aria-label={`Open settings for ${account.email}`}
       aria-current={active ? "page" : undefined}
       className="flex min-h-12 items-center gap-2.5 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-white/[0.06]"
       style={{ background: active ? "var(--shell-elevated)" : undefined }}
@@ -663,11 +662,17 @@ function AccountLink({ account, active }: { account: AccountSummary; active: boo
   );
 }
 
-function CompactAccountLink({ account, active }: { account: AccountSummary; active: boolean }) {
+function CompactAccountLink({
+  account,
+  active,
+}: {
+  account: AccountSummary;
+  active: boolean;
+}) {
   return (
     <Link
-      href="/settings#account"
-      aria-label={`Open account settings for ${account.email}`}
+      href="/settings"
+      aria-label={`Open settings for ${account.email}`}
       title={account.name?.trim() || account.email}
       aria-current={active ? "page" : undefined}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
@@ -682,15 +687,15 @@ function CompactLoginLink({ authMode }: { authMode: AuthMode }) {
   const title = authMode === "configured" ? "Log in" : "Set up login";
 
   return (
-    <Link
-      href="/auth/login"
-      aria-label={title}
+    <AuthTrigger
+      intent="login"
+      ariaLabel={title}
       title={title}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
       style={{ color: "var(--shell-muted)" }}
     >
       <LoginIcon />
-    </Link>
+    </AuthTrigger>
   );
 }
 

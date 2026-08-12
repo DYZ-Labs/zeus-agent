@@ -35,6 +35,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const isAuthPath = request.nextUrl.pathname.startsWith("/auth/");
   const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath;
   const isApi = request.nextUrl.pathname.startsWith("/api/");
+  const isGuestChatApi = request.nextUrl.pathname === "/api/chat";
 
   if (configuration.mode === "misconfigured") {
     if (isApi) {
@@ -66,8 +67,15 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   try {
     const { data, error } = await supabase.auth.getClaims();
     if (error || !data?.claims) {
-      if (isApi) return copySession(Response.json({ error: "Authentication required." }, { status: 401 }), sessionResponse);
-      if (!isPublicPage) return copySession(loginRedirect(request), sessionResponse);
+      if (isApi && !isGuestChatApi) {
+        return copySession(
+          Response.json({ error: "Authentication required." }, { status: 401 }),
+          sessionResponse,
+        );
+      }
+      if (!isPublicPage && !isGuestChatApi) {
+        return copySession(loginRedirect(request), sessionResponse);
+      }
     }
   } catch {
     if (isApi) {
