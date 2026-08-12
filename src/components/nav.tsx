@@ -8,7 +8,11 @@ import {
   deleteConversationFromHistoryAction,
   renameConversationAction,
 } from "@/app/actions";
-import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
+import {
+  CHAT_UPDATED_EVENT,
+  NEW_CHAT_EVENT,
+  type ChatUpdatedDetail,
+} from "@/components/chat-events";
 import type { RecentChat } from "@/core/conversations";
 import type { AccountSummary, AuthMode } from "@/lib/auth-types";
 
@@ -39,13 +43,26 @@ export function Nav({
   const searchParams = useSearchParams();
   const [isOpen, setIsOpen] = useState(true);
   const requestedConversationId = Number(searchParams.get("conversation"));
-  const activeConversationId =
+  const routedConversationId =
     pathname === "/" && Number.isInteger(requestedConversationId) && requestedConversationId > 0
       ? requestedConversationId
       : null;
+  const [activeConversationId, setActiveConversationId] = useState<number | null>(
+    routedConversationId,
+  );
+  const routeSelectionKey = `${pathname}:${routedConversationId ?? "new"}`;
+  const [trackedRouteSelectionKey, setTrackedRouteSelectionKey] = useState(routeSelectionKey);
+  if (trackedRouteSelectionKey !== routeSelectionKey) {
+    setTrackedRouteSelectionKey(routeSelectionKey);
+    setActiveConversationId(routedConversationId);
+  }
 
   useEffect(() => {
-    function refreshRecentChats() {
+    function refreshRecentChats(event: Event) {
+      const detail = (event as CustomEvent<ChatUpdatedDetail>).detail;
+      if (Number.isInteger(detail?.conversationId) && detail.conversationId > 0) {
+        setActiveConversationId(detail.conversationId);
+      }
       router.refresh();
     }
 
@@ -54,12 +71,23 @@ export function Nav({
   }, [router]);
 
   function startNewChat() {
+    setActiveConversationId(null);
     if (pathname === "/") {
       window.dispatchEvent(new Event(NEW_CHAT_EVENT));
       router.replace("/");
       return;
     }
     router.push("/");
+  }
+
+  function finishRecentChatDeletion(deletedId: number) {
+    if (deletedId === activeConversationId) {
+      setActiveConversationId(null);
+      window.dispatchEvent(new Event(NEW_CHAT_EVENT));
+      router.replace("/");
+      return;
+    }
+    router.refresh();
   }
 
   if (pathname === "/auth" || pathname.startsWith("/auth/")) return null;
@@ -220,6 +248,7 @@ export function Nav({
                   key={chat.id}
                   chat={chat}
                   active={activeConversationId === chat.id}
+                  onDeleted={() => finishRecentChatDeletion(chat.id)}
                 />
               ))}
             </ul>
@@ -252,14 +281,36 @@ export function Nav({
   );
 }
 
-function RecentChatLink({ chat, active }: { chat: RecentChat; active: boolean }) {
+function RecentChatLink({
+  chat,
+  active,
+  onDeleted,
+}: {
+  chat: RecentChat;
+  active: boolean;
+  onDeleted: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+
+  async function deleteChat() {
+    if (pending) return;
+
+    setPending(true);
+    try {
+      await deleteConversationFromHistoryAction(chat.id, "delete");
+      onDeleted();
+    } finally {
+      setPending(false);
+    }
+  }
+
   return (
-    <li>
+    <li className="group relative">
       <Link
         href={`/?conversation=${chat.id}`}
         title={chat.title}
         aria-current={active ? "page" : undefined}
-        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
+        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 pr-9 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
         style={{
           background: active ? "var(--shell-elevated)" : undefined,
           color: "var(--shell-fg)",
@@ -267,6 +318,20 @@ function RecentChatLink({ chat, active }: { chat: RecentChat; active: boolean })
       >
         <span className="truncate">{chat.title}</span>
       </Link>
+      <button
+        type="button"
+        aria-label={`Delete ${chat.title}`}
+        title="Delete"
+        disabled={pending}
+        onClick={() => void deleteChat()}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${
+          active
+            ? "opacity-100"
+            : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+        }`}
+      >
+        <TrashIcon />
+      </button>
     </li>
   );
 }

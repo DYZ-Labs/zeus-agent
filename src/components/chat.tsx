@@ -3,7 +3,11 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
-import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
+import {
+  CHAT_UPDATED_EVENT,
+  NEW_CHAT_EVENT,
+  type ChatUpdatedDetail,
+} from "@/components/chat-events";
 import type { FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
@@ -136,7 +140,11 @@ export function Chat({
           if (event.type === "meta") {
             const nextConversationId = event.conversationId as number;
             conversationId.current = nextConversationId;
-            window.dispatchEvent(new Event(CHAT_UPDATED_EVENT));
+            window.dispatchEvent(
+              new CustomEvent<ChatUpdatedDetail>(CHAT_UPDATED_EVENT, {
+                detail: { conversationId: nextConversationId },
+              }),
+            );
           } else if (event.type === "delta") {
             const chunk = event.text as string;
             setTurns((prior) =>

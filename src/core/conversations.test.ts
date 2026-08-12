@@ -57,6 +57,26 @@ describe("recent chats", () => {
     expect(getConversation(db, visible.id)).not.toBeNull();
   });
 
+  it("limits the sidebar to the 12 newest chats with deterministic tie ordering", () => {
+    const db = openTestDb();
+    const chats = Array.from({ length: 14 }, (_, index) => {
+      const chat = createConversation(db, { title: `Chat ${index + 1}` });
+      appendMessage(db, chat.id, "user", `Message ${index + 1}`);
+      db.prepare<[string, number]>("UPDATE conversation SET updated_at = ? WHERE id = ?").run(
+        "2026-01-01T00:00:00.000Z",
+        chat.id,
+      );
+      return chat;
+    });
+
+    expect(listRecentChats(db).map((chat) => chat.id)).toEqual(
+      chats
+        .slice(-12)
+        .reverse()
+        .map((chat) => chat.id),
+    );
+  });
+
   it("adds history visibility state to an existing conversation store", () => {
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
