@@ -8,6 +8,7 @@ import {
   deleteConversationFromHistoryAction,
   renameConversationAction,
 } from "@/app/actions";
+import { AuthTrigger } from "@/components/auth-trigger";
 import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
 import type { RecentChat } from "@/core/conversations";
 import type { AccountSummary, AuthMode } from "@/lib/auth-types";
@@ -71,8 +72,6 @@ export function Nav({
     router.refresh();
   }
 
-  if (pathname === "/auth" || pathname.startsWith("/auth/")) return null;
-
   if (!isOpen) {
     return (
       <nav
@@ -120,16 +119,18 @@ export function Nav({
         ))}
 
         <div className="hidden flex-1 lg:block" />
-        <CompactNavLink
-          href="/settings"
-          label="Settings"
-          icon="settings"
-          active={pathname.startsWith("/settings")}
-        />
         {account ? (
-          <CompactAccountLink account={account} />
+          <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
         ) : (
-          <CompactLoginLink authMode={authMode} />
+          <>
+            <CompactNavLink
+              href="/settings"
+              label="Settings"
+              icon="settings"
+              active={pathname.startsWith("/settings")}
+            />
+            <CompactLoginLink authMode={authMode} />
+          </>
         )}
       </nav>
     );
@@ -189,54 +190,43 @@ export function Nav({
           />
         ))}
         <span className="shrink-0 lg:hidden">
-          <CompactNavLink
-            href="/settings"
-            label="Settings"
-            icon="settings"
-            active={pathname.startsWith("/settings")}
-          />
-        </span>
-        <span className="shrink-0 lg:hidden">
           {account ? (
-            <CompactAccountLink account={account} />
+            <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
           ) : (
-            <CompactLoginLink authMode={authMode} />
+            <span className="flex gap-0.5">
+              <CompactNavLink
+                href="/settings"
+                label="Settings"
+                icon="settings"
+                active={pathname.startsWith("/settings")}
+              />
+              <CompactLoginLink authMode={authMode} />
+            </span>
           )}
         </span>
       </div>
 
-      <section className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
-        <Link
-          href="/conversations"
-          className="group flex h-8 items-center justify-between rounded-lg px-2.5 transition-colors hover:bg-white/[0.04]"
+      <section className="mt-5 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
+        <h2
+          id="recent-chats-heading"
+          className="h-8 shrink-0 px-2.5 text-xs font-semibold leading-8"
+          style={{ color: "var(--shell-faint)" }}
         >
-          <h2
-            id="recent-chats-heading"
-            className="text-xs font-semibold leading-5"
-            style={{ color: "var(--shell-faint)" }}
-          >
-            Recents
-          </h2>
-          <span
-            className="translate-x-[-2px] opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100"
-            style={{ color: "var(--shell-faint)" }}
-          >
-            <ChevronRightIcon />
-          </span>
-        </Link>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-20">
+          Recents
+        </h2>
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-4">
           {initialRecentChats.length > 0 ? (
-            <ul className="space-y-0.5">
-              {initialRecentChats.map((chat, index) => (
+            <ul>
+              {initialRecentChats.map((chat) => (
                 <ChatHistoryItem
                   key={chat.id}
                   chat={chat}
                   active={activeConversationId === chat.id}
-                  menuPlacement={index >= initialRecentChats.length - 2 ? "above" : "below"}
+                  menuPlacement="below"
                   onOpen={() => undefined}
                   onChanged={() => finishConversationChange()}
                   onDeleted={() => finishConversationChange(chat.id)}
-                  directDelete
+                  hideActions
                 />
               ))}
             </ul>
@@ -249,17 +239,19 @@ export function Nav({
       </section>
 
       <div className="mt-auto hidden lg:block">
-        <NavLink
-          href="/settings"
-          label="Settings"
-          icon="settings"
-          active={pathname.startsWith("/settings")}
-        />
         <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
           {account ? (
-            <AccountLink account={account} />
+            <AccountLink account={account} active={pathname.startsWith("/settings")} />
           ) : (
-            <GuestSidebarCta authMode={authMode} />
+            <>
+              <NavLink
+                href="/settings"
+                label="Settings"
+                icon="settings"
+                active={pathname.startsWith("/settings")}
+              />
+              <GuestSidebarCta authMode={authMode} />
+            </>
           )}
         </div>
       </div>
@@ -274,7 +266,7 @@ export function ChatHistoryItem({
   onOpen,
   onChanged,
   onDeleted,
-  directDelete = false,
+  hideActions = false,
 }: {
   chat: RecentChat;
   active: boolean;
@@ -282,7 +274,7 @@ export function ChatHistoryItem({
   onOpen: () => void;
   onChanged: () => void;
   onDeleted: () => void;
-  directDelete?: boolean;
+  hideActions?: boolean;
 }) {
   const containerRef = useRef<HTMLLIElement>(null);
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
@@ -392,7 +384,9 @@ export function ChatHistoryItem({
         title={title}
         aria-current={active ? "page" : undefined}
         onClick={onOpen}
-        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 pr-9 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
+        className={`flex h-9 min-w-0 items-center rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06] ${
+          hideActions ? "w-full" : "pr-9"
+        }`}
         style={{
           background: active ? "var(--shell-elevated)" : undefined,
           color: "var(--shell-fg)",
@@ -400,31 +394,24 @@ export function ChatHistoryItem({
       >
         <span className="truncate">{title}</span>
       </Link>
-      <button
-        type="button"
-        aria-label={directDelete ? `Delete ${title}` : `Chat options for ${title}`}
-        title={directDelete ? "Delete" : undefined}
-        aria-expanded={directDelete ? undefined : state !== "closed"}
-        disabled={pending}
-        onClick={() => {
-          if (directDelete) {
-            void deleteChat();
-            return;
-          }
-          setState((current) => (current === "closed" ? "menu" : "closed"));
-        }}
-        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] ${
-          directDelete ? "hover:[color:#ff6767]" : ""
-        } disabled:cursor-wait disabled:opacity-50 ${
-          active || state !== "closed"
-            ? "opacity-100"
-            : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
-        }`}
-      >
-        {directDelete ? <TrashIcon /> : <MoreIcon />}
-      </button>
+      {!hideActions && (
+        <button
+          type="button"
+          aria-label={`Chat options for ${title}`}
+          aria-expanded={state !== "closed"}
+          disabled={pending}
+          onClick={() => setState((current) => (current === "closed" ? "menu" : "closed"))}
+          className={`absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-50 ${
+            active || state !== "closed"
+              ? "opacity-100"
+              : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+          }`}
+        >
+          <MoreIcon />
+        </button>
+      )}
 
-      {state !== "closed" && (
+      {!hideActions && state !== "closed" && (
         <div
           role="menu"
           className={`absolute right-1 z-30 w-52 rounded-xl border p-1.5 shadow-2xl ${
@@ -552,7 +539,7 @@ function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
   const description =
     authMode === "misconfigured"
       ? "Account access needs Supabase configuration."
-      : "Your personal AI that remembers what matters—and shows its sources.";
+      : "Your personal AI that remembers what matters.";
 
   return (
     <section
@@ -565,25 +552,27 @@ function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
       <p className="mt-1 text-xs leading-[1.1rem]" style={{ color: "var(--shell-faint)" }}>
         {description}
       </p>
-      <Link
-        href="/auth/login"
+      <AuthTrigger
+        intent="login"
         className="mt-2.5 flex h-8 w-full items-center justify-center rounded-lg text-sm font-medium transition-opacity hover:opacity-90"
         style={{ background: "var(--shell-accent)", color: "#000000" }}
       >
         {configured ? "Log in" : "Set up login"}
-      </Link>
+      </AuthTrigger>
     </section>
   );
 }
 
-function AccountLink({ account }: { account: AccountSummary }) {
+function AccountLink({ account, active }: { account: AccountSummary; active: boolean }) {
   const label = account.name?.trim() || account.email;
 
   return (
     <Link
-      href="/settings#account"
-      aria-label={`Open account settings for ${account.email}`}
+      href="/settings"
+      aria-label={`Open settings for ${account.email}`}
+      aria-current={active ? "page" : undefined}
       className="flex min-h-12 items-center gap-2.5 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-white/[0.06]"
+      style={{ background: active ? "var(--shell-elevated)" : undefined }}
     >
       <AccountAvatar account={account} className="h-8 w-8 text-xs" />
       <span className="min-w-0 flex-1">
@@ -596,13 +585,21 @@ function AccountLink({ account }: { account: AccountSummary }) {
   );
 }
 
-function CompactAccountLink({ account }: { account: AccountSummary }) {
+function CompactAccountLink({
+  account,
+  active,
+}: {
+  account: AccountSummary;
+  active: boolean;
+}) {
   return (
     <Link
-      href="/settings#account"
-      aria-label={`Open account settings for ${account.email}`}
+      href="/settings"
+      aria-label={`Open settings for ${account.email}`}
       title={account.name?.trim() || account.email}
+      aria-current={active ? "page" : undefined}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+      style={{ background: active ? "var(--shell-elevated)" : undefined }}
     >
       <AccountAvatar account={account} className="h-7 w-7 text-[0.65rem]" />
     </Link>
@@ -613,15 +610,15 @@ function CompactLoginLink({ authMode }: { authMode: AuthMode }) {
   const title = authMode === "configured" ? "Log in" : "Set up login";
 
   return (
-    <Link
-      href="/auth/login"
-      aria-label={title}
+    <AuthTrigger
+      intent="login"
+      ariaLabel={title}
       title={title}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
       style={{ color: "var(--shell-muted)" }}
     >
       <LoginIcon />
-    </Link>
+    </AuthTrigger>
   );
 }
 
@@ -770,14 +767,6 @@ function SmallCloseIcon() {
   return (
     <svg aria-hidden viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
       <path d="m7 7 10 10M17 7 7 17" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function ChevronRightIcon() {
-  return (
-    <svg aria-hidden viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="m10 7 5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

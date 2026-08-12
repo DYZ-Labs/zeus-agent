@@ -54,41 +54,53 @@ export type StreamTurnOptions = {
   input: string;
   onDelta?: (text: string) => void;
   historyLimit?: number;
+  signal?: AbortSignal;
 };
 
 export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<TurnResult> {
+  options.signal?.throwIfAborted();
   const userMessage = appendMessage(db, options.conversationId, "user", options.input);
 
   const context = await buildContext(db, options.input, {
     excludeMessageIds: [userMessage.id],
   });
+  options.signal?.throwIfAborted();
   if (context.queryVector) putEmbedding(db, "message", userMessage.id, context.queryVector);
   const history = recentMessages(db, options.conversationId, options.historyLimit ?? 20);
   const priorTurns = history.filter((message) => message.id !== userMessage.id);
 
-  const stream = openai().responses.stream({
-    model: MODEL,
-    max_output_tokens: 8000,
-    reasoning: { effort: "high" },
-    instructions: SYSTEM_PROMPT,
-    input: [
-      ...priorTurns.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-      {
-        role: "user" as const,
-        content: `${renderMemoryBlock(context)}\n\n${options.input}`,
-      },
-    ],
-    store: false,
-  });
+  const stream = openai().responses.stream(
+    {
+      model: MODEL,
+      max_output_tokens: 8000,
+      reasoning: { effort: "high" },
+      instructions: SYSTEM_PROMPT,
+      input: [
+        ...priorTurns.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+        {
+          role: "user" as const,
+          content: `${renderMemoryBlock(context)}\n\n${options.input}`,
+        },
+      ],
+      store: false,
+    },
+    { signal: options.signal },
+  );
 
   if (options.onDelta) {
-    stream.on("response.output_text.delta", (event) => options.onDelta?.(event.delta));
+    stream.on("response.output_text.delta", (event) => {
+      if (!options.signal?.aborted) options.onDelta?.(event.delta);
+    });
   }
   const final = await stream.finalResponse();
+  // The SDK normally rejects finalResponse on abort. This explicit boundary also
+  // covers a completion/abort race before any assistant-authored state is stored.
+  options.signal?.throwIfAborted();
   assertResponseComplete(final);
+  options.signal?.throwIfAborted();
 
   const reply = final.output_text;
   const assistantMessage = appendMessage(db, options.conversationId, "assistant", reply);
@@ -100,7 +112,7 @@ export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<Tu
   // Extraction sees bounded preceding discourse through the current user message.
   // The newly generated reply is intentionally excluded: it cannot be evidence and
   // including it only increases the chance of assistant-authored suggestions leaking.
-  const learned = await learnFrom(db, history.slice(-13), userMessage.id);
+  const learned = await learnFrom(db, history.slice(-13), userMessage.id, options.signal);
 
   return { message: assistantMessage, hits: context.hits, context, learned };
 }
@@ -110,7 +122,9 @@ export async function learnFrom(
   db: Db,
   messages: readonly Message[],
   sourceMessageId: number | null,
+  signal?: AbortSignal,
 ): Promise<ApplyResult | null> {
+  signal?.throwIfAborted();
   let run;
   try {
     run = startExtractionRun(db, sourceMessageId);
@@ -127,9 +141,11 @@ export async function learnFrom(
     const extractOptions = {
       messages,
       context: extractionContext(db, 100, focusText),
+      signal,
     };
     const allowedSourceMessageIds = extractionSourceMessageIds(extractOptions);
     const extraction = await extract(extractOptions);
+    signal?.throwIfAborted();
     const applied = db.transaction(() => {
       const result = applyExtraction(db, extraction, sourceMessageId, {
         requireEvidence: true,
@@ -179,6 +195,9 @@ export async function learnFrom(
     } catch {
       // Audit failure must not replace an already streamed assistant reply.
     }
+    // Cancellation means the caller stopped the turn, not that the source failed
+    // privacy classification. Leave it unclassified instead of permanently hiding it.
+    if (signal?.aborted) signal.throwIfAborted();
     safelyBlockRecall(db, sourceMessageId);
     console.warn(
       `[zeus] extraction failed for this turn (${extractionErrorCode(error)}); chat response preserved`,
