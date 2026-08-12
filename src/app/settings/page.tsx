@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 import {
   followThroughDecisionAction,
   setStewardshipModeAction,
@@ -6,7 +8,6 @@ import { logoutAction } from "@/app/auth/actions";
 import { DeleteAllRecentChats } from "@/components/delete-all-conversations";
 import { SettingsModal } from "@/components/settings-modal";
 import { listChatHistory } from "@/core/conversations";
-import Link from "next/link";
 import type {
   FollowThroughEventView,
   StewardshipMode,
@@ -134,14 +135,14 @@ function AuthLinks() {
   return (
     <div className="mt-6 flex flex-wrap items-center gap-3">
       <Link
-        href="/auth/login"
+        href="/auth/login?next=/settings"
         className="rounded-lg px-4 py-2 text-sm font-medium"
         style={{ background: "var(--shell-accent)", color: "#000000" }}
       >
         Log in
       </Link>
       <Link
-        href="/auth/signup"
+        href="/auth/signup?next=/settings"
         className="rounded-lg border px-4 py-2 text-sm font-medium"
         style={{ borderColor: "var(--shell-line-strong)" }}
       >

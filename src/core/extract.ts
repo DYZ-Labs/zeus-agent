@@ -229,6 +229,7 @@ function renderTranscript(messages: readonly Pick<Message, "id" | "role" | "cont
 export type ExtractOptions = {
   messages: readonly Pick<Message, "id" | "role" | "content">[];
   context: ExtractionContext;
+  signal?: AbortSignal;
 };
 
 type PreparedExtractionInput = {
@@ -385,25 +386,31 @@ function emptyExtraction(): ParsedExtraction {
 }
 
 export async function extract(options: ExtractOptions): Promise<ParsedExtraction> {
+  options.signal?.throwIfAborted();
   if (options.messages.length === 0) return emptyExtraction();
   const input = buildExtractionInput(options);
 
-  const response = await openai().responses.parse({
-    model: MODEL,
-    max_output_tokens: 8000,
-    reasoning: { effort: "low" },
-    instructions: SYSTEM_PROMPT,
-    text: { format: zodTextFormat(ExtractionSchema, "memory_extraction") },
-    input: [
-      {
-        role: "user",
-        content: input,
-      },
-    ],
-    store: false,
-  });
+  const response = await openai().responses.parse(
+    {
+      model: MODEL,
+      max_output_tokens: 8000,
+      reasoning: { effort: "low" },
+      instructions: SYSTEM_PROMPT,
+      text: { format: zodTextFormat(ExtractionSchema, "memory_extraction") },
+      input: [
+        {
+          role: "user",
+          content: input,
+        },
+      ],
+      store: false,
+    },
+    { signal: options.signal },
+  );
 
+  options.signal?.throwIfAborted();
   assertResponseComplete(response);
+  options.signal?.throwIfAborted();
 
   return response.output_parsed ?? emptyExtraction();
 }
