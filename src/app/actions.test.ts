@@ -23,6 +23,7 @@ const actionMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/server/db", () => ({ getDb: actionMocks.getDb }));
+vi.mock("server-only", () => ({}));
 vi.mock("next/cache", () => ({ revalidatePath: actionMocks.revalidatePath }));
 vi.mock("next/navigation", () => ({ redirect: actionMocks.redirect }));
 vi.mock("@/core/embed", async (importOriginal) => {

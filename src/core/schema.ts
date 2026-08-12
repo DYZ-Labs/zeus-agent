@@ -135,6 +135,16 @@ export type PassageRecallStatus = z.infer<typeof PassageRecallStatus>;
 // Stored rows
 // ---------------------------------------------------------------------------
 
+export const AppOwner = z
+  .object({
+    id: z.literal(1),
+    supabase_user_id: z.string().uuid(),
+    email: z.string().email(),
+    bound_at: z.string(),
+  })
+  .strict();
+export type AppOwner = z.infer<typeof AppOwner>;
+
 export const Entity = z
   .object({
     id: z.number().int(),

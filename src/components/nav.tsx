@@ -10,6 +10,7 @@ import {
 } from "@/app/actions";
 import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
 import type { RecentChat } from "@/core/conversations";
+import type { AccountSummary, AuthMode } from "@/lib/auth-types";
 
 const PRIMARY_LINKS = [
   { href: "/today", label: "Today", icon: "today" },
@@ -24,7 +25,15 @@ const COMPACT_LINKS = [
 
 type IconName = (typeof COMPACT_LINKS)[number]["icon"] | "settings";
 
-export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }) {
+export function Nav({
+  initialRecentChats,
+  authMode,
+  account,
+}: {
+  initialRecentChats: RecentChat[];
+  authMode: AuthMode;
+  account: AccountSummary | null;
+}) {
   const pathname = usePathname();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -61,6 +70,8 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
     }
     router.refresh();
   }
+
+  if (pathname === "/auth" || pathname.startsWith("/auth/")) return null;
 
   if (!isOpen) {
     return (
@@ -115,6 +126,11 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
           icon="settings"
           active={pathname.startsWith("/settings")}
         />
+        {account ? (
+          <CompactAccountLink account={account} />
+        ) : (
+          <CompactLoginLink authMode={authMode} />
+        )}
       </nav>
     );
   }
@@ -180,6 +196,13 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
             active={pathname.startsWith("/settings")}
           />
         </span>
+        <span className="shrink-0 lg:hidden">
+          {account ? (
+            <CompactAccountLink account={account} />
+          ) : (
+            <CompactLoginLink authMode={authMode} />
+          )}
+        </span>
       </div>
 
       <section className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
@@ -225,13 +248,20 @@ export function Nav({ initialRecentChats }: { initialRecentChats: RecentChat[] }
         </div>
       </section>
 
-      <div className="mt-auto hidden border-t pt-2 lg:block" style={{ borderColor: "var(--shell-line)" }}>
+      <div className="mt-auto hidden lg:block">
         <NavLink
           href="/settings"
           label="Settings"
           icon="settings"
           active={pathname.startsWith("/settings")}
         />
+        <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
+          {account ? (
+            <AccountLink account={account} />
+          ) : (
+            <GuestSidebarCta authMode={authMode} />
+          )}
+        </div>
       </div>
     </nav>
   );
@@ -514,6 +544,111 @@ function CompactNavLink({
     >
       <NavIcon name={icon} />
     </Link>
+  );
+}
+
+function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
+  const configured = authMode === "configured";
+  const description =
+    authMode === "misconfigured"
+      ? "Account access needs Supabase configuration."
+      : "Your personal AI that remembers what matters—and shows its sources.";
+
+  return (
+    <section
+      className="rounded-xl px-2.5 py-2"
+      aria-label={configured ? "Log in to Zeus" : "Set up Zeus login"}
+    >
+      <p className="text-sm font-medium leading-5" style={{ color: "var(--shell-fg)" }}>
+        Make Zeus yours
+      </p>
+      <p className="mt-1 text-xs leading-[1.1rem]" style={{ color: "var(--shell-faint)" }}>
+        {description}
+      </p>
+      <Link
+        href="/auth/login"
+        className="mt-2.5 flex h-8 w-full items-center justify-center rounded-lg text-sm font-medium transition-opacity hover:opacity-90"
+        style={{ background: "var(--shell-accent)", color: "#000000" }}
+      >
+        {configured ? "Log in" : "Set up login"}
+      </Link>
+    </section>
+  );
+}
+
+function AccountLink({ account }: { account: AccountSummary }) {
+  const label = account.name?.trim() || account.email;
+
+  return (
+    <Link
+      href="/settings#account"
+      aria-label={`Open account settings for ${account.email}`}
+      className="flex min-h-12 items-center gap-2.5 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-white/[0.06]"
+    >
+      <AccountAvatar account={account} className="h-8 w-8 text-xs" />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium leading-5">{label}</span>
+        <span className="block truncate text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
+          {account.name?.trim() ? account.email : "Account"}
+        </span>
+      </span>
+    </Link>
+  );
+}
+
+function CompactAccountLink({ account }: { account: AccountSummary }) {
+  return (
+    <Link
+      href="/settings#account"
+      aria-label={`Open account settings for ${account.email}`}
+      title={account.name?.trim() || account.email}
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+    >
+      <AccountAvatar account={account} className="h-7 w-7 text-[0.65rem]" />
+    </Link>
+  );
+}
+
+function CompactLoginLink({ authMode }: { authMode: AuthMode }) {
+  const title = authMode === "configured" ? "Log in" : "Set up login";
+
+  return (
+    <Link
+      href="/auth/login"
+      aria-label={title}
+      title={title}
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+      style={{ color: "var(--shell-muted)" }}
+    >
+      <LoginIcon />
+    </Link>
+  );
+}
+
+function AccountAvatar({ account, className }: { account: AccountSummary; className: string }) {
+  const fallback = (account.name?.trim() || account.email).slice(0, 1).toLocaleUpperCase();
+
+  return (
+    <span
+      aria-hidden
+      className={`flex shrink-0 items-center justify-center rounded-full bg-cover bg-center font-semibold ${className}`}
+      style={
+        account.avatarUrl
+          ? { backgroundImage: `url(${account.avatarUrl})`, backgroundColor: "var(--shell-elevated)" }
+          : { background: "var(--shell-accent)", color: "#000000" }
+      }
+    >
+      {!account.avatarUrl && fallback}
+    </span>
+  );
+}
+
+function LoginIcon() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M10 5H6.5A2.5 2.5 0 0 0 4 7.5v9A2.5 2.5 0 0 0 6.5 19H10" strokeLinecap="round" />
+      <path d="M13 8.5 16.5 12 13 15.5M7.5 12h9" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   );
 }
 

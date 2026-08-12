@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { getCommitment } from "@/core/intentions";
 import { recordFollowThroughDecision } from "@/core/stewardship";
-import { getDb } from "@/server/db";
+import { getOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,6 +17,14 @@ const Body = z
   .strict();
 
 export async function POST(request: Request): Promise<Response> {
+  const access = await getOwnerAccess();
+  if (!access.canAccessPrivateData) {
+    return Response.json(
+      { error: access.message },
+      { status: access.state === "signed_out" ? 401 : access.state === "wrong_account" ? 403 : 503 },
+    );
+  }
+
   const parsed = Body.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return Response.json(
@@ -25,7 +33,7 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const db = getDb();
+  const db = access.db;
   if (!getCommitment(db, parsed.data.commitmentId)) {
     return Response.json({ error: "That commitment no longer exists." }, { status: 404 });
   }

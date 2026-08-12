@@ -785,6 +785,27 @@ CREATE TABLE conversation_history_state (
 );
 `;
 
+/** Zeus owns one local memory store, so authentication binds that store to exactly one
+ * Supabase identity. The singleton key prevents a later signup from claiming the same
+ * evidence-backed memory, while the UUID remains the stable identity if email changes. */
+const APP_OWNER = `
+CREATE TABLE app_owner (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  supabase_user_id   TEXT NOT NULL UNIQUE
+                     CHECK (
+                       supabase_user_id = lower(trim(supabase_user_id))
+                       AND length(supabase_user_id) = 36
+                       AND substr(supabase_user_id, 9, 1) = '-'
+                       AND substr(supabase_user_id, 14, 1) = '-'
+                       AND substr(supabase_user_id, 19, 1) = '-'
+                       AND substr(supabase_user_id, 24, 1) = '-'
+                     ),
+  email              TEXT NOT NULL
+                     CHECK (email = lower(trim(email)) AND length(email) > 3),
+  bound_at           TEXT NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -797,4 +818,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "009_backfill_preview_reason", sql: BACKFILL_PREVIEW_REASON },
   { id: "010_backfill_item_compatibility", sql: BACKFILL_ITEM_COMPATIBILITY },
   { id: "011_conversation_history_state", sql: CONVERSATION_HISTORY_STATE },
+  { id: "012_app_owner", sql: APP_OWNER },
 ];

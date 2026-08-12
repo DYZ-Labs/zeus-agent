@@ -12,6 +12,7 @@ import {
   listCommitments,
   listGoals,
 } from "@/core/intentions";
+import type { Db } from "@/core/db";
 import type {
   CommitmentStatus,
   CommitmentView,
@@ -19,10 +20,8 @@ import type {
   GoalPriority,
   GoalStatus,
 } from "@/core/schema";
-import { getDb } from "@/server/db";
 
-export function Plans({ showCompleted }: { showCompleted: boolean }) {
-  const db = getDb();
+export function Plans({ db, showCompleted }: { db: Db; showCompleted: boolean }) {
   const goals = listGoals(db, { includeClosed: showCompleted, limit: 300 });
   const commitments = listCommitments(db, { includeClosed: showCompleted, limit: 500 });
 
@@ -50,7 +49,7 @@ export function Plans({ showCompleted }: { showCompleted: boolean }) {
         {goals.length ? (
           <ul className="mt-2">
             {goals.map((goal) => (
-              <GoalRow key={goal.id} goal={goal} />
+              <GoalRow key={goal.id} db={db} goal={goal} />
             ))}
           </ul>
         ) : (
@@ -63,7 +62,7 @@ export function Plans({ showCompleted }: { showCompleted: boolean }) {
         {commitments.length ? (
           <ul className="mt-2">
             {commitments.map((commitment) => (
-              <CommitmentRow key={commitment.id} commitment={commitment} />
+              <CommitmentRow key={commitment.id} db={db} commitment={commitment} />
             ))}
           </ul>
         ) : (
@@ -74,8 +73,8 @@ export function Plans({ showCompleted }: { showCompleted: boolean }) {
   );
 }
 
-function GoalRow({ goal }: { goal: Goal }) {
-  const events = goalEvents(getDb(), goal.id);
+function GoalRow({ db, goal }: { db: Db; goal: Goal }) {
+  const events = goalEvents(db, goal.id);
   const actions: GoalStatus[] =
     goal.status === "active"
       ? ["paused", "achieved", "abandoned"]
@@ -126,8 +125,8 @@ function GoalRow({ goal }: { goal: Goal }) {
   );
 }
 
-function CommitmentRow({ commitment }: { commitment: CommitmentView }) {
-  const events = commitmentEvents(getDb(), commitment.id);
+function CommitmentRow({ db, commitment }: { db: Db; commitment: CommitmentView }) {
+  const events = commitmentEvents(db, commitment.id);
   const actions: CommitmentStatus[] =
     commitment.status === "open"
       ? ["waiting", "done", "cancelled"]

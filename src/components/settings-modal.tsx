@@ -1,19 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-type SettingsSection = "follow-through" | "data";
+type SettingsSection = "account" | "follow-through" | "data";
 
 export function SettingsModal({
+  account,
   followThrough,
   dataControls,
 }: {
+  account: React.ReactNode;
   followThrough: React.ReactNode;
   dataControls: React.ReactNode;
 }) {
   const router = useRouter();
-  const [activeSection, setActiveSection] = useState<SettingsSection>("follow-through");
+  const [activeSection, setActiveSection] = useState<SettingsSection>("account");
+  const dialogRef = useRef<HTMLElement>(null);
 
   const close = useCallback(() => {
     if (window.history.length > 1) {
@@ -28,28 +31,73 @@ export function SettingsModal({
     window.history.replaceState(
       window.history.state,
       "",
-      section === "data" ? "#data" : "#follow-through",
+      `#${section}`,
     );
   }, []);
 
   useEffect(() => {
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === "Escape") close();
-    }
-
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [close]);
-
-  useEffect(() => {
     function syncSectionFromHash() {
-      setActiveSection(window.location.hash === "#data" ? "data" : "follow-through");
+      const requestedSection = window.location.hash.slice(1);
+      setActiveSection(
+        requestedSection === "follow-through" || requestedSection === "data"
+          ? requestedSection
+          : "account",
+      );
     }
 
     syncSectionFromHash();
     window.addEventListener("hashchange", syncSectionFromHash);
     return () => window.removeEventListener("hashchange", syncSectionFromHash);
   }, []);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (!dialog) return;
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      (dialog.querySelector<HTMLElement>('[aria-current="page"]') ?? dialog).focus();
+    });
+
+    function keepFocusInside(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.key !== "Tab" || !dialog) return;
+
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      const focused = document.activeElement;
+      if (event.shiftKey && (focused === first || !dialog.contains(focused))) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && (focused === last || !dialog.contains(focused))) {
+        event.preventDefault();
+        first?.focus();
+      }
+    }
+
+    document.addEventListener("keydown", keepFocusInside);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", keepFocusInside);
+      previouslyFocused?.focus();
+    };
+  }, [close]);
 
   return (
     <div
@@ -59,9 +107,11 @@ export function SettingsModal({
       }}
     >
       <section
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
+        tabIndex={-1}
         className="flex h-full w-full flex-col overflow-hidden border text-sm leading-5 shadow-2xl sm:h-[560px] sm:max-h-[calc(100vh-3rem)] sm:w-[680px] sm:max-w-[calc(100vw-3rem)] sm:flex-row sm:rounded-2xl"
         style={{
           background: "var(--shell-panel)",
@@ -93,6 +143,12 @@ export function SettingsModal({
             className="flex gap-1 overflow-x-auto px-2 pb-2 sm:flex-col sm:overflow-visible"
           >
             <SettingsSectionButton
+              label="Account"
+              icon={<AccountIcon />}
+              active={activeSection === "account"}
+              onSelect={() => selectSection("account")}
+            />
+            <SettingsSectionButton
               label="Follow-through"
               icon={<FollowThroughIcon />}
               active={activeSection === "follow-through"}
@@ -108,7 +164,11 @@ export function SettingsModal({
         </aside>
 
         <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
-          {activeSection === "follow-through" ? followThrough : dataControls}
+          {activeSection === "account"
+            ? account
+            : activeSection === "follow-through"
+              ? followThrough
+              : dataControls}
         </div>
       </section>
     </div>
@@ -147,6 +207,15 @@ function CloseIcon() {
   return (
     <svg aria-hidden viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8">
       <path d="m6 6 12 12M18 6 6 18" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function AccountIcon() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="8" r="3.2" />
+      <path d="M5.5 19a6.5 6.5 0 0 1 13 0" strokeLinecap="round" />
     </svg>
   );
 }

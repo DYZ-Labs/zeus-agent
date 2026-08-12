@@ -9,7 +9,7 @@ import {
   recommendationForCommitment,
   recommendNextAction,
 } from "@/core/stewardship";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -18,7 +18,7 @@ export default async function TodayPage({
 }: {
   searchParams: Promise<{ focus?: string; show?: string }>;
 }) {
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const params = await searchParams;
   const focus = Number(params.focus);
   const recommendation = Number.isInteger(focus) && focus > 0
@@ -55,7 +55,7 @@ export default async function TodayPage({
           )}
         </section>
 
-        <Plans showCompleted={params.show === "completed"} />
+        <Plans db={db} showCompleted={params.show === "completed"} />
       </div>
     </div>
   );

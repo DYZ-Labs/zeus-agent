@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { CHAT_UPDATED_EVENT, NEW_CHAT_EVENT } from "@/components/chat-events";
@@ -38,16 +39,20 @@ type Status = "idle" | "streaming" | "error";
 
 export function Chat({
   hasCredentials,
+  canAccessPrivateData,
+  showAuthActions,
   initialPrompt,
   initialTurns = [],
   initialConversationId,
 }: {
   hasCredentials: boolean;
+  canAccessPrivateData: boolean;
+  showAuthActions: boolean;
   initialPrompt?: string;
   initialTurns?: ChatHistoryTurn[];
   initialConversationId?: number;
 }) {
-  const [turns, setTurns] = useState<Turn[]>(initialTurns);
+  const [turns, setTurns] = useState<Turn[]>(canAccessPrivateData ? initialTurns : []);
   const [input, setInput] = useState(initialPrompt ?? "");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -83,7 +88,7 @@ export function Chat({
 
   async function send() {
     const text = input.trim();
-    if (!text || status === "streaming") return;
+    if (!text || status === "streaming" || !canAccessPrivateData) return;
 
     const replyId = crypto.randomUUID();
     setTurns((prior) => [
@@ -224,7 +229,9 @@ export function Chat({
     }
   }
 
-  const canSend = Boolean(input.trim()) && status !== "streaming" && hasCredentials;
+  const hasVisibleTurns = canAccessPrivateData && turns.length > 0;
+  const canSend =
+    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canAccessPrivateData;
   const composer = (
     <Composer
       input={input}
@@ -234,17 +241,22 @@ export function Chat({
       status={status}
       canSend={canSend}
       hasCredentials={hasCredentials}
-      centered={turns.length === 0}
+      canAccessPrivateData={canAccessPrivateData}
+      centered={!hasVisibleTurns}
     />
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col" style={{ background: "var(--shell-bg)" }}>
-      {turns.length === 0 ? (
+    <div
+      className="relative flex h-full min-h-0 flex-col"
+      style={{ background: "var(--shell-bg)" }}
+    >
+      {!hasVisibleTurns && showAuthActions && <GuestAuthActions />}
+      {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[12vh] pt-20">
-            {!hasCredentials && <CredentialsNotice />}
-            <EmptyState />
+            {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
+            <EmptyState requiresLogin={!canAccessPrivateData} />
             {composer}
           </div>
         </div>
@@ -252,7 +264,7 @@ export function Chat({
         <>
           <div className="min-h-0 flex-1 overflow-y-auto">
             <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 pt-6 md:px-6">
-              {!hasCredentials && <CredentialsNotice />}
+              {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
               <ol className="space-y-8 py-4">
                 {turns.map((turn) => (
                   <li key={turn.id}>
@@ -312,6 +324,7 @@ function Composer({
   status,
   canSend,
   hasCredentials,
+  canAccessPrivateData,
   centered,
 }: {
   input: string;
@@ -321,8 +334,11 @@ function Composer({
   status: Status;
   canSend: boolean;
   hasCredentials: boolean;
+  canAccessPrivateData: boolean;
   centered: boolean;
 }) {
+  const inputLabel = canAccessPrivateData ? "Message Zeus" : "Log in to message Zeus";
+
   return (
     <form
       onSubmit={(event) => {
@@ -338,15 +354,15 @@ function Composer({
           style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
         >
           <label htmlFor="chat-input" className="sr-only">
-            Message Zeus
+            {inputLabel}
           </label>
           <textarea
             ref={textareaRef}
             id="chat-input"
             rows={1}
             value={input}
-            disabled={!hasCredentials}
-            autoFocus={centered && hasCredentials}
+            disabled={!hasCredentials || !canAccessPrivateData}
+            autoFocus={centered && hasCredentials && canAccessPrivateData}
             onChange={(event) => onInputChange(event.target.value)}
             onInput={(event) => resizeComposer(event.currentTarget)}
             onKeyDown={(event) => {
@@ -355,7 +371,7 @@ function Composer({
                 void onSend();
               }
             }}
-            placeholder="Message Zeus"
+            placeholder={inputLabel}
             className="max-h-[200px] min-h-9 flex-1 resize-none overflow-y-auto bg-transparent px-1 py-1.5 text-[0.95rem] leading-6 outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{ color: "var(--shell-fg)", outline: "none" }}
           />
@@ -531,7 +547,7 @@ function FollowThroughCard({
         <a href={`/source/${recommendation.commitment_source_message_id}`} className="underline underline-offset-2">
           why this is known
         </a>
-        <a href="/settings" className="underline underline-offset-2">
+        <a href="/settings#follow-through" className="underline underline-offset-2">
           follow-through settings
         </a>
       </div>
@@ -621,13 +637,42 @@ function Receipt({
   );
 }
 
-function EmptyState() {
+function EmptyState({ requiresLogin }: { requiresLogin: boolean }) {
   return (
     <div className="w-full text-center">
       <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">
         What can I help with?
       </h1>
+      {requiresLogin && (
+        <p className="mx-auto mt-2 max-w-[28rem] text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+          Log in to start a private conversation with the personal AI that remembers what matters.
+        </p>
+      )}
     </div>
+  );
+}
+
+function GuestAuthActions() {
+  return (
+    <nav
+      aria-label="Account access"
+      className="absolute right-0 top-0 z-10 flex h-16 items-center gap-2 px-4 sm:px-5"
+    >
+      <Link
+        href="/auth/login"
+        className="flex h-9 items-center rounded-full px-4 text-sm font-medium transition-opacity hover:opacity-90"
+        style={{ background: "var(--shell-accent)", color: "#000000" }}
+      >
+        Log in
+      </Link>
+      <Link
+        href="/auth/signup"
+        className="flex h-9 items-center rounded-full border px-4 text-sm font-medium transition-colors hover:bg-white/[0.06]"
+        style={{ borderColor: "var(--shell-line-strong)", color: "var(--shell-fg)" }}
+      >
+        Sign up
+      </Link>
+    </nav>
   );
 }
 

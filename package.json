@@ -20,6 +20,8 @@
   "dependencies": {
     "@huggingface/transformers": "4.2.0",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@supabase/ssr": "0.12.4",
+    "@supabase/supabase-js": "2.112.3",
     "better-sqlite3": "13.0.3",
     "next": "16.2.11",
     "openai": "7.4.0",

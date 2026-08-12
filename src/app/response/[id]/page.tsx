@@ -10,7 +10,7 @@ import {
 } from "@/core/response-context";
 import type { RecallItem } from "@/core/schema";
 import { recommendationsForResponse } from "@/core/stewardship";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -21,7 +21,7 @@ export default async function ResponseSourcesPage({
 }) {
   const id = Number((await params).id);
   if (!Number.isInteger(id)) notFound();
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const message = getMessage(db, id);
   if (!message || message.role !== "assistant") notFound();
   const selections = responseSelectionsForResponse(db, id);

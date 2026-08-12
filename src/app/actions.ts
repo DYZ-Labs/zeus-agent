@@ -74,7 +74,7 @@ import {
   recordFollowThroughDecision,
   setStewardshipMode,
 } from "@/core/stewardship";
-import { getDb } from "@/server/db";
+import { requireOwnerDb } from "@/server/auth/access";
 
 /**
  * Curation actions.
@@ -89,7 +89,7 @@ export async function editFactAction(formData: FormData): Promise<void> {
   const object = String(formData.get("object") ?? "").trim();
   if (!Number.isInteger(id) || !object) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const existing = getFact(db, id);
   if (!existing || existing.object === object) return;
 
@@ -122,7 +122,7 @@ export async function editFactAction(formData: FormData): Promise<void> {
 export async function acceptCandidateAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.status !== "pending") return;
   const applied = acceptCandidate(db, id);
@@ -137,7 +137,7 @@ export async function acceptCandidateAction(formData: FormData): Promise<void> {
 export async function rejectCandidateAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  rejectCandidateWithAudit(getDb(), id);
+  rejectCandidateWithAudit(await requireOwnerDb(), id);
   revalidatePath("/memory");
 }
 
@@ -147,7 +147,7 @@ export async function acceptFacetCandidateAction(formData: FormData): Promise<vo
   const machineEffect = parseMachineEffect(formData.get("machineEffect"));
   if (!Number.isInteger(id) || !statement || machineEffect === undefined) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.kind !== "facet" || candidate.status !== "pending") return;
   const applied = acceptCandidate(db, id, { facetEdit: { statement, machineEffect } });
@@ -160,7 +160,7 @@ export async function acceptFacetCandidateAction(formData: FormData): Promise<vo
 export async function rejectFacetCandidateAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.kind !== "facet") return;
   rejectCandidateWithAudit(db, id);
@@ -174,7 +174,7 @@ export async function correctFacetAction(formData: FormData): Promise<void> {
   const machineEffect = parseMachineEffect(formData.get("machineEffect"));
   if (!Number.isInteger(id) || !statement || machineEffect === undefined) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const existing = getFacet(db, id);
   if (!existing || existing.valid_to !== null) return;
   if (existing.statement === statement && existing.machine_effect === machineEffect) return;
@@ -211,7 +211,7 @@ export async function correctFacetAction(formData: FormData): Promise<void> {
 export async function closeFacetAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const facet = getFacet(db, id);
   if (!facet || facet.valid_to !== null) return;
   const source = curationMessage(db, `Marked understanding as no longer applicable: ${facet.statement}`);
@@ -223,7 +223,7 @@ export async function closeFacetAction(formData: FormData): Promise<void> {
 export async function forgetFacetAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  forgetFacet(getDb(), id);
+  forgetFacet(await requireOwnerDb(), id);
   revalidatePath("/understanding");
   revalidatePath("/today");
 }
@@ -234,7 +234,7 @@ export async function answerReflectionAction(formData: FormData): Promise<void> 
   const kind = String(formData.get("kind") ?? "") as FacetKind;
   if (!prompt || !answer || !FACET_KIND_VALUES.has(kind)) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const conversation =
     listConversations(db, 500).find((entry) => entry.title === "Understanding reflections") ??
     createConversation(db, { title: "Understanding reflections", source: "web" });
@@ -293,14 +293,14 @@ export async function answerReflectionAction(formData: FormData): Promise<void> 
 }
 
 export async function startBackfillAction(): Promise<void> {
-  startUnderstandingBackfill(getDb());
+  startUnderstandingBackfill(await requireOwnerDb());
   revalidatePath("/understanding/backfill");
 }
 
 export async function processBackfillAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   if (!getUnderstandingBackfillJob(db, id)) return;
   await processUnderstandingBackfillBatch(db, id);
   revalidatePath("/understanding/backfill");
@@ -310,7 +310,7 @@ export async function processBackfillAction(formData: FormData): Promise<void> {
 export async function acceptBackfillBatchAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const accepted = acceptEligibleBackfillFacets(db, id);
   await embedAppliedMemory(
     db,
@@ -329,7 +329,7 @@ export async function updateGoalStatusAction(formData: FormData): Promise<void> 
     !Number.isInteger(id) ||
     !["active", "paused", "achieved", "abandoned"].includes(status)
   ) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const goal = getGoal(db, id);
   if (!goal) return;
   const source = curationMessage(db, `Set goal "${goal.title}" to ${status}.`);
@@ -345,7 +345,7 @@ export async function setGoalPriorityAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   const priority = String(formData.get("priority") ?? "") as GoalPriority;
   if (!Number.isInteger(id) || !["low", "normal", "high"].includes(priority)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const goal = getGoal(db, id);
   if (!goal || goal.priority === priority) return;
   const source = curationMessage(db, `Set goal "${goal.title}" to ${priority} priority.`);
@@ -363,7 +363,7 @@ export async function updateCommitmentStatusAction(formData: FormData): Promise<
   if (!Number.isInteger(id) || !["open", "waiting", "done", "cancelled"].includes(status)) {
     return;
   }
-  const db = getDb();
+  const db = await requireOwnerDb();
   const commitment = getCommitment(db, id);
   if (!commitment) return;
   const source = curationMessage(
@@ -382,7 +382,7 @@ export async function snoozeCommitmentAction(formData: FormData): Promise<void> 
   const id = Number(formData.get("id"));
   const until = String(formData.get("until") ?? "");
   if (!Number.isInteger(id) || !until) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const commitment = getCommitment(db, id);
   if (!commitment) return;
   const source = curationMessage(
@@ -400,7 +400,7 @@ export async function snoozeCommitmentAction(formData: FormData): Promise<void> 
 export async function setStewardshipModeAction(formData: FormData): Promise<void> {
   const mode = String(formData.get("mode") ?? "") as StewardshipMode;
   if (!["quiet", "balanced", "proactive"].includes(mode)) return;
-  const db = getDb();
+  const db = await requireOwnerDb();
   const source = curationMessage(db, `Set follow-through mode to ${mode}.`);
   setStewardshipMode(db, mode, source.id);
   revalidatePath("/today");
@@ -419,7 +419,7 @@ export async function followThroughDecisionAction(formData: FormData): Promise<v
   ) {
     return;
   }
-  const db = getDb();
+  const db = await requireOwnerDb();
   const recommendation = recommendationForCommitment(db, commitmentId);
   const userReason = normalizedText(formData.get("reason"), 1_000);
   const event = recordFollowThroughDecision(db, {
@@ -440,7 +440,7 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   const id = Number(formData.get("id"));
   const confirmation = String(formData.get("confirmation") ?? "");
   if (!Number.isInteger(id) || confirmation !== "delete") return;
-  if (!hideConversationFromHistory(getDb(), id)) return;
+  if (!hideConversationFromHistory(await requireOwnerDb(), id)) return;
   revalidatePath("/", "layout");
   revalidatePath("/conversations");
   revalidatePath("/settings");
@@ -451,7 +451,7 @@ export async function renameConversationAction(id: number, title: string): Promi
   const normalizedTitle = title.replace(/\s+/gu, " ").trim().slice(0, 100);
   if (!Number.isInteger(id) || !normalizedTitle) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const conversation = getConversation(db, id);
   if (!conversation || conversation.title === "Memory curation") return;
 
@@ -467,7 +467,7 @@ export async function deleteConversationFromHistoryAction(
 ): Promise<void> {
   if (!Number.isInteger(id) || confirmation !== "delete") return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   if (!hideConversationFromHistory(db, id)) return;
   revalidatePath("/", "layout");
   revalidatePath("/conversations");
@@ -478,7 +478,7 @@ export async function deleteAllRecentChatsAction(formData: FormData): Promise<vo
   const confirmation = String(formData.get("confirmation") ?? "");
   if (confirmation !== "delete-all-recent") return;
 
-  hideAllConversationsFromHistory(getDb());
+  hideAllConversationsFromHistory(await requireOwnerDb());
   revalidatePath("/", "layout");
   revalidatePath("/conversations");
   revalidatePath("/settings");
@@ -488,7 +488,7 @@ export async function supersedeFactAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const fact = getFact(db, id);
   if (!fact) return;
   const source = curationMessage(
@@ -504,7 +504,7 @@ export async function reviveFactAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const fact = getFact(db, id);
   if (!fact) return;
   const source = curationMessage(
@@ -532,7 +532,7 @@ export async function forgetFactAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
 
-  const db = getDb();
+  const db = await requireOwnerDb();
   const fact = getFact(db, id);
   if (!fact) return;
 
@@ -548,7 +548,7 @@ export async function setCardinalityAction(formData: FormData): Promise<void> {
   const cardinality = String(formData.get("cardinality") ?? "") as Cardinality;
   if (!name || (cardinality !== "single" && cardinality !== "multi")) return;
 
-  setPredicateCardinality(getDb(), name, cardinality);
+  setPredicateCardinality(await requireOwnerDb(), name, cardinality);
   revalidatePath("/memory");
 }
 
@@ -557,7 +557,7 @@ export async function mergeEntitiesAction(formData: FormData): Promise<void> {
   const target = Number(formData.get("target"));
   if (!Number.isInteger(source) || !Number.isInteger(target)) return;
 
-  mergeEntities(getDb(), source, target);
+  mergeEntities(await requireOwnerDb(), source, target);
   revalidatePath("/memory");
 }
 
@@ -567,7 +567,7 @@ export async function setSummaryAction(formData: FormData): Promise<void> {
   const summary = String(formData.get("summary") ?? "").trim();
   if (!Number.isInteger(id)) return;
 
-  setEntitySummary(getDb(), id, summary || null);
+  setEntitySummary(await requireOwnerDb(), id, summary || null);
   if (slug) revalidatePath(`/entity/${slug}`);
 }
 

@@ -6,7 +6,7 @@ import {
   startBackfillAction,
 } from "@/app/actions";
 import { PageHeader } from "@/components/page-header";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -35,8 +35,8 @@ type CandidateCounts = {
   batchEligible: number;
 };
 
-export default function UnderstandingBackfillPage() {
-  const db = getDb();
+export default async function UnderstandingBackfillPage() {
+  const db = await requireOwnerPageDb();
   const job = db
     .prepare<[], BackfillJob>(
       `SELECT id, status, conversation_count, message_count, processed_count,
@@ -239,7 +239,10 @@ function BackfillControls({
   );
 }
 
-function countsForJob(db: ReturnType<typeof getDb>, jobId: number): CandidateCounts {
+function countsForJob(
+  db: Awaited<ReturnType<typeof requireOwnerPageDb>>,
+  jobId: number,
+): CandidateCounts {
   const rows = db
     .prepare<[number], { status: "pending" | "accepted" | "rejected"; count: number }>(
       `SELECT status, COUNT(*) AS count

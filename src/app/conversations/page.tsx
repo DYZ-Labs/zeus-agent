@@ -3,12 +3,12 @@ import {
   type ConversationHistoryEntry,
 } from "@/components/conversation-history";
 import { listChatHistory } from "@/core/conversations";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
-export default function ConversationsPage() {
-  const db = getDb();
+export default async function ConversationsPage() {
+  const db = await requireOwnerPageDb();
   const conversations = listChatHistory(db, 500);
   const chats: ConversationHistoryEntry[] = conversations.map((conversation) => {
     const firstUserMessage = db

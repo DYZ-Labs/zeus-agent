@@ -14,7 +14,7 @@ import {
   type FacetKind,
   type UnderstandingFacetView,
 } from "@/core/facets";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +27,7 @@ export default async function UnderstandingPage({
 }) {
   const params = await searchParams;
   const view = parseView(params.view);
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const allFacets = listFacets(db, { includeClosed: true, limit: 10_000 });
   const currentFacets = allFacets.filter((facet) => facet.valid_to === null);
   const historicalFacets = allFacets.filter((facet) => facet.valid_to !== null);

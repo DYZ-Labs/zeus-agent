@@ -3,7 +3,7 @@ import { z } from "zod";
 import { streamTurn } from "@/core/chat";
 import { createConversation, getConversation } from "@/core/conversations";
 import { MissingCredentialsError, RefusedError, hasCredentials } from "@/core/openai";
-import { getDb } from "@/server/db";
+import { getOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -27,6 +27,14 @@ const Body = z
  * memory changing rather than having to trust that it did.
  */
 export async function POST(request: Request): Promise<Response> {
+  const access = await getOwnerAccess();
+  if (!access.canAccessPrivateData) {
+    return Response.json(
+      { error: access.message },
+      { status: access.state === "signed_out" ? 401 : access.state === "wrong_account" ? 403 : 503 },
+    );
+  }
+
   const parsed = Body.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return Response.json({ error: "Expected { input: string, conversationId?: number }" }, { status: 400 });
@@ -36,7 +44,7 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: new MissingCredentialsError().message }, { status: 503 });
   }
 
-  const db = getDb();
+  const db = access.db;
   const conversation =
     (parsed.data.conversationId ? getConversation(db, parsed.data.conversationId) : null) ??
     createConversation(db, { source: "web" });

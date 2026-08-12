@@ -1,5 +1,8 @@
 import { redirect } from "next/navigation";
 
-export default function TimelinePage() {
+import { requireOwnerPageDb } from "@/server/auth/access";
+
+export default async function TimelinePage() {
+  await requireOwnerPageDb();
   redirect("/memory?view=history");
 }

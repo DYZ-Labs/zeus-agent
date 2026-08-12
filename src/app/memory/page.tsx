@@ -8,7 +8,7 @@ import { listEntities } from "@/core/entities";
 import { countFacts, timeline } from "@/core/facts";
 import type { FactView } from "@/core/schema";
 import { search } from "@/core/search";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +23,7 @@ export default async function MemoryPage({
   const view = parseView(params);
   const query = view === "review" ? "" : params.q?.trim() ?? "";
 
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const counts = countFacts(db);
   const pendingCount = countPendingCandidates(db);
   const pendingCandidates = view === "review"

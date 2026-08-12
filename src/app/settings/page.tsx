@@ -2,9 +2,11 @@ import {
   followThroughDecisionAction,
   setStewardshipModeAction,
 } from "@/app/actions";
+import { logoutAction } from "@/app/auth/actions";
 import { DeleteAllRecentChats } from "@/components/delete-all-conversations";
 import { SettingsModal } from "@/components/settings-modal";
 import { listChatHistory } from "@/core/conversations";
+import Link from "next/link";
 import type {
   FollowThroughEventView,
   StewardshipMode,
@@ -14,29 +16,155 @@ import {
   getStewardshipSetting,
   listFollowThroughEvents,
 } from "@/core/stewardship";
-import { getDb } from "@/server/db";
+import { getOwnerAccess, type OwnerAccess } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
-export default function SettingsPage() {
-  const db = getDb();
-  const setting = getStewardshipSetting(db);
-  const metrics = followThroughMetrics(db);
-  const events = listFollowThroughEvents(db, 20);
-  const recentChatCount = listChatHistory(db, 500).length;
+export default async function SettingsPage() {
+  const access = await getOwnerAccess();
+  const privateSettings = access.canAccessPrivateData
+    ? {
+        setting: getStewardshipSetting(access.db),
+        metrics: followThroughMetrics(access.db),
+        events: listFollowThroughEvents(access.db, 20),
+        recentChatCount: listChatHistory(access.db, 500).length,
+      }
+    : null;
 
   return (
     <SettingsModal
+      account={<AccountSettings access={access} />}
       followThrough={
-        <FollowThroughSettings
-          mode={setting.mode}
-          metrics={metrics}
-          events={events}
-        />
+        privateSettings ? (
+          <FollowThroughSettings
+            mode={privateSettings.setting.mode}
+            metrics={privateSettings.metrics}
+            events={privateSettings.events}
+          />
+        ) : (
+          <LockedSettings />
+        )
       }
-      dataControls={<DataControlsSettings recentChatCount={recentChatCount} />}
+      dataControls={
+        privateSettings ? (
+          <DataControlsSettings recentChatCount={privateSettings.recentChatCount} />
+        ) : (
+          <LockedSettings />
+        )
+      }
     />
   );
+}
+
+function AccountSettings({ access }: { access: OwnerAccess }) {
+  if (access.state === "authorized" && access.account) {
+    const label = access.account.name?.trim() || access.account.email;
+    const initial = label.slice(0, 1).toLocaleUpperCase();
+
+    return (
+      <section className="px-5 py-5 sm:px-6 sm:py-6">
+        <h1 className="text-lg font-semibold leading-6">Account</h1>
+        <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+          This verified account is the only web identity linked to your Zeus memory.
+        </p>
+        <div className="mt-6 flex items-center gap-3 border-y py-4" style={{ borderColor: "var(--shell-line)" }}>
+          <span
+            aria-hidden
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-semibold"
+            style={{ background: "var(--shell-accent)", color: "#000000" }}
+          >
+            {initial}
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-medium">{label}</p>
+            <p className="truncate text-xs" style={{ color: "var(--shell-faint)" }}>
+              {access.account.email} · {providerLabel(access.account.provider)}
+            </p>
+          </div>
+        </div>
+        <form action={logoutAction} className="mt-5">
+          <button
+            type="submit"
+            className="rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-white/[0.06]"
+            style={{ borderColor: "var(--shell-line-strong)" }}
+          >
+            Log out
+          </button>
+        </form>
+      </section>
+    );
+  }
+
+  if (access.state === "local") {
+    return (
+      <section className="px-5 py-5 sm:px-6 sm:py-6">
+        <h1 className="text-lg font-semibold leading-6">Account</h1>
+        <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+          Zeus is running in local-only mode. Add the Supabase values from .env.example to enable login.
+        </p>
+        <AuthLinks />
+      </section>
+    );
+  }
+
+  return (
+    <section className="px-5 py-5 sm:px-6 sm:py-6">
+      <h1 className="text-lg font-semibold leading-6">Account</h1>
+      <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+        {access.message}
+      </p>
+      {access.account ? (
+        <form action={logoutAction} className="mt-5">
+          <button
+            type="submit"
+            className="rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-white/[0.06]"
+            style={{ borderColor: "var(--shell-line-strong)" }}
+          >
+            Log out {access.account.email}
+          </button>
+        </form>
+      ) : (
+        <AuthLinks />
+      )}
+    </section>
+  );
+}
+
+function AuthLinks() {
+  return (
+    <div className="mt-6 flex flex-wrap items-center gap-3">
+      <Link
+        href="/auth/login"
+        className="rounded-lg px-4 py-2 text-sm font-medium"
+        style={{ background: "var(--shell-accent)", color: "#000000" }}
+      >
+        Log in
+      </Link>
+      <Link
+        href="/auth/signup"
+        className="rounded-lg border px-4 py-2 text-sm font-medium"
+        style={{ borderColor: "var(--shell-line-strong)" }}
+      >
+        Sign up
+      </Link>
+    </div>
+  );
+}
+
+function LockedSettings() {
+  return (
+    <section className="px-5 py-5 sm:px-6 sm:py-6">
+      <h1 className="text-lg font-semibold leading-6">Login required</h1>
+      <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
+        Sign in with the linked owner account to view or change private Zeus data.
+      </p>
+      <AuthLinks />
+    </section>
+  );
+}
+
+function providerLabel(provider: string | null): string {
+  return provider === "google" ? "Google" : "Email";
 }
 
 function FollowThroughSettings({

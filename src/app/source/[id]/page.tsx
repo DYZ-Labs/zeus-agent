@@ -7,7 +7,7 @@ import { getConversation, getMessage, messagesIn } from "@/core/conversations";
 import { getFacts } from "@/core/facts";
 import { getCommitment, getGoal } from "@/core/intentions";
 import { getPassage } from "@/core/passages";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +26,7 @@ export default async function SourcePage({
   const messageId = Number(id);
   if (!Number.isInteger(messageId)) notFound();
 
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const message = getMessage(db, messageId);
   if (!message) notFound();
   const passageId = Number((await searchParams).passage);

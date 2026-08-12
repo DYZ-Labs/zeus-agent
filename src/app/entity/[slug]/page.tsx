@@ -6,13 +6,13 @@ import { PageHeader } from "@/components/page-header";
 import { aliasesOf, getEntityBySlug } from "@/core/entities";
 import { factsForEntity } from "@/core/facts";
 import type { FactView } from "@/core/schema";
-import { getDb } from "@/server/db";
+import { requireOwnerPageDb } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
 export default async function EntityPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const db = getDb();
+  const db = await requireOwnerPageDb();
   const entity = getEntityBySlug(db, slug);
   if (!entity) notFound();
 

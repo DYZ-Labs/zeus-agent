@@ -115,12 +115,57 @@ The first semantic search may download `Xenova/bge-small-en-v1.5` into `.models/
 model runs locally. Set `ZEUS_EMBEDDINGS=off` to skip it and use full-text plus graph
 retrieval only.
 
+### Optional account login
+
+Zeus can use Supabase Auth for passwordless email login and Google login. Supabase stores
+identity only; conversations and memory remain in the local SQLite file. Because one
+Zeus database represents one person, the first verified session must match
+`ZEUS_OWNER_EMAIL`. Zeus then binds the store to that account's immutable Supabase UUID,
+and another account cannot replace it.
+
+Add these values to `.env.local`:
+
+```bash
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
+NEXT_PUBLIC_SITE_URL=http://127.0.0.1:3000
+ZEUS_OWNER_EMAIL=you@example.com
+```
+
+Then configure the Supabase project:
+
+1. Keep email authentication enabled. Supabase's default hosted Magic Link and Confirm
+   Signup templates work with Zeus's PKCE callback, so custom SMTP is not required for
+   local testing. If you later customize the templates, Zeus also accepts direct
+   `token_hash` links.
+2. Set the Site URL to `http://127.0.0.1:3000`. Allow redirects to
+   `http://127.0.0.1:3000/auth/confirm` and
+   `http://127.0.0.1:3000/auth/callback` (plus the production equivalents).
+3. Enable Google in Supabase Auth with a Google OAuth client ID and secret. In Google
+   Cloud, use `https://YOUR_PROJECT_REF.supabase.co/auth/v1/callback` as the authorized
+   redirect URI.
+
+Always open local Zeus at `http://127.0.0.1:3000`, not `http://localhost:3000`.
+Email links must be opened in the same browser profile that requested them because the
+PKCE verifier is stored in a host-bound cookie. Zeus redirects the login screen to the
+configured `NEXT_PUBLIC_SITE_URL` before starting a flow to enforce this.
+
+No Supabase service-role key, database table, or RLS policy is needed. Supabase's default
+email sender only delivers to members of the project's organization and is heavily
+rate-limited; configure custom SMTP before production use. Leave the Supabase URL,
+publishable key, and owner email blank to keep the original local-only mode. Setting only
+part of that group locks private web data until configuration is completed.
+
 ## Configuration
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `OPENAI_API_KEY` | For chat/extraction | — | OpenAI API credential |
 | `OPENAI_MODEL` | No | `gpt-5.5` | Model used for both chat and extraction |
+| `NEXT_PUBLIC_SUPABASE_URL` | For web login | — | Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | For web login | — | Browser-safe Supabase publishable key |
+| `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
+| `ZEUS_OWNER_EMAIL` | For web login | — | Server-only email allowed to bind the one-person store |
 | `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
 | `ZEUS_EMBEDDINGS` | No | enabled | Set to `off` for FTS5 and graph search only |
 | `ZEUS_MODEL_CACHE` | No | `.models` | Local embedding-model cache |
@@ -192,6 +237,9 @@ The server provides:
 
 Run `npm run mcp` to launch the same server directly. It writes protocol data only to
 stdout and diagnostics to stderr.
+
+Supabase login protects the web interface. The stdio MCP server remains a separate local
+trust boundary and can access the same store when a same-OS process launches it.
 
 ## Commands
 
