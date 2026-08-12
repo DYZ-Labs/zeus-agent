@@ -107,11 +107,10 @@ export async function POST(request: Request): Promise<Response> {
         { error: access.message },
         {
           status:
-            access.state === "signed_out"
-              ? 401
-              : access.state === "forbidden_origin"
-                ? 403
-                : 503,
+            access.state === "wrong_account" ||
+            access.state === "forbidden_origin"
+              ? 403
+              : 503,
         },
       );
     }

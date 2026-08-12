@@ -1,6 +1,6 @@
 import "server-only";
 
-import type { User } from "@supabase/supabase-js";
+import { isAuthSessionMissingError, type User } from "@supabase/supabase-js";
 import { redirect } from "next/navigation";
 
 import { bindAppOwner, getAppOwner } from "@/core/owner";
@@ -64,8 +64,14 @@ export async function getOwnerAccess(): Promise<OwnerAccess> {
   try {
     const supabase = await createSupabaseServerClient(configuration);
     const { data, error } = await supabase.auth.getUser();
-    if (error || !data.user) {
+    if (!data.user && isAuthSessionMissingError(error)) {
       return denied("signed_out", "Log in to access this Zeus memory store.");
+    }
+    if (error || !data.user) {
+      return denied(
+        "unavailable",
+        "Zeus could not verify the account right now. Private memory stayed locked.",
+      );
     }
     return authorizeSupabaseUser(data.user);
   } catch {
@@ -96,20 +102,19 @@ export async function getBrowserOwnerAccess(
 }
 
 export type StoreFreeChatAccess =
-  | { allowed: true; state: "local" | "authorized" }
+  | { allowed: true; state: "local" | "authorized" | "signed_out" }
   | {
       allowed: false;
-      state: "signed_out" | "forbidden_origin" | "misconfigured" | "unavailable";
+      state: "wrong_account" | "forbidden_origin" | "misconfigured" | "unavailable";
       message: string;
     };
 
 /**
- * Authorize memory-free chat without opening SQLite.
+ * Authorize temporary chat while keeping signed-out chat completely store-free.
  *
- * Temporary chat must prove a negative: it cannot even inspect owner memory. This
- * boundary therefore checks the browser origin and, in configured mode, the Supabase
- * session directly instead of delegating to `getOwnerAccess`, whose owner binding is
- * stored in SQLite.
+ * A genuine missing session is the guest capability and returns before SQLite can be
+ * opened. Authenticated requests read only the owner binding so that a different signed-in
+ * account cannot bypass the blocked UI; they never bind an owner or inspect memory here.
  */
 export async function verifyStoreFreeChatAccess(
   request: Pick<Request, "headers" | "method" | "url">,
@@ -127,13 +132,38 @@ export async function verifyStoreFreeChatAccess(
   try {
     const supabase = await createSupabaseServerClient(configuration);
     const { data, error } = await supabase.auth.getUser();
+    if (!data.user && isAuthSessionMissingError(error)) {
+      return {
+        allowed: true,
+        state: "signed_out",
+      };
+    }
     if (error || !data.user) {
       return {
         allowed: false,
-        state: "signed_out",
-        message: "Log in to start a temporary chat.",
+        state: "unavailable",
+        message: "Zeus could not verify the account right now.",
       };
     }
+
+    const db = getDb();
+    const owner = getAppOwner(db);
+    const email = data.user.email?.trim().toLowerCase() ?? "";
+    const isOwner = owner
+      ? owner.supabase_user_id === data.user.id
+      : Boolean(
+          email &&
+            data.user.email_confirmed_at &&
+            email === configuration.ownerEmail,
+        );
+    if (!isOwner) {
+      return {
+        allowed: false,
+        state: "wrong_account",
+        message: "Use the verified owner account configured for this Zeus installation.",
+      };
+    }
+
     return { allowed: true, state: "authorized" };
   } catch {
     return {

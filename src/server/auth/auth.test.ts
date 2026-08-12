@@ -1,4 +1,8 @@
-import type { User } from "@supabase/supabase-js";
+import {
+  AuthApiError,
+  AuthSessionMissingError,
+  type User,
+} from "@supabase/supabase-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { openTestDb, type Db } from "@/core/db";
@@ -135,6 +139,40 @@ describe("auth downgrade protection", () => {
     expect(access.canAccessPrivateData).toBe(false);
     expect(access.db).toBeNull();
   });
+
+  it("reports only an explicit missing session as signed out", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: null },
+          error: new AuthSessionMissingError(),
+        }),
+      },
+    });
+
+    const access = await getOwnerAccess();
+
+    expect(access).toMatchObject({ state: "signed_out", canAccessPrivateData: false });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("keeps private memory locked when session verification fails", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: null },
+          error: new AuthApiError("verification failed", 503, "unexpected_failure"),
+        }),
+      },
+    });
+
+    const access = await getOwnerAccess();
+
+    expect(access).toMatchObject({ state: "unavailable", canAccessPrivateData: false });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
 });
 
 describe("browser access boundary", () => {
@@ -190,7 +228,7 @@ describe("browser access boundary", () => {
     expect(mocks.getDb).not.toHaveBeenCalled();
   });
 
-  it("verifies a configured temporary-chat session without reading owner binding", async () => {
+  it("verifies a configured temporary-chat owner without creating a binding", async () => {
     configureAuth();
     mocks.createSupabaseServerClient.mockResolvedValue({
       auth: { getUser: vi.fn().mockResolvedValue({ data: { user: user(OWNER_ID, "owner@example.com") }, error: null }) },
@@ -207,6 +245,116 @@ describe("browser access boundary", () => {
     );
 
     expect(access).toEqual({ allowed: true, state: "authorized" });
+    expect(mocks.getDb).toHaveBeenCalledOnce();
+    expect(getAppOwner(db)).toBeNull();
+  });
+
+  it("authorizes a genuine missing session as store-free guest chat", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: null },
+          error: new AuthSessionMissingError(),
+        }),
+      },
+    });
+
+    const access = await verifyStoreFreeChatAccess(browserChatRequest());
+
+    expect(access).toEqual({ allowed: true, state: "signed_out" });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on session verification errors without opening the store", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: null },
+          error: new AuthApiError("verification failed", 503, "unexpected_failure"),
+        }),
+      },
+    });
+
+    const access = await verifyStoreFreeChatAccess(browserChatRequest());
+
+    expect(access).toMatchObject({ allowed: false, state: "unavailable" });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("does not interpret an unexplained null user as a signed-out guest", async () => {
+    configureAuth();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({ data: { user: null }, error: null }),
+      },
+    });
+
+    const access = await verifyStoreFreeChatAccess(browserChatRequest());
+
+    expect(access).toMatchObject({ allowed: false, state: "unavailable" });
+    expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("blocks an authenticated non-owner without changing the owner binding", async () => {
+    configureAuth();
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe(
+      "authorized",
+    );
+    mocks.getDb.mockClear();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: user(OTHER_ID, "other@example.com") },
+          error: null,
+        }),
+      },
+    });
+
+    const access = await verifyStoreFreeChatAccess(browserChatRequest());
+
+    expect(access).toMatchObject({ allowed: false, state: "wrong_account" });
+    expect(mocks.getDb).toHaveBeenCalledOnce();
+    expect(getAppOwner(db)?.supabase_user_id).toBe(OWNER_ID);
+  });
+
+  it("preserves temporary chat for the UUID-bound owner after an email change", async () => {
+    configureAuth();
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe(
+      "authorized",
+    );
+    mocks.getDb.mockClear();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: vi.fn().mockResolvedValue({
+          data: { user: user(OWNER_ID, "changed@example.com") },
+          error: null,
+        }),
+      },
+    });
+
+    const access = await verifyStoreFreeChatAccess(browserChatRequest());
+
+    expect(access).toEqual({ allowed: true, state: "authorized" });
+    expect(mocks.getDb).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a hostile guest origin before checking its session or store", async () => {
+    configureAuth();
+    const access = await verifyStoreFreeChatAccess(
+      new Request("http://attacker.example/api/chat", {
+        method: "POST",
+        headers: {
+          host: "attacker.example",
+          origin: "http://attacker.example",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+    );
+
+    expect(access).toMatchObject({ allowed: false, state: "forbidden_origin" });
+    expect(mocks.createSupabaseServerClient).not.toHaveBeenCalled();
     expect(mocks.getDb).not.toHaveBeenCalled();
   });
 });
@@ -228,6 +376,17 @@ function configureAuth() {
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_test";
   process.env.NEXT_PUBLIC_SITE_URL = "http://127.0.0.1:3000";
   process.env.ZEUS_OWNER_EMAIL = " Owner@Example.com ";
+}
+
+function browserChatRequest(): Request {
+  return new Request("http://127.0.0.1:3000/api/chat", {
+    method: "POST",
+    headers: {
+      host: "127.0.0.1:3000",
+      origin: "http://127.0.0.1:3000",
+      "sec-fetch-site": "same-origin",
+    },
+  });
 }
 
 function user(id: string, email: string, verified = true): User {

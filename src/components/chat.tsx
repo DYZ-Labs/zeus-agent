@@ -33,10 +33,11 @@ type Turn = ChatHistoryTurn & {
 
 type Status = "idle" | "streaming" | "error";
 
+export type ChatAccessMode = "durable" | "guest" | "blocked";
+
 export function Chat({
   hasCredentials,
-  canAccessPrivateData,
-  canUseChat,
+  accessMode,
   showAuthActions,
   initialPrompt,
   initialTurns = [],
@@ -44,23 +45,25 @@ export function Chat({
   onboardingStatus = "complete",
 }: {
   hasCredentials: boolean;
-  canAccessPrivateData: boolean;
-  canUseChat: boolean;
+  accessMode: ChatAccessMode;
   showAuthActions: boolean;
   initialPrompt?: string;
   initialTurns?: ChatHistoryTurn[];
   initialConversationId?: ResourceId;
   onboardingStatus?: OnboardingStatus;
 }) {
-  const [turns, setTurns] = useState<Turn[]>(canAccessPrivateData ? initialTurns : []);
+  const durable = accessMode === "durable";
+  const guest = accessMode === "guest";
+  const canUseChat = accessMode !== "blocked";
+  const [turns, setTurns] = useState<Turn[]>(durable ? initialTurns : []);
   const [input, setInput] = useState(initialPrompt ?? "");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<ChatMode>(
-    canAccessPrivateData ? "standard" : "temporary",
+    durable ? "standard" : "temporary",
   );
   const [showWelcome, setShowWelcome] = useState(
-    canAccessPrivateData && onboardingStatus === "welcome" && initialTurns.length === 0,
+    durable && onboardingStatus === "welcome" && initialTurns.length === 0,
   );
   const [onboarding, setOnboarding] = useState<OnboardingStatus>(onboardingStatus);
   const conversationId = useRef<ResourceId | null>(initialConversationId ?? null);
@@ -83,7 +86,7 @@ export function Chat({
       conversationId.current = null;
       setTurns([]);
       setInput("");
-      setMode(canAccessPrivateData ? "standard" : "temporary");
+      setMode(durable ? "standard" : "temporary");
       setStatus("idle");
       setError(null);
       requestAnimationFrame(() => textareaRef.current?.focus());
@@ -96,7 +99,7 @@ export function Chat({
       for (const request of memoryRequests) request.abort();
       memoryRequests.clear();
     };
-  }, [canAccessPrivateData]);
+  }, [durable]);
 
   useEffect(() => {
     if (turns.length > 0 && shouldFollowOutput.current) {
@@ -117,7 +120,7 @@ export function Chat({
 
   const updateOnboarding = useCallback((next: OnboardingStatus) => {
     if (
-      !canAccessPrivateData ||
+      !durable ||
       onboarding === next ||
       onboardingRank(next) <= onboardingRank(onboarding)
     ) return;
@@ -125,10 +128,10 @@ export function Chat({
     const formData = new FormData();
     formData.set("status", next);
     void setOnboardingStatusAction(formData).catch(() => undefined);
-  }, [canAccessPrivateData, onboarding]);
+  }, [durable, onboarding]);
 
   function selectMode(next: ChatMode) {
-    if (next === mode || status === "streaming" || (!canAccessPrivateData && next === "standard")) return;
+    if (!durable || next === mode || status === "streaming") return;
     activeRequest.current?.abort();
     activeRequest.current = null;
     activeReplyId.current = null;
@@ -366,7 +369,7 @@ export function Chat({
       canUseChat={canUseChat}
       centered={!hasVisibleTurns}
       mode={mode}
-      canSwitchMode={canAccessPrivateData}
+      accessMode={accessMode}
     />
   );
 
@@ -378,8 +381,10 @@ export function Chat({
           <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[16vh] pt-20">
             {!canUseChat
               ? <LoginRequiredNotice />
-              : canAccessPrivateData && !hasCredentials && <AvailabilityNotice />}
-            {showWelcome ? <Welcome onChoose={chooseStarter} onSkip={() => { setShowWelcome(false); updateOnboarding("complete"); }} /> : <EmptyState mode={mode} onChoose={chooseStarter} />}
+              : !hasCredentials && <AvailabilityNotice guest={guest} />}
+            {showWelcome
+              ? <Welcome onChoose={chooseStarter} onSkip={() => { setShowWelcome(false); updateOnboarding("complete"); }} />
+              : <EmptyState accessMode={accessMode} mode={mode} onChoose={chooseStarter} />}
             {composer}
           </div>
         </div>
@@ -394,10 +399,10 @@ export function Chat({
             }}
           >
             <div className={`mx-auto flex min-h-full w-full max-w-[48rem] flex-col px-4 pb-8 md:px-6 ${showAuthActions ? "pt-16" : "pt-6"}`}>
-              {mode === "temporary" && <TemporaryBanner />}
+              {durable && mode === "temporary" && <TemporaryBanner />}
               {!canUseChat
                 ? <LoginRequiredNotice />
-                : canAccessPrivateData && !hasCredentials && <AvailabilityNotice />}
+                : !hasCredentials && <AvailabilityNotice guest={guest} />}
               <ol className="space-y-8 py-4">
                 {turns.map((turn, index) => (
                   <li key={turn.id}>
@@ -439,7 +444,7 @@ function Composer({
   canUseChat,
   centered,
   mode,
-  canSwitchMode,
+  accessMode,
 }: {
   input: string;
   onInputChange: (value: string) => void;
@@ -453,8 +458,11 @@ function Composer({
   canUseChat: boolean;
   centered: boolean;
   mode: ChatMode;
-  canSwitchMode: boolean;
+  accessMode: ChatAccessMode;
 }) {
+  const durable = accessMode === "durable";
+  const guest = accessMode === "guest";
+
   return (
     <form
       onSubmit={(event) => { event.preventDefault(); void onSend(); }}
@@ -462,19 +470,26 @@ function Composer({
       style={{ background: "var(--shell-bg)" }}
     >
       <div className="mx-auto w-full max-w-[48rem]">
-        <div className="mb-2 flex items-center justify-between gap-3 px-1 text-xs" style={{ color: "var(--shell-faint)" }}>
-          <button
-            type="button"
-            disabled={status === "streaming" || !canSwitchMode}
-            onClick={() => onModeChange(mode === "temporary" ? "standard" : "temporary")}
-            aria-pressed={mode === "temporary"}
-            className="rounded-full border px-3 py-1.5 disabled:opacity-50"
-            style={{ borderColor: mode === "temporary" ? "var(--shell-accent)" : "var(--shell-line-strong)", color: mode === "temporary" ? "var(--shell-accent)" : undefined }}
-          >
-            {mode === "temporary" ? "Temporary chat on" : "Temporary chat"}
-          </button>
-          {mode === "temporary" && <span>Nothing from this chat is saved</span>}
-        </div>
+        {durable && (
+          <div className="mb-2 flex items-center justify-between gap-3 px-1 text-xs" style={{ color: "var(--shell-faint)" }}>
+            <button
+              type="button"
+              disabled={status === "streaming"}
+              onClick={() => onModeChange(mode === "temporary" ? "standard" : "temporary")}
+              aria-pressed={mode === "temporary"}
+              className="rounded-full border px-3 py-1.5 disabled:opacity-50"
+              style={{ borderColor: mode === "temporary" ? "var(--shell-accent)" : "var(--shell-line-strong)", color: mode === "temporary" ? "var(--shell-accent)" : undefined }}
+            >
+              {mode === "temporary" ? "Temporary chat on" : "Temporary chat"}
+            </button>
+            {mode === "temporary" && <span>Nothing from this chat is saved</span>}
+          </div>
+        )}
+        {guest && (
+          <p className="mb-2 px-1 text-xs" style={{ color: "var(--shell-faint)" }}>
+            This chat isn’t saved. Context lasts until you refresh or leave.
+          </p>
+        )}
         <div className="flex items-end gap-2 rounded-[26px] border px-3 py-2" style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}>
           <label htmlFor="chat-input" className="sr-only">Message Zeus</label>
           <textarea
@@ -634,17 +649,44 @@ function Welcome({ onChoose, onSkip }: { onChoose: (prompt: string) => void; onS
   );
 }
 
-function EmptyState({ mode, onChoose }: { mode: ChatMode; onChoose: (prompt: string) => void }) {
+function EmptyState({
+  accessMode,
+  mode,
+  onChoose,
+}: {
+  accessMode: ChatAccessMode;
+  mode: ChatMode;
+  onChoose: (prompt: string) => void;
+}) {
+  const signedInTemporary = accessMode === "durable" && mode === "temporary";
+  const showStarters = accessMode !== "blocked" && !signedInTemporary;
+
   return (
     <div className="w-full text-center">
-      <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">{mode === "temporary" ? "Temporary chat" : "What can I help with?"}</h1>
-      {mode === "temporary" ? <p className="mt-3 text-sm" style={{ color: "var(--shell-muted)" }}>No saved memory is read. This conversation disappears when you refresh or leave.</p> : <StarterButtons onChoose={onChoose} />}
+      <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">
+        {signedInTemporary ? "Temporary chat" : "What can I help with?"}
+      </h1>
+      {signedInTemporary ? (
+        <p className="mt-3 text-sm" style={{ color: "var(--shell-muted)" }}>
+          No saved memory is read. This conversation disappears when you refresh or leave.
+        </p>
+      ) : showStarters ? (
+        <StarterButtons guest={accessMode === "guest"} onChoose={onChoose} />
+      ) : null}
     </div>
   );
 }
 
-function StarterButtons({ onChoose }: { onChoose: (prompt: string) => void }) {
-  const starters = ["Help me think through something", "Remember what I’m working on", "Show me how memory works"];
+function StarterButtons({
+  guest = false,
+  onChoose,
+}: {
+  guest?: boolean;
+  onChoose: (prompt: string) => void;
+}) {
+  const starters = guest
+    ? ["Help me think through something", "Draft something with me", "Explain something clearly"]
+    : ["Help me think through something", "Remember what I’m working on", "Show me how memory works"];
   return <div className="mt-6 flex flex-wrap justify-center gap-2">{starters.map((starter) => <button type="button" key={starter} onClick={() => onChoose(starter)} className="rounded-full border px-3.5 py-2 text-sm hover:bg-white/[0.05]" style={{ borderColor: "var(--shell-line-strong)" }}>{starter}</button>)}</div>;
 }
 
@@ -668,8 +710,8 @@ function ErrorNotice({ message, onRetry }: { message: string; onRetry: () => voi
   return <div role="alert" className="mt-5 flex items-center justify-between gap-4 rounded-xl border px-4 py-3 text-sm" style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)", color: "var(--shell-muted)" }}><span>{message}</span><button type="button" onClick={onRetry} className="shrink-0 underline underline-offset-3">Retry</button></div>;
 }
 
-function AvailabilityNotice() {
-  return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Chat is temporarily unavailable</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>Saved details and data controls are still available.</p></div>;
+function AvailabilityNotice({ guest }: { guest: boolean }) {
+  return <div role="status" className="mb-4 rounded-2xl border px-5 py-4" style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-panel)" }}><p className="text-sm font-medium">Chat is temporarily unavailable</p><p className="mt-1 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>{guest ? "Try again later." : "Saved details and data controls are still available."}</p></div>;
 }
 
 function LoginRequiredNotice() {

@@ -1,4 +1,4 @@
-import { Chat } from "@/components/chat";
+import { Chat, type ChatAccessMode } from "@/components/chat";
 import {
   hydrateConversationTurns,
   type ChatHydrationTurn,
@@ -35,6 +35,11 @@ export default async function ChatPage({
   const prompt = params.prompt?.slice(0, 4_000);
   const requestedConversationId = numericResourceId(params.conversation, "conversation");
   const access = await getOwnerAccess();
+  const accessMode: ChatAccessMode = access.canAccessPrivateData
+    ? "durable"
+    : access.state === "signed_out"
+      ? "guest"
+      : "blocked";
   const db = access.canAccessPrivateData ? access.db : null;
   const conversation = db && requestedConversationId !== null
     ? getConversation(db, requestedConversationId)
@@ -46,10 +51,9 @@ export default async function ChatPage({
 
   return (
     <Chat
-      key={`${conversation?.id ?? "new"}:${prompt ?? "empty"}`}
+      key={`${accessMode}:${conversation?.id ?? "new"}:${prompt ?? "empty"}`}
       hasCredentials={hasCredentials()}
-      canAccessPrivateData={access.canAccessPrivateData}
-      canUseChat={access.canAccessPrivateData}
+      accessMode={accessMode}
       showAuthActions={access.state !== "authorized"}
       initialPrompt={prompt}
       initialTurns={initialTurns}

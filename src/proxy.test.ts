@@ -152,6 +152,57 @@ describe("proxy public chat exception", () => {
   });
 });
 
+describe("proxy public page boundary", () => {
+  it("lets a signed-out visitor reach the root chat page", async () => {
+    const response = await proxy(pageRequest("/"));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  it("keeps signed-out conversation history private", async () => {
+    const response = await proxy(pageRequest("/conversations?view=hidden"));
+
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get("location") ?? "");
+    expect(location.pathname).toBe("/auth/login");
+    expect(location.searchParams.get("next")).toBe("/conversations?view=hidden");
+  });
+
+  it("keeps the public root available but login-gates private pages when auth is misconfigured", async () => {
+    mocks.getAuthConfiguration.mockReturnValue({
+      mode: "misconfigured",
+      message: "Supabase login configuration is incomplete.",
+    });
+
+    const rootResponse = await proxy(pageRequest("/"));
+    const privateResponse = await proxy(pageRequest("/conversations"));
+
+    expect(rootResponse.status).toBe(200);
+    expect(rootResponse.headers.get("x-middleware-next")).toBe("1");
+    expect(privateResponse.status).toBe(307);
+    expect(privateResponse.headers.get("location")).toContain("/auth/login?");
+    expect(mocks.createServerClient).not.toHaveBeenCalled();
+  });
+
+  it("keeps verification failures on the public root and redirects private pages", async () => {
+    mocks.getClaims.mockRejectedValue(new Error("network unavailable"));
+
+    const rootResponse = await proxy(pageRequest("/"));
+    const privateResponse = await proxy(pageRequest("/conversations"));
+
+    expect(rootResponse.status).toBe(200);
+    expect(rootResponse.headers.get("x-middleware-next")).toBe("1");
+    expect(privateResponse.status).toBe(307);
+    const location = new URL(privateResponse.headers.get("location") ?? "");
+    expect(location.pathname).toBe("/auth/login");
+    expect(location.searchParams.get("next")).toBe("/conversations");
+    expect(location.searchParams.get("error")).toBe(
+      "Account verification is temporarily unavailable.",
+    );
+  });
+});
+
 function localPost(origin?: string): NextRequest {
   return new NextRequest("http://127.0.0.1:3000/api/chat", {
     method: "POST",
@@ -170,6 +221,16 @@ function request(path: string): NextRequest {
       host: "zeus.example",
       origin: "https://zeus.example",
       "sec-fetch-site": "same-origin",
+    },
+  });
+}
+
+function pageRequest(path: string): NextRequest {
+  return new NextRequest(`https://zeus.example${path}`, {
+    headers: {
+      host: "zeus.example",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
     },
   });
 }

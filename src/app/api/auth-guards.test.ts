@@ -91,7 +91,11 @@ beforeEach(() => {
 });
 
 describe("chat API protocol and access", () => {
-  it("streams temporary chat without touching owner access or conversation storage", async () => {
+  it("streams signed-out guest chat without touching owner access or conversation storage", async () => {
+    mocks.verifyStoreFreeChatAccess.mockResolvedValue({
+      allowed: true,
+      state: "signed_out",
+    });
     const response = await postChat(
       jsonRequest("/api/chat", {
         input: "Continue this thought",
@@ -104,6 +108,7 @@ describe("chat API protocol and access", () => {
     );
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(ndjson(response)).resolves.toEqual([
       { type: "text_delta", text: "Temporary reply" },
       { type: "response_complete", responseId: null, memoryJobId: null, memoryError: null },
@@ -112,7 +117,82 @@ describe("chat API protocol and access", () => {
     expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
     expect(mocks.getConversation).not.toHaveBeenCalled();
     expect(mocks.createConversation).not.toHaveBeenCalled();
+    expect(mocks.getExperienceSettings).not.toHaveBeenCalled();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
     expect(mocks.createMemoryJob).not.toHaveBeenCalled();
+    expect(mocks.streamGuestTurn).toHaveBeenCalledWith({
+      input: "Continue this thought",
+      history: [
+        { role: "user", content: "Hello" },
+        { role: "assistant", content: "Hi there" },
+      ],
+      onDelta: expect.any(Function),
+      signal: expect.any(AbortSignal),
+    });
+  });
+
+  it("preserves explicit temporary chat for an authenticated owner", async () => {
+    mocks.verifyStoreFreeChatAccess.mockResolvedValue({
+      allowed: true,
+      state: "authorized",
+    });
+
+    const response = await postChat(
+      jsonRequest("/api/chat", { input: "Do not save this", mode: "temporary" }),
+    );
+
+    expect(response.status).toBe(200);
+    expect((await ndjson(response)).at(-1)).toEqual({
+      type: "response_complete",
+      responseId: null,
+      memoryJobId: null,
+      memoryError: null,
+    });
+    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+    expect(mocks.createMemoryJob).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["an authenticated non-owner", "wrong_account", 403],
+    ["a hostile origin", "forbidden_origin", 403],
+    ["a verification failure", "unavailable", 503],
+    ["bad auth configuration", "misconfigured", 503],
+  ] as const)("blocks %s before starting temporary generation", async (_label, state, status) => {
+    mocks.verifyStoreFreeChatAccess.mockResolvedValue({
+      allowed: false,
+      state,
+      message: "Temporary chat stayed locked.",
+    });
+
+    const response = await postChat(
+      jsonRequest("/api/chat", { input: "Hello", mode: "temporary" }),
+    );
+
+    expect(response.status).toBe(status);
+    await expect(response.json()).resolves.toEqual({
+      error: "Temporary chat stayed locked.",
+    });
+    expect(mocks.acquireGuestChat).not.toHaveBeenCalled();
+    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
+    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
+  });
+
+  it("continues returning 401 for signed-out standard chat", async () => {
+    const response = await postChat(
+      jsonRequest("/api/chat", {
+        input: "Save this",
+        mode: "standard",
+        conversationId: "conversation_99",
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    expect(mocks.getBrowserOwnerAccess).toHaveBeenCalledOnce();
+    expect(mocks.verifyStoreFreeChatAccess).not.toHaveBeenCalled();
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
   });
 
   it("rejects conversation ids in temporary mode", async () => {
@@ -149,6 +229,36 @@ describe("chat API protocol and access", () => {
       }),
     );
     expect(response.status).toBe(400);
+  });
+
+  it("enforces the aggregate temporary transcript character limit", async () => {
+    const response = await postChat(
+      jsonRequest("/api/chat", {
+        input: "hello",
+        mode: "temporary",
+        temporaryHistory: Array.from({ length: 6 }, () => ({
+          role: "user",
+          content: "x".repeat(3_500),
+        })),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(mocks.verifyStoreFreeChatAccess).not.toHaveBeenCalled();
+    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized request before checking temporary access", async () => {
+    const request = jsonRequest("/api/chat", {
+      input: "hello",
+      mode: "temporary",
+    });
+    request.headers.set("Content-Length", "32769");
+
+    const response = await postChat(request);
+
+    expect(response.status).toBe(400);
+    expect(mocks.verifyStoreFreeChatAccess).not.toHaveBeenCalled();
   });
 
   it("emits completion and a durable job before any extraction is processed", async () => {
