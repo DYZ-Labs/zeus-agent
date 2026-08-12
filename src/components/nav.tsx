@@ -62,15 +62,6 @@ export function Nav({
     router.push("/");
   }
 
-  function finishConversationChange(deletedId?: number) {
-    if (deletedId === activeConversationId) {
-      window.dispatchEvent(new Event(NEW_CHAT_EVENT));
-      router.replace("/");
-      return;
-    }
-    router.refresh();
-  }
-
   if (pathname === "/auth" || pathname.startsWith("/auth/")) return null;
 
   if (!isOpen) {
@@ -120,16 +111,18 @@ export function Nav({
         ))}
 
         <div className="hidden flex-1 lg:block" />
-        <CompactNavLink
-          href="/settings"
-          label="Settings"
-          icon="settings"
-          active={pathname.startsWith("/settings")}
-        />
         {account ? (
-          <CompactAccountLink account={account} />
+          <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
         ) : (
-          <CompactLoginLink authMode={authMode} />
+          <>
+            <CompactNavLink
+              href="/settings"
+              label="Settings"
+              icon="settings"
+              active={pathname.startsWith("/settings")}
+            />
+            <CompactLoginLink authMode={authMode} />
+          </>
         )}
       </nav>
     );
@@ -188,28 +181,29 @@ export function Nav({
             active={pathname.startsWith(link.href)}
           />
         ))}
-        <span className="shrink-0 lg:hidden">
-          <CompactNavLink
-            href="/settings"
-            label="Settings"
-            icon="settings"
-            active={pathname.startsWith("/settings")}
-          />
-        </span>
-        <span className="shrink-0 lg:hidden">
-          {account ? (
-            <CompactAccountLink account={account} />
-          ) : (
-            <CompactLoginLink authMode={authMode} />
-          )}
-        </span>
+        {account ? (
+          <span className="shrink-0 lg:hidden">
+            <CompactAccountLink account={account} active={pathname.startsWith("/settings")} />
+          </span>
+        ) : (
+          <>
+            <span className="shrink-0 lg:hidden">
+              <CompactNavLink
+                href="/settings"
+                label="Settings"
+                icon="settings"
+                active={pathname.startsWith("/settings")}
+              />
+            </span>
+            <span className="shrink-0 lg:hidden">
+              <CompactLoginLink authMode={authMode} />
+            </span>
+          </>
+        )}
       </div>
 
       <section className="mt-4 hidden min-h-0 flex-1 flex-col lg:flex" aria-labelledby="recent-chats-heading">
-        <Link
-          href="/conversations"
-          className="group flex h-8 items-center justify-between rounded-lg px-2.5 transition-colors hover:bg-white/[0.04]"
-        >
+        <div className="flex h-8 items-center px-2.5">
           <h2
             id="recent-chats-heading"
             className="text-xs font-semibold leading-5"
@@ -217,26 +211,15 @@ export function Nav({
           >
             Recents
           </h2>
-          <span
-            className="translate-x-[-2px] opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100"
-            style={{ color: "var(--shell-faint)" }}
-          >
-            <ChevronRightIcon />
-          </span>
-        </Link>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-20">
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {initialRecentChats.length > 0 ? (
             <ul className="space-y-0.5">
-              {initialRecentChats.map((chat, index) => (
-                <ChatHistoryItem
+              {initialRecentChats.map((chat) => (
+                <RecentChatLink
                   key={chat.id}
                   chat={chat}
                   active={activeConversationId === chat.id}
-                  menuPlacement={index >= initialRecentChats.length - 2 ? "above" : "below"}
-                  onOpen={() => undefined}
-                  onChanged={() => finishConversationChange()}
-                  onDeleted={() => finishConversationChange(chat.id)}
-                  directDelete
                 />
               ))}
             </ul>
@@ -249,21 +232,42 @@ export function Nav({
       </section>
 
       <div className="mt-auto hidden lg:block">
-        <NavLink
-          href="/settings"
-          label="Settings"
-          icon="settings"
-          active={pathname.startsWith("/settings")}
-        />
-        <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
-          {account ? (
-            <AccountLink account={account} />
-          ) : (
-            <GuestSidebarCta authMode={authMode} />
-          )}
-        </div>
+        {account ? (
+          <AccountLink account={account} active={pathname.startsWith("/settings")} />
+        ) : (
+          <>
+            <NavLink
+              href="/settings"
+              label="Settings"
+              icon="settings"
+              active={pathname.startsWith("/settings")}
+            />
+            <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
+              <GuestSidebarCta authMode={authMode} />
+            </div>
+          </>
+        )}
       </div>
     </nav>
+  );
+}
+
+function RecentChatLink({ chat, active }: { chat: RecentChat; active: boolean }) {
+  return (
+    <li>
+      <Link
+        href={`/?conversation=${chat.id}`}
+        title={chat.title}
+        aria-current={active ? "page" : undefined}
+        className="flex h-8 min-w-0 items-center rounded-lg px-2.5 text-sm font-normal leading-5 transition-colors hover:bg-white/[0.06]"
+        style={{
+          background: active ? "var(--shell-elevated)" : undefined,
+          color: "var(--shell-fg)",
+        }}
+      >
+        <span className="truncate">{chat.title}</span>
+      </Link>
+    </li>
   );
 }
 
@@ -274,7 +278,6 @@ export function ChatHistoryItem({
   onOpen,
   onChanged,
   onDeleted,
-  directDelete = false,
 }: {
   chat: RecentChat;
   active: boolean;
@@ -282,7 +285,6 @@ export function ChatHistoryItem({
   onOpen: () => void;
   onChanged: () => void;
   onDeleted: () => void;
-  directDelete?: boolean;
 }) {
   const containerRef = useRef<HTMLLIElement>(null);
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
@@ -402,26 +404,17 @@ export function ChatHistoryItem({
       </Link>
       <button
         type="button"
-        aria-label={directDelete ? `Delete ${title}` : `Chat options for ${title}`}
-        title={directDelete ? "Delete" : undefined}
-        aria-expanded={directDelete ? undefined : state !== "closed"}
+        aria-label={`Chat options for ${title}`}
+        aria-expanded={state !== "closed"}
         disabled={pending}
-        onClick={() => {
-          if (directDelete) {
-            void deleteChat();
-            return;
-          }
-          setState((current) => (current === "closed" ? "menu" : "closed"));
-        }}
-        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] ${
-          directDelete ? "hover:[color:#ff6767]" : ""
-        } disabled:cursor-wait disabled:opacity-50 ${
+        onClick={() => setState((current) => (current === "closed" ? "menu" : "closed"))}
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] disabled:cursor-wait disabled:opacity-50 ${
           active || state !== "closed"
             ? "opacity-100"
             : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
         }`}
       >
-        {directDelete ? <TrashIcon /> : <MoreIcon />}
+        <MoreIcon />
       </button>
 
       {state !== "closed" && (
@@ -576,14 +569,16 @@ function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
   );
 }
 
-function AccountLink({ account }: { account: AccountSummary }) {
+function AccountLink({ account, active }: { account: AccountSummary; active: boolean }) {
   const label = account.name?.trim() || account.email;
 
   return (
     <Link
       href="/settings#account"
       aria-label={`Open account settings for ${account.email}`}
+      aria-current={active ? "page" : undefined}
       className="flex min-h-12 items-center gap-2.5 rounded-lg px-2.5 py-1.5 transition-colors hover:bg-white/[0.06]"
+      style={{ background: active ? "var(--shell-elevated)" : undefined }}
     >
       <AccountAvatar account={account} className="h-8 w-8 text-xs" />
       <span className="min-w-0 flex-1">
@@ -596,13 +591,15 @@ function AccountLink({ account }: { account: AccountSummary }) {
   );
 }
 
-function CompactAccountLink({ account }: { account: AccountSummary }) {
+function CompactAccountLink({ account, active }: { account: AccountSummary; active: boolean }) {
   return (
     <Link
       href="/settings#account"
       aria-label={`Open account settings for ${account.email}`}
       title={account.name?.trim() || account.email}
+      aria-current={active ? "page" : undefined}
       className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-white/[0.06]"
+      style={{ background: active ? "var(--shell-elevated)" : undefined }}
     >
       <AccountAvatar account={account} className="h-7 w-7 text-[0.65rem]" />
     </Link>
@@ -770,14 +767,6 @@ function SmallCloseIcon() {
   return (
     <svg aria-hidden viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
       <path d="m7 7 10 10M17 7 7 17" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function ChevronRightIcon() {
-  return (
-    <svg aria-hidden viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="m10 7 5 5-5 5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
