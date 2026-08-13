@@ -52,6 +52,16 @@ export const McpMutationEvent = z
   .strict();
 export type McpMutationEvent = z.infer<typeof McpMutationEvent>;
 
+export const SnapshotDestination = z
+  .object({
+    directory: z.string().min(1),
+    file_prefix: z.string().regex(/^.+\.zeus-snapshot-[a-f0-9]{16}-$/u),
+    device_id: z.string().regex(/^\d+$/u),
+    registered_at: z.string(),
+  })
+  .strict();
+export type SnapshotDestination = z.infer<typeof SnapshotDestination>;
+
 export const OwnerKind = z.enum(["fact", "message", "entity"]);
 export type OwnerKind = z.infer<typeof OwnerKind>;
 

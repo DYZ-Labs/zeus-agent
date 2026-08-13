@@ -177,6 +177,9 @@ part of that group locks private web data until configuration is completed.
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
 | `ZEUS_OWNER_EMAIL` | For web login | — | Server-only email allowed to bind the one-person store |
 | `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
+| `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
+| `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
+| `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
 | `ZEUS_EMBEDDINGS` | No | enabled | Set to `off` for FTS5 and graph search only |
 | `ZEUS_MODEL_CACHE` | No | `.models` | Local embedding-model cache |
 | `ZEUS_SEMANTIC_FLOOR` | No | `0.5` | Minimum fact-vector similarity |
@@ -196,6 +199,106 @@ npm run ambient:uninstall  # remove the LaunchAgent
 The worker opens the configured SQLite path directly and performs no OpenAI call. The
 browser converts coordinates to a coarse cell and keeps only its cell-to-name mapping
 locally; Zeus stores only the name and an observation time that expires after 30 minutes.
+
+### Scheduled database snapshots
+
+`npm run snapshot` creates a standalone SQLite snapshot with `VACUUM INTO`. It reads a
+consistent committed view, including committed WAL state, while the web and MCP
+connections remain live. Zeus publishes the file only after the shared database
+verification passes: `integrity_check`, foreign keys, the Zeus application marker, and
+the exact migration ledger. It then keeps the newest `ZEUS_SNAPSHOT_RETENTION` verified
+snapshots in `ZEUS_SNAPSHOT_DIR`.
+
+On macOS, install the dedicated LaunchAgent to run once at load and daily at
+`ZEUS_SNAPSHOT_HOUR` local time:
+
+```bash
+npm run snapshot             # create and verify one snapshot now
+npm run snapshot:install     # install the daily macOS LaunchAgent
+npm run snapshot:uninstall   # stop and remove the LaunchAgent
+npm run snapshot:verify -- /absolute/path/to/zeus-snapshot.sqlite
+```
+
+The installer captures the current database path, snapshot directory, retention, and
+hour from `.env.local` (an already-set process environment still takes precedence).
+Reinstall it after changing any of those values. Snapshot files are owner-only
+(`0600`) but are complete, cleartext copies of the store; keep the directory private and
+outside the repository. Explicit source deletion purges Zeus-managed local snapshots for
+that database from every destination it has used. Each destination and filesystem
+identity is registered in the store before its first snapshot; deletion fails closed
+before removing source rows if a registered removable target is unavailable.
+
+#### Restore runbook
+
+Restoring rolls Zeus back to the snapshot time. It discards later changes and can
+resurrect information that was explicitly deleted after the snapshot was made.
+
+1. Stop every Zeus web process, close MCP clients that use the store, and stop scheduled
+   jobs. If installed, run `npm run snapshot:uninstall` and
+   `npm run ambient:uninstall`; reinstall them after recovery.
+2. Resolve the exact `ZEUS_DB` path and verify the selected snapshot before touching the
+   live store:
+
+   ```bash
+   npm run snapshot:verify -- /absolute/path/to/zeus-snapshot.sqlite
+   ```
+
+3. Set the following to exact absolute paths. The quarantine directory must not already
+   exist:
+
+   ```bash
+   ZEUS_RESTORE_DB=/absolute/path/to/zeus.db
+   ZEUS_RESTORE_SNAPSHOT=/absolute/path/to/zeus-snapshot.sqlite
+   ZEUS_RESTORE_QUARANTINE=/absolute/path/to/zeus-restore-quarantine-YYYYMMDD-HHMMSS
+   mkdir -m 700 "$ZEUS_RESTORE_QUARANTINE"
+   ```
+
+4. Move the current database and its exact WAL/SHM companions into quarantine. Do not
+   delete them until the restore has been checked:
+
+   ```bash
+   for suffix in "" "-wal" "-shm"; do
+     if [ -e "${ZEUS_RESTORE_DB}${suffix}" ]; then
+       mv "${ZEUS_RESTORE_DB}${suffix}" "$ZEUS_RESTORE_QUARANTINE/"
+     fi
+   done
+   ```
+
+5. Copy the snapshot to a temporary file beside the destination, set its mode, and
+   atomically rename it into place. A snapshot is standalone; never restore WAL or SHM
+   files with it.
+
+   ```bash
+   ZEUS_RESTORE_TEMP="$(mktemp "${ZEUS_RESTORE_DB}.restore.XXXXXX")"
+   cp "$ZEUS_RESTORE_SNAPSHOT" "$ZEUS_RESTORE_TEMP"
+   chmod 600 "$ZEUS_RESTORE_TEMP"
+   mv "$ZEUS_RESTORE_TEMP" "$ZEUS_RESTORE_DB"
+   npm run snapshot:verify -- "$ZEUS_RESTORE_DB"
+   ```
+
+6. Restart Zeus with the same `ZEUS_DB`. The current build will migrate an older valid
+   snapshot when necessary. Confirm the expected conversations and memory before
+   removing the quarantine, then reinstall any previously enabled LaunchAgents.
+
+#### Optional encrypted off-machine copy
+
+Zeus does not upload snapshots or manage encryption keys. For an opt-in off-machine
+copy, run an established encrypted backup tool such as restic only after the local
+snapshot command succeeds. Keep its password in an owner-only file outside the
+repository rather than in a command argument, and target the snapshot directory with a
+dedicated tag or repository. For example, after configuring a restic repository:
+
+```bash
+export RESTIC_PASSWORD_FILE=/absolute/path/to/private-restic-password
+export RESTIC_REPOSITORY=/absolute/path-or-supported-remote
+restic backup /absolute/path/to/zeus-snapshots --tag zeus
+```
+
+Off-machine retention and deletion are a separate user-owned boundary. Zeus's explicit
+source deletion removes managed local snapshots, not copies already uploaded elsewhere;
+expire those with the remote repository's `forget`/`prune` policy. Restore an off-machine
+copy to a temporary local path and pass it through `npm run snapshot:verify` before using
+the runbook above.
 
 ## Using Zeus
 
@@ -284,6 +387,10 @@ trust boundary and can access the same store when a same-OS process launches it.
 | `npm run reindex -- --fts-only` | Rebuild full-text indexes without embeddings |
 | `npm run export` | Export the store as Markdown to `./zeus-export` |
 | `npm run export -- /path/to/output` | Export to a private chosen directory (must be empty or a managed Zeus export) |
+| `npm run snapshot` | Create and verify an online SQLite snapshot |
+| `npm run snapshot:verify -- /absolute/file` | Verify one snapshot without restoring it |
+| `npm run snapshot:install` | Install the daily macOS snapshot LaunchAgent |
+| `npm run snapshot:uninstall` | Stop and remove the snapshot LaunchAgent |
 | `npm run mcp` | Start the stdio MCP server |
 
 `npm run check` is the required development gate.
@@ -342,7 +449,8 @@ What is sent to OpenAI:
 
 Both OpenAI paths use the Responses API with `store: false`. Zeus is local-first, but it
 is **not encrypted at rest**: any process running as your operating-system user can read
-the database. Treat Markdown exports as equally sensitive and do not commit either one.
+the database. Treat snapshots and Markdown exports as equally sensitive and do not
+commit them.
 
 ## Known limitations
 

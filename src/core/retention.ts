@@ -2,6 +2,10 @@ import type { Db } from "./db";
 import { now, purgeManagedMigrationBackups } from "./db";
 import { forgetFact, recomputeFactEvidenceAggregates } from "./facts";
 import { pruneBehavioralPolicySuggestions } from "./personalization";
+import {
+  purgeManagedSnapshotsWhileErasureLocked,
+  withSnapshotErasureLock,
+} from "./snapshots";
 import { invalidateWorkPlansForSourceLink } from "./work-plans";
 
 export type ConversationDependencies = {
@@ -453,9 +457,11 @@ export function deleteConversationWithMemory(
   db: Db,
   conversationId: number,
 ): ConversationDependencies {
-  const dependencies = deleteConversationRowsWithMemory(db, conversationId);
-  finalizeExplicitErasure(db);
-  return dependencies;
+  return withSnapshotErasureLock(db, () => {
+    const dependencies = deleteConversationRowsWithMemory(db, conversationId);
+    finalizeExplicitErasure(db);
+    return dependencies;
+  });
 }
 
 function finalizeExplicitErasure(db: Db): void {
@@ -482,6 +488,11 @@ function finalizeExplicitErasure(db: Db): void {
   // Once the live database is verified, retaining an older copy would make source
   // deletion misleading. The helper removes only exact, validated sibling backups.
   purgeManagedMigrationBackups(main.file);
+  // Scheduled snapshots are the same recovery boundary. The source-wide lock was
+  // acquired before row deletion; purge every registered name-scoped artifact,
+  // including an interrupted or corrupt copy. User-managed off-machine repositories
+  // remain a separate retention boundary documented in the runbook.
+  purgeManagedSnapshotsWhileErasureLocked(db);
 }
 
 function rebuildFullTextIndexes(db: Db): void {
@@ -873,20 +884,22 @@ function refreshBackfillCountsAfterDeletion(db: Db, jobIds: readonly number[]): 
 
 /** Explicitly delete every stored conversation using the same evidence-aware policy. */
 export function deleteAllConversationsWithMemory(db: Db): number {
-  const conversationIds = db
-    .prepare<[], { id: number }>("SELECT id FROM conversation ORDER BY id")
-    .all()
-    .map((row) => row.id);
+  return withSnapshotErasureLock(db, () => {
+    const conversationIds = db
+      .prepare<[], { id: number }>("SELECT id FROM conversation ORDER BY id")
+      .all()
+      .map((row) => row.id);
 
-  db.transaction(() => {
-    for (const conversationId of conversationIds) {
-      deleteConversationRowsWithMemory(db, conversationId);
-    }
-  })();
+    db.transaction(() => {
+      for (const conversationId of conversationIds) {
+        deleteConversationRowsWithMemory(db, conversationId);
+      }
+    })();
 
-  finalizeExplicitErasure(db);
+    finalizeExplicitErasure(db);
 
-  return conversationIds.length;
+    return conversationIds.length;
+  });
 }
 
 function reopenAfterSoleCorrectionDeletion(

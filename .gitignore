@@ -12,6 +12,9 @@ next-env.d.ts
 *.sqlite
 *.pre-migration-*.backup
 *.pre-migration-*.backup.tmp
+*.zeus-snapshot-*.db
+*.zeus-snapshot-*.db.tmp
+*.zeus-snapshot.lock*
 .zeus/
 
 .env*

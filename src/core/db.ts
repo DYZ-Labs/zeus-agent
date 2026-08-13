@@ -204,7 +204,7 @@ function createVerifiedPreMigrationBackup(db: Db, applied: readonly string[]): s
   }
 }
 
-function databaseFilePath(db: Db): string {
+export function databaseFilePath(db: Db): string {
   const databases = db.pragma("database_list") as Array<{ name: string; file: string }>;
   const main = databases.find((entry) => entry.name === "main");
   if (!main?.file) throw new Error("Cannot resolve the on-disk Zeus database path.");
@@ -220,48 +220,68 @@ function syncDirectory(directory: string): void {
   }
 }
 
-function verifyMigrationBackup(path: string, expectedApplied: readonly string[]): void {
+type DatabaseCopyLedgerMode = "exact" | "prefix";
+
+/**
+ * Verify that a SQLite copy is a structurally sound Zeus store with the expected
+ * migration history. Migration backups and scheduled snapshots deliberately share
+ * this boundary so neither path can weaken provenance checks to integrity_check alone.
+ */
+export function verifyDatabaseCopy(
+  path: string,
+  expectedApplied: readonly string[],
+  description = "Database copy",
+  ledgerMode: DatabaseCopyLedgerMode = "exact",
+): void {
   const backup = new Database(path, { readonly: true, fileMustExist: true });
   try {
     const integrity = backup.pragma("integrity_check", { simple: true });
     if (integrity !== "ok") {
-      throw new Error(`Pre-migration backup failed integrity_check: ${String(integrity)}`);
+      throw new Error(`${description} failed integrity_check: ${String(integrity)}`);
     }
     if ((backup.pragma("foreign_key_check") as unknown[]).length > 0) {
-      throw new Error("Pre-migration backup failed foreign_key_check.");
+      throw new Error(`${description} failed foreign_key_check.`);
     }
     if (backup.pragma("application_id", { simple: true }) !== ZEUS_APPLICATION_ID) {
-      throw new Error("Pre-migration backup is missing the Zeus application marker.");
+      throw new Error(`${description} is missing the Zeus application marker.`);
     }
     const backedUp = appliedMigrationLedger(backup);
-    if (
-      backedUp.length !== expectedApplied.length ||
-      backedUp.some((id, index) => id !== expectedApplied[index])
-    ) {
-      throw new Error("Pre-migration backup does not match the source migration ledger.");
+    const ledgerMatches =
+      ledgerMode === "exact"
+        ? backedUp.length === expectedApplied.length &&
+          backedUp.every((id, index) => id === expectedApplied[index])
+        : backedUp.length > 0 &&
+          backedUp.length <= expectedApplied.length &&
+          backedUp.every((id, index) => id === expectedApplied[index]);
+    if (!ledgerMatches) {
+      const relationship = ledgerMode === "exact" ? "match" : "precede";
+      throw new Error(`${description} migration ledger does not ${relationship} the source.`);
     }
   } finally {
     backup.close();
   }
 }
 
+/** Verify a copy that may have been created by an older compatible Zeus build. */
+export function verifyRestorableDatabaseCopy(path: string): void {
+  verifyDatabaseCopy(
+    path,
+    MIGRATIONS.map((migration) => migration.id),
+    "Zeus database copy",
+    "prefix",
+  );
+}
+
+function verifyMigrationBackup(path: string, expectedApplied: readonly string[]): void {
+  verifyDatabaseCopy(path, expectedApplied, "Pre-migration backup");
+}
+
 function isVerifiedManagedMigrationBackup(path: string): boolean {
-  let backup: Database.Database | null = null;
   try {
-    backup = new Database(path, { readonly: true, fileMustExist: true });
-    if (backup.pragma("application_id", { simple: true }) !== ZEUS_APPLICATION_ID) return false;
-    if (backup.pragma("integrity_check", { simple: true }) !== "ok") return false;
-    if ((backup.pragma("foreign_key_check") as unknown[]).length > 0) return false;
-    const ledger = backup
-      .prepare<[], { id: string }>("SELECT id FROM schema_migration ORDER BY rowid")
-      .all()
-      .map((row) => row.id);
-    if (ledger.length === 0 || ledger.length > MIGRATIONS.length) return false;
-    return ledger.every((id, index) => id === MIGRATIONS[index]?.id);
+    verifyRestorableDatabaseCopy(path);
+    return true;
   } catch {
     return false;
-  } finally {
-    backup?.close();
   }
 }
 
@@ -274,7 +294,7 @@ function ensureZeusApplicationId(db: Db): void {
   db.pragma(`application_id = ${ZEUS_APPLICATION_ID}`);
 }
 
-function appliedMigrationLedger(db: Db): string[] {
+export function appliedMigrationLedger(db: Db): string[] {
   return db
     .prepare<[], { id: string }>("SELECT id FROM schema_migration ORDER BY rowid")
     .all()

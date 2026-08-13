@@ -1422,6 +1422,21 @@ CREATE INDEX mcp_mutation_event_created_idx
 ON mcp_mutation_event(created_at DESC);
 `;
 
+/**
+ * Snapshot destinations are durable erasure boundaries. Keeping every path and its
+ * filesystem identity in the store lets explicit source deletion fail closed when a
+ * formerly used removable target is unavailable, and purge old configured targets.
+ */
+const SNAPSHOT_DESTINATIONS = `
+CREATE TABLE snapshot_destination (
+  directory      TEXT NOT NULL,
+  file_prefix    TEXT NOT NULL,
+  device_id      TEXT NOT NULL,
+  registered_at  TEXT NOT NULL,
+  PRIMARY KEY (directory, file_prefix)
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1443,4 +1458,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "018_work_plan_generation_provenance", sql: WORK_PLAN_GENERATION_PROVENANCE },
   { id: "019_work_artifact_memory_provenance", sql: WORK_ARTIFACT_MEMORY_PROVENANCE },
   { id: "020_mcp_mutation_approval", sql: MCP_MUTATION_APPROVAL },
+  { id: "021_snapshot_destinations", sql: SNAPSHOT_DESTINATIONS },
 ];
