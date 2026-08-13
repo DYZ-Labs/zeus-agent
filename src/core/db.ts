@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  statfsSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -108,6 +109,14 @@ export function migrate(
     }
 
     if (!db.memory && applied.length > 0 && statSync(databaseFilePath(db)).size > 0) {
+      const databasePath = databaseFilePath(db);
+      // Prune before writing rather than after. Stale copies are the likeliest reason
+      // a volume is short of room, and the new backup needs that room now; keeping
+      // retention-1 leaves exactly `retention` once this migration's copy lands.
+      // Verification makes this list expensive, which is affordable here because a
+      // migration is rare — never do it on an ordinary open.
+      pruneManagedMigrationBackups(databasePath, configuredMigrationBackupRetention() - 1);
+      assertRoomForMigrationBackup(databasePath);
       createVerifiedPreMigrationBackup(db, applied);
     }
 
@@ -127,6 +136,15 @@ export function migrate(
 
 const MIGRATION_BACKUP_MARKER = ".pre-migration-";
 const MIGRATION_BACKUP_SUFFIX = ".backup";
+/**
+ * How many pre-migration copies to keep per store. Each is a full copy of the database
+ * on the same volume as the data it protects, so an unbounded series eventually fills
+ * the disk and blocks the very migration that would fix it. Three covers a rollback
+ * across a couple of releases, which is the window these copies actually serve.
+ */
+export const DEFAULT_MIGRATION_BACKUP_RETENTION = 3;
+/** Room for the copy's own overhead and the migration that follows it. */
+const MIGRATION_BACKUP_HEADROOM_BYTES = 16 * 1024 * 1024;
 // ASCII "ZEUS". SQLite reserves application_id for formats owned by applications.
 const ZEUS_APPLICATION_ID = 0x5a455553;
 
@@ -167,6 +185,70 @@ export function purgeManagedMigrationBackups(databasePath: string): number {
   const backups = listManagedMigrationBackups(databasePath);
   for (const backup of backups) rmSync(backup);
   return backups.length;
+}
+
+/**
+ * Keep only the newest `retention` validated backups for this database.
+ *
+ * Backup names embed a UTC ISO timestamp, so the validated list sorts oldest-first and
+ * the tail is the set worth keeping. Only validated backups are eligible for deletion:
+ * a filename alone never grants deletion authority, which is also why an unreadable
+ * copy is left in place for an operator to look at rather than quietly removed.
+ */
+export function pruneManagedMigrationBackups(
+  databasePath: string,
+  retention: number,
+): number {
+  const keep = Math.max(0, Math.trunc(retention));
+  const backups = listManagedMigrationBackups(databasePath);
+  const expired = backups.slice(0, Math.max(0, backups.length - keep));
+  for (const backup of expired) rmSync(backup, { force: true });
+  return expired.length;
+}
+
+export function configuredMigrationBackupRetention(): number {
+  const raw = process.env.ZEUS_MIGRATION_BACKUP_RETENTION?.trim();
+  if (!raw) return DEFAULT_MIGRATION_BACKUP_RETENTION;
+  if (!/^\d+$/u.test(raw)) {
+    throw new Error("ZEUS_MIGRATION_BACKUP_RETENTION must be a positive integer");
+  }
+  const value = Number(raw);
+  // At least one: a store must never be configured out of its own rollback path.
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1_000) {
+    throw new Error("ZEUS_MIGRATION_BACKUP_RETENTION must be between 1 and 1000");
+  }
+  return value;
+}
+
+/**
+ * Refuse to start a backup that cannot finish.
+ *
+ * The backup is taken inside the migration's writer reservation and before any schema
+ * change, so a disk-full failure mid-write aborts the migration — and the volume stays
+ * full, so the next deploy fails the same way. Checking first turns an obscure partial
+ * write into an operator-actionable message while the store is still untouched.
+ */
+function assertRoomForMigrationBackup(databasePath: string): void {
+  const required = statSync(databasePath).size + MIGRATION_BACKUP_HEADROOM_BYTES;
+  let available: number;
+  try {
+    const volume = statfsSync(dirname(databasePath));
+    available = volume.bavail * volume.bsize;
+  } catch {
+    // statfs is not available everywhere. The backup verifies itself before it is
+    // published, so losing an early warning is not a reason to block a migration.
+    return;
+  }
+  if (available >= required) return;
+  throw new Error(
+    `Not enough free space to back up ${basename(databasePath)} before migrating: ` +
+      `${megabytes(available)} available, ${megabytes(required)} required. Free space on ` +
+      "this volume and restart. Zeus does not migrate without a pre-migration backup.",
+  );
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function createVerifiedPreMigrationBackup(db: Db, applied: readonly string[]): string {

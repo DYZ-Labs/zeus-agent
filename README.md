@@ -182,6 +182,7 @@ group locks private web data until configuration is completed.
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
 | `ZEUS_OWNER_EMAIL` | Legacy migration only | — | Email allowed to claim an unbound pre-multi-account `ZEUS_DB` |
 | `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
+| `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
@@ -204,6 +205,25 @@ npm run ambient:uninstall  # remove the LaunchAgent
 The worker opens the configured SQLite path directly and performs no OpenAI call. The
 browser converts coordinates to a coarse cell and keeps only its cell-to-name mapping
 locally; Zeus stores only the name and an observation time that expires after 30 minutes.
+
+### Pre-migration backups
+
+Before applying any pending migration to a store that already has one, Zeus writes a
+verified full copy beside the database and refuses to migrate if that copy cannot be
+made. Each copy is as large as the store and sits on the same volume as the data it
+protects, so Zeus keeps only the newest `ZEUS_MIGRATION_BACKUP_RETENTION` of them and
+prunes the rest as part of the migration that creates one. Pruning happens *before* the
+new copy is written, because stale copies are the likeliest reason a volume is short of
+room.
+
+Zeus also checks free space before starting the copy. The backup is taken inside the
+migration's writer reservation and before any schema change, so running out of disk
+mid-write would abort the migration and leave the volume just as full for the next
+attempt — the deploy that would fix the problem is the one that cannot run. Failing up
+front reports what is needed while the store is still untouched.
+
+Only validated copies are ever pruned: an unreadable file that merely looks like a
+backup is left in place for an operator to inspect rather than quietly removed.
 
 ### Scheduled database snapshots
 

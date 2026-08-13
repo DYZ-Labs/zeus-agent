@@ -1,5 +1,21 @@
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
+
+// db.ts binds `statfsSync` as a named ESM import, so a spy on the module object would
+// not intercept it. Mock with passthrough and let one test substitute a full volume.
+const fsMocks = vi.hoisted(() => ({
+  statfs: null as null | (() => { bavail: number; bsize: number }),
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    statfsSync: (...args: Parameters<typeof actual.statfsSync>) =>
+      fsMocks.statfs ? fsMocks.statfs() : actual.statfsSync(...args),
+  };
+});
+
 import {
   chmodSync,
   mkdirSync,
@@ -15,12 +31,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  DEFAULT_MIGRATION_BACKUP_RETENTION,
   listManagedMigrationBackups,
   migrate,
   openTestDb,
   purgeManagedMigrationBackups,
 } from "./db";
-import type { Migration } from "./migrations";
+import { MIGRATIONS, type Migration } from "./migrations";
 
 const FIRST: Migration = {
   id: "001_init",
@@ -35,6 +52,8 @@ const temporaryDirectories: string[] = [];
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  fsMocks.statfs = null;
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -202,6 +221,102 @@ describe("managed migration backup cleanup", () => {
     expect(lstatSync(symlink).isSymbolicLink()).toBe(true);
   });
 });
+
+// These use real MIGRATIONS slices rather than the synthetic FIRST/SECOND pair above:
+// a managed backup is only listed when its ledger is a genuine prefix of this build, so
+// invented migration ids produce copies that verification correctly refuses to see.
+describe("bounded migration backup retention", () => {
+  it("keeps only the newest copies as releases accumulate", () => {
+    const { db, path } = storeAtMigration(1);
+    vi.stubEnv("ZEUS_MIGRATION_BACKUP_RETENTION", "2");
+
+    // Four migrating releases against the same store.
+    for (let count = 2; count <= 5; count += 1) migrate(db, MIGRATIONS.slice(0, count));
+
+    const backups = listManagedMigrationBackups(path);
+    expect(backups).toHaveLength(2);
+    // The survivors are the newest — the ones a rollback would actually reach for.
+    expect(ledgerOf(backups.at(-1)!)).toEqual(migrationIds(4));
+    expect(ledgerOf(backups[0]!)).toEqual(migrationIds(3));
+  });
+
+  it("still keeps this migration's own copy at the minimum retention", () => {
+    const { db, path } = storeAtMigration(1);
+    vi.stubEnv("ZEUS_MIGRATION_BACKUP_RETENTION", "1");
+
+    migrate(db, MIGRATIONS.slice(0, 2));
+    migrate(db, MIGRATIONS.slice(0, 3));
+
+    const backups = listManagedMigrationBackups(path);
+    expect(backups).toHaveLength(1);
+    expect(ledgerOf(backups[0]!)).toEqual(migrationIds(2));
+  });
+
+  it("defaults to a bounded number rather than growing forever", () => {
+    const { db, path } = storeAtMigration(1);
+
+    for (let count = 2; count <= 6; count += 1) migrate(db, MIGRATIONS.slice(0, count));
+
+    expect(listManagedMigrationBackups(path)).toHaveLength(
+      DEFAULT_MIGRATION_BACKUP_RETENTION,
+    );
+  });
+
+  it("never prunes a copy belonging to another database", () => {
+    const { db, path } = storeAtMigration(1);
+    const { db: otherDb, path: other } = storeAtMigration(1);
+    migrate(otherDb, MIGRATIONS.slice(0, 2));
+    otherDb.close();
+    vi.stubEnv("ZEUS_MIGRATION_BACKUP_RETENTION", "1");
+
+    migrate(db, MIGRATIONS.slice(0, 2));
+    migrate(db, MIGRATIONS.slice(0, 3));
+
+    expect(listManagedMigrationBackups(path)).toHaveLength(1);
+    expect(listManagedMigrationBackups(other)).toHaveLength(1);
+  });
+
+  it("rejects a retention setting that would disable rollback", () => {
+    const { db } = storeAtMigration(1);
+    vi.stubEnv("ZEUS_MIGRATION_BACKUP_RETENTION", "0");
+
+    expect(() => migrate(db, MIGRATIONS.slice(0, 2))).toThrow(/between 1 and 1000/u);
+  });
+
+  it("refuses to start a backup the volume cannot hold, before any schema change", () => {
+    const { db, path } = storeAtMigration(1);
+    // A volume with no usable blocks left.
+    fsMocks.statfs = () => ({ bavail: 0, bsize: 4096 });
+
+    expect(() => migrate(db, MIGRATIONS.slice(0, 2))).toThrow(/Not enough free space/u);
+    expect(listManagedMigrationBackups(path)).toEqual([]);
+    // Failing early means the schema is untouched, not half-migrated.
+    expect(ledgerOf(path)).toEqual(migrationIds(1));
+  });
+});
+
+function storeAtMigration(count: number): { db: Database.Database; path: string } {
+  const path = join(temporaryDirectory(), "zeus.db");
+  const db = database(path);
+  migrate(db, MIGRATIONS.slice(0, count));
+  return { db, path };
+}
+
+function migrationIds(count: number): string[] {
+  return MIGRATIONS.slice(0, count).map((migration) => migration.id);
+}
+
+function ledgerOf(backupPath: string): string[] {
+  const backup = new Database(backupPath, { readonly: true, fileMustExist: true });
+  try {
+    return backup
+      .prepare<[], { id: string }>("SELECT id FROM schema_migration ORDER BY rowid")
+      .all()
+      .map((row) => row.id);
+  } finally {
+    backup.close();
+  }
+}
 
 function existingStore(): { db: Database.Database; path: string } {
   const path = join(temporaryDirectory(), "zeus.db");
