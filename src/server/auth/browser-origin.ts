@@ -75,12 +75,32 @@ export function checkBrowserBoundary(
   return { allowed: true, origin: expectedOrigin };
 }
 
-/** Local-mode responses are not reusable by an embedding or a different origin. */
-export function applyLocalBrowserSecurityHeaders(response: Response): Response {
+/**
+ * Harden every browser-facing response so it is not framable, sniffable, cacheable by
+ * an intermediary, or reusable from another origin.
+ *
+ * Local and configured mode deliberately share one set. The publicly reachable
+ * deployment must never be weaker than the loopback one, and applying this at a single
+ * exit point is what keeps a newly added branch from silently shipping bare responses.
+ */
+export function applyBrowserSecurityHeaders(
+  response: Response,
+  configuration: AuthConfiguration,
+): Response {
   response.headers.set("Cross-Origin-Resource-Policy", "same-origin");
   response.headers.set("X-Frame-Options", "DENY");
   response.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+  response.headers.set("X-Content-Type-Options", "nosniff");
+  // Paths carry entity slugs and source/response ids. Same-origin keeps the full
+  // referer for Zeus's own boundary check while sending none to a third party.
+  response.headers.set("Referrer-Policy", "same-origin");
   response.headers.set("Cache-Control", "private, no-store");
+  if (configuration.mode === "configured" && configuration.siteUrl.startsWith("https://")) {
+    response.headers.set(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    );
+  }
   return response;
 }
 

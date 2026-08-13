@@ -165,6 +165,21 @@ Email links must be opened in the same browser profile that requested them becau
 PKCE verifier is stored in a host-bound cookie. Zeus redirects the login screen to the
 configured `NEXT_PUBLIC_SITE_URL` before starting a flow to enforce this.
 
+### Hosting Zeus
+
+Two settings are mandatory once Supabase login is configured, and Zeus enforces both
+rather than trusting the deployment:
+
+- **`ZEUS_DB` must point at a mounted persistent volume**, and its parent directory must
+  already exist. The default `~/.zeus/zeus.db` sits in the container filesystem, so every
+  deploy would silently replace each account's memory with an empty store. Zeus refuses to
+  start rather than serve that, and it will not create a missing directory, because a
+  missing mount point is precisely the failure worth catching.
+- **`ZEUS_ALLOWED_SIGNUP_EMAILS` decides who may create an account.** It is empty by
+  default, which admits nobody new: every signup permanently allocates a database, a
+  migration run, and an open connection on the host. Accounts that already have a store
+  are never affected by the list, so tightening it cannot lock out an existing user.
+
 No Supabase service-role key, database table, or RLS policy is needed. Supabase's default
 email sender only delivers to members of the project's organization and is heavily
 rate-limited; configure custom SMTP before production use. Leave both the Supabase URL
@@ -181,7 +196,8 @@ group locks private web data until configuration is completed.
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | For web login | — | Browser-safe Supabase publishable key |
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
 | `ZEUS_OWNER_EMAIL` | Legacy migration only | — | Email allowed to claim an unbound pre-multi-account `ZEUS_DB` |
-| `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
+| `ZEUS_ALLOWED_SIGNUP_EMAILS` | For web login | — (nobody) | Comma-separated emails permitted to create a **new** personal store |
+| `ZEUS_DB` | Yes once login is configured | `~/.zeus/zeus.db` | SQLite database path; must be on a mounted volume for a hosted deployment |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
@@ -249,6 +265,13 @@ verification passes: `integrity_check`, foreign keys, the Zeus application marke
 the exact migration ledger. It then keeps the newest `ZEUS_SNAPSHOT_RETENTION` verified
 snapshots in `ZEUS_SNAPSHOT_DIR`.
 
+It covers **every** store: the primary database and each `accounts/<uuid>.db` beside it.
+Snapshot filenames are scoped by a hash of their source path, so all stores share one
+directory without pruning each other's copies — one directory to replicate off-machine,
+and retention counts per store. A store that cannot be read is reported and skipped so
+one bad database never costs every other account its backup; the run still exits
+non-zero. Use `--only` to operate on the primary store alone.
+
 On macOS, install the dedicated LaunchAgent to run once at load and daily at
 `ZEUS_SNAPSHOT_HOUR` local time:
 
@@ -273,52 +296,44 @@ before removing source rows if a registered removable target is unavailable.
 Restoring rolls Zeus back to the snapshot time. It discards later changes and can
 resurrect information that was explicitly deleted after the snapshot was made.
 
+`npm run restore` performs the whole procedure: it verifies the snapshot before touching
+anything, refuses to run while another process holds the store's writer reservation,
+renames the current store aside instead of deleting it, moves any WAL/SHM sidecars with
+it, and re-verifies the installed file. Without `--yes` it is a dry run that still
+verifies the snapshot, so you can confirm a copy is usable before committing to it.
+
 1. Stop every Zeus web process, close MCP clients that use the store, and stop scheduled
    jobs. If installed, run `npm run snapshot:uninstall` and
-   `npm run ambient:uninstall`; reinstall them after recovery.
-2. Resolve the exact `ZEUS_DB` path and verify the selected snapshot before touching the
-   live store:
+   `npm run ambient:uninstall`; reinstall them after recovery. The restore refuses to
+   proceed if a writer is still attached, but a reader started mid-restore would still
+   see a store swapped underneath it.
+2. Find the verified snapshots for the store you are recovering. This works even when
+   that store is missing or unopenable, which is the usual state during a recovery:
 
    ```bash
-   npm run snapshot:verify -- /absolute/path/to/zeus-snapshot.sqlite
+   npm run restore -- --list
+   npm run restore -- --db ~/.zeus/accounts/<uuid>.db --list
    ```
 
-3. Set the following to exact absolute paths. The quarantine directory must not already
-   exist:
+3. Dry-run the restore. This verifies the snapshot and reports exactly what would move:
 
    ```bash
-   ZEUS_RESTORE_DB=/absolute/path/to/zeus.db
-   ZEUS_RESTORE_SNAPSHOT=/absolute/path/to/zeus-snapshot.sqlite
-   ZEUS_RESTORE_QUARANTINE=/absolute/path/to/zeus-restore-quarantine-YYYYMMDD-HHMMSS
-   mkdir -m 700 "$ZEUS_RESTORE_QUARANTINE"
+   npm run restore -- --from /absolute/path/to/zeus-snapshot.db
    ```
 
-4. Move the current database and its exact WAL/SHM companions into quarantine. Do not
-   delete them until the restore has been checked:
+4. Perform it. Use `--latest` instead of `--from` to take the newest verified snapshot:
 
    ```bash
-   for suffix in "" "-wal" "-shm"; do
-     if [ -e "${ZEUS_RESTORE_DB}${suffix}" ]; then
-       mv "${ZEUS_RESTORE_DB}${suffix}" "$ZEUS_RESTORE_QUARANTINE/"
-     fi
-   done
+   npm run restore -- --from /absolute/path/to/zeus-snapshot.db --yes
+   npm run restore -- --db ~/.zeus/accounts/<uuid>.db --latest --yes
    ```
 
-5. Copy the snapshot to a temporary file beside the destination, set its mode, and
-   atomically rename it into place. A snapshot is standalone; never restore WAL or SHM
-   files with it.
+5. Restart Zeus with the same `ZEUS_DB`. The current build migrates an older valid
+   snapshot when necessary. Confirm the expected conversations and memory, then remove
+   the preserved `*.pre-restore-*` file and reinstall any LaunchAgents you stopped.
 
-   ```bash
-   ZEUS_RESTORE_TEMP="$(mktemp "${ZEUS_RESTORE_DB}.restore.XXXXXX")"
-   cp "$ZEUS_RESTORE_SNAPSHOT" "$ZEUS_RESTORE_TEMP"
-   chmod 600 "$ZEUS_RESTORE_TEMP"
-   mv "$ZEUS_RESTORE_TEMP" "$ZEUS_RESTORE_DB"
-   npm run snapshot:verify -- "$ZEUS_RESTORE_DB"
-   ```
-
-6. Restart Zeus with the same `ZEUS_DB`. The current build will migrate an older valid
-   snapshot when necessary. Confirm the expected conversations and memory before
-   removing the quarantine, then reinstall any previously enabled LaunchAgents.
+Restore one store at a time and name it explicitly; there is deliberately no
+restore-everything flag.
 
 #### Optional encrypted off-machine copy
 
@@ -414,8 +429,10 @@ stdout and diagnostics to stderr.
 
 Supabase login protects the web interface. The stdio MCP server remains a separate local
 trust boundary and opens the specific database selected by `ZEUS_DB`; it does not infer a
-web account. To export, reindex, snapshot, or open MCP for an additional account, point
-`ZEUS_DB` at that account's UUID-named database explicitly.
+web account. `npm run snapshot` and `npm run reindex` cover every account store
+automatically. Export still operates on one store at a time — deliberately, so one
+directory never mixes two people's personal data — so point `ZEUS_DB` at that account's
+UUID-named database to export it or to open MCP against it.
 
 ## Commands
 
@@ -431,8 +448,10 @@ web account. To export, reindex, snapshot, or open MCP for an additional account
 | `npm run eval:memory` | Run the deterministic offline trust-policy corpus |
 | `npm run check` | Run lint, typecheck, tests, trust evaluation, and build |
 | `npm run seed:demo` | Replay fixture extractions into a demo database and assert the result |
-| `npm run reindex` | Rebuild FTS5 and any missing embeddings |
+| `npm run reindex` | Rebuild FTS5 and any missing embeddings, for every store |
 | `npm run reindex -- --fts-only` | Rebuild full-text indexes without embeddings |
+| `npm run restore -- --list` | List verified snapshots available for a store |
+| `npm run restore -- --latest --yes` | Restore the newest verified snapshot over a store |
 | `npm run export` | Export the store as Markdown to `./zeus-export` |
 | `npm run export -- /path/to/output` | Export to a private chosen directory (must be empty or a managed Zeus export) |
 | `npm run snapshot` | Create and verify an online SQLite snapshot |

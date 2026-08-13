@@ -21,6 +21,7 @@ const CONFIGURED = {
   publishableKey: "sb_publishable_test",
   legacyOwnerEmail: "owner@example.com",
   siteUrl: "https://zeus.example",
+  allowedSignupEmails: [],
 };
 
 beforeEach(() => {
@@ -70,6 +71,61 @@ describe("health check reachability", () => {
     // The state most worth reporting is the one where the door is broken.
     expect(health.headers.get("x-middleware-next")).toBe("1");
     expect(other.status).toBe(503);
+  });
+});
+
+describe("browser response hardening", () => {
+  it("hardens a successful configured-mode response, not just the local one", async () => {
+    mocks.getClaims.mockResolvedValue({ data: { claims: { sub: "owner" } }, error: null });
+
+    const response = await proxy(
+      new NextRequest("https://zeus.example/today", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+    expect(response.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("referrer-policy")).toBe("same-origin");
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(response.headers.get("strict-transport-security")).toBe(
+      "max-age=31536000; includeSubDomains",
+    );
+  });
+
+  it("hardens a signed-out redirect and an unauthenticated API rejection", async () => {
+    const redirect = await proxy(
+      new NextRequest("https://zeus.example/today", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+    const api = await proxy(
+      new NextRequest("https://zeus.example/api/work-plans", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+
+    expect(redirect.status).toBe(307);
+    expect(api.status).toBe(401);
+    for (const response of [redirect, api]) {
+      expect(response.headers.get("x-frame-options")).toBe("DENY");
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+    }
+  });
+
+  it("omits HSTS for a plaintext local origin", async () => {
+    mocks.getAuthConfiguration.mockReturnValue({ mode: "local" });
+
+    const response = await proxy(
+      new NextRequest("http://127.0.0.1:3000/today", {
+        headers: { host: "127.0.0.1:3000", "sec-fetch-site": "none" },
+      }),
+    );
+
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+    expect(response.headers.get("strict-transport-security")).toBeNull();
   });
 });
 

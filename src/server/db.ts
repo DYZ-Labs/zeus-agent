@@ -1,5 +1,6 @@
 import "server-only";
 
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { databaseFilePath, migrate, openDb, type Db } from "@/core/db";
@@ -79,6 +80,19 @@ export function getAccountDb(identity: AccountIdentity): Db {
     cached.latestMigrationId = latestMigrationId;
   }
   return cached.db;
+}
+
+/**
+ * Whether this identity already has a store on disk, answered without creating one.
+ *
+ * Establishing a new store is precisely the allocation the signup allowlist gates, so
+ * this check must never be the thing that performs it. `getAccountDb` opens and
+ * migrates; this only resolves a path and asks the filesystem.
+ */
+export function accountDbExists(identity: AccountIdentity): boolean {
+  // turbopackIgnore: the path is resolved at runtime from the configured store, so
+  // there is nothing for the bundler's file tracer to follow.
+  return existsSync(/* turbopackIgnore: true */ accountDbPath(getDb(), identity));
 }
 
 /** Pure path selection kept exported so the legacy-routing safety policy is testable. */
