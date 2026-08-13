@@ -17,4 +17,9 @@ export async function register(): Promise<void> {
   // be worse than none, because it would look like the memory was safe.
   const { startSnapshotScheduler } = await import("./server/snapshot-scheduler");
   startSnapshotScheduler();
+
+  // Deliberately not awaited: the model download must never delay the server coming up
+  // or keep it from coming up at all. Search answers from full-text until it lands.
+  const { startEmbeddingWarmup } = await import("./server/embedding-warmup");
+  startEmbeddingWarmup();
 }

@@ -55,7 +55,9 @@ const FIELD_PATTERNS = {
   account: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
   error_name: /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u,
   error_site: /^[A-Za-z0-9/_\-.]{1,128}:\d{1,6}$/u,
-  model: /^[A-Za-z0-9._-]{1,64}$/u,
+  // Slashes are legitimate in a model id (`Xenova/bge-small-en-v1.5`) and carry
+  // no user data; without them a real value would be reported as "invalid".
+  model: /^[A-Za-z0-9._/-]{1,64}$/u,
   mode: /^[a-z][a-z0-9_]{0,31}$/u,
   store: /^[a-z][a-z0-9_]{0,31}$/u,
 } as const;
