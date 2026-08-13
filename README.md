@@ -165,6 +165,21 @@ Email links must be opened in the same browser profile that requested them becau
 PKCE verifier is stored in a host-bound cookie. Zeus redirects the login screen to the
 configured `NEXT_PUBLIC_SITE_URL` before starting a flow to enforce this.
 
+### Hosting Zeus
+
+Two settings are mandatory once Supabase login is configured, and Zeus enforces both
+rather than trusting the deployment:
+
+- **`ZEUS_DB` must point at a mounted persistent volume**, and its parent directory must
+  already exist. The default `~/.zeus/zeus.db` sits in the container filesystem, so every
+  deploy would silently replace each account's memory with an empty store. Zeus refuses to
+  start rather than serve that, and it will not create a missing directory, because a
+  missing mount point is precisely the failure worth catching.
+- **`ZEUS_ALLOWED_SIGNUP_EMAILS` decides who may create an account.** It is empty by
+  default, which admits nobody new: every signup permanently allocates a database, a
+  migration run, and an open connection on the host. Accounts that already have a store
+  are never affected by the list, so tightening it cannot lock out an existing user.
+
 No Supabase service-role key, database table, or RLS policy is needed. Supabase's default
 email sender only delivers to members of the project's organization and is heavily
 rate-limited; configure custom SMTP before production use. Leave both the Supabase URL
@@ -181,7 +196,8 @@ group locks private web data until configuration is completed.
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | For web login | — | Browser-safe Supabase publishable key |
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
 | `ZEUS_OWNER_EMAIL` | Legacy migration only | — | Email allowed to claim an unbound pre-multi-account `ZEUS_DB` |
-| `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
+| `ZEUS_ALLOWED_SIGNUP_EMAILS` | For web login | — (nobody) | Comma-separated emails permitted to create a **new** personal store |
+| `ZEUS_DB` | Yes once login is configured | `~/.zeus/zeus.db` | SQLite database path; must be on a mounted volume for a hosted deployment |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |

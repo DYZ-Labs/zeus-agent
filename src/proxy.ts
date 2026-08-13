@@ -1,9 +1,9 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-import { getAuthConfiguration } from "@/server/auth/config";
+import { getAuthConfiguration, type AuthConfiguration } from "@/server/auth/config";
 import {
-  applyLocalBrowserSecurityHeaders,
+  applyBrowserSecurityHeaders,
   checkBrowserBoundary,
 } from "@/server/auth/browser-origin";
 
@@ -13,23 +13,34 @@ const PUBLIC_PATHS = new Set(["/", "/settings"]);
  * Refresh Supabase cookies and provide a coarse signed-in gate. The data-access layer
  * still verifies the immutable local owner on every DB boundary; Proxy is only the
  * fast outer door and is never the sole authorization check.
+ *
+ * Every response leaves through one hardening step. Routing decides *what* to return;
+ * it never decides whether the response is hardened.
  */
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const configuration = getAuthConfiguration();
+  return applyBrowserSecurityHeaders(
+    await routeRequest(request, configuration),
+    configuration,
+  ) as NextResponse;
+}
+
+async function routeRequest(
+  request: NextRequest,
+  configuration: AuthConfiguration,
+): Promise<NextResponse> {
   if (configuration.mode === "local") {
     const capability = isSafeMethod(request.method) ? "private-read" : "private-mutation";
     const boundary = checkBrowserBoundary(request, capability, configuration);
     if (!boundary.allowed) {
-      return localBoundaryDenied(request, boundary.message);
+      return boundaryDenied(request, boundary.message);
     }
-    return applyLocalBrowserSecurityHeaders(
-      NextResponse.next({ request }),
-    ) as NextResponse;
+    return NextResponse.next({ request });
   }
 
   if (configuration.mode === "configured" && !isSafeMethod(request.method)) {
     const boundary = checkBrowserBoundary(request, "private-mutation", configuration);
-    if (!boundary.allowed) return configuredBoundaryDenied(request, boundary.message);
+    if (!boundary.allowed) return boundaryDenied(request, boundary.message);
   }
 
   const isAuthPath = request.nextUrl.pathname.startsWith("/auth/");
@@ -104,21 +115,10 @@ function isSafeMethod(method: string): boolean {
   return method === "GET" || method === "HEAD" || method === "OPTIONS";
 }
 
-function localBoundaryDenied(request: NextRequest, message: string): NextResponse {
-  const response = request.nextUrl.pathname.startsWith("/api/")
+function boundaryDenied(request: NextRequest, message: string): NextResponse {
+  return request.nextUrl.pathname.startsWith("/api/")
     ? NextResponse.json({ error: message }, { status: 403 })
     : new NextResponse("Forbidden", { status: 403 });
-  return applyLocalBrowserSecurityHeaders(response) as NextResponse;
-}
-
-function configuredBoundaryDenied(request: NextRequest, message: string): NextResponse {
-  const response = request.nextUrl.pathname.startsWith("/api/")
-    ? NextResponse.json({ error: message }, { status: 403 })
-    : new NextResponse("Forbidden", { status: 403 });
-  response.headers.set("Cache-Control", "private, no-store");
-  response.headers.set("X-Frame-Options", "DENY");
-  response.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
-  return response;
 }
 
 function loginRedirect(request: NextRequest, error?: string): NextResponse {
