@@ -46,6 +46,7 @@ import {
   updateCommitment,
   updateGoal,
 } from "../core/intentions";
+import { logResolvedModelOnce } from "../core/openai";
 import { getProject, listProjects, projectEvents } from "../core/projects";
 import { listBehavioralPolicySuggestions } from "../core/personalization";
 import {
@@ -91,6 +92,7 @@ import {
   runWorkPlan,
 } from "../core/work-plans";
 
+logResolvedModelOnce();
 const db: Db = openDb();
 
 function text(body: string) {

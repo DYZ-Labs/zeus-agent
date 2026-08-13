@@ -37,15 +37,17 @@ describe("private local file preflight", () => {
       writeFileSync(path, "private sentinel", { mode: 0o666 });
       chmodSync(path, 0o666);
     }
-    const example = join(root, ".env.example");
-    writeFileSync(example, "PLACEHOLDER=", { mode: 0o644 });
+    const examples = [join(root, ".env.example"), join(root, ".mcp.json.example")];
+    for (const example of examples) {
+      writeFileSync(example, "PLACEHOLDER=", { mode: 0o644 });
+    }
     chmodSync(exportDirectory, 0o777);
 
     runPreflight(root);
 
     for (const path of privateFiles) expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(exportDirectory).mode & 0o777).toBe(0o700);
-    expect(statSync(example).mode & 0o777).toBe(0o644);
+    for (const example of examples) expect(statSync(example).mode & 0o777).toBe(0o644);
   });
 
   it("refuses a private symlink instead of changing its target", () => {

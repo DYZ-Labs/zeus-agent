@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./openai", () => ({
   MODEL: "test-model",
+  OPENAI_TIMEOUT_MS: 75_000,
   assertResponseComplete: mocks.assertResponseComplete,
   openai: () => ({ responses: { stream: mocks.openaiStream } }),
 }));
@@ -83,8 +84,11 @@ describe("streamTurn cancellation", () => {
 
     expect(mocks.openaiStream).toHaveBeenCalledWith(
       expect.objectContaining({ model: "test-model", store: false }),
-      { signal: controller.signal },
+      { signal: expect.any(AbortSignal) },
     );
+    const streamSignal = mocks.openaiStream.mock.calls[0]?.[1]?.signal as AbortSignal;
+    expect(streamSignal).not.toBe(controller.signal);
+    expect(streamSignal.aborted).toBe(true);
     expect(messagesIn(db, conversation.id)).toMatchObject([
       { role: "user", content: "Stop this turn" },
     ]);
@@ -110,6 +114,47 @@ describe("streamTurn cancellation", () => {
     expect(messagesIn(db, conversation.id)).toEqual([]);
     expect(mocks.buildContext).not.toHaveBeenCalled();
     expect(mocks.openaiStream).not.toHaveBeenCalled();
+  });
+
+  it("ends the whole stream at the configured deadline without persisting a reply", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const deadline = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let streamSignal: AbortSignal | undefined;
+    mocks.openaiStream.mockImplementation(
+      (_body: unknown, request: { signal: AbortSignal }) => {
+        streamSignal = request.signal;
+        return { on: mocks.on, finalResponse: mocks.finalResponse };
+      },
+    );
+    mocks.finalResponse.mockImplementation(async () => {
+      deadline.abort();
+      streamSignal?.throwIfAborted();
+      throw new Error("deadline signal did not abort the stream");
+    });
+
+    try {
+      await expect(
+        streamTurn(db, {
+          conversationId: conversation.id,
+          input: "Do not store a partial timed-out reply",
+        }),
+      ).rejects.toMatchObject({
+        name: "OpenAIStreamTimeoutError",
+        message: "OpenAI streaming timed out after 75 seconds.",
+      });
+      expect(timeoutSpy).toHaveBeenCalledExactlyOnceWith(75_000);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+
+    expect(messagesIn(db, conversation.id)).toMatchObject([
+      { role: "user", content: "Do not store a partial timed-out reply" },
+    ]);
+    expect(mocks.assertResponseComplete).not.toHaveBeenCalled();
+    expect(mocks.recordResponseContext).not.toHaveBeenCalled();
+    expect(mocks.startExtractionRun).not.toHaveBeenCalled();
   });
 
   it("cancels extraction before it can apply memory writes", async () => {

@@ -20,7 +20,7 @@
     "precheck": "npm run secure:local",
     "check": "npm run lint && npm run typecheck && npm test && npm run eval:memory && npm run build",
     "premcp": "npm run secure:local",
-    "mcp": "tsx src/mcp/server.ts",
+    "mcp": "node --env-file-if-exists=.env.local --import tsx src/mcp/server.ts",
     "preambient:worker": "npm run secure:local",
     "ambient:worker": "tsx scripts/ambient-worker.ts",
     "preambient:install": "npm run secure:local",
