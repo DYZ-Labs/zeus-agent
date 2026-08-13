@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   logResolvedModelOnce: vi.fn(),
 }));
 
+vi.mock("server-only", () => ({}));
 vi.mock("./core/openai", () => ({
   logResolvedModelOnce: mocks.logResolvedModelOnce,
 }));

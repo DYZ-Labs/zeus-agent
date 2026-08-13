@@ -6,12 +6,12 @@ import { redirect } from "next/navigation";
 import { bindAppOwner, getAppOwner } from "@/core/owner";
 import type { Db } from "@/core/db";
 import type { AccountSummary } from "@/lib/auth-types";
-import { getAuthConfiguration } from "@/server/auth/config";
+import { getAuthConfiguration, signupAllowed } from "@/server/auth/config";
 import {
   checkBrowserBoundary,
   type BrowserCapability,
 } from "@/server/auth/browser-origin";
-import { getAccountDb, getDb } from "@/server/db";
+import { accountDbExists, getAccountDb, getDb } from "@/server/db";
 import { createSupabaseServerClient } from "@/server/auth/supabase";
 
 export type OwnerAccessState =
@@ -122,11 +122,24 @@ export function authorizeSupabaseUser(user: User): OwnerAccess {
     );
   }
 
-  const db = getAccountDb({
+  const identity = {
     supabaseUserId: userId,
     email,
     legacyOwnerEmail: configuration.legacyOwnerEmail,
-  });
+  };
+
+  // Gate the *allocation*, not the session. An account that already has a store keeps
+  // working regardless of the allowlist, so tightening it can never lock out an
+  // established user; only a first-time store creation needs operator consent.
+  if (!accountDbExists(identity) && !signupAllowed(email, configuration)) {
+    return denied(
+      "wrong_account",
+      "Zeus is invite-only on this deployment, and this email is not on the allowlist.",
+      account,
+    );
+  }
+
+  const db = getAccountDb(identity);
   const owner = getAppOwner(db);
 
   if (owner) {

@@ -9,6 +9,7 @@ const CONFIGURED = {
   publishableKey: "sb_publishable_test",
   legacyOwnerEmail: "owner@example.com",
   siteUrl: "https://zeus.example",
+  allowedSignupEmails: [],
 };
 
 describe("local browser origin boundary", () => {
