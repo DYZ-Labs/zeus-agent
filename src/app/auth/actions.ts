@@ -40,15 +40,6 @@ export async function requestEmailLinkAction(
     };
   }
 
-  // This public action never inspects the private store. Only the configured owner
-  // email can consume the project's email quota or create an Auth user.
-  if (email.data !== configuration.ownerEmail) {
-    return {
-      status: "error",
-      message: "Use the owner email configured for this Zeus installation.",
-    };
-  }
-
   const next = safeNextPath(String(formData.get("next") ?? "/"));
   const supabase = await createSupabaseServerClient(configuration, {
     cookieWrites: "required",

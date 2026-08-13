@@ -17,7 +17,7 @@ vi.mock("@/server/auth/config", () => ({
     mode: "configured",
     url: "https://project.supabase.co",
     publishableKey: "sb_publishable_test",
-    ownerEmail: "owner@example.com",
+    legacyOwnerEmail: "owner@example.com",
     siteUrl: "http://127.0.0.1:3000",
   }),
 }));

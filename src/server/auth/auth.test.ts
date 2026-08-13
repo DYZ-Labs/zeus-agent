@@ -5,11 +5,15 @@ import { openTestDb, type Db } from "@/core/db";
 import { getAppOwner } from "@/core/owner";
 
 const mocks = vi.hoisted(() => ({
+  getAccountDb: vi.fn(),
   getDb: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@/server/db", () => ({ getDb: mocks.getDb }));
+vi.mock("@/server/db", () => ({
+  getAccountDb: mocks.getAccountDb,
+  getDb: mocks.getDb,
+}));
 vi.mock("@/server/auth/supabase", () => ({
   createSupabaseServerClient: vi.fn(),
 }));
@@ -32,6 +36,7 @@ const AUTH_KEYS = [
 ] as const;
 
 let db: Db;
+let otherDb: Db;
 const savedEnvironment = Object.fromEntries(
   AUTH_KEYS.map((key) => [key, process.env[key]]),
 ) as Record<(typeof AUTH_KEYS)[number], string | undefined>;
@@ -39,7 +44,12 @@ const savedEnvironment = Object.fromEntries(
 beforeEach(() => {
   AUTH_KEYS.forEach((key) => delete process.env[key]);
   db = openTestDb();
+  otherDb = openTestDb();
   mocks.getDb.mockReturnValue(db);
+  mocks.getAccountDb.mockImplementation(
+    ({ supabaseUserId }: { supabaseUserId: string }) =>
+      supabaseUserId === OWNER_ID ? db : otherDb,
+  );
 });
 
 afterEach(() => {
@@ -69,8 +79,18 @@ describe("auth configuration", () => {
       mode: "configured",
       url: "https://project.supabase.co",
       publishableKey: "sb_publishable_test",
-      ownerEmail: "owner@example.com",
       siteUrl: "http://127.0.0.1:3000",
+      legacyOwnerEmail: "owner@example.com",
+    });
+  });
+
+  it("does not require a legacy owner email for a new multi-account install", () => {
+    configureAuth();
+    delete process.env.ZEUS_OWNER_EMAIL;
+
+    expect(getAuthConfiguration()).toMatchObject({
+      mode: "configured",
+      legacyOwnerEmail: null,
     });
   });
 
@@ -90,28 +110,27 @@ describe("auth configuration", () => {
 describe("owner authorization", () => {
   beforeEach(configureAuth);
 
-  it("binds only the configured, verified owner email", () => {
-    const wrong = authorizeSupabaseUser(user(OTHER_ID, "other@example.com"));
-    expect(wrong).toMatchObject({ state: "wrong_account", canAccessPrivateData: false });
-    expect(wrong.message).not.toContain("owner@example.com");
-    expect(getAppOwner(db)).toBeNull();
-
+  it("binds every verified account to its selected isolated store", () => {
     const unverified = authorizeSupabaseUser(user(OWNER_ID, "owner@example.com", false));
     expect(unverified).toMatchObject({ state: "wrong_account", canAccessPrivateData: false });
-    expect(unverified.message).not.toContain("owner@example.com");
     expect(getAppOwner(db)).toBeNull();
+    expect(mocks.getAccountDb).not.toHaveBeenCalled();
 
     const owner = authorizeSupabaseUser(user(OWNER_ID, "owner@example.com"));
+    const other = authorizeSupabaseUser(user(OTHER_ID, "other@example.com"));
     expect(owner).toMatchObject({ state: "authorized", canAccessPrivateData: true });
+    expect(other).toMatchObject({ state: "authorized", canAccessPrivateData: true });
     expect(getAppOwner(db)?.supabase_user_id).toBe(OWNER_ID);
+    expect(getAppOwner(otherDb)?.supabase_user_id).toBe(OTHER_ID);
   });
 
-  it("uses the immutable UUID after binding and never admits another account", () => {
+  it("uses the immutable UUID within each account store even if email changes", () => {
     expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe("authorized");
 
     expect(authorizeSupabaseUser(user(OWNER_ID, "changed@example.com")).state).toBe("authorized");
-    expect(authorizeSupabaseUser(user(OTHER_ID, "owner@example.com")).state).toBe("wrong_account");
+    expect(authorizeSupabaseUser(user(OTHER_ID, "owner@example.com")).state).toBe("authorized");
     expect(getAppOwner(db)?.supabase_user_id).toBe(OWNER_ID);
+    expect(getAppOwner(otherDb)?.supabase_user_id).toBe(OTHER_ID);
   });
 });
 
@@ -154,6 +173,7 @@ describe("browser access boundary", () => {
       db: null,
     });
     expect(mocks.getDb).not.toHaveBeenCalled();
+    expect(mocks.getAccountDb).not.toHaveBeenCalled();
   });
 
   it("preserves a fail-closed configuration error ahead of origin details", async () => {

@@ -8,7 +8,7 @@ const CONFIGURATION = {
   mode: "configured" as const,
   url: "https://project.supabase.co",
   publishableKey: "sb_publishable_test",
-  ownerEmail: "owner@example.com",
+  legacyOwnerEmail: "owner@example.com",
   siteUrl: "http://127.0.0.1:3000",
 };
 

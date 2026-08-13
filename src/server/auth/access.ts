@@ -6,12 +6,12 @@ import { redirect } from "next/navigation";
 import { bindAppOwner, getAppOwner } from "@/core/owner";
 import type { Db } from "@/core/db";
 import type { AccountSummary } from "@/lib/auth-types";
-import { getDb } from "@/server/db";
 import { getAuthConfiguration } from "@/server/auth/config";
 import {
   checkBrowserBoundary,
   type BrowserCapability,
 } from "@/server/auth/browser-origin";
+import { getAccountDb, getDb } from "@/server/db";
 import { createSupabaseServerClient } from "@/server/auth/supabase";
 
 export type OwnerAccessState =
@@ -96,8 +96,9 @@ export async function getBrowserOwnerAccess(
 }
 
 /**
- * Bind the empty local store only to the configured, verified owner email. Once
- * bound, the immutable Supabase UUID—not mutable email or user metadata—authorizes it.
+ * Route each verified identity to its isolated personal store, then bind that store to
+ * the immutable Supabase UUID—not mutable email or user metadata. The optional legacy
+ * email only selects the pre-multi-account database during its one-time transition.
  */
 export function authorizeSupabaseUser(user: User): OwnerAccess {
   const configuration = getAuthConfiguration();
@@ -111,12 +112,25 @@ export function authorizeSupabaseUser(user: User): OwnerAccess {
   }
 
   const account = accountSummary(user);
+  const userId = user.id.trim().toLowerCase();
   const email = user.email?.trim().toLowerCase() ?? "";
-  const db = getDb();
+  if (!email || !user.email_confirmed_at) {
+    return denied(
+      "wrong_account",
+      "Use a Supabase account with a verified email address.",
+      account,
+    );
+  }
+
+  const db = getAccountDb({
+    supabaseUserId: userId,
+    email,
+    legacyOwnerEmail: configuration.legacyOwnerEmail,
+  });
   const owner = getAppOwner(db);
 
   if (owner) {
-    return owner.supabase_user_id === user.id
+    return owner.supabase_user_id === userId
       ? allowed(db, account)
       : denied(
           "wrong_account",
@@ -125,16 +139,8 @@ export function authorizeSupabaseUser(user: User): OwnerAccess {
         );
   }
 
-  if (!email || !user.email_confirmed_at || email !== configuration.ownerEmail) {
-    return denied(
-      "wrong_account",
-      "Use the verified owner account configured for this Zeus installation.",
-      account,
-    );
-  }
-
-  const binding = bindAppOwner(db, { supabaseUserId: user.id, email });
-  return binding.owner.supabase_user_id === user.id
+  const binding = bindAppOwner(db, { supabaseUserId: userId, email });
+  return binding.owner.supabase_user_id === userId
     ? allowed(db, account)
     : denied(
         "wrong_account",

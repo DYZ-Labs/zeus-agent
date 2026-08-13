@@ -34,7 +34,7 @@ const CONFIGURATION = {
   mode: "configured" as const,
   url: "https://project.supabase.co",
   publishableKey: "sb_publishable_test",
-  ownerEmail: "owner@example.com",
+  legacyOwnerEmail: "owner@example.com",
   siteUrl: "https://zeus.example",
 };
 
@@ -127,15 +127,21 @@ describe("requestEmailLinkAction", () => {
     expect(mocks.createSupabaseServerClient).not.toHaveBeenCalled();
   });
 
-  it("rejects a non-owner email before calling Supabase", async () => {
+  it("allows a valid signup email without consulting a shared owner store", async () => {
     const result = await requestEmailLinkAction("signup", IDLE, form("other@example.com"));
 
     expect(result).toEqual({
-      status: "error",
-      message: "Use the owner email configured for this Zeus installation.",
+      status: "sent",
+      message:
+        "Check your email, then open the newest link in this same browser to finish signup.",
     });
-    expect(mocks.createSupabaseServerClient).not.toHaveBeenCalled();
-    expect(mocks.signInWithOtp).not.toHaveBeenCalled();
+    expect(mocks.signInWithOtp).toHaveBeenCalledWith({
+      email: "other@example.com",
+      options: {
+        shouldCreateUser: true,
+        emailRedirectTo: "https://zeus.example/auth/confirm",
+      },
+    });
   });
 
   it("starts login without creating a user and uses the configured exact origin", async () => {
@@ -169,7 +175,7 @@ describe("requestEmailLinkAction", () => {
     );
   });
 
-  it("allows signup to create the configured owner account", async () => {
+  it("allows the legacy owner email to sign up normally", async () => {
     const result = await requestEmailLinkAction(
       "signup",
       IDLE,
