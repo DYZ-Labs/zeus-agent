@@ -167,6 +167,55 @@ export function listManagedSnapshots(db: Db, directory?: string): string[] {
 }
 
 /**
+ * When this store was last snapshotted, or null if it never was.
+ *
+ * Deliberately cheap: it stats files matching the store's prefix and opens nothing.
+ * `listRestorableSnapshots` runs an integrity check per candidate, which is right
+ * before a restore and far too expensive for a scheduler asking "is one due yet?"
+ * every hour. A file that turns out to be unverifiable still proves an attempt was
+ * made recently, which is the question being asked here.
+ */
+export function latestSnapshotTime(
+  databasePath: string,
+  directory?: string,
+): Date | null {
+  const sourcePath = canonicalDatabasePath(databasePath);
+  let exactDirectory: string;
+  try {
+    const requested = validateSnapshotDirectoryPath(
+      normalize(requireAbsolutePath(directory ?? defaultSnapshotDirectory(sourcePath))),
+    );
+    if (!existsSync(requested)) return null;
+    exactDirectory = canonicalSnapshotDirectory(requested);
+  } catch {
+    return null;
+  }
+
+  const prefix = snapshotPrefix(sourcePath);
+  let newest: number | null = null;
+  let names: string[];
+  try {
+    names = readdirSync(exactDirectory);
+  } catch {
+    return null;
+  }
+
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(SNAPSHOT_SUFFIX)) continue;
+    try {
+      const entry = lstatSync(join(exactDirectory, name));
+      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+      const time = entry.mtimeMs;
+      if (newest === null || time > newest) newest = time;
+    } catch {
+      // A file removed between listing and stat is simply not the newest.
+    }
+  }
+
+  return newest === null ? null : new Date(newest);
+}
+
+/**
  * Verified snapshots for a database path, oldest first, resolved without opening the
  * source.
  *

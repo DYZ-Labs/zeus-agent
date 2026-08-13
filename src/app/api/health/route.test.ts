@@ -17,6 +17,10 @@ vi.mock("@/server/auth/config", () => ({
 
 import { openTestDb } from "@/core/db";
 import { MIGRATIONS } from "@/core/migrations";
+import {
+  resetSnapshotScheduler,
+  startSnapshotScheduler,
+} from "@/server/snapshot-scheduler";
 import { GET } from "./route";
 
 beforeEach(() => {
@@ -28,7 +32,11 @@ beforeEach(() => {
   mocks.getAuthConfiguration.mockReturnValue({ mode: "configured" });
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  resetSnapshotScheduler();
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+});
 
 describe("health check", () => {
   it("reports the schema version and subsystem state when the store opens", async () => {
@@ -46,7 +54,25 @@ describe("health check", () => {
       auth: "configured",
       embeddings: "ready",
       model: "configured",
+      // A backup that quietly stopped is the failure the subsystem exists to prevent.
+      snapshots: {
+        state: "not_started",
+        intervalHours: null,
+        lastResult: null,
+        lastRunAt: null,
+      },
     });
+  });
+
+  it("surfaces a scheduler that has stopped backing stores up", async () => {
+    vi.stubEnv("ZEUS_SNAPSHOT_SCHEDULER", "off");
+    startSnapshotScheduler();
+
+    const body = await (await GET()).json();
+
+    // Still serving, so still 200 — but the backups are visibly not running.
+    expect(body.status).toBe("ok");
+    expect(body.snapshots.state).toBe("disabled");
   });
 
   it("fails with 503 when the store cannot be opened", async () => {
