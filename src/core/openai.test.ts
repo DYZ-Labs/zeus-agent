@@ -33,7 +33,9 @@ describe("OpenAI client policy", () => {
       })
     );
     vi.stubGlobal("fetch", fetchMock);
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Structured events go to stderr; stdout belongs to the MCP protocol.
+    const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stdout = vi.spyOn(console, "log").mockImplementation(() => {});
     const { OPENAI_MAX_RETRIES, OPENAI_TIMEOUT_MS, openai } = await import("./openai");
 
     const client = openai();
@@ -48,10 +50,17 @@ describe("OpenAI client policy", () => {
     ).rejects.toMatchObject({ status: 500 });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(warning).toHaveBeenCalledExactlyOnceWith(
-      "[zeus] OpenAI retry budget exhausted after 2 attempts",
+    expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({
+        event: "openai_retries_exhausted",
+        outcome: "error",
+        reason: "retry_budget_exhausted",
+        count: 2,
+      }),
     );
-    expect(JSON.stringify(warning.mock.calls)).not.toContain("private sentinel");
+    // The SDK's own diagnostics can quote response bodies; ours must not.
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain("private sentinel");
+    expect(stdout).not.toHaveBeenCalled();
   });
 
   it("logs the trimmed resolved model once without requiring credentials", async () => {
@@ -65,7 +74,7 @@ describe("OpenAI client policy", () => {
     logResolvedModelOnce();
 
     expect(diagnostic).toHaveBeenCalledExactlyOnceWith(
-      "[zeus] OpenAI model: custom-model",
+      JSON.stringify({ event: "startup", outcome: "ok", model: "custom-model" }),
     );
     expect(() => openai()).toThrow("No OpenAI credentials found");
   });

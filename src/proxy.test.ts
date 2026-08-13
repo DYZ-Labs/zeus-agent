@@ -33,6 +33,46 @@ beforeEach(() => {
   mocks.createServerClient.mockReturnValue({ auth: { getClaims: mocks.getClaims } });
 });
 
+describe("health check reachability", () => {
+  it("reaches the route while signed out, unlike every other API path", async () => {
+    const health = await proxy(
+      new NextRequest("https://zeus.example/api/health", {
+        headers: { host: "zeus.example" },
+      }),
+    );
+    const other = await proxy(
+      new NextRequest("https://zeus.example/api/work-plans", {
+        headers: { host: "zeus.example" },
+      }),
+    );
+
+    expect(health.headers.get("x-middleware-next")).toBe("1");
+    expect(other.status).toBe(401);
+  });
+
+  it("reaches the route while auth itself is misconfigured", async () => {
+    mocks.getAuthConfiguration.mockReturnValue({
+      mode: "misconfigured",
+      message: "Supabase login needs a project URL",
+    });
+
+    const health = await proxy(
+      new NextRequest("https://zeus.example/api/health", {
+        headers: { host: "zeus.example" },
+      }),
+    );
+    const other = await proxy(
+      new NextRequest("https://zeus.example/api/work-plans", {
+        headers: { host: "zeus.example" },
+      }),
+    );
+
+    // The state most worth reporting is the one where the door is broken.
+    expect(health.headers.get("x-middleware-next")).toBe("1");
+    expect(other.status).toBe(503);
+  });
+});
+
 describe("local proxy boundary", () => {
   it("rejects DNS-rebinding hosts before a private page is rendered", async () => {
     mocks.getAuthConfiguration.mockReturnValue({ mode: "local" });

@@ -1,6 +1,7 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+import { logEvent } from "@/core/observability";
 import { getAuthConfiguration } from "@/server/auth/config";
 import {
   applyLocalBrowserSecurityHeaders,
@@ -8,6 +9,11 @@ import {
 } from "@/server/auth/browser-origin";
 
 const PUBLIC_PATHS = new Set(["/", "/settings"]);
+/**
+ * The health check answers before authentication, because the states worth reporting
+ * include the ones where authentication itself is broken. It returns no user data.
+ */
+const HEALTH_PATH = "/api/health";
 
 /**
  * Refresh Supabase cookies and provide a coarse signed-in gate. The data-access layer
@@ -33,10 +39,12 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   }
 
   const isAuthPath = request.nextUrl.pathname.startsWith("/auth/");
-  const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath;
-  const isApi = request.nextUrl.pathname.startsWith("/api/");
+  const isHealth = request.nextUrl.pathname === HEALTH_PATH;
+  const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath || isHealth;
+  const isApi = request.nextUrl.pathname.startsWith("/api/") && !isHealth;
 
   if (configuration.mode === "misconfigured") {
+    if (isHealth) return NextResponse.next({ request });
     if (isApi) {
       return NextResponse.json({ error: configuration.message }, { status: 503 });
     }
@@ -104,7 +112,24 @@ function isSafeMethod(method: string): boolean {
   return method === "GET" || method === "HEAD" || method === "OPTIONS";
 }
 
+/**
+ * Denials are logged; successful pass-through is not. An operator needs to see the
+ * door being rattled without paying for a line per page view, and a 403 here is the
+ * one outcome that is always worth explaining after the fact.
+ */
+function logDenial(request: NextRequest, reason: string, status: number): void {
+  logEvent({
+    event: "http_denied",
+    outcome: "error",
+    reason,
+    status,
+    method: request.method,
+    route: request.nextUrl.pathname,
+  });
+}
+
 function localBoundaryDenied(request: NextRequest, message: string): NextResponse {
+  logDenial(request, "forbidden_origin", 403);
   const response = request.nextUrl.pathname.startsWith("/api/")
     ? NextResponse.json({ error: message }, { status: 403 })
     : new NextResponse("Forbidden", { status: 403 });
@@ -112,6 +137,7 @@ function localBoundaryDenied(request: NextRequest, message: string): NextRespons
 }
 
 function configuredBoundaryDenied(request: NextRequest, message: string): NextResponse {
+  logDenial(request, "forbidden_origin", 403);
   const response = request.nextUrl.pathname.startsWith("/api/")
     ? NextResponse.json({ error: message }, { status: 403 })
     : new NextResponse("Forbidden", { status: 403 });

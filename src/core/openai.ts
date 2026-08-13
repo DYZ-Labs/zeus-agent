@@ -1,6 +1,8 @@
 import OpenAI from "openai";
 import type { Response } from "openai/resources/responses/responses";
 
+import { logEvent } from "./observability";
+
 /**
  * The single OpenAI client. Constructed lazily so the store, tests, and curation
  * UI continue to work without credentials; only model-backed paths require a key.
@@ -22,9 +24,12 @@ const sdkLogger = {
     // The SDK logs terminal retry state at info level. Keep normal request metadata
     // quiet and emit a stable diagnostic that cannot contain prompts or responses.
     if (message.includes("error; no more retries left")) {
-      console.warn(
-        `[zeus] OpenAI retry budget exhausted after ${OPENAI_MAX_RETRIES + 1} attempts`,
-      );
+      logEvent({
+        event: "openai_retries_exhausted",
+        outcome: "error",
+        reason: "retry_budget_exhausted",
+        count: OPENAI_MAX_RETRIES + 1,
+      });
     }
   },
   debug() {},
@@ -47,7 +52,7 @@ export function openai(): OpenAI {
 export function logResolvedModelOnce(): void {
   if (globalForOpenAI.zeusResolvedOpenAIModelLogged) return;
   globalForOpenAI.zeusResolvedOpenAIModelLogged = true;
-  console.error(`[zeus] OpenAI model: ${MODEL}`);
+  logEvent({ event: "startup", outcome: "ok", model: MODEL });
 }
 
 export function hasCredentials(): boolean {

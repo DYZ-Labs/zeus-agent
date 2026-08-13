@@ -21,7 +21,8 @@ import { buildEvaluationContextForTrigger } from "../core/ambient";
 import { remember } from "../core/chat";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
 import type { Db } from "../core/db";
-import { defaultDbPath, openDb } from "../core/db";
+import { openDb } from "../core/db";
+import { logEvent } from "../core/observability";
 import { embed, embedFacet, embedFact, embedPassage } from "../core/embed";
 import { listEntities, resolveEntity, selfEntity } from "../core/entities";
 import { searchEpisodes } from "../core/episodes";
@@ -1649,4 +1650,4 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 // stdout is the protocol channel — anything written there corrupts the stream.
-console.error(`[zeus] MCP server ready on ${defaultDbPath()}`);
+logEvent({ event: "mcp_ready", outcome: "ok" });
