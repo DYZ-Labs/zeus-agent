@@ -12,4 +12,9 @@ export async function register(): Promise<void> {
 
   const { logResolvedModelOnce } = await import("./core/openai");
   logResolvedModelOnce();
+
+  // Only after the store is known to be durable: a backup of an ephemeral volume would
+  // be worse than none, because it would look like the memory was safe.
+  const { startSnapshotScheduler } = await import("./server/snapshot-scheduler");
+  startSnapshotScheduler();
 }

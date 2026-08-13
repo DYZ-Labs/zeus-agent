@@ -5,6 +5,7 @@ import { errorSignature, logEvent } from "@/core/observability";
 import { hasCredentials } from "@/core/openai";
 import { getAuthConfiguration } from "@/server/auth/config";
 import { getDb } from "@/server/db";
+import { snapshotSchedulerStatus } from "@/server/snapshot-scheduler";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,6 +46,9 @@ export async function GET(): Promise<Response> {
       // full-text when the local model cannot load, and that is worth surfacing.
       embeddings,
       model: hasCredentials() ? "configured" : "absent",
+      // A backup that quietly stopped running is the failure this whole subsystem
+      // exists to prevent, so its state is reported rather than assumed.
+      snapshots: snapshotSchedulerStatus(),
     },
     {
       status: healthy ? 200 : 503,

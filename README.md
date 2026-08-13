@@ -203,6 +203,8 @@ group locks private web data until configuration is completed.
 | `ZEUS_MODEL_TOKENS_PER_DAY` | No | `2000000` | Per-account model tokens per day |
 | `ZEUS_MAX_CONCURRENT_WORK_RUNS` | No | `2` | Bounded work runs this process executes at once |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
+| `ZEUS_SNAPSHOT_SCHEDULER` | No | on when hosted | In-process scheduled snapshots (`on`/`off`) |
+| `ZEUS_SNAPSHOT_INTERVAL_HOURS` | No | `24` | How stale a store's newest snapshot may get |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
@@ -322,6 +324,38 @@ directory without pruning each other's copies — one directory to replicate off
 and retention counts per store. A store that cannot be read is reported and skipped so
 one bad database never costs every other account its backup; the run still exits
 non-zero. Use `--only` to operate on the primary store alone.
+
+#### On a hosted deployment
+
+Scheduled snapshots run **inside the server process**, and are on by default once
+Supabase login is configured and `NODE_ENV=production`. The macOS LaunchAgent below
+shells out to `launchctl`, which does not exist on the Linux host a hosted deployment
+actually runs on — so `npm run snapshot` was portable but nothing was calling it there,
+and a deployment shipped with a documented, tested backup mechanism that was not running.
+
+An in-process timer rather than a platform cron job because a mounted volume belongs to
+one service: a separate cron container would not have the store to copy. The server that
+already holds the volume is the only place with both the data and a clock.
+
+Whether a snapshot is due is read from the newest snapshot on disk, not from a timer's
+memory. That is what makes it correct across restarts — a redeploy every ten minutes
+cannot produce a snapshot every ten minutes, and a process that was down all night takes
+one as soon as it returns. Every store is considered separately, so an account created
+today is backed up today rather than waiting for the primary store's next turn.
+
+A failing backup can never take the server down: one unreadable store does not stop the
+others, and no snapshot problem reaches a user's request. `GET /api/health` reports the
+scheduler under `snapshots`, so a backup that silently stopped is visible rather than
+assumed.
+
+`ZEUS_SNAPSHOT_SCHEDULER=off` disables it; `=on` enables it anywhere, including local
+development.
+
+Ambient notifications stay macOS-only on purpose. They deliver to a desktop notification
+centre, which a headless Linux host does not have; the scheduler here covers backups,
+which is the part a deployment genuinely needs.
+
+#### On macOS
 
 On macOS, install the dedicated LaunchAgent to run once at load and daily at
 `ZEUS_SNAPSHOT_HOUR` local time:
