@@ -1,5 +1,6 @@
 import { MODEL, OPENAI_TIMEOUT_MS, assertResponseComplete, openai } from "./openai";
 import { appendMessage, recentMessages } from "./conversations";
+import { recordModelCall, responseUsage } from "./budget";
 import type { Db } from "./db";
 import { errorSignature, logEvent } from "./observability";
 import {
@@ -136,6 +137,8 @@ export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<Tu
     throw error;
   }
 
+  recordModelCall(db, responseUsage(final));
+
   const reply = final.output_text;
   const assistantMessage = appendMessage(db, options.conversationId, "assistant", reply);
   recordResponseContext(db, assistantMessage.id, context.plan);
@@ -271,6 +274,8 @@ export async function learnFrom(
       messages,
       context: extractionContext(db, 100, focusText),
       signal,
+      onUsage: (usage: { inputTokens: number | null; outputTokens: number | null }) =>
+        recordModelCall(db, usage),
     };
     const allowedSourceMessageIds = extractionSourceMessageIds(extractOptions);
     const extraction = await extract(extractOptions);

@@ -1437,6 +1437,20 @@ CREATE TABLE snapshot_destination (
 );
 `;
 
+const MODEL_USAGE = `
+-- One row per closed accounting window per store. Durable rather than in-memory so a
+-- restart cannot reset a spend cap: the bill outlives the process.
+CREATE TABLE model_usage (
+  window_kind    TEXT NOT NULL,
+  window_start   TEXT NOT NULL,
+  calls          INTEGER NOT NULL DEFAULT 0,
+  input_tokens   INTEGER NOT NULL DEFAULT 0,
+  output_tokens  INTEGER NOT NULL DEFAULT 0,
+  updated_at     TEXT NOT NULL,
+  PRIMARY KEY (window_kind, window_start)
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1459,4 +1473,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "019_work_artifact_memory_provenance", sql: WORK_ARTIFACT_MEMORY_PROVENANCE },
   { id: "020_mcp_mutation_approval", sql: MCP_MUTATION_APPROVAL },
   { id: "021_snapshot_destinations", sql: SNAPSHOT_DESTINATIONS },
+  { id: "022_model_usage", sql: MODEL_USAGE },
 ];

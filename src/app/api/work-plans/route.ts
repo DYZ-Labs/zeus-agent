@@ -5,6 +5,7 @@ import {
   createConversation,
   listConversations,
 } from "@/core/conversations";
+import { BUDGET_MESSAGES, checkModelBudget, logBudgetDenial } from "@/core/budget";
 import { generateWorkPlanProposal } from "@/core/work-execution";
 import {
   authorizeWorkPlan,
@@ -37,6 +38,13 @@ export async function POST(request: Request): Promise<Response> {
   const parsed = Body.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return Response.json({ error: "Expected a bounded work objective." }, { status: 400 });
+  }
+
+  // Planning is itself a model call, and an authorized plan licenses many more.
+  const budget = checkModelBudget(access.db);
+  if (!budget.allowed) {
+    logBudgetDenial("/api/work-plans", budget);
+    return budgetDenied(budget);
   }
 
   try {
@@ -79,6 +87,21 @@ export async function POST(request: Request): Promise<Response> {
       { status: 422 },
     );
   }
+}
+
+function budgetDenied(
+  decision: Extract<ReturnType<typeof checkModelBudget>, { allowed: false }>,
+): Response {
+  return Response.json(
+    { error: BUDGET_MESSAGES[decision.reason], retryAfterSeconds: decision.retryAfterSeconds },
+    {
+      status: 429,
+      headers: {
+        "Retry-After": String(decision.retryAfterSeconds),
+        "Cache-Control": "no-store",
+      },
+    },
+  );
 }
 
 function denied(access: Awaited<ReturnType<typeof getBrowserOwnerAccess>>): Response {

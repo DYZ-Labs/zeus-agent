@@ -1,5 +1,6 @@
 import { zodTextFormat } from "openai/helpers/zod";
 
+import { responseUsage } from "./budget";
 import { MODEL, assertResponseComplete, openai } from "./openai";
 import {
   createCandidate,
@@ -254,6 +255,12 @@ export type ExtractOptions = {
   messages: readonly Pick<Message, "id" | "role" | "content">[];
   context: ExtractionContext;
   signal?: AbortSignal;
+  /**
+   * Report what this call spent. A callback rather than a database write keeps
+   * extraction free of store access: it says what it used, the caller decides where
+   * that is counted.
+   */
+  onUsage?: (usage: { inputTokens: number | null; outputTokens: number | null }) => void;
 };
 
 type PreparedExtractionInput = {
@@ -432,6 +439,7 @@ export async function extract(options: ExtractOptions): Promise<ParsedExtraction
     },
     { signal: options.signal },
   );
+  options.onUsage?.(responseUsage(response));
 
   options.signal?.throwIfAborted();
   assertResponseComplete(response);

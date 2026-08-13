@@ -1,4 +1,12 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { recordModelCall } from "@/core/budget";
+import {
+  acquireWorkRunSlot,
+  configuredMaxConcurrentWorkRuns,
+  resetWorkRunSlots,
+} from "@/core/concurrency";
+import { openTestDb } from "@/core/db";
 
 const mocks = vi.hoisted(() => ({
   createConversation: vi.fn(),
@@ -46,6 +54,78 @@ beforeEach(() => {
     account: null,
     db: null,
     message: "Log in to access this Zeus memory store.",
+  });
+});
+
+describe("model budget limits", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    resetWorkRunSlots();
+  });
+
+  it("refuses a chat turn over the ceiling before any model work happens", async () => {
+    vi.stubEnv("ZEUS_MODEL_CALLS_PER_MINUTE", "1");
+    const db = openTestDb();
+    authorizeChat(db);
+    recordModelCall(db);
+
+    const response = await postChat(jsonRequest("/api/chat", { input: "Hello" }));
+
+    expect(response.status).toBe(429);
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(0);
+    // The whole point of a ceiling: the refused request costs nothing.
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+  });
+
+  it("tells the user which limit they hit and what still works", async () => {
+    vi.stubEnv("ZEUS_MODEL_CALLS_PER_DAY", "1");
+    const db = openTestDb();
+    authorizeChat(db);
+    recordModelCall(db);
+
+    const body = await (await postChat(jsonRequest("/api/chat", { input: "Hi" }))).json();
+
+    expect(body.error).toMatch(/daily limit/iu);
+    expect(body.error).toMatch(/browsing, curation, search, and export still work/iu);
+  });
+
+  it("admits a turn again once the account is back under the ceiling", async () => {
+    vi.stubEnv("ZEUS_MODEL_CALLS_PER_MINUTE", "5");
+    const db = openTestDb();
+    authorizeChat(db);
+    mocks.createConversation.mockReturnValue({ id: 3 });
+    mocks.streamTurn.mockResolvedValue({
+      message: { id: 1 },
+      context: { items: [], recommendation: null, opportunityId: null },
+      learned: null,
+      work: null,
+    });
+
+    const response = await postChat(jsonRequest("/api/chat", { input: "Hello" }));
+
+    expect(response.status).toBe(200);
+    expect(mocks.streamTurn).toHaveBeenCalledOnce();
+  });
+
+  it("refuses to start a work run when the process is already at capacity", async () => {
+    const db = openTestDb();
+    authorizeChat(db);
+    const planId = await seedWorkPlan(db);
+    // Occupy every slot, as long-running runs would.
+    const limit = configuredMaxConcurrentWorkRuns();
+    const held = Array.from({ length: limit }, () => acquireWorkRunSlot());
+    expect(held.every(Boolean)).toBe(true);
+
+    const response = await postWorkPlanRun(request(`/api/work-plans/${planId}/run`), {
+      params: Promise.resolve({ id: String(planId) }),
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("30");
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringMatching(/still authorized/u),
+    });
   });
 });
 
@@ -167,7 +247,8 @@ describe("chat API access boundaries", () => {
   });
 
   it("streams an authorized turn through the durable-memory path", async () => {
-    const db = { private: true };
+    // A real store: the route now consults the model budget before streaming.
+    const db = openTestDb();
     authorizeChat(db);
     mocks.createConversation.mockReturnValue({ id: 7 });
     mocks.streamTurn.mockImplementation(
@@ -207,7 +288,7 @@ describe("chat API access boundaries", () => {
   });
 
   it("aborts an authorized turn when its response stream is cancelled", async () => {
-    const db = { private: true };
+    const db = openTestDb();
     mocks.getBrowserOwnerAccess.mockResolvedValue({
       state: "authorized",
       canAccessPrivateData: true,
@@ -356,6 +437,41 @@ describe("private API auth guards", () => {
     });
   });
 });
+
+/**
+ * A real proposed plan, so the run route reaches its capacity check rather than 404.
+ * Conversations are mocked in this file, so the seed uses the real module directly.
+ */
+async function seedWorkPlan(db: ReturnType<typeof openTestDb>): Promise<number> {
+  const { createConversation, appendMessage } =
+    await vi.importActual<typeof import("@/core/conversations")>("@/core/conversations");
+  const { createWorkPlan } =
+    await vi.importActual<typeof import("@/core/work-plans")>("@/core/work-plans");
+  const conversation = createConversation(db);
+  const source = appendMessage(db, conversation.id, "user", "Research this and draft it.");
+  return createWorkPlan(db, {
+    proposal: {
+      objective: "Prepare a local recommendation",
+      steps: [
+        {
+          title: "Recall accepted context",
+          instruction: "Recall only accepted memory relevant to the decision.",
+          effect_kind: "memory_read",
+          depends_on: [],
+        },
+      ],
+      allowed_effects: ["memory_read"],
+      completion_criteria: ["A reviewable draft exists"],
+      limits: {
+        max_model_tool_calls: 4,
+        max_retries_per_step: 1,
+        max_duration_seconds: 300,
+      },
+    },
+    sourceMessageId: source.id,
+    origin: "explicit_request",
+  }).plan.id;
+}
 
 function authorizeChat(db: unknown): void {
   mocks.getBrowserOwnerAccess.mockResolvedValue({
