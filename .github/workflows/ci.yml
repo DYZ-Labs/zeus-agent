@@ -19,6 +19,9 @@ jobs:
     timeout-minutes: 30
     env:
       CI: true
+      # The build prefetches the embedding model; CI does not need 130MB of ONNX
+      # weights to typecheck, lint, and test the code that loads them.
+      ZEUS_SKIP_MODEL_PREFETCH: "1"
     steps:
       - name: Check out the exact revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

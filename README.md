@@ -121,9 +121,10 @@ Without `OPENAI_API_KEY`, the memory browser, curation UI, export, tests, and le
 search still work. Only chat, explicit MCP remembering, and model-backed extraction are
 unavailable.
 
-The first semantic search may download `Xenova/bge-small-en-v1.5` into `.models/`. The
-model runs locally. Set `ZEUS_EMBEDDINGS=off` to skip it and use full-text plus graph
-retrieval only.
+`npm run build` caches `Xenova/bge-small-en-v1.5` (~140MB) into `.models/`, so the model
+is on disk before the app needs it. The model runs locally and the corpus never leaves
+the machine. Set `ZEUS_EMBEDDINGS=off` to skip it and use full-text plus graph retrieval
+only, or `ZEUS_SKIP_MODEL_PREFETCH=1` for a build that must not reach the network.
 
 ### Optional account login
 
@@ -210,7 +211,9 @@ group locks private web data until configuration is completed.
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
 | `ZEUS_EMBEDDINGS` | No | enabled | Set to `off` for FTS5 and graph search only |
-| `ZEUS_MODEL_CACHE` | No | `.models` | Local embedding-model cache |
+| `ZEUS_MODEL_CACHE` | No | `.models` | Embedding-model cache; resolved to an absolute path |
+| `ZEUS_WARM_EMBEDDINGS` | No | on when hosted | Load the model at startup rather than on first search |
+| `ZEUS_SKIP_MODEL_PREFETCH` | No | — | Skip the build-time model download |
 | `ZEUS_SEMANTIC_FLOOR` | No | `0.5` | Minimum fact-vector similarity |
 | `ZEUS_EPISODE_SEMANTIC_FLOOR` | No | `0.52` | Minimum user-message similarity |
 
@@ -312,6 +315,30 @@ does not grow one indefinitely, and again when the process is asked to stop. The
 shutdown checkpoint is passive: it never waits for a reader, so a redeploy is not delayed
 and a request still draining does not find its store pulled away. Stores are checkpointed
 but deliberately not closed, since closing them would trade a tidy log for a failed turn.
+
+### The embedding model on a hosted deployment
+
+Semantic search runs a local ONNX model, which is a ~140MB download on a cache miss.
+Three things keep that out of a user's request:
+
+- **`npm run build` prefetches it**, so a deployment ships with the model already cached
+  rather than fetching it the first time somebody searches. The prefetch uses the same
+  load path the server does, so what the build caches is exactly what the runtime looks
+  for. It never fails the build — the runtime falls back to full-text on its own, and
+  failing a deploy over a CDN blip would be the worse outcome.
+- **`ZEUS_MODEL_CACHE` should point at the mounted volume.** It is resolved to an
+  absolute path, so a process started from a different working directory cannot download
+  a second copy, and a cache on the volume makes the download a one-time cost rather
+  than a per-deploy one.
+- **The model loads at startup**, not inside whichever request searches first. The
+  warm-up is never awaited and never throws: search answers from full-text until the
+  model is ready. On by default for a hosted deployment, off in development so
+  `npm run dev` does not pull 140MB unasked.
+
+A failed load is retried after a cooldown rather than disabling semantic search for the
+life of the process. A momentary problem at startup used to leave a permanently
+worse-answering server that still looked healthy. `GET /api/health` reports the model
+under `embeddings`, so a downgrade is visible rather than silent.
 
 ### Pre-migration backups
 
