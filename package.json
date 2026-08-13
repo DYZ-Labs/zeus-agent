@@ -31,6 +31,8 @@
     "snapshot": "tsx scripts/snapshot.ts",
     "presnapshot:verify": "npm run secure:local",
     "snapshot:verify": "tsx scripts/snapshot-verify.ts",
+    "prerestore": "npm run secure:local",
+    "restore": "tsx scripts/restore.ts",
     "presnapshot:install": "npm run secure:local",
     "snapshot:install": "tsx scripts/snapshot-install.ts",
     "presnapshot:uninstall": "npm run secure:local",

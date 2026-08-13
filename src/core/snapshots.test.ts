@@ -26,6 +26,7 @@ import {
   createVerifiedSnapshot,
   defaultSnapshotDirectory,
   listManagedSnapshots,
+  listRestorableSnapshots,
   purgeManagedSnapshots,
 } from "./snapshots";
 
@@ -300,6 +301,63 @@ describe("snapshot configuration and scheduling", () => {
     expect(plist).toContain("<string>14</string>");
     expect(plist).toContain("/Volumes/Backup &amp; Local/snapshots");
     expect(plist).not.toMatch(/(?:sh|zsh|bash) -c/u);
+  });
+});
+
+describe("recovery-time snapshot lookup", () => {
+  it("lists a store's snapshots after the store itself is gone", () => {
+    const root = temporaryDirectory();
+    const databasePath = join(root, "zeus.db");
+    const snapshotDirectory = join(root, "snapshots");
+    const db = openDb(databasePath);
+    const first = createVerifiedSnapshot(db, {
+      directory: snapshotDirectory,
+      createdAt: new Date("2026-01-01T03:00:00.000Z"),
+    });
+    const second = createVerifiedSnapshot(db, {
+      directory: snapshotDirectory,
+      createdAt: new Date("2026-01-02T03:00:00.000Z"),
+    });
+    db.close();
+    // The disaster this exists for: the store it protects is unopenable or absent.
+    rmSync(databasePath);
+
+    const found = listRestorableSnapshots(databasePath, snapshotDirectory);
+
+    expect(found).toEqual([first.path, second.path]);
+    expect(found.at(-1)).toBe(second.path);
+  });
+
+  it("keeps each store's snapshots separate in a shared directory", () => {
+    const root = temporaryDirectory();
+    const snapshotDirectory = join(root, "snapshots");
+    const primaryPath = join(root, "zeus.db");
+    const accountPath = join(root, "account.db");
+    const primary = openDb(primaryPath);
+    const account = openDb(accountPath);
+    const primarySnapshot = createVerifiedSnapshot(primary, { directory: snapshotDirectory });
+    const accountSnapshot = createVerifiedSnapshot(account, { directory: snapshotDirectory });
+    primary.close();
+    account.close();
+
+    expect(listRestorableSnapshots(primaryPath, snapshotDirectory)).toEqual([
+      primarySnapshot.path,
+    ]);
+    expect(listRestorableSnapshots(accountPath, snapshotDirectory)).toEqual([
+      accountSnapshot.path,
+    ]);
+  });
+
+  it("ignores an unverifiable file that merely looks like a snapshot", () => {
+    const root = temporaryDirectory();
+    const databasePath = join(root, "zeus.db");
+    const snapshotDirectory = join(root, "snapshots");
+    const db = openDb(databasePath);
+    const real = createVerifiedSnapshot(db, { directory: snapshotDirectory });
+    db.close();
+    writeFileSync(real.path.replace(/-[^-]+\.db$/u, "-forged.db"), "not SQLite");
+
+    expect(listRestorableSnapshots(databasePath, snapshotDirectory)).toEqual([real.path]);
   });
 });
 

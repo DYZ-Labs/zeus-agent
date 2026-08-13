@@ -24,6 +24,7 @@ import {
   now,
   type Db,
   verifyDatabaseCopy,
+  verifyRestorableDatabaseCopy,
 } from "./db";
 import {
   SnapshotDestination,
@@ -162,6 +163,44 @@ export function listManagedSnapshots(db: Db, directory?: string): string[] {
     .filter((name) => name.startsWith(prefix) && name.endsWith(SNAPSHOT_SUFFIX))
     .map((name) => join(exactDirectory, name))
     .filter((path) => isManagedSnapshot(path, expectedLedger))
+    .sort();
+}
+
+/**
+ * Verified snapshots for a database path, oldest first, resolved without opening the
+ * source.
+ *
+ * `listManagedSnapshots` needs a live `Db` to read its migration ledger, which is
+ * exactly what a recovery does not have: the store being restored is typically missing
+ * or unopenable. Verification here is the standalone restorable check, so a snapshot
+ * taken by an older compatible build still lists.
+ */
+export function listRestorableSnapshots(
+  databasePath: string,
+  directory?: string,
+): string[] {
+  const sourcePath = canonicalDatabasePath(databasePath);
+  const requestedDirectory = validateSnapshotDirectoryPath(
+    normalize(requireAbsolutePath(directory ?? defaultSnapshotDirectory(sourcePath))),
+  );
+  if (!existsSync(requestedDirectory)) return [];
+  const exactDirectory = canonicalSnapshotDirectory(requestedDirectory);
+  assertSnapshotDirectory(exactDirectory);
+  const prefix = snapshotPrefix(sourcePath);
+
+  return readdirSync(exactDirectory)
+    .filter((name) => name.startsWith(prefix) && name.endsWith(SNAPSHOT_SUFFIX))
+    .map((name) => join(exactDirectory, name))
+    .filter((path) => {
+      try {
+        const entry = lstatSync(path);
+        if (!entry.isFile() || entry.isSymbolicLink()) return false;
+        verifyRestorableDatabaseCopy(path);
+        return true;
+      } catch {
+        return false;
+      }
+    })
     .sort();
 }
 
@@ -327,6 +366,24 @@ function isManagedSnapshot(path: string, expectedLedger: readonly string[]): boo
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Resolve a database path the way SQLite reports it, so a snapshot prefix computed
+ * from a live connection matches one computed from a path alone.
+ *
+ * `databaseFilePath()` reflects SQLite's own canonicalization, which resolves symlinked
+ * parents (`/var` → `/private/var`, or a symlinked volume mount). Hashing the
+ * unresolved spelling instead would silently match nothing. The file itself may be
+ * missing during a recovery, so only its directory is resolved.
+ */
+function canonicalDatabasePath(databasePath: string): string {
+  const exactPath = normalize(requireAbsolutePath(databasePath));
+  try {
+    return join(realpathSync(dirname(exactPath)), basename(exactPath));
+  } catch {
+    return exactPath;
   }
 }
 
