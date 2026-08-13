@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import type { Db } from "./db";
 import { now } from "./db";
 import { errorSignature, logEvent } from "./observability";
@@ -24,14 +26,57 @@ type FeatureExtractor = (
   options: { pooling: "mean"; normalize: boolean },
 ) => Promise<{ data: Float32Array | number[]; dims: number[] }>;
 
-let pipelinePromise: Promise<FeatureExtractor | null> | null = null;
-
 export type EmbeddingStatus = "disabled" | "unloaded" | "loading" | "ready" | "unavailable";
 
-let extractorState: Exclude<EmbeddingStatus, "disabled"> = "unloaded";
+/**
+ * Loader state on globalThis rather than in module scope.
+ *
+ * Next.js gives `instrumentation.ts` its own module registry, so a model warmed at
+ * startup would otherwise live in an instance no request handler can see: the warm-up
+ * would populate the disk cache but every route would still report "unloaded" and load
+ * its own copy. The same trick keeps a hot reload from leaking a second extractor.
+ */
+type EmbeddingRuntime = {
+  pipelinePromise: Promise<FeatureExtractor | null> | null;
+  state: Exclude<EmbeddingStatus, "disabled">;
+  lastFailureAt: number | null;
+};
+
+const globalForEmbeddings = globalThis as typeof globalThis & {
+  zeusEmbeddings?: EmbeddingRuntime;
+};
+
+function runtime(): EmbeddingRuntime {
+  return (globalForEmbeddings.zeusEmbeddings ??= {
+    pipelinePromise: null,
+    state: "unloaded",
+    lastFailureAt: null,
+  });
+}
+
+/**
+ * How long a failed load suppresses another attempt.
+ *
+ * Long enough that a missing model costs one attempt rather than one per query, short
+ * enough that a transient failure — a CDN blip during boot, a volume mounted a moment
+ * late — does not silently cost this process semantic search until the next deploy.
+ */
+export const MODEL_LOAD_RETRY_COOLDOWN_MS = 10 * 60_000;
 
 export function embeddingsDisabled(): boolean {
   return process.env.ZEUS_EMBEDDINGS === "off";
+}
+
+/**
+ * Where the model is cached, as an absolute path.
+ *
+ * Resolved rather than left relative: the default is interpreted against the working
+ * directory, so the same deployment started from a different directory would download
+ * the model again into a second copy. On a hosted deployment this should point at the
+ * mounted volume, which turns a per-deploy download into a one-time one.
+ */
+export function modelCacheDirectory(): string {
+  return resolve(process.env.ZEUS_MODEL_CACHE?.trim() || ".models");
 }
 
 /**
@@ -42,44 +87,80 @@ export function embeddingsDisabled(): boolean {
  * looking healthy. Health reporting needs to see that without paying to load the model.
  */
 export function embeddingStatus(): EmbeddingStatus {
-  return embeddingsDisabled() ? "disabled" : extractorState;
+  return embeddingsDisabled() ? "disabled" : runtime().state;
 }
 
 /**
- * Load the model once per process. Returns null — permanently, for this process —
- * if it cannot be loaded, so a missing model costs one failed attempt rather than
- * one per query.
+ * Load the model once per process, retrying only after a cooldown.
+ *
+ * A failed load used to disable semantic search for the life of the process, which
+ * turned a momentary problem at startup into a permanently worse-answering server that
+ * still looked healthy. Now a failure is remembered just long enough to stop one failed
+ * load per query, and a later call gets another chance.
  */
 async function getExtractor(): Promise<FeatureExtractor | null> {
   if (embeddingsDisabled()) return null;
+  const current = runtime();
+  if (
+    current.pipelinePromise === null &&
+    current.lastFailureAt !== null &&
+    Date.now() - current.lastFailureAt < MODEL_LOAD_RETRY_COOLDOWN_MS
+  ) {
+    return null;
+  }
 
-  pipelinePromise ??= (async () => {
-    extractorState = "loading";
-    try {
-      const { pipeline, env } = await import("@huggingface/transformers");
-      // Keep the model cache inside the project so it is obvious and disposable.
-      env.cacheDir = process.env.ZEUS_MODEL_CACHE ?? ".models";
-      const extractor = await pipeline("feature-extraction", EMBEDDING_MODEL, {
-        dtype: "fp32",
-      });
-      extractorState = "ready";
-      return extractor as unknown as FeatureExtractor;
-    } catch (error) {
-      extractorState = "unavailable";
-      // This downgrade lasts for the life of the process, so it is worth an event
-      // rather than a line: retrieval quality drops without anything else changing.
-      logEvent({
-        event: "embeddings_unavailable",
-        outcome: "degraded",
-        reason: "model_load_failed",
-        model: EMBEDDING_MODEL,
-        ...errorSignature(error),
-      });
-      return null;
-    }
-  })();
+  current.pipelinePromise ??= loadExtractor();
+  return current.pipelinePromise;
+}
 
-  return pipelinePromise;
+async function loadExtractor(): Promise<FeatureExtractor | null> {
+  const current = runtime();
+  current.state = "loading";
+  try {
+    const { pipeline, env } = await import("@huggingface/transformers");
+    env.cacheDir = modelCacheDirectory();
+    const extractor = await pipeline("feature-extraction", EMBEDDING_MODEL, {
+      dtype: "fp32",
+    });
+    current.state = "ready";
+    current.lastFailureAt = null;
+    return extractor as unknown as FeatureExtractor;
+  } catch (error) {
+    current.state = "unavailable";
+    current.lastFailureAt = Date.now();
+    // Drop the memo so the cooldown, not this promise, decides when to try again.
+    current.pipelinePromise = null;
+    // Retrieval quality drops without anything else changing, so it is worth an event.
+    logEvent({
+      event: "embeddings_unavailable",
+      outcome: "degraded",
+      reason: "model_load_failed",
+      model: EMBEDDING_MODEL,
+      ...errorSignature(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * Load the model now rather than inside whichever request happens to search first.
+ *
+ * The first semantic search otherwise pays for a ~140MB download from a public CDN
+ * while a user waits. Returns the resulting status instead of throwing: a warm-up that
+ * fails must leave the caller running on full-text search, not break it.
+ */
+export async function warmEmbeddings(): Promise<EmbeddingStatus> {
+  await getExtractor();
+  return embeddingStatus();
+}
+
+/** Tests only: forget the loaded model and any cooldown. */
+export function resetEmbeddingsForTest(): void {
+  globalForEmbeddings.zeusEmbeddings = {
+    pipelinePromise: null,
+    state: "unloaded",
+    lastFailureAt: null,
+  };
 }
 
 /** Embed one string. Returns null when semantic search is unavailable. */
