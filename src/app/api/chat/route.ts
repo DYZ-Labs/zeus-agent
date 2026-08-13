@@ -3,6 +3,7 @@ import { z } from "zod";
 import { streamTurn } from "@/core/chat";
 import { createConversation, getConversation } from "@/core/conversations";
 import type { Db } from "@/core/db";
+import { errorSignature, logEvent } from "@/core/observability";
 import { MissingCredentialsError, RefusedError, hasCredentials } from "@/core/openai";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
 
@@ -81,6 +82,7 @@ function privateChatResponse(
   requestSignal: AbortSignal,
 ): Response {
   const encoder = new TextEncoder();
+  const startedAt = Date.now();
   const turnAbort = new AbortController();
   let cancelled = false;
   const abortFromRequest = () => turnAbort.abort(requestSignal.reason);
@@ -154,6 +156,16 @@ function privateChatResponse(
         });
       } catch (error) {
         if (!turnAbort.signal.aborted) {
+          // The message goes to the person whose memory it is; the log gets only the
+          // error's class and code location.
+          logEvent({
+            event: "chat_turn",
+            outcome: "error",
+            reason: error instanceof RefusedError ? "model_refused" : "turn_failed",
+            conversation_id: conversationId,
+            duration_ms: Date.now() - startedAt,
+            ...errorSignature(error),
+          });
           send({
             type: "error",
             message:

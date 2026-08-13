@@ -1,6 +1,7 @@
 import { MODEL, OPENAI_TIMEOUT_MS, assertResponseComplete, openai } from "./openai";
 import { appendMessage, recentMessages } from "./conversations";
 import type { Db } from "./db";
+import { errorSignature, logEvent } from "./observability";
 import {
   buildContext,
   recordResponseContext,
@@ -182,9 +183,13 @@ async function maybeExecuteBoundedWork(
   } catch (error) {
     // Preserve an ordinary chat turn when planning itself cannot start. The assistant
     // must not claim execution happened merely because the request sounded actionable.
-    console.warn(
-      `[zeus] bounded work could not start (${error instanceof Error ? error.name : "work_error"})`,
-    );
+    logEvent({
+      event: "work_plan_not_started",
+      outcome: "degraded",
+      reason: "planning_failed",
+      message_id: sourceMessage.id,
+      ...errorSignature(error),
+    });
     return null;
   }
 }
@@ -250,9 +255,13 @@ export async function learnFrom(
     run = startExtractionRun(db, sourceMessageId);
   } catch (error) {
     safelyBlockRecall(db, sourceMessageId);
-    console.warn(
-      `[zeus] extraction audit could not start (${extractionErrorCode(error)}); chat response preserved`,
-    );
+    logEvent({
+      event: "extraction_failed",
+      outcome: "degraded",
+      reason: "audit_start_failed",
+      message_id: sourceMessageId,
+      ...errorSignature(error),
+    });
     return null;
   }
 
@@ -319,9 +328,13 @@ export async function learnFrom(
     // privacy classification. Leave it unclassified instead of permanently hiding it.
     if (signal?.aborted) signal.throwIfAborted();
     safelyBlockRecall(db, sourceMessageId);
-    console.warn(
-      `[zeus] extraction failed for this turn (${extractionErrorCode(error)}); chat response preserved`,
-    );
+    logEvent({
+      event: "extraction_failed",
+      outcome: "degraded",
+      reason: "extraction_error",
+      message_id: sourceMessageId,
+      ...errorSignature(error),
+    });
     return null;
   }
 }

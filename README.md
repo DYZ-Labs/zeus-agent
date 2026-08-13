@@ -221,6 +221,41 @@ The worker opens the configured SQLite path directly and performs no OpenAI call
 browser converts coordinates to a coarse cell and keeps only its cell-to-name mapping
 locally; Zeus stores only the name and an observation time that expires after 30 minutes.
 
+### Health and operational events
+
+`GET /api/health` reports whether this process can actually serve, not merely whether it
+is listening: it opens the store and reads its migration ledger, so a database that
+cannot be opened returns `503` rather than letting `/` keep answering `200` while every
+private route fails. It answers before authentication — including while auth itself is
+misconfigured, which is exactly when it is worth asking — and returns no user data:
+schema version and subsystem availability only.
+
+```bash
+curl -s http://127.0.0.1:3000/api/health
+{"status":"ok","store":{"status":"ok","migrations_applied":21,"migrations_expected":21},
+ "auth":"local","embeddings":"ready","model":"configured"}
+```
+
+`embeddings` is reported honestly rather than reassuringly. Semantic search falls back to
+full-text for the life of a process when the local model cannot load, which is right for
+a chat turn and invisible to an operator; `"unavailable"` says recall got worse while
+everything else looks healthy.
+
+Zeus emits one JSON object per line on **stderr** for operational events — denied
+requests, failed chat turns, extraction failures, embedding downgrades, exhausted OpenAI
+retries. stdout is left alone because it is the MCP server's protocol channel.
+
+These events are built as an **allowlist, not a scrubber**. Zeus's own error strings can
+quote the person the store is about, so only declared fields are ever serialized, each is
+validated against a shape that cannot hold a sentence, and there is deliberately no
+free-form message field and no `error.message`. An error is identified by its class and
+the first line of Zeus code in its stack — a code location the operator wrote, never a
+sentence the user wrote. A value that does not fit its field is replaced with `invalid`
+rather than truncated, so a bad call site is visible instead of leaking half a sentence.
+
+Account ids in events are Supabase UUIDs, which are pseudonymous by design; emails and
+display names are never logged.
+
 ### Scheduled database snapshots
 
 `npm run snapshot` creates a standalone SQLite snapshot with `VACUUM INTO`. It reads a

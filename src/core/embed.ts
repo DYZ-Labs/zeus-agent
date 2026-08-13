@@ -1,5 +1,6 @@
 import type { Db } from "./db";
 import { now } from "./db";
+import { errorSignature, logEvent } from "./observability";
 import type { OwnerKind } from "./schema";
 
 /**
@@ -25,8 +26,23 @@ type FeatureExtractor = (
 
 let pipelinePromise: Promise<FeatureExtractor | null> | null = null;
 
+export type EmbeddingStatus = "disabled" | "unloaded" | "loading" | "ready" | "unavailable";
+
+let extractorState: Exclude<EmbeddingStatus, "disabled"> = "unloaded";
+
 export function embeddingsDisabled(): boolean {
   return process.env.ZEUS_EMBEDDINGS === "off";
+}
+
+/**
+ * Report the model's state without loading it.
+ *
+ * Semantic search degrades silently by design, which is right for a chat turn and wrong
+ * for an operator: a process that quietly fell back to full-text answers worse while
+ * looking healthy. Health reporting needs to see that without paying to load the model.
+ */
+export function embeddingStatus(): EmbeddingStatus {
+  return embeddingsDisabled() ? "disabled" : extractorState;
 }
 
 /**
@@ -38,6 +54,7 @@ async function getExtractor(): Promise<FeatureExtractor | null> {
   if (embeddingsDisabled()) return null;
 
   pipelinePromise ??= (async () => {
+    extractorState = "loading";
     try {
       const { pipeline, env } = await import("@huggingface/transformers");
       // Keep the model cache inside the project so it is obvious and disposable.
@@ -45,13 +62,19 @@ async function getExtractor(): Promise<FeatureExtractor | null> {
       const extractor = await pipeline("feature-extraction", EMBEDDING_MODEL, {
         dtype: "fp32",
       });
+      extractorState = "ready";
       return extractor as unknown as FeatureExtractor;
     } catch (error) {
-      console.warn(
-        `[zeus] semantic search unavailable, falling back to full-text only: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      extractorState = "unavailable";
+      // This downgrade lasts for the life of the process, so it is worth an event
+      // rather than a line: retrieval quality drops without anything else changing.
+      logEvent({
+        event: "embeddings_unavailable",
+        outcome: "degraded",
+        reason: "model_load_failed",
+        model: EMBEDDING_MODEL,
+        ...errorSignature(error),
+      });
       return null;
     }
   })();
@@ -72,10 +95,15 @@ export async function embed(text: string): Promise<Float32Array | null> {
     return output.data instanceof Float32Array
       ? output.data
       : Float32Array.from(output.data as number[]);
-  } catch {
-    // Do not include the input or model exception in logs: embedding text may itself
-    // be sensitive. Every retrieval caller can continue through FTS/graph paths.
-    console.warn("[zeus] local embedding failed; falling back to non-semantic retrieval");
+  } catch (error) {
+    // Never the input or the model exception text: embedding text is memory. The
+    // error's class and code location are enough to tell one failure from another.
+    logEvent({
+      event: "embedding_failed",
+      outcome: "degraded",
+      reason: "inference_failed",
+      ...errorSignature(error),
+    });
     return null;
   }
 }
