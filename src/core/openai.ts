@@ -6,13 +6,48 @@ import type { Response } from "openai/resources/responses/responses";
  * UI continue to work without credentials; only model-backed paths require a key.
  */
 export const MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5.5";
+export const OPENAI_TIMEOUT_MS = 75_000;
+export const OPENAI_MAX_RETRIES = 1;
+
+const globalForOpenAI = globalThis as typeof globalThis & {
+  zeusResolvedOpenAIModelLogged?: boolean;
+};
+
+const sdkLogger = {
+  // Do not forward SDK diagnostics: some parser errors can include response chunks.
+  // Callers still receive the thrown error through the ordinary request boundary.
+  error() {},
+  warn() {},
+  info(message: string) {
+    // The SDK logs terminal retry state at info level. Keep normal request metadata
+    // quiet and emit a stable diagnostic that cannot contain prompts or responses.
+    if (message.includes("error; no more retries left")) {
+      console.warn(
+        `[zeus] OpenAI retry budget exhausted after ${OPENAI_MAX_RETRIES + 1} attempts`,
+      );
+    }
+  },
+  debug() {},
+};
 
 let client: OpenAI | null = null;
 
 export function openai(): OpenAI {
   if (!hasCredentials()) throw new MissingCredentialsError();
-  client ??= new OpenAI();
+  client ??= new OpenAI({
+    timeout: OPENAI_TIMEOUT_MS,
+    maxRetries: OPENAI_MAX_RETRIES,
+    logger: sdkLogger,
+    logLevel: "info",
+  });
   return client;
+}
+
+/** Log configuration without constructing a client or requiring credentials. */
+export function logResolvedModelOnce(): void {
+  if (globalForOpenAI.zeusResolvedOpenAIModelLogged) return;
+  globalForOpenAI.zeusResolvedOpenAIModelLogged = true;
+  console.error(`[zeus] OpenAI model: ${MODEL}`);
 }
 
 export function hasCredentials(): boolean {

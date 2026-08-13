@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "zeus": {
+      "command": "node",
+      "args": ["--env-file-if-exists=.env.local", "--import", "tsx", "src/mcp/server.ts"],
+      "cwd": "/absolute/path/to/zeus"
+    }
+  }
+}

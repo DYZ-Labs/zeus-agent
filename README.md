@@ -336,17 +336,23 @@ configuration looks like this:
 {
   "mcpServers": {
     "zeus": {
-      "command": "npx",
-      "args": ["tsx", "src/mcp/server.ts"],
+      "command": "node",
+      "args": ["--env-file-if-exists=.env.local", "--import", "tsx", "src/mcp/server.ts"],
       "cwd": "/absolute/path/to/zeus"
     }
   }
 }
 ```
 
-Use the same `ZEUS_DB` and `OPENAI_API_KEY` environment in the MCP client if you override
-either value. The repository’s `.mcp.json` is a local example; update its absolute `cwd`
-when the checkout moves.
+The example loads `.env.local` when it exists, while preserving environment values set
+by the MCP client. Copy it, then update its absolute `cwd` for your checkout:
+
+```bash
+cp .mcp.json.example .mcp.json
+```
+
+If you use a different launcher, pass the same `ZEUS_DB`, `OPENAI_API_KEY`, and
+`OPENAI_MODEL` environment as the web process.
 
 The server provides:
 

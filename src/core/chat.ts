@@ -1,4 +1,4 @@
-import { MODEL, assertResponseComplete, openai } from "./openai";
+import { MODEL, OPENAI_TIMEOUT_MS, assertResponseComplete, openai } from "./openai";
 import { appendMessage, recentMessages } from "./conversations";
 import type { Db } from "./db";
 import {
@@ -86,6 +86,10 @@ export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<Tu
   const history = recentMessages(db, options.conversationId, options.historyLimit ?? 20);
   const priorTurns = history.filter((message) => message.id !== userMessage.id);
 
+  const deadlineSignal = AbortSignal.timeout(OPENAI_TIMEOUT_MS);
+  const streamSignal = options.signal
+    ? AbortSignal.any([options.signal, deadlineSignal])
+    : deadlineSignal;
   const stream = openai().responses.stream(
     {
       model: MODEL,
@@ -104,20 +108,32 @@ export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<Tu
       ],
       store: false,
     },
-    { signal: options.signal },
+    { signal: streamSignal },
   );
 
   if (options.onDelta) {
     stream.on("response.output_text.delta", (event) => {
-      if (!options.signal?.aborted) options.onDelta?.(event.delta);
+      if (!streamSignal.aborted) options.onDelta?.(event.delta);
     });
   }
-  const final = await stream.finalResponse();
-  // The SDK normally rejects finalResponse on abort. This explicit boundary also
-  // covers a completion/abort race before any assistant-authored state is stored.
-  options.signal?.throwIfAborted();
-  assertResponseComplete(final);
-  options.signal?.throwIfAborted();
+  let final;
+  try {
+    final = await stream.finalResponse();
+    // The SDK normally rejects finalResponse on abort. This explicit boundary also
+    // covers a completion/abort race before any assistant-authored state is stored.
+    streamSignal.throwIfAborted();
+    assertResponseComplete(final);
+    streamSignal.throwIfAborted();
+  } catch (error) {
+    if (deadlineSignal.aborted && !options.signal?.aborted) {
+      const timeout = new Error(
+        `OpenAI streaming timed out after ${OPENAI_TIMEOUT_MS / 1_000} seconds.`,
+      );
+      timeout.name = "OpenAIStreamTimeoutError";
+      throw timeout;
+    }
+    throw error;
+  }
 
   const reply = final.output_text;
   const assistantMessage = appendMessage(db, options.conversationId, "assistant", reply);
