@@ -95,6 +95,21 @@ export function accountDbExists(identity: AccountIdentity): boolean {
   return existsSync(/* turbopackIgnore: true */ accountDbPath(getDb(), identity));
 }
 
+/**
+ * Every store this process currently holds open.
+ *
+ * Deliberately does not open anything: maintenance should act on the handles that
+ * already exist, not create work by touching stores nobody has asked for.
+ */
+export function openStoreHandles(): Db[] {
+  const handles: Db[] = [];
+  if (globalForDb.zeusDb) handles.push(globalForDb.zeusDb);
+  for (const cached of globalForDb.zeusAccountDbs?.values() ?? []) {
+    handles.push(cached.db);
+  }
+  return handles;
+}
+
 /** Pure path selection kept exported so the legacy-routing safety policy is testable. */
 export function accountDbPath(
   primaryDb: Db,

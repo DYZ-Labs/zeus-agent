@@ -202,6 +202,7 @@ group locks private web data until configuration is completed.
 | `ZEUS_MODEL_CALLS_PER_DAY` | No | `500` | Per-account model calls per day |
 | `ZEUS_MODEL_TOKENS_PER_DAY` | No | `2000000` | Per-account model tokens per day |
 | `ZEUS_MAX_CONCURRENT_WORK_RUNS` | No | `2` | Bounded work runs this process executes at once |
+| `ZEUS_SYNCHRONOUS` | No | `full` | `full` fsyncs each commit; `normal` trades host-crash durability for speed |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_SCHEDULER` | No | on when hosted | In-process scheduled snapshots (`on`/`off`) |
 | `ZEUS_SNAPSHOT_INTERVAL_HOURS` | No | `24` | How stale a store's newest snapshot may get |
@@ -289,6 +290,28 @@ more than one instance multiplies it.
 Work-run execution still happens on the request path. Moving it onto a queue would remove
 the 900-second request entirely; the runner-lease machinery already supports resuming a
 run from another process.
+
+### Durability
+
+Zeus commits with `synchronous=FULL`. WAL with `NORMAL` does not fsync on commit: a
+process crash is safe because the log is already written, but a host crash or power loss
+can lose the most recently committed transactions — the last facts a user just watched
+Zeus learn, which is precisely the thing this store exists to keep.
+
+Measured on this write path: **0.06ms per commit at `NORMAL` against 0.14ms at `FULL`**,
+with no measurable difference for rows written inside one transaction, where fsync
+happens once per commit rather than once per row. A chat turn makes a handful of commits
+and is dominated by a multi-second model call, so the durability is close to free.
+
+That measurement is from macOS, whose fsync does not force a drive cache flush the way
+Linux does, and network-attached storage can make fsync markedly slower.
+`ZEUS_SYNCHRONOUS=normal` reverts without a code change if a volume turns out to be slow.
+
+The write-ahead log is checkpointed every 30 minutes so a server that stays up for weeks
+does not grow one indefinitely, and again when the process is asked to stop. The
+shutdown checkpoint is passive: it never waits for a reader, so a redeploy is not delayed
+and a request still draining does not find its store pulled away. Stores are checkpointed
+but deliberately not closed, since closing them would trade a tidy log for a failed turn.
 
 ### Pre-migration backups
 

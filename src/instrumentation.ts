@@ -17,4 +17,9 @@ export async function register(): Promise<void> {
   // be worse than none, because it would look like the memory was safe.
   const { startSnapshotScheduler } = await import("./server/snapshot-scheduler");
   startSnapshotScheduler();
+
+  // Bound the write-ahead log for a process that stays up for weeks, and fold it back
+  // in when this one is asked to stop.
+  const { startDurabilityMaintenance } = await import("./server/durability");
+  startDurabilityMaintenance();
 }
