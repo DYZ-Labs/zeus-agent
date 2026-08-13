@@ -10,6 +10,7 @@ const CONFIGURATION = {
   publishableKey: "sb_publishable_test",
   legacyOwnerEmail: "owner@example.com",
   siteUrl: "http://127.0.0.1:3000",
+  allowedSignupEmails: [],
 };
 
 afterEach(() => vi.unstubAllGlobals());

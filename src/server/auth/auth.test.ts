@@ -5,12 +5,14 @@ import { openTestDb, type Db } from "@/core/db";
 import { getAppOwner } from "@/core/owner";
 
 const mocks = vi.hoisted(() => ({
+  accountDbExists: vi.fn(),
   getAccountDb: vi.fn(),
   getDb: vi.fn(),
 }));
 
 vi.mock("server-only", () => ({}));
 vi.mock("@/server/db", () => ({
+  accountDbExists: mocks.accountDbExists,
   getAccountDb: mocks.getAccountDb,
   getDb: mocks.getDb,
 }));
@@ -33,6 +35,7 @@ const AUTH_KEYS = [
   "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
   "NEXT_PUBLIC_SITE_URL",
   "ZEUS_OWNER_EMAIL",
+  "ZEUS_ALLOWED_SIGNUP_EMAILS",
 ] as const;
 
 let db: Db;
@@ -46,6 +49,9 @@ beforeEach(() => {
   db = openTestDb();
   otherDb = openTestDb();
   mocks.getDb.mockReturnValue(db);
+  // Existing tests describe accounts that already have a store; the signup allowlist
+  // gates only first-time store creation and is exercised separately below.
+  mocks.accountDbExists.mockReturnValue(true);
   mocks.getAccountDb.mockImplementation(
     ({ supabaseUserId }: { supabaseUserId: string }) =>
       supabaseUserId === OWNER_ID ? db : otherDb,
@@ -81,6 +87,7 @@ describe("auth configuration", () => {
       publishableKey: "sb_publishable_test",
       siteUrl: "http://127.0.0.1:3000",
       legacyOwnerEmail: "owner@example.com",
+      allowedSignupEmails: [],
     });
   });
 
@@ -131,6 +138,45 @@ describe("owner authorization", () => {
     expect(authorizeSupabaseUser(user(OTHER_ID, "owner@example.com")).state).toBe("authorized");
     expect(getAppOwner(db)?.supabase_user_id).toBe(OWNER_ID);
     expect(getAppOwner(otherDb)?.supabase_user_id).toBe(OTHER_ID);
+  });
+});
+
+describe("signup allowlist", () => {
+  beforeEach(configureAuth);
+
+  it("refuses to allocate a new store for an uninvited email", () => {
+    mocks.accountDbExists.mockReturnValue(false);
+
+    const access = authorizeSupabaseUser(user(OTHER_ID, "stranger@example.com"));
+
+    expect(access).toMatchObject({ state: "wrong_account", canAccessPrivateData: false });
+    // The allocation itself must not happen: no database, no migration, no connection.
+    expect(mocks.getAccountDb).not.toHaveBeenCalled();
+    expect(getAppOwner(otherDb)).toBeNull();
+  });
+
+  it("allocates a new store for an allowlisted email, ignoring case and spacing", () => {
+    mocks.accountDbExists.mockReturnValue(false);
+    process.env.ZEUS_ALLOWED_SIGNUP_EMAILS = " Other@Example.com , spare@example.com ";
+
+    expect(authorizeSupabaseUser(user(OTHER_ID, "other@example.com")).state).toBe(
+      "authorized",
+    );
+    expect(getAppOwner(otherDb)?.supabase_user_id).toBe(OTHER_ID);
+  });
+
+  it("never locks out an account that already has a store", () => {
+    mocks.accountDbExists.mockReturnValue(true);
+
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe(
+      "authorized",
+    );
+  });
+
+  it("fails the configuration rather than silently narrowing a mistyped allowlist", () => {
+    process.env.ZEUS_ALLOWED_SIGNUP_EMAILS = "good@example.com,not-an-email";
+
+    expect(getAuthConfiguration()).toMatchObject({ mode: "misconfigured" });
   });
 });
 
