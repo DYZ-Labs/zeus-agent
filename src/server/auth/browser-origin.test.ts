@@ -7,7 +7,7 @@ const CONFIGURED = {
   mode: "configured" as const,
   url: "https://project.supabase.co",
   publishableKey: "sb_publishable_test",
-  ownerEmail: "owner@example.com",
+  legacyOwnerEmail: "owner@example.com",
   siteUrl: "https://zeus.example",
 };
 
@@ -99,6 +99,22 @@ describe("configured browser origin boundary", () => {
     });
     expect(checkBrowserBoundary(wrongHost, "private-mutation", CONFIGURED)).toMatchObject({
       allowed: false,
+    });
+  });
+
+  it("accepts the exact public browser origin behind an internal Railway URL", () => {
+    const forwarded = new Request("http://zeus.railway.internal/auth/signup", {
+      method: "POST",
+      headers: {
+        origin: "https://zeus.example",
+        referer: "https://zeus.example/auth/signup",
+        "sec-fetch-site": "same-origin",
+      },
+    });
+
+    expect(checkBrowserBoundary(forwarded, "private-mutation", CONFIGURED)).toMatchObject({
+      allowed: true,
+      origin: "https://zeus.example",
     });
   });
 });

@@ -169,7 +169,7 @@ function LockedSettings() {
     <section className="px-5 py-5 sm:px-6 sm:py-6">
       <h1 className="text-lg font-semibold leading-6">Login required</h1>
       <p className="mt-1.5 text-sm leading-5" style={{ color: "var(--shell-muted)" }}>
-        Sign in with the linked owner account to view or change private Zeus data.
+        Sign in to view or change your private Zeus data.
       </p>
       <AuthLinks />
     </section>

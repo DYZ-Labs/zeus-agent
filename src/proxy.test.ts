@@ -19,7 +19,7 @@ const CONFIGURED = {
   mode: "configured" as const,
   url: "https://project.supabase.co",
   publishableKey: "sb_publishable_test",
-  ownerEmail: "owner@example.com",
+  legacyOwnerEmail: "owner@example.com",
   siteUrl: "https://zeus.example",
 };
 
@@ -91,6 +91,22 @@ describe("configured proxy mutation boundary", () => {
 
     expect(response.status).toBe(403);
     expect(response.headers.get("x-frame-options")).toBe("DENY");
+  });
+
+  it("allows an exact public-origin Server Action behind Railway's internal URL", async () => {
+    const response = await proxy(
+      new NextRequest("http://zeus.railway.internal/auth/signup", {
+        method: "POST",
+        headers: {
+          origin: "https://zeus.example",
+          referer: "https://zeus.example/auth/signup",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-middleware-next")).toBe("1");
   });
 });
 

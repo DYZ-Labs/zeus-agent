@@ -7,7 +7,7 @@ export type BrowserBoundaryResult =
   | { allowed: false; message: string };
 
 const FORBIDDEN_MESSAGE =
-  "This private Zeus browser request did not come from the local app origin.";
+  "This private Zeus browser request did not come from the configured app origin.";
 
 /**
  * Keep the unauthenticated local web UI on its literal loopback authority. A hostname
@@ -28,6 +28,8 @@ export function checkBrowserBoundary(
 
   if (configuration.mode === "misconfigured") return forbidden();
 
+  const origin = headerOrigin(request.headers.get("origin"));
+  const referer = headerOrigin(request.headers.get("referer"));
   let expectedOrigin: string;
   if (configuration.mode === "local") {
     const host = request.headers.get("host");
@@ -44,14 +46,23 @@ export function checkBrowserBoundary(
     expectedOrigin = `http://${host}`;
   } else {
     expectedOrigin = new URL(configuration.siteUrl).origin;
-    if (target.origin !== expectedOrigin) return forbidden();
+    // Behind Railway (and similar reverse proxies), NextRequest.url can contain the
+    // service's internal authority even though the browser reached the configured
+    // public origin. An exact browser Origin/Referer still proves the public boundary;
+    // requiring the internal request URL to match would reject every legitimate
+    // production Server Action before it reaches Supabase.
+    if (
+      target.origin !== expectedOrigin &&
+      origin !== expectedOrigin &&
+      referer !== expectedOrigin
+    ) {
+      return forbidden();
+    }
   }
 
   const fetchSite = request.headers.get("sec-fetch-site")?.toLowerCase() ?? null;
   if (fetchSite === "cross-site" || fetchSite === "same-site") return forbidden();
 
-  const origin = headerOrigin(request.headers.get("origin"));
-  const referer = headerOrigin(request.headers.get("referer"));
   if (origin !== null && origin !== expectedOrigin) return forbidden();
   if (referer !== null && referer !== expectedOrigin) return forbidden();
 

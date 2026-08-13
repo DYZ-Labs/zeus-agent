@@ -128,10 +128,14 @@ retrieval only.
 ### Optional account login
 
 Zeus can use Supabase Auth for passwordless email login and Google login. Supabase stores
-identity only; conversations and memory remain in the local SQLite file. Because one
-Zeus database represents one person, the first verified session must match
-`ZEUS_OWNER_EMAIL`. Zeus then binds the store to that account's immutable Supabase UUID,
-and another account cannot replace it.
+identity only; conversations and memory remain in local SQLite files. A web deployment
+can serve multiple verified accounts, but it never mixes their data: every account is
+bound to a separate personal database by its immutable Supabase UUID.
+
+The original `ZEUS_DB` remains available to an existing installation. Set the optional
+`ZEUS_OWNER_EMAIL` migration bridge so that account can claim the original database while
+it is still unbound. Other accounts are created under `accounts/<supabase-uuid>.db` beside
+`ZEUS_DB`. Once a database is bound, the UUID—not a mutable email address—controls access.
 
 Add these values to `.env.local`:
 
@@ -139,7 +143,8 @@ Add these values to `.env.local`:
 NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_YOUR_KEY
 NEXT_PUBLIC_SITE_URL=http://127.0.0.1:3000
-ZEUS_OWNER_EMAIL=you@example.com
+# Optional only when preserving a pre-multi-account ZEUS_DB:
+# ZEUS_OWNER_EMAIL=you@example.com
 ```
 
 Then configure the Supabase project:
@@ -162,9 +167,9 @@ configured `NEXT_PUBLIC_SITE_URL` before starting a flow to enforce this.
 
 No Supabase service-role key, database table, or RLS policy is needed. Supabase's default
 email sender only delivers to members of the project's organization and is heavily
-rate-limited; configure custom SMTP before production use. Leave the Supabase URL,
-publishable key, and owner email blank to keep the original local-only mode. Setting only
-part of that group locks private web data until configuration is completed.
+rate-limited; configure custom SMTP before production use. Leave both the Supabase URL
+and publishable key blank to keep local-only mode. Setting only part of the required auth
+group locks private web data until configuration is completed.
 
 ## Configuration
 
@@ -175,7 +180,7 @@ part of that group locks private web data until configuration is completed.
 | `NEXT_PUBLIC_SUPABASE_URL` | For web login | — | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | For web login | — | Browser-safe Supabase publishable key |
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
-| `ZEUS_OWNER_EMAIL` | For web login | — | Server-only email allowed to bind the one-person store |
+| `ZEUS_OWNER_EMAIL` | Legacy migration only | — | Email allowed to claim an unbound pre-multi-account `ZEUS_DB` |
 | `ZEUS_DB` | No | `~/.zeus/zeus.db` | SQLite database path |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
@@ -373,7 +378,9 @@ Run `npm run mcp` to launch the same server directly. It writes protocol data on
 stdout and diagnostics to stderr.
 
 Supabase login protects the web interface. The stdio MCP server remains a separate local
-trust boundary and can access the same store when a same-OS process launches it.
+trust boundary and opens the specific database selected by `ZEUS_DB`; it does not infer a
+web account. To export, reindex, snapshot, or open MCP for an additional account, point
+`ZEUS_DB` at that account's UUID-named database explicitly.
 
 ## Commands
 
