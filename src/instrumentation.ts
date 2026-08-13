@@ -18,6 +18,11 @@ export async function register(): Promise<void> {
   const { startSnapshotScheduler } = await import("./server/snapshot-scheduler");
   startSnapshotScheduler();
 
+  // Bound the write-ahead log for a process that stays up for weeks, and fold it back
+  // in when this one is asked to stop.
+  const { startDurabilityMaintenance } = await import("./server/durability");
+  startDurabilityMaintenance();
+
   // Deliberately not awaited: the model download must never delay the server coming up
   // or keep it from coming up at all. Search answers from full-text until it lands.
   const { startEmbeddingWarmup } = await import("./server/embedding-warmup");
