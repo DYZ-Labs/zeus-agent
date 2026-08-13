@@ -1,6 +1,7 @@
 import { zodTextFormat } from "openai/helpers/zod";
 
 import { buildEvaluationContextForTrigger } from "./ambient";
+import { recordModelCall, responseUsage } from "./budget";
 import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
 import { MODEL, assertResponseComplete, openai } from "./openai";
@@ -81,6 +82,7 @@ export async function generateWorkPlanProposal(
     }],
     store: false,
   });
+  recordModelCall(db, responseUsage(response));
   assertResponseComplete(response);
   const proposal = response.output_parsed;
   if (!proposal) throw new Error("The model did not return a work plan");
@@ -310,6 +312,7 @@ async function executeSafeStep(
       include: ["web_search_call.action.sources"],
       store: false,
     }, { idempotencyKey: input.providerRequestKey, signal: input.signal });
+    recordModelCall(db, responseUsage(response));
     assertResponseComplete(response);
     const webSearch = webSearchAudit(response.output);
     const unsafe = inspectUntrustedWorkData(
@@ -352,6 +355,7 @@ async function executeSafeStep(
     ],
     store: false,
   }, { idempotencyKey: input.providerRequestKey, signal: input.signal });
+  recordModelCall(db, responseUsage(response));
   assertResponseComplete(response);
   const unsafe = inspectUntrustedWorkData(response.output_text);
   if (unsafe) return sensitivePause(unsafe, 1, 1);

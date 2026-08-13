@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { BUDGET_MESSAGES, checkModelBudget, logBudgetDenial } from "@/core/budget";
 import { streamTurn } from "@/core/chat";
 import { createConversation, getConversation } from "@/core/conversations";
 import type { Db } from "@/core/db";
@@ -63,6 +64,14 @@ export async function POST(request: Request): Promise<Response> {
   }
 
   const db = access.db;
+  // Refuse before any model work, not after: the point of the ceiling is that the
+  // request that exceeds it costs nothing.
+  const budget = checkModelBudget(db);
+  if (!budget.allowed) {
+    logBudgetDenial("/api/chat", budget);
+    return budgetResponse(budget);
+  }
+
   const conversation =
     (parsed.data.conversationId ? getConversation(db, parsed.data.conversationId) : null) ??
     createConversation(db, { source: "web" });
@@ -194,6 +203,21 @@ function privateChatResponse(
   });
 
   return new Response(stream, { headers: streamHeaders() });
+}
+
+function budgetResponse(
+  decision: Extract<ReturnType<typeof checkModelBudget>, { allowed: false }>,
+): Response {
+  return Response.json(
+    { error: BUDGET_MESSAGES[decision.reason], retryAfterSeconds: decision.retryAfterSeconds },
+    {
+      status: 429,
+      headers: {
+        "Retry-After": String(decision.retryAfterSeconds),
+        "Cache-Control": "no-store",
+      },
+    },
+  );
 }
 
 function streamHeaders(): HeadersInit {

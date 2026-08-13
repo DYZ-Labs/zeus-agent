@@ -198,6 +198,10 @@ group locks private web data until configuration is completed.
 | `ZEUS_OWNER_EMAIL` | Legacy migration only | — | Email allowed to claim an unbound pre-multi-account `ZEUS_DB` |
 | `ZEUS_ALLOWED_SIGNUP_EMAILS` | For web login | — (nobody) | Comma-separated emails permitted to create a **new** personal store |
 | `ZEUS_DB` | Yes once login is configured | `~/.zeus/zeus.db` | SQLite database path; must be on a mounted volume for a hosted deployment |
+| `ZEUS_MODEL_CALLS_PER_MINUTE` | No | `20` | Per-account model calls per minute |
+| `ZEUS_MODEL_CALLS_PER_DAY` | No | `500` | Per-account model calls per day |
+| `ZEUS_MODEL_TOKENS_PER_DAY` | No | `2000000` | Per-account model tokens per day |
+| `ZEUS_MAX_CONCURRENT_WORK_RUNS` | No | `2` | Bounded work runs this process executes at once |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
@@ -256,6 +260,33 @@ rather than truncated, so a bad call site is visible instead of leaking half a s
 
 Account ids in events are Supabase UUIDs, which are pseudonymous by design; emails and
 display names are never logged.
+
+### Model budget and concurrency
+
+Every model call spends one shared OpenAI key. Nothing previously bounded how many an
+account could make, so a loop over `POST /api/chat` — or a client retrying a failed turn
+forever — could spend without limit and take every other account's budget with it.
+
+Two ceilings, per account, because they answer different questions. The per-minute window
+stops a runaway loop while a person is still typing; the daily windows bound the bill.
+Counters live in each account's own database rather than in memory, because a spend limit
+that a restart or crash-loop clears is not a spend limit.
+
+Requests over a ceiling are refused with `429` and a `Retry-After` before any model work
+happens, so the request that exceeds the limit costs nothing. The reply says which limit
+was reached and when it clears. **Memory browsing, curation, search, timeline, export, and
+every non-model feature keep working** — a spent budget stops new model calls, not access
+to the memory already recorded.
+
+Separately, `ZEUS_MAX_CONCURRENT_WORK_RUNS` bounds how many bounded work runs execute at
+once. A run holds its request open for up to 900 seconds, and Zeus serves from a single
+Node process, so without a cap a few runs starve ordinary chat traffic behind them. That
+cap is per process and in memory — a restart really does free every slot — so running
+more than one instance multiplies it.
+
+Work-run execution still happens on the request path. Moving it onto a queue would remove
+the 900-second request entirely; the runner-lease machinery already supports resuming a
+run from another process.
 
 ### Pre-migration backups
 
