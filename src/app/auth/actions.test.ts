@@ -51,7 +51,7 @@ beforeEach(() => {
 });
 
 describe("startGoogleAuthAction", () => {
-  it("uses the exact callback URL and remembers the private destination", async () => {
+  it("shows Google's account chooser, uses the exact callback URL, and remembers the private destination", async () => {
     mocks.signInWithOAuth.mockResolvedValue({
       data: { url: "https://project.supabase.co/auth/v1/authorize" },
       error: null,
@@ -65,7 +65,10 @@ describe("startGoogleAuthAction", () => {
 
     expect(mocks.signInWithOAuth).toHaveBeenCalledWith({
       provider: "google",
-      options: { redirectTo: "https://zeus.example/auth/callback" },
+      options: {
+        redirectTo: "https://zeus.example/auth/callback",
+        queryParams: { prompt: "select_account" },
+      },
     });
     expect(mocks.cookieSet).toHaveBeenCalledWith(
       expect.objectContaining({ name: "zeus-auth-next", value: "/today" }),
