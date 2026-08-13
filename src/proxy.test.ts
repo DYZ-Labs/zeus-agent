@@ -94,15 +94,15 @@ describe("configured proxy mutation boundary", () => {
   });
 });
 
-describe("proxy public chat exception", () => {
-  it("lets a signed-out chat request reach the memory-free route", async () => {
+describe("configured proxy API boundary", () => {
+  it("keeps signed-out chat behind the account boundary", async () => {
     const response = await proxy(request("/api/chat"));
 
-    expect(response.status).toBe(200);
-    expect(response.headers.get("x-middleware-next")).toBe("1");
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "Authentication required." });
   });
 
-  it("keeps every other signed-out API private", async () => {
+  it("keeps other signed-out APIs private", async () => {
     const response = await proxy(request("/api/follow-through"));
 
     expect(response.status).toBe(401);

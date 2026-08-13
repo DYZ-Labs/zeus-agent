@@ -1,15 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  acquireChatVerification: vi.fn(),
-  acquireGuestChat: vi.fn(),
   createConversation: vi.fn(),
   getBrowserOwnerAccess: vi.fn(),
   getConversation: vi.fn(),
   hasCredentials: vi.fn(),
-  streamGuestTurn: vi.fn(),
   streamTurn: vi.fn(),
-  releaseGuestChat: vi.fn(),
 }));
 
 vi.mock("@/server/auth/access", () => ({
@@ -19,11 +15,6 @@ vi.mock("@/core/chat", () => ({ streamTurn: mocks.streamTurn }));
 vi.mock("@/core/conversations", () => ({
   createConversation: mocks.createConversation,
   getConversation: mocks.getConversation,
-}));
-vi.mock("@/core/guest-chat", () => ({ streamGuestTurn: mocks.streamGuestTurn }));
-vi.mock("@/server/guest-chat-limit", () => ({
-  acquireChatVerification: mocks.acquireChatVerification,
-  acquireGuestChat: mocks.acquireGuestChat,
 }));
 vi.mock("@/core/openai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/core/openai")>();
@@ -49,14 +40,6 @@ const ID_PARAMS = { params: Promise.resolve({ id: "1" }) };
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.hasCredentials.mockReturnValue(true);
-  mocks.acquireChatVerification.mockReturnValue({
-    allowed: true,
-    release: vi.fn(),
-  });
-  mocks.acquireGuestChat.mockReturnValue({
-    allowed: true,
-    release: mocks.releaseGuestChat,
-  });
   mocks.getBrowserOwnerAccess.mockResolvedValue({
     state: "signed_out",
     canAccessPrivateData: false,
@@ -64,62 +47,50 @@ beforeEach(() => {
     db: null,
     message: "Log in to access this Zeus memory store.",
   });
-  mocks.streamGuestTurn.mockImplementation(
-    async ({ onDelta }: { onDelta?: (text: string) => void }) => {
-      onDelta?.("Temporary reply");
-      return "Temporary reply";
-    },
-  );
 });
 
 describe("chat API access boundaries", () => {
-  it("streams a bounded, memory-free conversation while signed out", async () => {
-    const response = await postChat(
-      jsonRequest("/api/chat", {
-        input: "Continue this thought",
-        conversationId: 42,
-        history: [
-          { role: "user", content: "Hello" },
-          { role: "assistant", content: "Hi there" },
-        ],
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    await expect(ndjson(response)).resolves.toEqual([
-      { type: "delta", text: "Temporary reply" },
-      { type: "done", guest: true },
-    ]);
-    expect(mocks.streamGuestTurn).toHaveBeenCalledWith({
-      input: "Continue this thought",
-      history: [
-        { role: "user", content: "Hello" },
-        { role: "assistant", content: "Hi there" },
-      ],
-      onDelta: expect.any(Function),
-      signal: expect.any(AbortSignal),
-    });
-    expect(mocks.streamTurn).not.toHaveBeenCalled();
-    expect(mocks.getConversation).not.toHaveBeenCalled();
-    expect(mocks.createConversation).not.toHaveBeenCalled();
-    expect(mocks.releaseGuestChat).toHaveBeenCalledOnce();
-  });
-
-  it("validates public chat input before starting a model request", async () => {
+  it("rejects signed-out chat before parsing or starting model work", async () => {
     const response = await postChat(
       new Request("http://127.0.0.1:3000/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: "not-json",
       }),
     );
 
-    expect(response.status).toBe(400);
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
-    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Log in to access this Zeus memory store.",
+    });
+    expect(mocks.getBrowserOwnerAccess).toHaveBeenCalledWith(
+      expect.any(Request),
+      "private-mutation",
+    );
+    expect(mocks.hasCredentials).not.toHaveBeenCalled();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
+    expect(mocks.getConversation).not.toHaveBeenCalled();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
   });
 
-  it("rejects simple cross-site form content before parsing it", async () => {
+  it("fails closed for an unavailable account check", async () => {
+    mocks.getBrowserOwnerAccess.mockResolvedValue({
+      state: "unavailable",
+      canAccessPrivateData: false,
+      account: null,
+      db: null,
+      message: "Zeus could not verify the account right now. Private memory stayed locked.",
+    });
+
+    const response = await postChat(
+      jsonRequest("/api/chat", { input: "Remember this" }),
+    );
+
+    expect(response.status).toBe(503);
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-JSON content after authorization", async () => {
+    authorizeChat({ private: true });
     const response = await postChat(
       new Request("http://127.0.0.1:3000/api/chat", {
         method: "POST",
@@ -129,38 +100,37 @@ describe("chat API access boundaries", () => {
     );
 
     expect(response.status).toBe(415);
-    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
+    expect(mocks.getBrowserOwnerAccess).toHaveBeenCalledOnce();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
   });
 
-  it("rejects oversized guest inputs and transcripts at every boundary", async () => {
+  it("rejects malformed, oversized, and transcript-bearing payloads", async () => {
+    authorizeChat({ private: true });
+    const malformed = await postChat(
+      new Request("http://127.0.0.1:3000/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "not-json",
+      }),
+    );
     const oversizedInput = await postChat(
       jsonRequest("/api/chat", { input: "x".repeat(4_001) }),
     );
-    const tooManyMessages = await postChat(
+    const transcript = await postChat(
       jsonRequest("/api/chat", {
         input: "hello",
-        history: Array.from({ length: 21 }, () => ({ role: "user", content: "x" })),
-      }),
-    );
-    const tooMuchHistory = await postChat(
-      jsonRequest("/api/chat", {
-        input: "hello",
-        history: Array.from({ length: 6 }, () => ({
-          role: "user",
-          content: "x".repeat(3_500),
-        })),
+        history: [{ role: "assistant", content: "Client-supplied transcript" }],
       }),
     );
 
+    expect(malformed.status).toBe(400);
     expect(oversizedInput.status).toBe(400);
-    expect(tooManyMessages.status).toBe(400);
-    expect(tooMuchHistory.status).toBe(400);
-    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
+    expect(transcript.status).toBe(400);
+    expect(mocks.hasCredentials).not.toHaveBeenCalled();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
   });
 
-  it("does not downgrade an authenticated but unlinked account to guest chat", async () => {
+  it("rejects an authenticated account that does not own the store", async () => {
     mocks.getBrowserOwnerAccess.mockResolvedValue({
       state: "wrong_account",
       canAccessPrivateData: false,
@@ -180,101 +150,25 @@ describe("chat API access boundaries", () => {
     await expect(response.json()).resolves.toEqual({
       error: "This Zeus memory store is already linked to a different account.",
     });
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
     expect(mocks.getConversation).not.toHaveBeenCalled();
     expect(mocks.streamTurn).not.toHaveBeenCalled();
   });
 
-  it("returns a retryable limit response before starting guest generation", async () => {
-    mocks.acquireGuestChat.mockReturnValue({
-      allowed: false,
-      retryAfterSeconds: 12,
-    });
+  it("checks model credentials only after authorizing and validating the request", async () => {
+    authorizeChat({ private: true });
+    mocks.hasCredentials.mockReturnValue(false);
 
     const response = await postChat(jsonRequest("/api/chat", { input: "Hello" }));
-
-    expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("12");
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
-  });
-
-  it("bounds account verification before calling the auth service", async () => {
-    mocks.acquireChatVerification.mockReturnValue({
-      allowed: false,
-      retryAfterSeconds: 9,
-    });
-
-    const response = await postChat(jsonRequest("/api/chat", { input: "Hello" }));
-
-    expect(response.status).toBe(429);
-    expect(response.headers.get("retry-after")).toBe("9");
-    expect(mocks.getBrowserOwnerAccess).not.toHaveBeenCalled();
-    expect(mocks.acquireGuestChat).not.toHaveBeenCalled();
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
-  });
-
-  it("aborts guest generation and releases its lease when the client disconnects", async () => {
-    const observed: { signal?: AbortSignal } = {};
-    let markStarted: () => void = () => {};
-    let markAborted: () => void = () => {};
-    let rejectTurn: (reason?: unknown) => void = () => {};
-    const started = new Promise<void>((resolve) => {
-      markStarted = () => resolve();
-    });
-    const aborted = new Promise<void>((resolve) => {
-      markAborted = () => resolve();
-    });
-    mocks.streamGuestTurn.mockImplementation(
-      ({ signal }: { signal: AbortSignal }) =>
-        new Promise<string>((_resolve, reject) => {
-          observed.signal = signal;
-          rejectTurn = reject;
-          markStarted();
-          signal.addEventListener(
-            "abort",
-            () => markAborted(),
-            { once: true },
-          );
-        }),
-    );
-
-    const response = await postChat(jsonRequest("/api/chat", { input: "Keep going" }));
-    await started;
-    const cancellation = response.body?.cancel();
-    await aborted;
-
-    expect(observed.signal?.aborted).toBe(true);
-    expect(mocks.releaseGuestChat).not.toHaveBeenCalled();
-
-    rejectTurn(new DOMException("aborted", "AbortError"));
-    await cancellation;
-    expect(mocks.releaseGuestChat).toHaveBeenCalledOnce();
-  });
-
-  it("does not downgrade temporary account-verification failures to guest chat", async () => {
-    mocks.getBrowserOwnerAccess.mockResolvedValue({
-      state: "unavailable",
-      canAccessPrivateData: false,
-      account: null,
-      db: null,
-      message: "Zeus could not verify the account right now. Private memory stayed locked.",
-    });
-
-    const response = await postChat(jsonRequest("/api/chat", { input: "Remember this" }));
 
     expect(response.status).toBe(503);
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
+    expect(mocks.hasCredentials).toHaveBeenCalledOnce();
+    expect(mocks.createConversation).not.toHaveBeenCalled();
+    expect(mocks.streamTurn).not.toHaveBeenCalled();
   });
 
-  it("ignores client-supplied guest history on the authorized memory path", async () => {
+  it("streams an authorized turn through the durable-memory path", async () => {
     const db = { private: true };
-    mocks.getBrowserOwnerAccess.mockResolvedValue({
-      state: "authorized",
-      canAccessPrivateData: true,
-      account: { id: "owner", email: "owner@example.com" },
-      db,
-      message: null,
-    });
+    authorizeChat(db);
     mocks.createConversation.mockReturnValue({ id: 7 });
     mocks.streamTurn.mockImplementation(
       async (_db: unknown, options: { onDelta: (text: string) => void }) => {
@@ -290,19 +184,26 @@ describe("chat API access boundaries", () => {
     const response = await postChat(
       jsonRequest("/api/chat", {
         input: "Use my saved context",
-        history: [{ role: "assistant", content: "Untrusted guest transcript" }],
       }),
     );
 
     expect(response.status).toBe(200);
-    await ndjson(response);
+    await expect(ndjson(response)).resolves.toEqual([
+      { type: "meta", conversationId: 7 },
+      { type: "delta", text: "Owner reply" },
+      expect.objectContaining({
+        type: "done",
+        messageId: 9,
+        recalled: 0,
+        extractionFailed: true,
+      }),
+    ]);
     expect(mocks.streamTurn).toHaveBeenCalledWith(db, {
       conversationId: 7,
       input: "Use my saved context",
       onDelta: expect.any(Function),
       signal: expect.any(AbortSignal),
     });
-    expect(mocks.streamGuestTurn).not.toHaveBeenCalled();
   });
 
   it("aborts an authorized turn when its response stream is cancelled", async () => {
@@ -455,6 +356,16 @@ describe("private API auth guards", () => {
     });
   });
 });
+
+function authorizeChat(db: unknown): void {
+  mocks.getBrowserOwnerAccess.mockResolvedValue({
+    state: "authorized",
+    canAccessPrivateData: true,
+    account: { id: "owner", email: "owner@example.com" },
+    db,
+    message: null,
+  });
+}
 
 function request(path: string, body?: string, method = "POST"): Request {
   return new Request(`http://127.0.0.1:3000${path}`, {

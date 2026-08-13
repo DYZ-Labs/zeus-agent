@@ -271,7 +271,7 @@ export function Nav({
               active={pathname.startsWith("/settings")}
             />
             <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--shell-line)" }}>
-              <GuestSidebarCta authMode={authMode} />
+              <AccountAccessCta authMode={authMode} />
             </div>
           </>
         )}
@@ -611,7 +611,7 @@ function CompactNavLink({
   );
 }
 
-function GuestSidebarCta({ authMode }: { authMode: AuthMode }) {
+function AccountAccessCta({ authMode }: { authMode: AuthMode }) {
   const configured = authMode === "configured";
   const description =
     authMode === "misconfigured"

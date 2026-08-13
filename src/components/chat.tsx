@@ -43,7 +43,6 @@ type Status = "idle" | "streaming" | "error";
 export function Chat({
   hasCredentials,
   canAccessPrivateData,
-  canUseChat,
   showAuthActions,
   initialPrompt,
   initialTurns = [],
@@ -51,7 +50,6 @@ export function Chat({
 }: {
   hasCredentials: boolean;
   canAccessPrivateData: boolean;
-  canUseChat: boolean;
   showAuthActions: boolean;
   initialPrompt?: string;
   initialTurns?: ChatHistoryTurn[];
@@ -97,7 +95,7 @@ export function Chat({
 
   async function send() {
     const text = input.trim();
-    if (!text || status === "streaming" || !hasCredentials || !canUseChat) return;
+    if (!text || status === "streaming" || !hasCredentials || !canAccessPrivateData) return;
 
     const replyId = crypto.randomUUID();
     setTurns((prior) => [
@@ -117,11 +115,7 @@ export function Chat({
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          canAccessPrivateData
-            ? { input: text, conversationId: conversationId.current }
-            : { input: text, history: boundedGuestHistory(turns) },
-        ),
+        body: JSON.stringify({ input: text, conversationId: conversationId.current }),
         signal: request.signal,
       });
 
@@ -164,8 +158,6 @@ export function Chat({
               ),
             );
           } else if (event.type === "done") {
-            if (event.guest === true) continue;
-
             const opportunityId = event.opportunityId as number | null;
             const messageId = event.messageId as number;
             const opportunityDelivered = opportunityId === null
@@ -260,9 +252,9 @@ export function Chat({
     }
   }
 
-  const hasVisibleTurns = turns.length > 0;
+  const hasVisibleTurns = canAccessPrivateData && turns.length > 0;
   const canSend =
-    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canUseChat;
+    Boolean(input.trim()) && status !== "streaming" && hasCredentials && canAccessPrivateData;
   const composer = (
     <Composer
       input={input}
@@ -272,7 +264,7 @@ export function Chat({
       status={status}
       canSend={canSend}
       hasCredentials={hasCredentials}
-      canUseChat={canUseChat}
+      canAccessPrivateData={canAccessPrivateData}
       centered={!hasVisibleTurns}
     />
   );
@@ -282,12 +274,12 @@ export function Chat({
       className="relative flex h-full min-h-0 flex-col"
       style={{ background: "var(--shell-bg)" }}
     >
-      {showAuthActions && <GuestAuthActions />}
+      {!hasVisibleTurns && showAuthActions && <AccountAccessActions />}
       {!hasVisibleTurns ? (
         <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6">
           <div className="mx-auto flex min-h-full w-full max-w-[48rem] flex-col justify-center pb-[24vh] pt-20 lg:pb-[27vh]">
             {canAccessPrivateData && !hasCredentials && <CredentialsNotice />}
-            <EmptyState />
+            <EmptyState requiresLogin={!canAccessPrivateData} />
             {composer}
           </div>
         </div>
@@ -378,7 +370,7 @@ function Composer({
   status,
   canSend,
   hasCredentials,
-  canUseChat,
+  canAccessPrivateData,
   centered,
 }: {
   input: string;
@@ -388,10 +380,10 @@ function Composer({
   status: Status;
   canSend: boolean;
   hasCredentials: boolean;
-  canUseChat: boolean;
+  canAccessPrivateData: boolean;
   centered: boolean;
 }) {
-  const inputLabel = "Message Zeus";
+  const inputLabel = canAccessPrivateData ? "Message Zeus" : "Log in to message Zeus";
 
   return (
     <form
@@ -415,8 +407,8 @@ function Composer({
             id="chat-input"
             rows={1}
             value={input}
-            disabled={!hasCredentials || !canUseChat}
-            autoFocus={centered && hasCredentials && canUseChat}
+            disabled={!hasCredentials || !canAccessPrivateData}
+            autoFocus={centered && hasCredentials && canAccessPrivateData}
             onChange={(event) => onInputChange(event.target.value)}
             onInput={(event) => resizeComposer(event.currentTarget)}
             onKeyDown={(event) => {
@@ -452,24 +444,6 @@ function Composer({
 function resizeComposer(element: HTMLTextAreaElement) {
   element.style.height = "auto";
   element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
-}
-
-function boundedGuestHistory(turns: readonly Turn[]): Array<{
-  role: "user" | "assistant";
-  content: string;
-}> {
-  const history: Array<{ role: "user" | "assistant"; content: string }> = [];
-  let remainingCharacters = 20_000;
-
-  for (const turn of turns.slice(-20).reverse()) {
-    const content = turn.text.trim().slice(0, 4_000);
-    if (!content || remainingCharacters === 0) continue;
-    const boundedContent = content.slice(0, remainingCharacters);
-    history.unshift({ role: turn.role, content: boundedContent });
-    remainingCharacters -= boundedContent.length;
-  }
-
-  return history;
 }
 
 function UserTurn({ text }: { text: string }) {
@@ -844,17 +818,25 @@ function Receipt({
   );
 }
 
-function EmptyState() {
+function EmptyState({ requiresLogin }: { requiresLogin: boolean }) {
   return (
     <div className="w-full text-center">
       <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.025em]">
         What can I help with?
       </h1>
+      {requiresLogin && (
+        <p
+          className="mx-auto mt-2 max-w-[28rem] text-sm leading-5"
+          style={{ color: "var(--shell-muted)" }}
+        >
+          Log in to start a private conversation with the personal AI that remembers what matters.
+        </p>
+      )}
     </div>
   );
 }
 
-function GuestAuthActions() {
+function AccountAccessActions() {
   return (
     <nav
       aria-label="Account access"

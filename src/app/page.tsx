@@ -46,7 +46,6 @@ export default async function ChatPage({
       key={`${conversation?.id ?? "new"}:${prompt ?? "empty"}`}
       hasCredentials={hasCredentials()}
       canAccessPrivateData={access.canAccessPrivateData}
-      canUseChat={access.canAccessPrivateData || access.state === "signed_out"}
       showAuthActions={access.state !== "authorized"}
       initialPrompt={prompt}
       initialTurns={initialTurns}
