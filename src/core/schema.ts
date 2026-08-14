@@ -963,13 +963,14 @@ export const Sha256Hex = z
   .regex(/^[0-9a-f]{64}$/u, "Expected a lowercase 64-character SHA-256 digest");
 
 /**
- * A user-configured MCP server. It records how to reach the server and the *names* of the
- * environment variables it needs — never their values. Zeus holds no third-party
- * credential, so deleting a connector cannot leave one behind.
+ * A configured MCP server. It records either a code-owned preset id or how to reach a
+ * manual server, plus environment-variable names—never credential values. Deleting a
+ * connector therefore cannot leave a credential behind in Zeus.
  */
 export const Connector = z
   .object({
     id: z.number().int(),
+    preset_id: z.string().nullable(),
     label: z.string(),
     transport: ConnectorTransport,
     command: z.string().nullable(),

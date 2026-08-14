@@ -99,6 +99,7 @@ npm run mcp            # stdio MCP server
   checkpoints, receipts, and artifacts.
 - `src/core/work-execution.ts` — plan generation and the bounded step executor.
 - `src/core/connectors.ts` — configured MCP servers and the capability slots granted to them.
+- `src/core/connector-catalog.ts` — code-owned connector presets, tool mappings, and scopes.
 - `src/core/mcp-client.ts` — the only outbound-network module in core.
 - `src/core/effects.ts` — proposed external requests and the payload confirmation gate.
 - `src/core/calendar-sync.ts` — the disposable external read cache.
@@ -257,9 +258,12 @@ machine. `effect_proposal` means a request was prepared and stopped. Keep them d
 
 ### Zeus stores no third-party credential
 
-A connector records a command, arguments, a URL, and the *names* of environment variables.
-There is nowhere to put a value, and there must not be. Values are read from the process
-environment at call time and never persisted, logged, or exported.
+A connector records a preset id or a command, arguments, URL, and the *names* of environment
+variables. There is nowhere to put a credential value, and there must not be. Manual values
+are read from the process environment at call time. The local-only Google Calendar preset
+asks `gcloud` for a short-lived ADC token and quota project for one MCP exchange; both stay
+in memory and are never persisted, logged, or exported. Preset ids, destinations, tools,
+and scopes must always be re-derived from the code-owned catalog before minting a token.
 
 A stdio connector is spawned without a shell, with explicit argv, and receives only the
 SDK's safe default environment plus exactly the variables the user named — never the whole

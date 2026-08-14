@@ -71,6 +71,7 @@ export default async function SettingsPage({
           <ConnectionsPanel
             connectors={privateSettings.connectors}
             errorMessage={typeof connectorError === "string" ? connectorError : null}
+            localMode={access.state === "local"}
           />
         ) : (
           <LockedSettings />

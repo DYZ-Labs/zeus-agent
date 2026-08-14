@@ -6,6 +6,7 @@ import {
   setConnectorEnabledAction,
   verifyConnectorAction,
 } from "@/app/actions";
+import { GOOGLE_CALENDAR_PRESET_ID } from "@/core/connector-catalog";
 import {
   CAPABILITY_SLOTS,
   type ConnectorView,
@@ -13,6 +14,7 @@ import {
   connectorStatusLabel,
 } from "@/core/connectors";
 import type { CapabilitySlot, ConnectorCapability } from "@/core/schema";
+import { GoogleCalendarConnection } from "@/components/google-calendar-connection";
 
 /**
  * What the user is actually deciding here is not "add an integration" but "what may Zeus
@@ -39,18 +41,23 @@ const SLOT_LABELS: Record<CapabilitySlot, { title: string; effect: string }> = {
 export function ConnectionsPanel({
   connectors,
   errorMessage,
+  localMode,
 }: {
   connectors: ConnectorView[];
   errorMessage: string | null;
+  localMode: boolean;
 }) {
+  const googleCalendar =
+    connectors.find((connector) => connector.preset_id === GOOGLE_CALENDAR_PRESET_ID) ?? null;
+  const customConnectors = connectors.filter((connector) => connector.preset_id === null);
+
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
       <h1 className="text-lg font-semibold leading-6">Connections</h1>
       <p className="mt-2 max-w-[60ch] text-[0.84rem] leading-6" style={{ color: "var(--shell-muted)" }}>
-        Zeus reaches other services through servers you run. It stores the command and the{" "}
-        <em>names</em> of the environment variables a server needs — never their values, which
-        stay in your environment. Nothing outside Zeus changes without your explicit
-        confirmation of the exact request.
+        Choose a service, review what Zeus may do, and verify it in one guided setup. Zeus
+        stores connection configuration and reviewed capability grants, never credential
+        values. Nothing outside Zeus changes without your confirmation of the exact request.
       </p>
 
       {errorMessage ? (
@@ -63,20 +70,30 @@ export function ConnectionsPanel({
         </p>
       ) : null}
 
-      {connectors.length === 0 ? (
-        <p className="mt-5 text-[0.84rem] leading-6" style={{ color: "var(--shell-faint)" }}>
-          Nothing is connected. Zeus can research and draft, but it cannot see or change
-          anything outside its own memory.
-        </p>
-      ) : (
+      <GoogleCalendarConnection
+        key={`${googleCalendar?.id ?? "new"}-${googleCalendar?.updated_at ?? "available"}`}
+        connector={googleCalendar}
+        localMode={localMode}
+      />
+
+      {customConnectors.length > 0 ? (
         <ul className="mt-5 space-y-4">
-          {connectors.map((connector) => (
+          {customConnectors.map((connector) => (
             <ConnectorCard key={connector.id} connector={connector} />
           ))}
         </ul>
-      )}
+      ) : null}
 
-      <AddConnectorForm />
+      <details className="mt-6 border-t pt-4" style={{ borderColor: "var(--shell-line)" }}>
+        <summary className="cursor-pointer text-[0.82rem] font-medium">
+          Advanced: custom MCP server
+        </summary>
+        <p className="mt-2 max-w-[60ch] text-[0.75rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+          Add a server manually when it is not in the guided catalog. You will verify its
+          live tools and grant each Zeus capability separately.
+        </p>
+        <AddConnectorForm />
+      </details>
     </section>
   );
 }
@@ -235,8 +252,8 @@ function CapabilityRow({
 
 function AddConnectorForm() {
   return (
-    <form action={addConnectorAction} className="mt-6 border-t pt-5" style={{ borderColor: "var(--shell-line)" }}>
-      <h2 className="text-sm font-medium leading-5">Add a connection</h2>
+    <form action={addConnectorAction} className="mt-4">
+      <h2 className="text-sm font-medium leading-5">Custom connection details</h2>
       <input type="hidden" name="transport" value="stdio" />
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <Field name="label" label="Name" placeholder="Calendar" required />

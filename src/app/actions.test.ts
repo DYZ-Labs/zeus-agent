@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createCandidate, getCandidate, listCandidates } from "@/core/candidates";
+import { getConnectorByPresetId, toolSchemaHash } from "@/core/connectors";
 import {
   appendMessage,
   createConversation,
@@ -20,6 +21,7 @@ const actionMocks = vi.hoisted(() => ({
   embedFact: vi.fn(async () => true),
   embedFacet: vi.fn(async () => true),
   embedPassage: vi.fn(async () => true),
+  probeConnectorPreset: vi.fn(),
 }));
 
 vi.mock("@/server/db", () => ({ getDb: actionMocks.getDb }));
@@ -35,14 +37,23 @@ vi.mock("@/core/embed", async (importOriginal) => {
     embedPassage: actionMocks.embedPassage,
   };
 });
+vi.mock("@/core/mcp-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/core/mcp-client")>();
+  return {
+    ...actual,
+    probeConnectorPreset: actionMocks.probeConnectorPreset,
+  };
+});
 
 import {
   acceptFacetCandidateAction,
   answerReflectionAction,
   clearConversationHistoryAction,
+  configureConnectorPresetAction,
   deleteConversationFromHistoryAction,
   removeConversationFromHistoryAction,
 } from "./actions";
+import { ConnectorError } from "@/core/mcp-client";
 
 describe("understanding web-action embeddings", () => {
   beforeEach(() => {
@@ -206,6 +217,105 @@ describe("conversation deletion actions", () => {
   });
 });
 
+describe("guided connector actions", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+  });
+
+  it("commits one read-only connection and its source after a successful probe", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    actionMocks.probeConnectorPreset.mockResolvedValue({ tools: calendarTools() });
+
+    const state = await configureConnectorPresetAction(idleConnectorState(), setupForm([
+      "calendar.list_events",
+    ]));
+
+    expect(state).toMatchObject({ status: "success", code: "connected" });
+    const connector = getConnectorByPresetId(db, "google-calendar-official");
+    expect(connector).not.toBeNull();
+    expect(connector?.capabilities).toMatchObject([
+      { slot: "calendar.list_events", enabled: 1 },
+    ]);
+    const sources = messagesIn(
+      db,
+      listConversations(db).find((conversation) => conversation.title === "Memory curation")!.id,
+    );
+    expect(sources).toHaveLength(1);
+    expect(sources[0]?.role).toBe("user");
+    expect(connector?.source_message_id).toBe(sources[0]?.id);
+  });
+
+  it("leaves no rows or provenance when the provider probe fails", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    actionMocks.probeConnectorPreset.mockRejectedValue(
+      new ConnectorError("adc_missing", "raw provider detail must not escape"),
+    );
+
+    const state = await configureConnectorPresetAction(idleConnectorState(), setupForm([
+      "calendar.list_events",
+    ]));
+
+    expect(state).toEqual({
+      status: "error",
+      code: "adc_missing",
+      message: "Create Application Default Credentials with the generated Calendar scopes.",
+    });
+    expect(getConnectorByPresetId(db, "google-calendar-official")).toBeNull();
+    expect(listConversations(db)).toEqual([]);
+  });
+
+  it("updates the full selected permission set with one additional source", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    actionMocks.probeConnectorPreset.mockResolvedValue({ tools: calendarTools() });
+    await configureConnectorPresetAction(idleConnectorState(), setupForm([
+      "calendar.list_events",
+    ]));
+    const original = getConnectorByPresetId(db, "google-calendar-official")!;
+
+    const state = await configureConnectorPresetAction(
+      idleConnectorState(),
+      setupForm(
+        ["calendar.create_event", "calendar.update_event"],
+        original.id,
+      ),
+    );
+
+    expect(state).toMatchObject({ status: "success", code: "updated" });
+    const updated = getConnectorByPresetId(db, "google-calendar-official")!;
+    const bySlot = new Map(updated.capabilities.map((capability) => [capability.slot, capability]));
+    expect(bySlot.get("calendar.list_events")?.enabled).toBe(0);
+    expect(bySlot.get("calendar.create_event")?.enabled).toBe(1);
+    expect(bySlot.get("calendar.update_event")?.enabled).toBe(1);
+    const curation = listConversations(db).find(
+      (conversation) => conversation.title === "Memory curation",
+    );
+    expect(messagesIn(db, curation!.id)).toHaveLength(2);
+    expect(actionMocks.probeConnectorPreset).toHaveBeenLastCalledWith(
+      "google-calendar-official",
+      ["calendar.create_event", "calendar.update_event"],
+      { tokenFailureCode: "scope_missing" },
+    );
+  });
+
+  it("rejects a forged preset before probing", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const form = setupForm(["calendar.list_events"]);
+    form.set("presetId", "attacker-controlled");
+
+    const state = await configureConnectorPresetAction(idleConnectorState(), form);
+
+    expect(state.code).toBe("invalid_preset");
+    expect(actionMocks.probeConnectorPreset).not.toHaveBeenCalled();
+    expect(getConnectorByPresetId(db, "google-calendar-official")).toBeNull();
+  });
+});
+
 function facetItem(sourceMessageId: number, quote: string) {
   return {
     kind: "communication_style" as const,
@@ -221,5 +331,35 @@ function facetItem(sourceMessageId: number, quote: string) {
     explicitness: "inferred" as const,
     sensitivity: "normal" as const,
     ambiguity: "clear" as const,
+  };
+}
+
+function idleConnectorState() {
+  return { status: "idle", code: "idle", message: "" } as const;
+}
+
+function setupForm(slots: readonly string[], connectorId?: number): FormData {
+  const form = new FormData();
+  form.set("presetId", "google-calendar-official");
+  if (connectorId !== undefined) form.set("connectorId", String(connectorId));
+  for (const slot of slots) form.append("slots", slot);
+  return form;
+}
+
+function calendarTools() {
+  return [
+    calendarTool("list_events", { type: "object", properties: { timeMin: { type: "string" } } }),
+    calendarTool("create_event", { type: "object", properties: { summary: { type: "string" } } }),
+    calendarTool("update_event", { type: "object", properties: { eventId: { type: "string" } } }),
+  ];
+}
+
+function calendarTool(name: string, inputSchema: unknown) {
+  return {
+    name,
+    description: null,
+    inputSchema,
+    schemaHash: toolSchemaHash(inputSchema),
+    readOnlyHint: name === "list_events",
   };
 }

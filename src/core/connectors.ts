@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 
+import {
+  type ConnectorPreset,
+  getConnectorPreset,
+  localConnectorPresetsAllowed,
+  presetCapability,
+} from "./connector-catalog";
 import type { Db } from "./db";
 import { now } from "./db";
 import type {
@@ -15,11 +21,11 @@ import { CAPABILITY_SLOT_EFFECTS } from "./schema";
 /**
  * Connectors: how Zeus reaches anything outside its own store.
  *
- * A connector is an MCP server the user configured. Zeus is the client, which is what
- * keeps "no adapter means no action" literally true and keeps third-party credentials out
- * of the store entirely — this table records a command, arguments, a URL, and the *names*
- * of environment variables, and has nowhere to put a value. Secrets stay in the user's
- * environment, where `scripts/secure-local-files.mjs` already holds the files at 0600.
+ * A connector is an MCP server the user configured or selected from the code-owned
+ * catalog. Zeus is the client, which keeps "no adapter means no action" literally true.
+ * The table records a preset id or reachability configuration and environment-variable
+ * names, never credential values. Catalog authentication is materialized only in the MCP
+ * client for the lifetime of one exchange.
  *
  * Discovering a remote tool is not the same as granting it. A capability is a deliberate
  * binding of one discovered tool to one Zeus slot, and the slot fixes the effect kind, so
@@ -75,6 +81,30 @@ export type CreateConnectorInput = {
   sourceMessageId: number;
 };
 
+export type ConfigureConnectorPresetInput = {
+  presetId: string;
+  selectedSlots: readonly CapabilitySlot[];
+  discoveredTools: readonly DiscoveredToolSummary[];
+  sourceMessageId: number;
+  /** Omit for first setup; provide the exact existing connector for a permission update. */
+  connectorId?: number;
+};
+
+export class ConnectorPresetError extends Error {
+  constructor(
+    readonly code:
+      | "invalid_preset"
+      | "invalid_permissions"
+      | "invalid_preset_configuration"
+      | "already_connected"
+      | "tool_contract_changed",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ConnectorPresetError";
+  }
+}
+
 export type BindCapabilityInput = {
   connectorId: number;
   slot: CapabilitySlot;
@@ -93,7 +123,7 @@ export type ConnectorVerification =
   | { status: "unreachable"; errorCode: string };
 
 const SELECT_CONNECTOR = `
-  SELECT id, label, transport, command, args_json, cwd, url, env_var_names_json,
+  SELECT id, preset_id, label, transport, command, args_json, cwd, url, env_var_names_json,
          discovered_tools_json, status, enabled, source_message_id, last_verified_at,
          last_error_code, created_at, updated_at
   FROM connector
@@ -154,6 +184,123 @@ export function createConnector(db: Db, input: CreateConnectorInput): ConnectorV
   return connector;
 }
 
+/**
+ * Create or update one catalog connector from live discovery.
+ *
+ * The caller supplies only a preset id, selected Zeus slots, and the tools returned by a
+ * just-completed handshake. Every sensitive configuration value is resolved from the
+ * catalog again here. The surrounding action includes its curation message in the same
+ * outer transaction, so any failure leaves neither configuration nor synthetic-looking
+ * provenance behind.
+ */
+export function configureConnectorPreset(
+  db: Db,
+  input: ConfigureConnectorPresetInput,
+): ConnectorView {
+  assertUserMessage(db, input.sourceMessageId);
+  const preset = getConnectorPreset(input.presetId);
+  if (!preset) {
+    throw new ConnectorPresetError("invalid_preset", "That connection preset is not available.");
+  }
+  const selectedSlots = normalizePresetSlots(preset, input.selectedSlots);
+  const discovered = discoveredPresetTools(preset, selectedSlots, input.discoveredTools);
+  const current = getConnectorByPresetId(db, preset.id);
+  if (input.connectorId === undefined && current) {
+    throw new ConnectorPresetError("already_connected", `${preset.label} is already connected.`);
+  }
+  if (
+    input.connectorId !== undefined &&
+    (!current || current.id !== input.connectorId)
+  ) {
+    throw new ConnectorPresetError(
+      "invalid_preset_configuration",
+      "That preset connection changed before the update was applied.",
+    );
+  }
+
+  const existing = current;
+  if (existing) {
+    assertPresetConnectorConfiguration(existing);
+    for (const slot of selectedSlots) {
+      const capability = capabilityForSlot(db, existing.id, slot);
+      const tool = discovered.get(slot)!;
+      if (capability && capability.schema_hash !== tool.schemaHash) {
+        throw new ConnectorPresetError(
+          "tool_contract_changed",
+          "Google changed a selected tool contract. Zeus left the existing grant disabled for review.",
+        );
+      }
+    }
+  }
+
+  return db.transaction(() => {
+    const connector = existing ?? insertPresetConnector(db, preset, input.sourceMessageId);
+    recordConnectorVerification(db, connector.id, {
+      status: "ready",
+      tools: input.discoveredTools,
+    });
+
+    const selected = new Set(selectedSlots);
+    const enabledCapabilityIds: number[] = [];
+    for (const slot of selectedSlots) {
+      const mapping = presetCapability(preset, slot)!;
+      const tool = discovered.get(slot)!;
+      const capability = bindCapability(db, {
+        connectorId: connector.id,
+        slot,
+        remoteToolName: mapping.remoteToolName,
+        inputSchema: tool.inputSchema,
+        sourceMessageId: input.sourceMessageId,
+      });
+      enabledCapabilityIds.push(capability.id);
+    }
+
+    for (const capability of listCapabilities(db, connector.id)) {
+      if (!selected.has(capability.slot)) {
+        setCapabilityEnabled(db, capability.id, false, input.sourceMessageId);
+      }
+    }
+
+    setConnectorEnabled(db, connector.id, true, input.sourceMessageId);
+    for (const id of enabledCapabilityIds) {
+      setCapabilityEnabled(db, id, true, input.sourceMessageId);
+    }
+    const configured = getConnector(db, connector.id);
+    if (!configured) throw new Error("Preset connector vanished after configuration");
+    return configured;
+  })();
+}
+
+export function getConnectorByPresetId(db: Db, presetId: string): ConnectorView | null {
+  const row = db
+    .prepare<[string], Connector>(`${SELECT_CONNECTOR} WHERE preset_id = ?`)
+    .get(presetId);
+  return row ? connectorView(db, row) : null;
+}
+
+/** Validate stored reachability before preset authentication can be materialized. */
+export function assertPresetConnectorConfiguration(
+  connector: ConnectorView,
+): ConnectorPreset | null {
+  if (connector.preset_id === null) return null;
+  const preset = getConnectorPreset(connector.preset_id);
+  if (
+    !preset ||
+    connector.transport !== preset.transport ||
+    connector.url !== preset.url ||
+    connector.command !== null ||
+    connector.cwd !== null ||
+    connector.args.length !== 0 ||
+    connector.envVarNames.length !== 0
+  ) {
+    throw new ConnectorPresetError(
+      "invalid_preset_configuration",
+      "That preset connector no longer matches Zeus's trusted catalog.",
+    );
+  }
+  return preset;
+}
+
 export function getConnector(db: Db, id: number): ConnectorView | null {
   const row = db.prepare<[number], Connector>(`${SELECT_CONNECTOR} WHERE id = ?`).get(id);
   return row ? connectorView(db, row) : null;
@@ -164,6 +311,76 @@ export function listConnectors(db: Db): ConnectorView[] {
     .prepare<[], Connector>(`${SELECT_CONNECTOR} ORDER BY id`)
     .all()
     .map((row) => connectorView(db, row));
+}
+
+function insertPresetConnector(
+  db: Db,
+  preset: ConnectorPreset,
+  sourceMessageId: number,
+): ConnectorView {
+  const timestamp = now();
+  const inserted = db.prepare<
+    [string, string, ConnectorTransport, string, number, string, string]
+  >(
+    `INSERT INTO connector
+       (preset_id, label, transport, args_json, url, env_var_names_json,
+        source_message_id, created_at, updated_at)
+     VALUES (?, ?, ?, '[]', ?, '[]', ?, ?, ?)`,
+  ).run(
+    preset.id,
+    preset.label,
+    preset.transport,
+    preset.url,
+    sourceMessageId,
+    timestamp,
+    timestamp,
+  );
+  const connector = getConnector(db, Number(inserted.lastInsertRowid));
+  if (!connector) throw new Error("Preset connector vanished after insertion");
+  return connector;
+}
+
+function normalizePresetSlots(
+  preset: ConnectorPreset,
+  slots: readonly CapabilitySlot[],
+): CapabilitySlot[] {
+  if (slots.length === 0) {
+    throw new ConnectorPresetError(
+      "invalid_permissions",
+      "Select at least one permission for this connection.",
+    );
+  }
+  const unique = [...new Set(slots)];
+  for (const slot of unique) {
+    if (!presetCapability(preset, slot)) {
+      throw new ConnectorPresetError(
+        "invalid_permissions",
+        `The ${preset.label} preset cannot fill ${slot}.`,
+      );
+    }
+  }
+  return unique;
+}
+
+function discoveredPresetTools(
+  preset: ConnectorPreset,
+  slots: readonly CapabilitySlot[],
+  tools: readonly DiscoveredToolSummary[],
+): Map<CapabilitySlot, DiscoveredToolSummary> {
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const discovered = new Map<CapabilitySlot, DiscoveredToolSummary>();
+  for (const slot of slots) {
+    const mapping = presetCapability(preset, slot)!;
+    const tool = byName.get(mapping.remoteToolName);
+    if (!tool || tool.schemaHash !== toolSchemaHash(tool.inputSchema)) {
+      throw new ConnectorPresetError(
+        "tool_contract_changed",
+        `Google's ${mapping.remoteToolName} tool is missing or has an invalid contract.`,
+      );
+    }
+    discovered.set(slot, tool);
+  }
+  return discovered;
 }
 
 /**
@@ -349,6 +566,7 @@ export function availableCapability(db: Db, slot: CapabilitySlot): BoundCapabili
   if (!capability) return null;
   const connector = getConnector(db, capability.connector_id);
   if (!connector || connector.enabled !== 1 || connector.status !== "ready") return null;
+  if (connector.preset_id !== null && !localConnectorPresetsAllowed()) return null;
   if (connector.missingEnvVarNames.length > 0) return null;
   return { capability, connector };
 }
