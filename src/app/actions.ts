@@ -20,6 +20,8 @@ import {
   appendMessage,
   createConversation,
   getConversation,
+  hideAllConversationsFromHistory,
+  hideConversationFromHistory,
   listConversations,
   setConversationTitle,
 } from "@/core/conversations";
@@ -638,6 +640,23 @@ export async function deleteConversationFromHistoryAction(
   revalidatePath("/memory");
   revalidatePath("/today");
   revalidatePath("/understanding");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
+}
+
+export async function removeConversationFromHistoryAction(id: number): Promise<void> {
+  if (!Number.isInteger(id)) return;
+
+  const db = await requireOwnerDb();
+  if (!hideConversationFromHistory(db, id)) return;
+  revalidatePath("/", "layout");
+  revalidatePath("/conversations");
+  revalidatePath("/settings");
+}
+
+export async function clearConversationHistoryAction(): Promise<void> {
+  hideAllConversationsFromHistory(await requireOwnerDb());
+  revalidatePath("/", "layout");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }

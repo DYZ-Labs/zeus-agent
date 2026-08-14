@@ -11,7 +11,7 @@ import { DeleteAllConversations } from "@/components/delete-all-conversations";
 import { CoarseLocationControl } from "@/components/coarse-location-control";
 import { SettingsModal } from "@/components/settings-modal";
 import { getAmbientSetting, getFreshCoarseLocation } from "@/core/ambient";
-import { listConversations } from "@/core/conversations";
+import { listChatHistory } from "@/core/conversations";
 import { listBehavioralPolicySuggestions } from "@/core/personalization";
 import type {
   FollowThroughEventView,
@@ -34,7 +34,7 @@ export default async function SettingsPage() {
         setting: getStewardshipSetting(access.db),
         metrics: followThroughMetrics(access.db),
         events: listFollowThroughEvents(access.db, 20),
-        storedConversationCount: listConversations(access.db, 100_000).length,
+        visibleConversationCount: listChatHistory(access.db, 100_000).length,
         ambient: getAmbientSetting(access.db),
         location: getFreshCoarseLocation(access.db),
         behavioralSuggestions: listBehavioralPolicySuggestions(access.db, { limit: 20 }),
@@ -60,7 +60,7 @@ export default async function SettingsPage() {
       }
       dataControls={
         privateSettings ? (
-          <DataControlsSettings storedConversationCount={privateSettings.storedConversationCount} />
+          <DataControlsSettings visibleConversationCount={privateSettings.visibleConversationCount} />
         ) : (
           <LockedSettings />
         )
@@ -399,9 +399,9 @@ function FollowThroughSettings({
 }
 
 function DataControlsSettings({
-  storedConversationCount,
+  visibleConversationCount,
 }: {
-  storedConversationCount: number;
+  visibleConversationCount: number;
 }) {
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
@@ -413,12 +413,12 @@ function DataControlsSettings({
       <div className="mt-5 border-y" style={{ borderColor: "var(--shell-line)" }}>
         <div className="flex min-h-16 flex-wrap items-center justify-between gap-3 py-3">
           <div className="min-w-0 flex-1">
-            <p className="text-sm leading-5">Permanently delete all source conversations</p>
+            <p className="text-sm leading-5">Delete all conversations</p>
             <p className="mt-0.5 text-xs leading-4" style={{ color: "var(--shell-faint)" }}>
-              Erases stored messages and removes saved details that have no surviving evidence.
+              Clears every chat from Recents and Search chats without deleting saved memory or source messages.
             </p>
           </div>
-          <DeleteAllConversations disabled={storedConversationCount === 0} />
+          <DeleteAllConversations disabled={visibleConversationCount === 0} />
         </div>
       </div>
     </section>
