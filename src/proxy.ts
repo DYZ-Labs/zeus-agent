@@ -35,6 +35,13 @@ async function routeRequest(
   request: NextRequest,
   configuration: AuthConfiguration,
 ): Promise<NextResponse> {
+  // Readiness must not depend on Supabase. Railway calls this endpoint before it
+  // routes traffic to a new deployment; waiting on external auth here can reject an
+  // otherwise healthy process during an auth outage. The route returns operational
+  // state only, and the outer proxy still applies the normal security headers.
+  const isHealth = request.nextUrl.pathname === HEALTH_PATH;
+  if (isHealth) return NextResponse.next({ request });
+
   if (configuration.mode === "local") {
     const capability = isSafeMethod(request.method) ? "private-read" : "private-mutation";
     const boundary = checkBrowserBoundary(request, capability, configuration);
@@ -50,12 +57,10 @@ async function routeRequest(
   }
 
   const isAuthPath = request.nextUrl.pathname.startsWith("/auth/");
-  const isHealth = request.nextUrl.pathname === HEALTH_PATH;
-  const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath || isHealth;
-  const isApi = request.nextUrl.pathname.startsWith("/api/") && !isHealth;
+  const isPublicPage = PUBLIC_PATHS.has(request.nextUrl.pathname) || isAuthPath;
+  const isApi = request.nextUrl.pathname.startsWith("/api/");
 
   if (configuration.mode === "misconfigured") {
-    if (isHealth) return NextResponse.next({ request });
     if (isApi) {
       return NextResponse.json({ error: configuration.message }, { status: 503 });
     }

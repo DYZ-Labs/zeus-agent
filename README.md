@@ -204,6 +204,18 @@ rate-limited; configure custom SMTP before production use. Leave both the Supaba
 and publishable key blank to keep local-only mode. Setting only part of the required auth
 group locks private web data until configuration is completed.
 
+For Railway, [`railway.json`](railway.json) keeps the runtime contract in version control:
+it binds Next.js to Railway's injected `PORT`, waits for `GET /api/health` before making a
+deployment active, and restarts only unexpected failures. The hosted start command runs
+Next.js directly instead of through npm, so Railway's expected `SIGTERM` for the previous
+deployment does not get mislabeled as an `npm error`. The package-level `npm start`
+remains loopback-only for local operation.
+
+Railway's environment log combines lifecycle output from consecutive deployments. A
+`Stopping Container` / `SIGTERM` sequence immediately after a new process becomes ready
+normally belongs to the previous deployment being retired. Open the deployment-specific
+log or filter by replica before treating that sequence as a crash in the new process.
+
 ## Configuration
 
 | Variable | Required | Default | Purpose |
