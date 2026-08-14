@@ -46,7 +46,11 @@ describe("Google Calendar broker envelopes", () => {
       ...envelopeTimes(AT),
     };
     const signed = signBrokerEnvelope(request, KEY);
-    expect(() => verifyOAuthRequest(`${signed.slice(0, -1)}x`, KEY, AT)).toThrow(/signature/u);
+    const signatureStart = signed.indexOf(".") + 1;
+    const replacement = signed[signatureStart] === "A" ? "B" : "A";
+    const tampered =
+      `${signed.slice(0, signatureStart)}${replacement}${signed.slice(signatureStart + 1)}`;
+    expect(() => verifyOAuthRequest(tampered, KEY, AT)).toThrow(/signature/u);
     expect(() =>
       verifyOAuthRequest(signed, KEY, new Date(AT.getTime() + 20 * 60 * 1000)),
     ).toThrow(/expired/u);
