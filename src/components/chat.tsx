@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { confirmEffectAction, declineEffectAction } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CHAT_UPDATED_EVENT,
@@ -31,6 +32,15 @@ type Turn = ChatHistoryTurn & {
     status: string;
     errorCode: string | null;
     artifacts: Array<{ id: number; title: string; kind: string }>;
+    pendingEffects: Array<{
+      id: number;
+      previewText: string;
+      payload: unknown;
+      payloadHash: string;
+      expiresAt: string;
+      capabilitySlot: string;
+      connectorLabel: string;
+    }>;
   };
   /** Set on the assistant turn once the stream closes. */
   receipt?: ChatReceipt & {
@@ -115,7 +125,11 @@ export function Chat({
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: text, conversationId: conversationId.current }),
+        body: JSON.stringify({
+          input: text,
+          conversationId: conversationId.current,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }),
         signal: request.signal,
       });
 
@@ -514,6 +528,7 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
   const closed = completed || status === "cancelled";
   const canResume = ["queued", "running", "paused"].includes(status);
   const awaitingConfirmation = errorCode === "effect_confirmation_required";
+  const pendingEffect = workPlan.pendingEffects[0];
 
   async function act(action: "resume" | "cancel") {
     if (busy) return;
@@ -560,9 +575,48 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
             ? "Zeus prepared an external request and stopped. Nothing has been sent."
             : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
       </p>
-      {awaitingConfirmation && (
-        // Resuming here would be misleading: the run is not stuck, it is waiting on a
-        // decision only the user can make, and that decision lives with the payload.
+      {awaitingConfirmation && pendingEffect ? (
+        <div className="mt-3 rounded-lg border px-3 py-3" style={{ borderColor: "var(--shell-line)" }}>
+          <p className="text-[0.82rem] font-medium leading-5">{pendingEffect.previewText}</p>
+          <details className="mt-2">
+            <summary className="cursor-pointer text-[0.72rem]" style={{ color: "var(--shell-muted)" }}>
+              Exactly what Google Calendar will receive
+            </summary>
+            <pre
+              className="mt-2 overflow-x-auto rounded-md border px-2.5 py-2 font-mono text-[0.66rem] leading-5"
+              style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+            >
+              {JSON.stringify(pendingEffect.payload, null, 2)}
+            </pre>
+            <p className="mt-1.5 font-mono text-[0.6rem]" style={{ color: "var(--shell-faint)" }}>
+              {pendingEffect.capabilitySlot} · {pendingEffect.connectorLabel} · {pendingEffect.payloadHash}
+            </p>
+          </details>
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
+            <form action={confirmEffectAction}>
+              <input type="hidden" name="id" value={pendingEffect.id} />
+              <input type="hidden" name="payloadHash" value={pendingEffect.payloadHash} />
+              <button
+                type="submit"
+                className="rounded-md px-3 py-1.5 font-medium"
+                style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
+              >
+                Confirm and create event
+              </button>
+            </form>
+            <form action={declineEffectAction}>
+              <input type="hidden" name="id" value={pendingEffect.id} />
+              <button type="submit" className="underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
+                Do not create
+              </button>
+            </form>
+          </div>
+          <p className="mt-2 text-[0.68rem]" style={{ color: "var(--shell-faint)" }}>
+            If you do nothing, nothing happens. Expires {pendingEffect.expiresAt.slice(0, 10)}.
+          </p>
+        </div>
+      ) : awaitingConfirmation ? (
+        // Older persisted runs may not have streamed their pending payload into this card.
         <a
           href="/today#confirmations"
           className="mt-3 inline-block text-[0.74rem] font-medium"
@@ -570,7 +624,7 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
         >
           Review the exact request →
         </a>
-      )}
+      ) : null}
       {!closed && !awaitingConfirmation && (
         <div className="mt-3 flex flex-wrap gap-4 text-[0.74rem]">
           {canResume && (

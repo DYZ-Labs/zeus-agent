@@ -16,6 +16,13 @@ const Body = z
   .object({
     input: z.string().trim().min(1).max(4_000),
     conversationId: z.number().int().nullable().optional(),
+    timezone: z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .refine(isIanaTimezone, "Expected an IANA timezone")
+      .optional(),
   })
   .strict();
 
@@ -81,6 +88,7 @@ export async function POST(request: Request): Promise<Response> {
     conversation.id,
     parsed.data.input,
     request.signal,
+    parsed.data.timezone,
   );
 }
 
@@ -89,6 +97,7 @@ function privateChatResponse(
   conversationId: number,
   input: string,
   requestSignal: AbortSignal,
+  timezone?: string,
 ): Response {
   const encoder = new TextEncoder();
   const startedAt = Date.now();
@@ -116,6 +125,7 @@ function privateChatResponse(
         const result = await streamTurn(db, {
           conversationId,
           input,
+          timezone,
           onDelta: (text) => send({ type: "delta", text }),
           signal: turnAbort.signal,
         });
@@ -158,6 +168,15 @@ function privateChatResponse(
                   id: artifact.id,
                   title: artifact.title,
                   kind: artifact.kind,
+                })),
+                pendingEffects: result.work.pendingEffects.map((effect) => ({
+                  id: effect.id,
+                  previewText: effect.preview_text,
+                  payload: effect.payload,
+                  payloadHash: effect.payload_hash,
+                  expiresAt: effect.expires_at,
+                  capabilitySlot: effect.capability.slot,
+                  connectorLabel: effect.connector.label,
                 })),
               }
             : null,
@@ -203,6 +222,15 @@ function privateChatResponse(
   });
 
   return new Response(stream, { headers: streamHeaders() });
+}
+
+function isIanaTimezone(value: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function budgetResponse(

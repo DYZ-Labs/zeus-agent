@@ -12,7 +12,7 @@ import {
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "./connectors";
-import { calendarReadWorkPlanProposal } from "./chat";
+import { calendarCreateWorkPlanProposal, calendarReadWorkPlanProposal } from "./chat";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
@@ -23,7 +23,6 @@ import {
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
 import { parseCalendarEvents } from "./calendar-sync";
-import type { WorkPlanProposal } from "./schema";
 import { createSafeWorkExecutor, payloadSchemaMismatch } from "./work-execution";
 import {
   authorizeWorkPlan,
@@ -149,26 +148,9 @@ async function connectCalendar(): Promise<void> {
   }
 }
 
-const PROPOSAL: WorkPlanProposal = {
-  objective: "Hold the dinner slot after the flight lands",
-  steps: [
-    {
-      title: "Draft the request",
-      instruction: "Draft the exact calendar request.",
-      effect_kind: "prepare_local",
-      depends_on: [],
-    },
-    {
-      title: "Hold the slot",
-      instruction: "Create the calendar event.",
-      effect_kind: "schedule",
-      depends_on: [1],
-    },
-  ],
-  allowed_effects: ["prepare_local", "schedule"],
-  completion_criteria: ["The dinner slot is held"],
-  limits: { max_model_tool_calls: 20, max_retries_per_step: 2, max_duration_seconds: 900 },
-};
+const PROPOSAL = calendarCreateWorkPlanProposal(
+  "Hold the dinner slot after the flight lands",
+);
 
 /**
  * Stands in for the model half of the executor. The write step still goes through the
