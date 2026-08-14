@@ -49,6 +49,10 @@ describe("health check reachability", () => {
 
     expect(health.headers.get("x-middleware-next")).toBe("1");
     expect(other.status).toBe(401);
+    // Only the private API request consults Supabase. Deployment readiness must not
+    // inherit the latency or availability of an external authentication service.
+    expect(mocks.createServerClient).toHaveBeenCalledTimes(1);
+    expect(mocks.getClaims).toHaveBeenCalledTimes(1);
   });
 
   it("reaches the route while auth itself is misconfigured", async () => {
@@ -71,6 +75,7 @@ describe("health check reachability", () => {
     // The state most worth reporting is the one where the door is broken.
     expect(health.headers.get("x-middleware-next")).toBe("1");
     expect(other.status).toBe(503);
+    expect(mocks.createServerClient).not.toHaveBeenCalled();
   });
 });
 
