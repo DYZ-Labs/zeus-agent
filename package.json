@@ -21,6 +21,7 @@
     "check": "npm run lint && npm run typecheck && npm test && npm run eval:memory && npm run build",
     "premcp": "npm run secure:local",
     "mcp": "node --env-file-if-exists=.env.local --import tsx src/mcp/server.ts",
+    "calendar:broker": "node --env-file-if-exists=.env.local --import tsx src/calendar-broker/server.ts",
     "preambient:worker": "npm run secure:local",
     "ambient:worker": "tsx scripts/ambient-worker.ts",
     "preambient:install": "npm run secure:local",
@@ -59,6 +60,7 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "server-only": "^0.0.1",
+    "tsx": "^4.20.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
@@ -71,7 +73,6 @@
     "eslint-config-next": "16.2.11",
     "postcss": "8.5.25",
     "tailwindcss": "4.3.3",
-    "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0"
   },

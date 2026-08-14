@@ -198,14 +198,11 @@ describe("serialized migrations and verified backups", () => {
 // then cascade their rows away on DROP. These assertions are the reason the migration
 // brackets itself in legacy_alter_table.
 describe("external-action migration rebuilds work_step in place", () => {
-  const upToTwentyTwo = MIGRATIONS.filter(
-    (migration) =>
-      migration.id !== "023_external_actions" &&
-      migration.id !== "024_connector_presets",
-  );
-  const externalActions = MIGRATIONS.find(
+  const externalActionsIndex = MIGRATIONS.findIndex(
     (migration) => migration.id === "023_external_actions",
   );
+  const upToTwentyTwo = MIGRATIONS.slice(0, externalActionsIndex);
+  const externalActions = MIGRATIONS[externalActionsIndex];
 
   function storeAtTwentyTwo(): Database.Database {
     const db = new Database(":memory:");
@@ -360,9 +357,10 @@ describe("external-action migration rebuilds work_step in place", () => {
 
 describe("connector preset migration", () => {
   it("preserves manual connectors and permits only one row per preset", () => {
-    const beforePresets = MIGRATIONS.filter(
-      (migration) => migration.id !== "024_connector_presets",
+    const presetMigrationIndex = MIGRATIONS.findIndex(
+      (migration) => migration.id === "024_connector_presets",
     );
+    const beforePresets = MIGRATIONS.slice(0, presetMigrationIndex);
     const db = new Database(":memory:");
     db.pragma("foreign_keys = ON");
     migrate(db, beforePresets);

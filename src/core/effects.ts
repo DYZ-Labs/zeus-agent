@@ -302,6 +302,7 @@ export async function executeConfirmedEffect(
     const result = await callCapability(db, capability.slot, payload, {
       signal: options.signal,
       capabilityId: capability.id,
+      requestKey: effect.provider_request_key,
     });
     if (result.isError) {
       finishConnectorCallReceipt(db, receiptId, "failed", "remote_reported_error");

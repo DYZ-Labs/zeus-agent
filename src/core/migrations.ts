@@ -1790,6 +1790,22 @@ ON connector(preset_id)
 WHERE preset_id IS NOT NULL;
 `;
 
+const GOOGLE_CALENDAR_PROVIDER = `
+-- First-party provider connections are created only from an authenticated OAuth result.
+-- The opaque connection id locates an encrypted grant in the separate broker; it is not
+-- a credential and is useless without the broker service key, which never enters this DB.
+ALTER TABLE connector
+ADD COLUMN provider TEXT NOT NULL DEFAULT 'generic'
+CHECK (provider IN ('generic','google_calendar'));
+
+ALTER TABLE connector
+ADD COLUMN provider_connection_id TEXT;
+
+CREATE UNIQUE INDEX connector_google_calendar_provider_idx
+ON connector(provider)
+WHERE provider = 'google_calendar';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1815,4 +1831,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "022_model_usage", sql: MODEL_USAGE },
   { id: "023_external_actions", sql: EXTERNAL_ACTIONS },
   { id: "024_connector_presets", sql: CONNECTOR_PRESETS },
+  { id: "025_google_calendar_provider", sql: GOOGLE_CALENDAR_PROVIDER },
 ];

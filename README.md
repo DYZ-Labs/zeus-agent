@@ -235,6 +235,8 @@ log or filter by replica before treating that sequence as a crash in the new pro
 | `ZEUS_MAX_CONCURRENT_WORK_RUNS` | No | `2` | Bounded work runs this process executes at once |
 | `ZEUS_CONNECTOR_CALLS_PER_MINUTE` | No | `30` | Calls to connected services per minute |
 | `ZEUS_CONNECTOR_CALLS_PER_DAY` | No | `1000` | Calls to connected services per day |
+| `GOOGLE_CALENDAR_BROKER_URL` | For hosted Calendar | — | Exact HTTPS origin of the separate Calendar broker |
+| `GOOGLE_CALENDAR_BROKER_SERVICE_KEY` | For hosted Calendar | — | Shared Zeus-to-broker key; at least 32 bytes and never exposed to generic connectors |
 | `ZEUS_SYNCHRONOUS` | No | `full` | `full` fsyncs each commit; `normal` trades host-crash durability for speed |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_SCHEDULER` | No | on when hosted | In-process scheduled snapshots (`on`/`off`) |
@@ -615,6 +617,48 @@ automatically. Export still operates on one store at a time — deliberately, so
 directory never mixes two people's personal data — so point `ZEUS_DB` at that account's
 UUID-named database to export it or to open MCP against it.
 
+## Multi-user Google Calendar
+
+Google Calendar uses a separate credential-broker service. Zeus stores an opaque broker
+connection id and the reviewed MCP schemas, but never a Google access token, refresh
+token, OAuth client secret, or token-encryption key. Each broker grant is bound to the
+immutable Supabase UUID from the user's personal Zeus store.
+
+Create a second Railway service from this repository and select
+[`railway.calendar-broker.json`](railway.calendar-broker.json) as its configuration file.
+Attach a persistent volume at `/data`, then set these variables on the broker service:
+
+```bash
+GOOGLE_CALENDAR_BROKER_DB=/data/google-calendar-broker.db
+GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY=<base64 of 32 random bytes>
+GOOGLE_CALENDAR_BROKER_SERVICE_KEY=<at least 32 random bytes>
+ZEUS_APP_URL=https://www.zeusagent.dev
+GOOGLE_OAUTH_CLIENT_ID=<development web client id>
+GOOGLE_OAUTH_CLIENT_SECRET=<development web client secret>
+GOOGLE_OAUTH_REDIRECT_URI=https://calendar.zeusagent.dev/oauth/google/callback
+```
+
+Generate independent encryption and service keys, for example:
+
+```bash
+openssl rand -base64 32
+openssl rand -base64 48
+```
+
+Assign `calendar.zeusagent.dev` to the broker service. On the main Zeus Railway
+service, set only:
+
+```bash
+GOOGLE_CALENDAR_BROKER_URL=https://calendar.zeusagent.dev
+GOOGLE_CALENDAR_BROKER_SERVICE_KEY=<the same broker service key>
+```
+
+The Connections screen then offers **Connect Google Calendar**. Initial consent grants
+event reads only. Enabling calendar changes starts a second incremental OAuth consent;
+Zeus still prepares every create or update payload and waits for exact confirmation
+before calling the broker. Disconnect first revokes the Google grant and only then
+removes the local connector row.
+
 ## Commands
 
 | Command | What it does |
@@ -640,6 +684,7 @@ UUID-named database to export it or to open MCP against it.
 | `npm run snapshot:install` | Install the daily macOS snapshot LaunchAgent |
 | `npm run snapshot:uninstall` | Stop and remove the snapshot LaunchAgent |
 | `npm run mcp` | Start the stdio MCP server |
+| `npm run calendar:broker` | Start the separate Google Calendar credential broker |
 
 `npm run check` is the required development gate.
 

@@ -22,10 +22,12 @@ import {
   bindCapability,
   configureConnectorPreset,
   createConnector,
+  deleteGoogleCalendarConnector,
   deleteConnector,
   getCapability,
   getConnector,
   getConnectorByPresetId,
+  getGoogleCalendarConnector,
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "@/core/connectors";
@@ -121,6 +123,10 @@ import {
   setStewardshipMode,
 } from "@/core/stewardship";
 import { getOwnerAccess, requireOwnerDb } from "@/server/auth/access";
+import {
+  disconnectGoogleCalendarGrant,
+  recordConnectionAction,
+} from "@/server/google-calendar/integration";
 
 /**
  * Curation actions.
@@ -1035,6 +1041,33 @@ export async function removeConnectorAction(formData: FormData): Promise<void> {
   const db = await requireOwnerDb();
   curationMessage(db, `Remove connected service ${id}.`);
   deleteConnector(db, id);
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
+export async function disconnectGoogleCalendarAction(): Promise<void> {
+  const access = await getOwnerAccess();
+  if (!access.canAccessPrivateData || access.state !== "authorized" || !access.account) {
+    redirect(
+      `/settings?connector_error=${encodeURIComponent(
+        "Sign in before disconnecting Google Calendar.",
+      )}#connections`,
+    );
+  }
+  const connector = getGoogleCalendarConnector(access.db);
+  if (!connector?.provider_connection_id) return;
+  try {
+    await disconnectGoogleCalendarGrant(
+      access.account.id,
+      connector.provider_connection_id,
+    );
+  } catch (error) {
+    redirect(
+      `/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`,
+    );
+  }
+  recordConnectionAction(access.db, "Disconnect Google Calendar and revoke its access.");
+  deleteGoogleCalendarConnector(access.db, connector.id);
   revalidatePath("/settings");
   revalidatePath("/today");
 }

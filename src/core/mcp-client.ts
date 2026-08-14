@@ -23,6 +23,7 @@ import {
   assertPresetConnectorConfiguration,
   availableCapability,
   connectorEnvironment,
+  GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
   getCapability,
   getConnector,
   recordConnectorVerification,
@@ -30,6 +31,7 @@ import {
 } from "./connectors";
 import type { Db } from "./db";
 import { errorSignature, logEvent } from "./observability";
+import { getAppOwner } from "./owner";
 import type { CapabilitySlot } from "./schema";
 
 /**
@@ -238,9 +240,11 @@ export async function verifyConnector(
       ? connector.capabilities.map((capability) => capability.slot)
       : (["calendar.list_events"] as const);
     const tools = await withClient(
+      db,
       connector,
       slots,
       options.signal,
+      undefined,
       listClientTools,
     );
     const verified = recordConnectorVerification(db, id, { status: "ready", tools });
@@ -278,7 +282,7 @@ export async function callCapability(
   db: Db,
   slot: CapabilitySlot,
   args: Record<string, unknown>,
-  options: { signal?: AbortSignal; capabilityId?: number } = {},
+  options: { signal?: AbortSignal; capabilityId?: number; requestKey?: string } = {},
 ): Promise<CapabilityCallResult> {
   const bound = resolveCapability(db, slot, options.capabilityId);
   const preset = presetForCapability(bound, slot);
@@ -300,30 +304,46 @@ export async function callCapability(
   recordConnectorCall(db);
   const startedAt = Date.now();
   try {
-    const result = await withClient(bound.connector, [slot], options.signal, async (client) => {
-      if (preset) {
-        const tools = await listClientTools(client);
-        recordConnectorVerification(db, bound.connector.id, { status: "ready", tools });
-        const live = tools.find((tool) => tool.name === bound.capability.remote_tool_name);
-        if (!live || live.schemaHash !== bound.capability.schema_hash) {
-          disableDriftedCapability(db, bound, live ? "schema_changed" : "tool_missing");
-          throw new ConnectorError(
-            "tool_contract_changed",
-            "Google changed the reviewed Calendar tool contract. Zeus disabled this permission before dispatch.",
-          );
+    const result = await withClient(
+      db,
+      bound.connector,
+      [slot],
+      options.signal,
+      options.requestKey,
+      async (client) => {
+        if (preset) {
+          const tools = await listClientTools(client);
+          recordConnectorVerification(db, bound.connector.id, { status: "ready", tools });
+          const live = tools.find((tool) => tool.name === bound.capability.remote_tool_name);
+          if (!live || live.schemaHash !== bound.capability.schema_hash) {
+            disableDriftedCapability(db, bound, live ? "schema_changed" : "tool_missing");
+            throw new ConnectorError(
+              "tool_contract_changed",
+              "Google changed the reviewed Calendar tool contract. Zeus disabled this permission before dispatch.",
+            );
+          }
         }
-      }
-      const response = await client.callTool(
-        { name: bound.capability.remote_tool_name, arguments: args },
-        undefined,
-        { signal: options.signal, timeout: CALL_TIMEOUT_MS },
-      );
-      return response;
-    });
+        return client.callTool(
+          { name: bound.capability.remote_tool_name, arguments: args },
+          undefined,
+          { signal: options.signal, timeout: CALL_TIMEOUT_MS },
+        );
+      },
+    );
 
     const text = boundedText(result.content);
     const value =
       result.structuredContent !== undefined ? result.structuredContent : parsedOrText(text);
+    if (
+      result.isError === true &&
+      bound.connector.provider === "google_calendar" &&
+      /^(?:reconnect_required|refresh_failed):/u.test(text)
+    ) {
+      recordConnectorVerification(db, bound.connector.id, {
+        status: "unreachable",
+        errorCode: "reconnect_required",
+      });
+    }
     logEvent({
       event: "connector_call",
       outcome: result.isError === true ? "error" : "ok",
@@ -410,12 +430,14 @@ function resolveCapability(
 }
 
 async function withClient<T>(
+  db: Db,
   connector: ConnectorView,
   slots: readonly CapabilitySlot[],
   signal: AbortSignal | undefined,
+  requestKey: string | undefined,
   run: (client: Client) => Promise<T>,
 ): Promise<T> {
-  const transport = await transportFor(connector, slots);
+  const transport = await transportFor(db, connector, slots, requestKey);
   return withTransport(transport, signal, run);
 }
 
@@ -440,8 +462,10 @@ async function withTransport<T>(
 }
 
 async function transportFor(
+  db: Db,
   connector: ConnectorView,
   slots: readonly CapabilitySlot[],
+  requestKey: string | undefined,
 ): Promise<Transport> {
   let preset: ConnectorPreset | null;
   try {
@@ -452,7 +476,6 @@ async function transportFor(
       : error;
   }
   if (preset) return presetTransport(preset, slots);
-
   if (connector.transport === "stdio") {
     if (!connector.command) {
       throw new ConnectorError("invalid_connector", "That connector has no command");
@@ -473,7 +496,12 @@ async function transportFor(
     throw new ConnectorError("invalid_connector", "That connector has no URL");
   }
   return new StreamableHTTPClientTransport(new URL(connector.url), {
-    requestInit: { headers: bearerHeaders(connector) },
+    requestInit: {
+      headers:
+        connector.provider === "google_calendar"
+          ? googleCalendarBrokerHeaders(db, requestKey)
+          : bearerHeaders(connector),
+    },
   });
 }
 
@@ -611,6 +639,31 @@ function numericErrorStatus(error: unknown, depth = 0): number | null {
   if (typeof record.status === "number") return record.status;
   if (typeof record.code === "number") return record.code;
   return numericErrorStatus(record.cause, depth + 1);
+}
+
+function googleCalendarBrokerHeaders(
+  db: Db,
+  requestKey: string | undefined,
+): Record<string, string> {
+  const serviceKey = process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY]?.trim();
+  const owner = getAppOwner(db);
+  if (!serviceKey) {
+    throw new ConnectorError(
+      "missing_environment",
+      "The Google Calendar broker service key is not configured.",
+    );
+  }
+  if (!owner) {
+    throw new ConnectorError(
+      "account_unbound",
+      "Google Calendar requires a verified hosted account.",
+    );
+  }
+  return {
+    Authorization: `Bearer ${serviceKey}`,
+    "X-Zeus-Account-Id": owner.supabase_user_id,
+    ...(requestKey ? { "X-Zeus-Request-Key": requestKey } : {}),
+  };
 }
 
 /**

@@ -618,11 +618,15 @@ const connectionsBody = connectors.length
         `## ${connector.label} (connector ${connector.id})`,
         "",
         `- preset: ${connector.preset_id ?? "manual"}`,
+        `- provider: ${connector.provider}`,
         `- transport: ${connector.transport}`,
         `- reached by: ${connector.transport === "stdio" ? [connector.command, ...connector.args].join(" ") : connector.url}`,
-        `- authentication: ${connector.preset_id === "google-calendar-official" ? "Google Application Default Credentials, resolved at call time and never stored" : "configured environment variable names, resolved at call time"}`,
-        `- environment variable names read at call time: ${connector.envVarNames.join(", ") || "none"}`,
-        "- values for those variables are never stored by Zeus and are not in this export",
+        connector.provider === "google_calendar"
+          ? "- Google credentials are held by the separate encrypted broker; Zeus stores only an opaque connection id"
+          : connector.preset_id === "google-calendar-official"
+            ? "- authentication: Google Application Default Credentials, resolved at call time and never stored"
+          : `- environment variable names read at call time: ${connector.envVarNames.join(", ") || "none"}`,
+        "- credential values are never stored by Zeus and are not in this export",
         `- status: ${connector.status}${connector.enabled === 1 ? " · enabled" : " · not enabled"}`,
         `- last verified: ${connector.last_verified_at ?? "never"}`,
         `- allowed by: message ${connector.source_message_id}`,

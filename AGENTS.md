@@ -101,6 +101,10 @@ npm run mcp            # stdio MCP server
 - `src/core/connectors.ts` — configured MCP servers and the capability slots granted to them.
 - `src/core/connector-catalog.ts` — code-owned connector presets, tool mappings, and scopes.
 - `src/core/mcp-client.ts` — the only outbound-network module in core.
+- `src/calendar-broker/` — separately deployed Google OAuth and encrypted per-user token
+  broker, plus the account-bound Calendar MCP service. Its database is never a Zeus store.
+- `src/server/google-calendar/` — signed OAuth handoff and system-managed provider setup for
+  the hosted web front door; no Google token crosses this boundary.
 - `src/core/effects.ts` — proposed external requests and the payload confirmation gate.
 - `src/core/calendar-sync.ts` — the disposable external read cache.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
