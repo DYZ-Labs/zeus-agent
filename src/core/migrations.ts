@@ -1451,6 +1451,332 @@ CREATE TABLE model_usage (
 );
 `;
 
+/**
+ * External action, gated twice.
+ *
+ * Zeus reaches a third-party service only through an MCP server the user configured, and
+ * only through a capability slot they explicitly bound to one discovered remote tool. No
+ * credential lives here: a connector records a command, arguments, a URL, and the *names*
+ * of environment variables, never their values.
+ *
+ * Authorizing a work plan approves a scope, not a payload — the concrete request is only
+ * known once earlier steps have run. So a write effect materializes a `proposed_effect`
+ * and stops. The user confirms one exact payload hash, and only those bytes execute.
+ * Proposals and receipts are system-authored data; neither is ever a claim about the user.
+ *
+ * `external_read` is a distinct effect kind rather than a widening of `web_read`. The
+ * effect kind is the unit of authorization, so a plan approved for public web research
+ * must not thereby be able to open the user's calendar.
+ *
+ * `work_step` and `tool_receipt` only need a relaxed CHECK, which SQLite cannot alter in
+ * place, so both are rebuilt. `work_step` is referenced by four tables; `migrate()`
+ * suspends foreign-key enforcement for the swap and verifies every reference still
+ * resolves before committing.
+ */
+const EXTERNAL_ACTIONS = `
+ALTER TABLE work_step RENAME TO work_step_safe_legacy;
+CREATE TABLE work_step (
+  id             INTEGER PRIMARY KEY,
+  work_plan_id   INTEGER NOT NULL REFERENCES work_plan(id) ON DELETE CASCADE,
+  position       INTEGER NOT NULL CHECK (position > 0),
+  title          TEXT NOT NULL,
+  instruction    TEXT NOT NULL,
+  effect_kind    TEXT NOT NULL
+                 CHECK (effect_kind IN ('memory_read','web_read','prepare_local',
+                                        'external_read','send','schedule','purchase',
+                                        'modify_external')),
+  status         TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','running','completed','failed','skipped','cancelled')),
+  attempt_count  INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  started_at     TEXT,
+  completed_at   TEXT,
+  error_code     TEXT,
+  error_message  TEXT,
+  UNIQUE (work_plan_id, position)
+);
+INSERT INTO work_step
+  (id, work_plan_id, position, title, instruction, effect_kind, status, attempt_count,
+   started_at, completed_at, error_code, error_message)
+SELECT id, work_plan_id, position, title, instruction, effect_kind, status, attempt_count,
+       started_at, completed_at, error_code, error_message
+FROM work_step_safe_legacy;
+DROP TABLE work_step_safe_legacy;
+CREATE INDEX work_step_plan_idx ON work_step(work_plan_id, status, position);
+
+-- A connector is a user-configured MCP server. Enabling it requires a live handshake, so
+-- a typo cannot sit in the store looking like an available capability.
+CREATE TABLE connector (
+  id                  INTEGER PRIMARY KEY,
+  label               TEXT NOT NULL,
+  transport           TEXT NOT NULL CHECK (transport IN ('stdio','http')),
+  command             TEXT,
+  args_json           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(args_json)),
+  cwd                 TEXT,
+  url                 TEXT,
+  env_var_names_json  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(env_var_names_json)),
+  -- What the last handshake found, so the grant UI can offer real tools with real
+  -- schemas instead of asking the user to type a name and hope.
+  discovered_tools_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(discovered_tools_json)),
+  status              TEXT NOT NULL DEFAULT 'unverified'
+                      CHECK (status IN ('unverified','ready','unreachable','disabled')),
+  enabled             INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id   INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  last_verified_at    TEXT,
+  last_error_code     TEXT,
+  created_at          TEXT NOT NULL,
+  updated_at          TEXT NOT NULL,
+  CHECK (
+    (transport = 'stdio' AND command IS NOT NULL AND length(command) > 0 AND url IS NULL)
+    OR
+    (transport = 'http' AND url IS NOT NULL AND length(url) > 0
+      AND command IS NULL AND cwd IS NULL)
+  ),
+  CHECK (enabled = 0 OR status = 'ready')
+);
+CREATE INDEX connector_enabled_idx ON connector(enabled, id);
+
+-- One bound capability = one remote tool the user reviewed and accepted for one slot.
+-- The slot fixes the effect kind, so reading the slot list is enough to understand the
+-- whole grant. schema_hash pins the remote tool's input contract: a server that changes
+-- what "create an event" accepts must be re-reviewed rather than silently obeyed.
+CREATE TABLE connector_capability (
+  id                 INTEGER PRIMARY KEY,
+  connector_id       INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  slot               TEXT NOT NULL
+                     CHECK (slot IN ('calendar.list_events','calendar.create_event',
+                                     'calendar.update_event')),
+  remote_tool_name   TEXT NOT NULL,
+  effect_kind        TEXT NOT NULL
+                     CHECK (effect_kind IN ('external_read','schedule','modify_external')),
+  input_schema_json  TEXT NOT NULL CHECK (json_valid(input_schema_json)),
+  schema_hash        TEXT NOT NULL
+                     CHECK (length(schema_hash) = 64 AND schema_hash NOT GLOB '*[^0-9a-f]*'),
+  enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  UNIQUE (connector_id, slot),
+  CHECK (
+    (slot = 'calendar.list_events' AND effect_kind = 'external_read')
+    OR (slot = 'calendar.create_event' AND effect_kind = 'schedule')
+    OR (slot = 'calendar.update_event' AND effect_kind = 'modify_external')
+  )
+);
+CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
+
+-- The payload gate. A run reaching a write effect stops here with the exact request it
+-- intends to make. Nothing leaves the machine until the user confirms this hash.
+CREATE TABLE proposed_effect (
+  id                       INTEGER PRIMARY KEY,
+  work_run_id              INTEGER NOT NULL REFERENCES work_run(id) ON DELETE CASCADE,
+  work_step_id             INTEGER NOT NULL REFERENCES work_step(id) ON DELETE CASCADE,
+  connector_capability_id  INTEGER NOT NULL
+                           REFERENCES connector_capability(id) ON DELETE RESTRICT,
+  effect_kind              TEXT NOT NULL
+                           CHECK (effect_kind IN ('send','schedule','modify_external')),
+  payload_json             TEXT NOT NULL CHECK (json_valid(payload_json)),
+  payload_hash             TEXT NOT NULL UNIQUE
+                           CHECK (length(payload_hash) = 64
+                                  AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+  preview_text             TEXT NOT NULL,
+  reversal_json            TEXT CHECK (reversal_json IS NULL OR json_valid(reversal_json)),
+  status                   TEXT NOT NULL DEFAULT 'pending_confirmation'
+                           CHECK (status IN ('pending_confirmation','confirmed','declined',
+                                             'expired','executed','failed','reverted')),
+  idempotency_key          TEXT NOT NULL UNIQUE,
+  provider_request_key     TEXT NOT NULL,
+  expires_at               TEXT NOT NULL,
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL
+);
+CREATE INDEX proposed_effect_run_idx ON proposed_effect(work_run_id, id);
+CREATE INDEX proposed_effect_pending_idx ON proposed_effect(expires_at)
+WHERE status = 'pending_confirmation';
+
+CREATE TABLE effect_event (
+  id                  INTEGER PRIMARY KEY,
+  proposed_effect_id  INTEGER NOT NULL REFERENCES proposed_effect(id) ON DELETE CASCADE,
+  event_type          TEXT NOT NULL
+                      CHECK (event_type IN ('proposed','confirmed','declined','expired',
+                                            'executed','failed','reverted')),
+  source_message_id   INTEGER REFERENCES message(id) ON DELETE RESTRICT,
+  detail_json         TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  created_at          TEXT NOT NULL,
+  UNIQUE (proposed_effect_id, event_type),
+  CHECK (
+    (event_type IN ('confirmed','declined','reverted') AND source_message_id IS NOT NULL)
+    OR
+    (event_type IN ('proposed','expired','executed','failed') AND source_message_id IS NULL)
+  )
+);
+CREATE INDEX effect_event_effect_idx ON effect_event(proposed_effect_id, id);
+CREATE INDEX effect_event_source_idx ON effect_event(source_message_id)
+WHERE source_message_id IS NOT NULL;
+
+CREATE TRIGGER effect_event_immutable
+BEFORE UPDATE ON effect_event
+BEGIN
+  SELECT RAISE(ABORT, 'effect history is append-only');
+END;
+
+-- Defense in depth for the rule the whole design rests on: an assistant message can never
+-- authorize an external action, whatever calls the write path.
+CREATE TRIGGER effect_event_decision_is_user_authored
+BEFORE INSERT ON effect_event
+WHEN NEW.source_message_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM message WHERE id = NEW.source_message_id AND role = 'user'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'an effect decision must cite a user message');
+END;
+
+ALTER TABLE tool_receipt RENAME TO tool_receipt_safe_legacy;
+CREATE TABLE tool_receipt (
+  id                       INTEGER PRIMARY KEY,
+  work_run_id              INTEGER NOT NULL REFERENCES work_run(id) ON DELETE CASCADE,
+  work_step_id             INTEGER REFERENCES work_step(id) ON DELETE SET NULL,
+  -- 'effect_proposal' is a step that prepared an external request and stopped; only a
+  -- 'connector_call' row means bytes actually left this machine. Keeping them distinct
+  -- makes "did anything happen out there?" a query rather than an interpretation.
+  tool_name                TEXT NOT NULL
+                           CHECK (tool_name IN ('memory_recall','web_search',
+                                                'local_artifact','effect_proposal',
+                                                'connector_call')),
+  effect_kind              TEXT NOT NULL
+                           CHECK (effect_kind IN ('memory_read','web_read','prepare_local',
+                                                  'external_read','send','schedule',
+                                                  'modify_external')),
+  connector_capability_id  INTEGER REFERENCES connector_capability(id) ON DELETE SET NULL,
+  proposed_effect_id       INTEGER REFERENCES proposed_effect(id) ON DELETE SET NULL,
+  call_index               INTEGER NOT NULL CHECK (call_index > 0),
+  input_json               TEXT NOT NULL CHECK (json_valid(input_json)),
+  output_json              TEXT CHECK (output_json IS NULL OR json_valid(output_json)),
+  citations_json           TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(citations_json)),
+  status                   TEXT NOT NULL CHECK (status IN ('started','completed','failed')),
+  error_code               TEXT,
+  error_message            TEXT,
+  idempotency_key          TEXT NOT NULL UNIQUE,
+  started_at               TEXT NOT NULL,
+  completed_at             TEXT,
+  CHECK (
+    (tool_name IN ('connector_call','effect_proposal') AND connector_capability_id IS NOT NULL)
+    OR
+    (tool_name NOT IN ('connector_call','effect_proposal')
+      AND connector_capability_id IS NULL AND proposed_effect_id IS NULL)
+  )
+);
+INSERT INTO tool_receipt
+  (id, work_run_id, work_step_id, tool_name, effect_kind, call_index, input_json,
+   output_json, citations_json, status, error_code, error_message, idempotency_key,
+   started_at, completed_at)
+SELECT id, work_run_id, work_step_id, tool_name, effect_kind, call_index, input_json,
+       output_json, citations_json, status, error_code, error_message, idempotency_key,
+       started_at, completed_at
+FROM tool_receipt_safe_legacy;
+DROP TABLE tool_receipt_safe_legacy;
+CREATE INDEX tool_receipt_run_idx ON tool_receipt(work_run_id, call_index);
+CREATE INDEX tool_receipt_effect_idx ON tool_receipt(proposed_effect_id)
+WHERE proposed_effect_id IS NOT NULL;
+
+-- A disposable, TTL-bounded copy of what a connector reported. Deliberately unreachable
+-- from every evidence table: a calendar invite is somebody else's text about the user,
+-- never the user's own statement, so it can inform a plan but can never become memory.
+CREATE TABLE external_signal (
+  id            INTEGER PRIMARY KEY,
+  connector_id  INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('calendar_event')),
+  external_id   TEXT NOT NULL,
+  starts_at     TEXT,
+  ends_at       TEXT,
+  location      TEXT,
+  payload_json  TEXT NOT NULL CHECK (json_valid(payload_json)),
+  fetched_at    TEXT NOT NULL,
+  expires_at    TEXT NOT NULL,
+  UNIQUE (connector_id, kind, external_id)
+);
+CREATE INDEX external_signal_window_idx ON external_signal(kind, starts_at);
+CREATE INDEX external_signal_expiry_idx ON external_signal(expires_at);
+
+-- Deterministic detector output. Like a follow-through recommendation this is an
+-- assistant-side proposal, kept in its own table so it can never be mistaken for an
+-- intention the user stated.
+CREATE TABLE detected_signal (
+  id                INTEGER PRIMARY KEY,
+  detector          TEXT NOT NULL
+                    CHECK (detector IN ('calendar_overlap','travel_gap',
+                                        'deadline_collision','commitment_unscheduled')),
+  dedupe_key        TEXT NOT NULL UNIQUE,
+  subject_json      TEXT NOT NULL CHECK (json_valid(subject_json)),
+  commitment_id     INTEGER REFERENCES commitment(id) ON DELETE CASCADE,
+  severity          INTEGER NOT NULL CHECK (severity BETWEEN 0 AND 100),
+  why               TEXT NOT NULL,
+  suggested_action  TEXT NOT NULL,
+  effect_kind       TEXT NOT NULL
+                    CHECK (effect_kind IN ('memory_read','web_read','prepare_local',
+                                           'external_read','send','schedule','purchase',
+                                           'modify_external')),
+  occurs_at         TEXT,
+  detected_at       TEXT NOT NULL,
+  snoozed_until     TEXT,
+  last_surfaced_at  TEXT,
+  resolved_at       TEXT
+);
+CREATE INDEX detected_signal_open_idx ON detected_signal(severity DESC, id)
+WHERE resolved_at IS NULL;
+CREATE INDEX detected_signal_commitment_idx ON detected_signal(commitment_id)
+WHERE commitment_id IS NOT NULL;
+
+-- Signal decisions mirror follow-through decisions but stay in their own ledger. A
+-- conflict Zeus noticed in the world is a different kind of claim from a commitment the
+-- user made, and the behavioral-policy machinery is deliberately built around the latter.
+CREATE TABLE signal_event (
+  id                   INTEGER PRIMARY KEY,
+  detected_signal_id   INTEGER NOT NULL REFERENCES detected_signal(id) ON DELETE CASCADE,
+  event_type           TEXT NOT NULL
+                       CHECK (event_type IN ('surfaced','accepted','dismissed','snoozed',
+                                             'completed','regretted')),
+  detail_json          TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  response_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_message_id    INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  source_kind          TEXT NOT NULL CHECK (source_kind IN ('system','message','user_action')),
+  created_at           TEXT NOT NULL,
+  CHECK (
+    (event_type = 'surfaced' AND source_kind = 'system' AND source_message_id IS NULL)
+    OR
+    (event_type <> 'surfaced' AND source_kind IN ('message','user_action')
+      AND source_message_id IS NOT NULL)
+  )
+);
+CREATE INDEX signal_event_signal_idx ON signal_event(detected_signal_id, created_at DESC);
+CREATE INDEX signal_event_type_idx ON signal_event(event_type, created_at DESC);
+
+CREATE TRIGGER signal_event_immutable
+BEFORE UPDATE ON signal_event
+BEGIN
+  SELECT RAISE(ABORT, 'signal decision history is append-only');
+END;
+
+-- One opportunity pipeline, two possible subjects. Every existing gate — intervention
+-- mode, quiet hours, the one-per-day budget, cooldown, snooze, dismissal, facet blocks —
+-- keeps applying because detector alerts are delivered through it rather than beside it.
+ALTER TABLE recommendation_cycle
+ADD COLUMN selected_signal_id INTEGER REFERENCES detected_signal(id) ON DELETE SET NULL;
+CREATE INDEX recommendation_cycle_signal_idx
+ON recommendation_cycle(selected_signal_id, created_at DESC)
+WHERE selected_signal_id IS NOT NULL;
+
+-- Connector calls get their own durable ceiling, for the same reason model calls do: a
+-- limit a crash-loop can reset is not a limit.
+CREATE TABLE connector_usage (
+  window_kind   TEXT NOT NULL,
+  window_start  TEXT NOT NULL,
+  calls         INTEGER NOT NULL DEFAULT 0,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (window_kind, window_start)
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1474,4 +1800,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "020_mcp_mutation_approval", sql: MCP_MUTATION_APPROVAL },
   { id: "021_snapshot_destinations", sql: SNAPSHOT_DESTINATIONS },
   { id: "022_model_usage", sql: MODEL_USAGE },
+  { id: "023_external_actions", sql: EXTERNAL_ACTIONS },
 ];

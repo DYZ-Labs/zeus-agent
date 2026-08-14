@@ -36,6 +36,8 @@ export type ZeusEvent = {
   message_id?: number | null;
   plan_id?: number | null;
   run_id?: number | null;
+  connector_id?: number | null;
+  effect_id?: number | null;
   count?: number | null;
   error_name?: string;
   /** First application stack frame as `src/…:line`. A code location, not user data. */
@@ -43,6 +45,10 @@ export type ZeusEvent = {
   model?: string;
   mode?: string;
   store?: string;
+  /** A capability slot such as `calendar.create_event`. Named by Zeus, never by a remote. */
+  slot?: string;
+  /** An effect kind. One of a fixed set; never a remote tool's own name. */
+  effect?: string;
 };
 
 /** Per-field shapes. A value that does not match is replaced, never truncated into. */
@@ -60,6 +66,8 @@ const FIELD_PATTERNS = {
   model: /^[A-Za-z0-9._/-]{1,64}$/u,
   mode: /^[a-z][a-z0-9_]{0,31}$/u,
   store: /^[a-z][a-z0-9_]{0,31}$/u,
+  slot: /^[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}$/u,
+  effect: /^[a-z][a-z0-9_]{0,31}$/u,
 } as const;
 
 const NUMERIC_FIELDS = [
@@ -69,6 +77,8 @@ const NUMERIC_FIELDS = [
   "message_id",
   "plan_id",
   "run_id",
+  "connector_id",
+  "effect_id",
   "count",
 ] as const;
 

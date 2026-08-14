@@ -1,5 +1,6 @@
 import type { Db } from "./db";
 import { now } from "./db";
+import { getSignal, listOpenSignals } from "./detectors";
 import { selfEntity } from "./entities";
 import {
   getCommitment,
@@ -12,6 +13,8 @@ import {
 import { materializeBehavioralPolicySuggestions } from "./personalization";
 import type {
   CommitmentView,
+  DetectedSignal,
+  DetectorKind,
   EffectKind,
   EvaluationContext,
   FollowThroughActionKind,
@@ -39,7 +42,28 @@ import {
 
 const DAY = 24 * 60 * 60 * 1000;
 const LOCATION_FRESHNESS = 30 * 60 * 1000;
+/** How soon a detected conflict has to be before it outranks a routine nudge. */
+const IMMINENT_WINDOW_MS = 48 * 60 * 60 * 1000;
 export const STEWARDSHIP_POLICY_VERSION = "2";
+
+/**
+ * What a detector noticed, selected for delivery.
+ *
+ * Deliberately its own type rather than a variant of `FollowThroughRecommendation`: a
+ * conflict Zeus observed in the world is a different kind of claim from a commitment the
+ * user made, and only the latter should feed the behavioral-policy machinery.
+ */
+export type SignalAlert = {
+  signal_id: number;
+  detector: DetectorKind;
+  commitment_id: number | null;
+  why: string;
+  suggested_action: string;
+  effect_kind: EffectKind;
+  requires_confirmation: boolean;
+  chat_prompt: string;
+  score: number;
+};
 
 type ActiveStewardshipMode = Exclude<StewardshipMode, "off">;
 
@@ -372,6 +396,7 @@ export function evaluateOpportunity(
     context,
     mode: options.mode,
   });
+  const signal = selectSignalAlert(db, evaluation, query);
   const createdAt = now();
   const inserted = db
     .prepare<[
@@ -383,6 +408,7 @@ export function evaluateOpportunity(
       string,
       string,
       number | null,
+      number | null,
       string | null,
       number | null,
       string,
@@ -390,8 +416,8 @@ export function evaluateOpportunity(
       `INSERT INTO recommendation_cycle
          (policy_version, trigger, context_json, query_text, candidate_scores_json,
           applied_facet_ids_json, exclusions_json, selected_commitment_id,
-          recommendation_json, source_message_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          selected_signal_id, recommendation_json, source_message_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       STEWARDSHIP_POLICY_VERSION,
@@ -408,12 +434,125 @@ export function evaluateOpportunity(
       JSON.stringify(evaluation.candidateScores),
       JSON.stringify(evaluation.appliedFacetIds),
       JSON.stringify(evaluation.exclusions),
-      evaluation.recommendation?.commitment_id ?? null,
-      evaluation.recommendation ? JSON.stringify(evaluation.recommendation) : null,
+      signal ? null : evaluation.recommendation?.commitment_id ?? null,
+      signal?.signal_id ?? null,
+      signal
+        ? JSON.stringify(signal)
+        : evaluation.recommendation
+          ? JSON.stringify(evaluation.recommendation)
+          : null,
       sourceMessageId,
       createdAt,
     );
   return getRecommendationCycle(db, Number(inserted.lastInsertRowid))!;
+}
+
+/**
+ * Pick a detected signal over a commitment nudge, or neither.
+ *
+ * The rule is one sentence: an imminent conflict in the world outranks a routine nudge,
+ * and otherwise the commitment wins. A signal never displaces an *explicitly requested*
+ * recommendation — "what should I do?" is a question about the user's own intentions.
+ *
+ * Every existing gate applies here, unchanged: intervention mode, snooze, dismissal,
+ * cooldown, and accepted facets that block. Detector output does not get its own way in.
+ */
+function selectSignalAlert(
+  db: Db,
+  evaluation: RecommendationEvaluation,
+  query: string,
+): SignalAlert | null {
+  if (evaluation.mode === "off") return null;
+  if (isExplicitTrigger(evaluation.context.trigger, query)) return null;
+
+  const referenceTime = new Date(evaluation.context.evaluated_at);
+  const scoringMode: ActiveStewardshipMode = evaluation.mode;
+  const machineEffects = activeMachineEffects(db, evaluation.context).active;
+
+  let best: SignalAlert | null = null;
+  for (const signal of listOpenSignals(db, { at: referenceTime })) {
+    if (signalIsDismissedWithoutChange(db, signal)) continue;
+    if (signalIsCoolingDown(signal, scoringMode, referenceTime)) continue;
+    if (signalIsBlockedByFacet(machineEffects, signal)) continue;
+
+    const imminent =
+      signal.occurs_at !== null &&
+      Date.parse(signal.occurs_at) - referenceTime.getTime() < IMMINENT_WINDOW_MS;
+    if (evaluation.recommendation && !imminent) continue;
+
+    const score = signal.severity + (imminent ? 40 : 0);
+    if (best && best.score >= score) continue;
+    best = {
+      signal_id: signal.id,
+      detector: signal.detector,
+      commitment_id: signal.commitment_id,
+      why: signal.why,
+      suggested_action: signal.suggested_action,
+      effect_kind: signal.effect_kind,
+      requires_confirmation: requiresEffectConfirmation(signal.effect_kind),
+      chat_prompt:
+        `${signal.suggested_action} Nothing outside this conversation changes ` +
+        "without my explicit confirmation.",
+      score,
+    };
+  }
+  return best;
+}
+
+/** A signal is raised at most once per cooldown window, on the same clock as a nudge. */
+function signalIsCoolingDown(
+  signal: DetectedSignal,
+  mode: ActiveStewardshipMode,
+  referenceTime: Date,
+): boolean {
+  if (!signal.last_surfaced_at) return false;
+  const cooldownDays = mode === "quiet" ? 14 : mode === "proactive" ? 3 : 7;
+  return Date.parse(signal.last_surfaced_at) > referenceTime.getTime() - cooldownDays * DAY;
+}
+
+/**
+ * A dismissed signal stays dismissed until the world changes it.
+ *
+ * `detected_at` moves only when a detector rewrites the signal, so a conflict the user
+ * waved away does not come back merely because the sweep ran again.
+ */
+function signalIsDismissedWithoutChange(db: Db, signal: DetectedSignal): boolean {
+  const last = db
+    .prepare<[number], { event_type: string; created_at: string }>(
+      `SELECT event_type, created_at FROM signal_event
+       WHERE detected_signal_id = ? AND event_type IN ('accepted','dismissed','regretted')
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(signal.id);
+  return Boolean(
+    last &&
+      (last.event_type === "dismissed" || last.event_type === "regretted") &&
+      last.created_at >= signal.detected_at,
+  );
+}
+
+/**
+ * Accepted facets that block still block. An unlinked signal answers to global and
+ * domain-scoped blocks; a linked one additionally answers to its commitment's and goal's.
+ */
+function signalIsBlockedByFacet(
+  machineEffects: readonly ActiveMachineEffect[],
+  signal: DetectedSignal,
+): boolean {
+  return machineEffects.some((effect) => {
+    if (effect.machine_effect !== "block") return false;
+    if (effect.scope_kind === "global") return true;
+    if (effect.scope_kind === "domain") {
+      return (
+        effect.scope_label !== null &&
+        overlapCount(tokens(effect.scope_label), `${signal.why} ${signal.suggested_action}`) > 0
+      );
+    }
+    if (effect.scope_kind === "commitment") {
+      return effect.scope_commitment_id === signal.commitment_id;
+    }
+    return false;
+  });
 }
 
 export function getRecommendationCycle(db: Db, id: number): RecommendationCycle | null {
@@ -421,7 +560,8 @@ export function getRecommendationCycle(db: Db, id: number): RecommendationCycle 
     .prepare<[number], RecommendationCycle>(
       `SELECT id, policy_version, trigger, context_json, query_text,
               candidate_scores_json, applied_facet_ids_json, exclusions_json,
-              selected_commitment_id, recommendation_json, source_message_id, created_at
+              selected_commitment_id, selected_signal_id, recommendation_json,
+              source_message_id, created_at
        FROM recommendation_cycle WHERE id = ?`,
     )
     .get(id) ?? null;
@@ -433,7 +573,35 @@ export function recommendationForOpportunity(
 ): FollowThroughRecommendation | null {
   const cycle = getRecommendationCycle(db, opportunityId);
   if (!cycle?.recommendation_json) return null;
+  // A signal cycle stores a different shape. Returning null rather than a coerced
+  // recommendation keeps callers that only understand commitments honest.
+  if (cycle.selected_signal_id !== null) return null;
   return parseRecommendationValue(safelyParseJson(cycle.recommendation_json));
+}
+
+/** The signal side of the same question: what, if anything, did this cycle select? */
+export function signalAlertForOpportunity(
+  db: Db,
+  opportunityId: number,
+): SignalAlert | null {
+  const cycle = getRecommendationCycle(db, opportunityId);
+  if (!cycle || cycle.selected_signal_id === null || !cycle.recommendation_json) return null;
+  const parsed: unknown = safelyParseJson(cycle.recommendation_json);
+  if (parsed === null || typeof parsed !== "object") return null;
+  const value = parsed as Partial<SignalAlert>;
+  if (typeof value.signal_id !== "number" || typeof value.why !== "string") return null;
+  if (typeof value.suggested_action !== "string") return null;
+  return {
+    signal_id: value.signal_id,
+    detector: value.detector as SignalAlert["detector"],
+    commitment_id: typeof value.commitment_id === "number" ? value.commitment_id : null,
+    why: value.why,
+    suggested_action: value.suggested_action,
+    effect_kind: value.effect_kind as SignalAlert["effect_kind"],
+    requires_confirmation: value.requires_confirmation === true,
+    chat_prompt: typeof value.chat_prompt === "string" ? value.chat_prompt : value.suggested_action,
+    score: typeof value.score === "number" ? value.score : 0,
+  };
 }
 
 export function listOpportunityDeliveries(
@@ -457,6 +625,10 @@ export function markOpportunityDelivered(
   responseMessageId: number | null = null,
 ): OpportunityDelivery | null {
   if (responseMessageId !== null) assertMessageRole(db, responseMessageId, "assistant");
+  const cycle = getRecommendationCycle(db, opportunityId);
+  if (cycle && cycle.selected_signal_id !== null) {
+    return markSignalDelivered(db, cycle, channel, responseMessageId);
+  }
   const recommendation = recommendationForOpportunity(db, opportunityId);
   if (!recommendation) return null;
 
@@ -490,6 +662,58 @@ export function markOpportunityDelivered(
         sourceMessageId: null,
         sourceKind: "system",
       });
+    }
+    return delivery;
+  })();
+}
+
+/**
+ * Count a signal as surfaced on its first channel, exactly as a commitment nudge is.
+ *
+ * `last_surfaced_at` is what the cooldown reads, so it moves here and nowhere else: a
+ * signal that was evaluated but never shown must not start its own cooldown.
+ */
+function markSignalDelivered(
+  db: Db,
+  cycle: RecommendationCycle,
+  channel: OpportunityDeliveryChannel,
+  responseMessageId: number | null,
+): OpportunityDelivery | null {
+  const signalId = cycle.selected_signal_id;
+  if (signalId === null) return null;
+  return db.transaction((): OpportunityDelivery | null => {
+    db.prepare<[number, OpportunityDeliveryChannel, number | null, string]>(
+      `INSERT OR IGNORE INTO opportunity_delivery
+         (opportunity_id, channel, response_message_id, delivered_at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(cycle.id, channel, responseMessageId, now());
+    const delivery = db
+      .prepare<[number, OpportunityDeliveryChannel], OpportunityDelivery>(
+        `SELECT id, opportunity_id, channel, response_message_id, delivered_at
+         FROM opportunity_delivery WHERE opportunity_id = ? AND channel = ?`,
+      )
+      .get(cycle.id, channel);
+    if (!delivery) throw new Error("Opportunity delivery vanished immediately after insert");
+
+    const alreadySurfaced = db
+      .prepare<[number, number], { found: number }>(
+        `SELECT 1 AS found FROM signal_event
+         WHERE detected_signal_id = ? AND event_type = 'surfaced'
+           AND created_at >= (SELECT detected_at FROM detected_signal WHERE id = ?)
+         LIMIT 1`,
+      )
+      .get(signalId, signalId);
+    if (!alreadySurfaced) {
+      const timestamp = now();
+      db.prepare<[string, number]>(
+        "UPDATE detected_signal SET last_surfaced_at = ? WHERE id = ?",
+      ).run(timestamp, signalId);
+      db.prepare<[number, number | null, string]>(
+        `INSERT INTO signal_event
+           (detected_signal_id, event_type, response_message_id, source_kind,
+            detail_json, created_at)
+         VALUES (?, 'surfaced', ?, 'system', NULL, ?)`,
+      ).run(signalId, responseMessageId, timestamp);
     }
     return delivery;
   })();
@@ -664,22 +888,96 @@ export function recommendationsForResponse(
   return rows.flatMap((row) => parseRecommendation(row.detail_json));
 }
 
+/**
+ * Record what the user decided about a detected signal.
+ *
+ * Kept parallel to `recordFollowThroughDecision` rather than merged into it: a decision
+ * about a conflict Zeus observed must not become evidence in the behavioral-policy
+ * machinery, which reasons about the user's own commitments. Outcomes are never inferred
+ * from silence or from the assistant's own text.
+ */
+export function recordSignalDecision(
+  db: Db,
+  input: {
+    signalId: number;
+    decision: FollowThroughDecision;
+    responseMessageId?: number | null;
+    sourceMessageId?: number | null;
+    snoozedUntil?: string | null;
+    userReason?: string | null;
+  },
+): DetectedSignal | null {
+  const signal = getSignal(db, input.signalId);
+  if (!signal) return null;
+  const responseMessageId = input.responseMessageId ?? null;
+  if (responseMessageId !== null) assertMessageRole(db, responseMessageId, "assistant");
+  const sourceMessageId = input.sourceMessageId ?? null;
+  if (sourceMessageId !== null) assertMessageRole(db, sourceMessageId, "user");
+
+  return db.transaction((): DetectedSignal | null => {
+    const timestamp = now();
+    const reason = normalizeUserReason(input.userReason ?? null);
+    if (input.decision === "snoozed") {
+      const until =
+        input.snoozedUntil ?? new Date(Date.parse(timestamp) + 7 * DAY).toISOString();
+      db.prepare<[string, number]>(
+        "UPDATE detected_signal SET snoozed_until = ? WHERE id = ?",
+      ).run(until, input.signalId);
+    }
+    if (input.decision === "completed") {
+      db.prepare<[string, number]>(
+        "UPDATE detected_signal SET resolved_at = ? WHERE id = ?",
+      ).run(timestamp, input.signalId);
+    }
+    db.prepare<[number, FollowThroughDecision, string | null, number | null, number | null, string, string]>(
+      `INSERT INTO signal_event
+         (detected_signal_id, event_type, detail_json, response_message_id,
+          source_message_id, source_kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.signalId,
+      input.decision,
+      reason === null ? null : JSON.stringify({ user_reason: reason }),
+      responseMessageId,
+      sourceMessageId,
+      sourceMessageId === null ? "user_action" : sourceKindForUserMessage(db, sourceMessageId),
+      timestamp,
+    );
+    return getSignal(db, input.signalId);
+  })();
+}
+
+/**
+ * Progress, control, and regret across both kinds of proposal.
+ *
+ * Signals are unioned in rather than counted separately because the question these
+ * numbers answer — is Zeus helping, and at what cost to the user's control — is the same
+ * question whichever kind of proposal was surfaced.
+ */
 export function followThroughMetrics(db: Db): FollowThroughMetrics {
   const counts = db
     .prepare<[], { event_type: FollowThroughEventType; count: number }>(
-      `SELECT event_type, COUNT(*) AS count
-       FROM follow_through_event
+      `SELECT event_type, COUNT(*) AS count FROM (
+         SELECT event_type FROM follow_through_event
+         UNION ALL
+         SELECT event_type FROM signal_event
+       )
        GROUP BY event_type`,
     )
     .all();
   const byType = new Map(counts.map((row) => [row.event_type, row.count]));
-  const progress = db
+  const progress = (db
     .prepare<[], { count: number }>(
       `SELECT COUNT(DISTINCT commitment_id) AS count
        FROM follow_through_event WHERE event_type = 'completed'`,
     )
-    .get()?.count ?? 0;
-  const progressWithoutRegret = db
+    .get()?.count ?? 0) + (db
+    .prepare<[], { count: number }>(
+      `SELECT COUNT(DISTINCT detected_signal_id) AS count
+       FROM signal_event WHERE event_type = 'completed'`,
+    )
+    .get()?.count ?? 0);
+  const progressWithoutRegret = (db
     .prepare<[], { count: number }>(
       `SELECT COUNT(DISTINCT completed.commitment_id) AS count
        FROM follow_through_event completed
@@ -691,7 +989,19 @@ export function followThroughMetrics(db: Db): FollowThroughMetrics {
              AND regretted.id > completed.id
          )`,
     )
-    .get()?.count ?? 0;
+    .get()?.count ?? 0) + (db
+    .prepare<[], { count: number }>(
+      `SELECT COUNT(DISTINCT completed.detected_signal_id) AS count
+       FROM signal_event completed
+       WHERE completed.event_type = 'completed'
+         AND NOT EXISTS (
+           SELECT 1 FROM signal_event regretted
+           WHERE regretted.detected_signal_id = completed.detected_signal_id
+             AND regretted.event_type = 'regretted'
+             AND regretted.id > completed.id
+         )`,
+    )
+    .get()?.count ?? 0);
 
   return {
     surfaced: byType.get("surfaced") ?? 0,

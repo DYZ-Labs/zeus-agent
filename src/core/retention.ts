@@ -318,6 +318,7 @@ function deleteConversationRowsWithMemory(
     }
 
     deleteSourceBackedWorkPlans(db, messageIds, placeholders);
+    deleteSourceBackedConnections(db, messageIds, placeholders);
 
     rehomeOrDeleteIntent(db, "commitment", "commitment_event", messageIds, placeholders);
     rehomeOrDeleteIntent(db, "goal", "goal_event", messageIds, placeholders);
@@ -521,6 +522,54 @@ function checkpointAndVerifyTruncated(db: Db): void {
  * Explicit source deletion therefore removes the complete local plan/run/artifact/receipt
  * subtree before deleting the source message; no external state exists to undo.
  */
+/**
+ * Erasure reaches the acting layer too.
+ *
+ * A connector's source message is the record of the user allowing it. Erasing that record
+ * withdraws the grant rather than leaving an unattributed permission behind — the
+ * fail-safe direction, and the only one that keeps "no adapter means no action" honest
+ * after a deletion. Prepared and sent requests go with the message that decided them, on
+ * the same reasoning as follow-through events. The external cache is cleared outright: it
+ * is disposable, it rebuilds within the hour, and meeting titles surviving an erasure
+ * would be exactly the residue the user asked to be rid of.
+ */
+function deleteSourceBackedConnections(
+  db: Db,
+  messageIds: number[],
+  placeholders: string,
+): void {
+  if (hasTable(db, "proposed_effect")) {
+    db.prepare<number[]>(
+      `DELETE FROM proposed_effect
+       WHERE id IN (
+         SELECT proposed_effect_id FROM effect_event
+         WHERE source_message_id IN (${placeholders})
+       )`,
+    ).run(...messageIds);
+  }
+  if (hasTable(db, "detected_signal")) {
+    db.prepare<number[]>(
+      `DELETE FROM detected_signal
+       WHERE id IN (
+         SELECT detected_signal_id FROM signal_event
+         WHERE source_message_id IN (${placeholders})
+            OR response_message_id IN (${placeholders})
+       )`,
+    ).run(...messageIds, ...messageIds);
+  }
+  if (hasTable(db, "external_signal")) {
+    db.prepare("DELETE FROM external_signal").run();
+  }
+  if (hasTable(db, "connector")) {
+    db.prepare<number[]>(
+      `DELETE FROM connector_capability WHERE source_message_id IN (${placeholders})`,
+    ).run(...messageIds);
+    db.prepare<number[]>(
+      `DELETE FROM connector WHERE source_message_id IN (${placeholders})`,
+    ).run(...messageIds);
+  }
+}
+
 function deleteSourceBackedWorkPlans(
   db: Db,
   messageIds: number[],

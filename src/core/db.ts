@@ -134,50 +134,87 @@ export function migrate(
   db: Db,
   migrations: readonly Migration[] = MIGRATIONS,
 ): void {
-  // One writer reservation covers pending detection, backup, and application. A
-  // second Zeus process waits at BEGIN IMMEDIATE, then rechecks the ledger instead
-  // of racing the same DDL or taking a backup of a half-migrated schema.
-  db.exec("BEGIN IMMEDIATE");
+  // SQLite cannot relax a CHECK in place, so a migration that needs one rebuilds the
+  // table. Left to its defaults, RENAME repoints every existing REFERENCES clause at the
+  // legacy copy, and the following DROP then cascades the referencing rows away — which
+  // is how a table swap silently destroys provenance. Suspending enforcement and
+  // restoring the pre-3.25 RENAME semantics together keeps those clauses naming the
+  // table that is about to reappear. Both pragmas are per-connection and no-ops inside a
+  // transaction, so they are set outside it and always restored.
+  //
+  // The `foreign_key_check` before COMMIT is strictly safer than what came before: no
+  // migration was previously verified for dangling references at all.
+  const enforcedForeignKeys = db.pragma("foreign_keys", { simple: true }) === 1;
+  const legacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
+  if (enforcedForeignKeys) db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
   try {
-    ensureZeusApplicationId(db);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_migration (
-        id          TEXT PRIMARY KEY,
-        applied_at  TEXT NOT NULL
+    // One writer reservation covers pending detection, backup, and application. A
+    // second Zeus process waits at BEGIN IMMEDIATE, then rechecks the ledger instead
+    // of racing the same DDL or taking a backup of a half-migrated schema.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      ensureZeusApplicationId(db);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS schema_migration (
+          id          TEXT PRIMARY KEY,
+          applied_at  TEXT NOT NULL
+        );
+      `);
+      const applied = appliedMigrationLedger(db);
+      validateMigrationLedger(applied, migrations);
+      const pending = migrations.slice(applied.length);
+      if (pending.length === 0) {
+        db.exec("COMMIT");
+        return;
+      }
+
+      if (!db.memory && applied.length > 0 && statSync(databaseFilePath(db)).size > 0) {
+        const databasePath = databaseFilePath(db);
+        // Prune before writing rather than after. Stale copies are the likeliest reason
+        // a volume is short of room, and the new backup needs that room now; keeping
+        // retention-1 leaves exactly `retention` once this migration's copy lands.
+        // Verification makes this list expensive, which is affordable here because a
+        // migration is rare — never do it on an ordinary open.
+        pruneManagedMigrationBackups(databasePath, configuredMigrationBackupRetention() - 1);
+        assertRoomForMigrationBackup(databasePath);
+        createVerifiedPreMigrationBackup(db, applied);
+      }
+
+      const record = db.prepare<[string, string]>(
+        "INSERT INTO schema_migration (id, applied_at) VALUES (?, ?)",
       );
-    `);
-    const applied = appliedMigrationLedger(db);
-    validateMigrationLedger(applied, migrations);
-    const pending = migrations.slice(applied.length);
-    if (pending.length === 0) {
+      for (const migration of pending) {
+        db.exec(migration.sql);
+        record.run(migration.id, now());
+      }
+      if (enforcedForeignKeys) assertNoDanglingReferences(db);
       db.exec("COMMIT");
-      return;
+    } catch (error) {
+      if (db.inTransaction) db.exec("ROLLBACK");
+      throw error;
     }
-
-    if (!db.memory && applied.length > 0 && statSync(databaseFilePath(db)).size > 0) {
-      const databasePath = databaseFilePath(db);
-      // Prune before writing rather than after. Stale copies are the likeliest reason
-      // a volume is short of room, and the new backup needs that room now; keeping
-      // retention-1 leaves exactly `retention` once this migration's copy lands.
-      // Verification makes this list expensive, which is affordable here because a
-      // migration is rare — never do it on an ordinary open.
-      pruneManagedMigrationBackups(databasePath, configuredMigrationBackupRetention() - 1);
-      assertRoomForMigrationBackup(databasePath);
-      createVerifiedPreMigrationBackup(db, applied);
-    }
-
-    const record = db.prepare<[string, string]>(
-      "INSERT INTO schema_migration (id, applied_at) VALUES (?, ?)",
-    );
-    for (const migration of pending) {
-      db.exec(migration.sql);
-      record.run(migration.id, now());
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    if (db.inTransaction) db.exec("ROLLBACK");
-    throw error;
+  } finally {
+    db.pragma(`legacy_alter_table = ${legacyAlterTable === 1 ? "ON" : "OFF"}`);
+    if (enforcedForeignKeys) db.pragma("foreign_keys = ON");
   }
+}
+
+/**
+ * Fail the whole migration rather than commit a store whose provenance links are broken.
+ * Every guarantee Zeus makes about evidence depends on these references resolving.
+ */
+function assertNoDanglingReferences(db: Db): void {
+  const violations = db.pragma("foreign_key_check") as Array<{ table?: unknown }>;
+  if (violations.length === 0) return;
+  const tables = [
+    ...new Set(
+      violations.map((row) => (typeof row.table === "string" ? row.table : "unknown")),
+    ),
+  ].sort();
+  throw new Error(
+    `Migration left dangling references in: ${tables.join(", ")}`,
+  );
 }
 
 const MIGRATION_BACKUP_MARKER = ".pre-migration-";

@@ -13,7 +13,9 @@ import { join } from "node:path";
 
 import { messagesIn } from "../src/core/conversations";
 import { listCandidates } from "../src/core/candidates";
+import { listConnectors } from "../src/core/connectors";
 import { defaultDbPath, openDb } from "../src/core/db";
+import { effectEvents } from "../src/core/effects";
 import { prepareExportWorkspace } from "../src/core/export-files";
 import { aliasesOf, listEntities } from "../src/core/entities";
 import { evidenceForFacet, listFacets } from "../src/core/facets";
@@ -26,7 +28,12 @@ import {
 } from "../src/core/intentions";
 import { listProjects, projectEvents } from "../src/core/projects";
 import { listBehavioralPolicySuggestions } from "../src/core/personalization";
-import type { FactView, RecommendationCycle, WorkAuthorization } from "../src/core/schema";
+import type {
+  FactView,
+  ProposedEffect,
+  RecommendationCycle,
+  WorkAuthorization,
+} from "../src/core/schema";
 import { getAmbientSetting, getCoarseLocation } from "../src/core/ambient";
 import {
   followThroughMetrics,
@@ -585,10 +592,117 @@ writeFileSync(
   [
     "# Bounded work plans",
     "",
-    "This is the complete local audit for bounded planning, read-only research, and drafting runs.",
-    "Tool inputs, outputs, citations, and errors are sanitized again during export; no external-write adapter exists in this milestone.",
+    "This is the complete local audit for bounded planning, research, drafting, and any",
+    "external request a run prepared. Tool inputs, outputs, citations, and errors are",
+    "sanitized again during export. A receipt named `connector_call` is the only kind that",
+    "means something left this machine; `effect_proposal` means a request was prepared and",
+    "stopped.",
     "",
     workPlanBody,
+    "",
+  ].join("\n"),
+  "utf8",
+);
+
+/**
+ * Connections and external requests.
+ *
+ * Exported deliberately: if Zeus can act, the record of what it was allowed to do and what
+ * it actually did has to leave with everything else. Connectors hold no credential, so
+ * there is nothing here to redact beyond the standard pass.
+ */
+const connectors = listConnectors(db);
+const connectionsBody = connectors.length
+  ? connectors
+      .map((connector) => [
+        `## ${connector.label} (connector ${connector.id})`,
+        "",
+        `- transport: ${connector.transport}`,
+        `- reached by: ${connector.transport === "stdio" ? [connector.command, ...connector.args].join(" ") : connector.url}`,
+        `- environment variable names read at call time: ${connector.envVarNames.join(", ") || "none"}`,
+        "- values for those variables are never stored by Zeus and are not in this export",
+        `- status: ${connector.status}${connector.enabled === 1 ? " · enabled" : " · not enabled"}`,
+        `- last verified: ${connector.last_verified_at ?? "never"}`,
+        `- allowed by: message ${connector.source_message_id}`,
+        "",
+        "### Capabilities granted",
+        "",
+        connector.capabilities.length
+          ? connector.capabilities
+              .map((capability) =>
+                [
+                  `- **${capability.slot}** → \`${capability.remote_tool_name}\``,
+                  `  - effect: ${capability.effect_kind}`,
+                  `  - state: ${capability.enabled === 1 ? "allowed" : "paused"}`,
+                  `  - reviewed input schema: ${capability.schema_hash}`,
+                  `  - granted by: message ${capability.source_message_id}`,
+                ].join("\n"),
+              )
+              .join("\n")
+          : "_None granted._",
+      ].join("\n"))
+      .join("\n\n---\n\n")
+  : "_No connected services._";
+
+const exportedEffects = db
+  .prepare<[], ProposedEffect>(
+    `SELECT id, work_run_id, work_step_id, connector_capability_id, effect_kind,
+            payload_json, payload_hash, preview_text, reversal_json, status,
+            idempotency_key, provider_request_key, expires_at, created_at, updated_at
+     FROM proposed_effect ORDER BY id`,
+  )
+  .all();
+const effectsBody = exportedEffects.length
+  ? exportedEffects
+      .map((effect) => {
+        const events = effectEvents(db, effect.id);
+        return [
+          `## Request ${effect.id} — ${effect.preview_text}`,
+          "",
+          `- status: ${effect.status}`,
+          `- effect: ${effect.effect_kind} · capability ${effect.connector_capability_id}`,
+          `- from work run ${effect.work_run_id}, step ${effect.work_step_id}`,
+          `- confirmation hash: ${effect.payload_hash}`,
+          `- expires: ${effect.expires_at}`,
+          "- exact request:",
+          jsonBlock(parseStoredJson(effect.payload_json)),
+          "",
+          "### Append-only decision history",
+          "",
+          events.length
+            ? events
+                .map(
+                  (event) =>
+                    `- ${event.created_at} · **${event.event_type}**` +
+                    `${event.source_message_id === null ? "" : ` · your message ${event.source_message_id}`}` +
+                    `${event.detail_json === null ? "" : ` · ${event.detail_json}`}`,
+                )
+                .join("\n")
+            : "_No events._",
+        ].join("\n");
+      })
+      .join("\n\n---\n\n")
+  : "_No external requests were ever prepared._";
+
+writeFileSync(
+  join(outDir, "connections.md"),
+  [
+    "# Connections and external requests",
+    "",
+    "Zeus reaches other services only through servers you configured, and only through",
+    "capability slots you granted. It stores the names of the environment variables a",
+    "server needs, never their values, so no credential appears in this export.",
+    "",
+    "Every external request is listed with the exact payload and the message in which you",
+    "confirmed it. A request with no `executed` event never happened.",
+    "",
+    connectionsBody,
+    "",
+    "---",
+    "",
+    "# External requests",
+    "",
+    effectsBody,
     "",
   ].join("\n"),
   "utf8",
@@ -811,6 +925,7 @@ writeFileSync(
     `Recommendation-cycle policy traces, delivery receipts, ambient settings, and the current short-lived coarse-zone signal are in [stewardship-cycles.md](stewardship-cycles.md).`,
     `Non-canonical behavioral-policy review proposals are in [behavioral-policy-suggestions.md](behavioral-policy-suggestions.md).`,
     `Bounded plans, dependencies, authorization history, runs, artifacts, citations, and sanitized tool receipts are in [work-plans.md](work-plans.md).`,
+    `Connected services, the capabilities you granted them, and every external request with the message that confirmed it are in [connections.md](connections.md).`,
     `Memory proposals and their review status are in [memory-candidates.md](memory-candidates.md).`,
     `Claim-sized evidence and recall status are in [evidence-passages.md](evidence-passages.md).`,
     `Accepted understanding facets and their history are in [understanding.md](understanding.md).`,

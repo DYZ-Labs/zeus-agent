@@ -7,10 +7,12 @@ import {
   updateAmbientSettingAction,
 } from "@/app/actions";
 import { logoutAction } from "@/app/auth/actions";
+import { ConnectionsPanel } from "@/components/connections-panel";
 import { DeleteAllConversations } from "@/components/delete-all-conversations";
 import { CoarseLocationControl } from "@/components/coarse-location-control";
 import { SettingsModal } from "@/components/settings-modal";
 import { getAmbientSetting, getFreshCoarseLocation } from "@/core/ambient";
+import { listConnectors } from "@/core/connectors";
 import { listChatHistory } from "@/core/conversations";
 import { listBehavioralPolicySuggestions } from "@/core/personalization";
 import type {
@@ -27,8 +29,13 @@ import { getOwnerAccess, type OwnerAccess } from "@/server/auth/access";
 
 export const dynamic = "force-dynamic";
 
-export default async function SettingsPage() {
+export default async function SettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
   const access = await getOwnerAccess();
+  const connectorError = (await searchParams).connector_error;
   const privateSettings = access.canAccessPrivateData
     ? {
         setting: getStewardshipSetting(access.db),
@@ -38,6 +45,7 @@ export default async function SettingsPage() {
         ambient: getAmbientSetting(access.db),
         location: getFreshCoarseLocation(access.db),
         behavioralSuggestions: listBehavioralPolicySuggestions(access.db, { limit: 20 }),
+        connectors: listConnectors(access.db),
       }
     : null;
 
@@ -53,6 +61,16 @@ export default async function SettingsPage() {
             ambient={privateSettings.ambient}
             location={privateSettings.location}
             behavioralSuggestions={privateSettings.behavioralSuggestions}
+          />
+        ) : (
+          <LockedSettings />
+        )
+      }
+      connections={
+        privateSettings ? (
+          <ConnectionsPanel
+            connectors={privateSettings.connectors}
+            errorMessage={typeof connectorError === "string" ? connectorError : null}
           />
         ) : (
           <LockedSettings />

@@ -41,9 +41,14 @@ contextual follow-through.
   goals, cooldowns, snoozes, dismissals, conditional preferences, quiet hours, and
   intervention mode are hard gates. Stewardship can be turned off without disabling
   explicit Today, MCP, or “what should I do?” requests.
-- **Permission before action.** Zeus can draft, research, compare, and plan in chat.
-  Sending, scheduling, purchasing, reminding, coordinating, or changing external state
-  requires explicit confirmation and an available adapter.
+- **Permission before action.** Zeus can draft, research, compare, and plan in chat, and —
+  once you connect a service — read your calendar and prepare changes to it. Preparing is
+  not doing. Every external request stops with the exact payload shown, and only a message
+  of yours naming that payload's hash lets it be sent. Silence is not consent: an
+  unanswered request expires.
+- **No credentials in the store.** Zeus reaches other services through MCP servers you
+  configure. It records the command and the *names* of the environment variables a server
+  needs, never their values, and hands a server only the variables you named.
 - **Outcomes without hiding regret.** Follow-through offers and user decisions form an
   append-only audit trail. Progress, control signals, and regret remain separately
   visible instead of collapsing into an engagement score.
@@ -71,7 +76,12 @@ contextual follow-through.
 - Opt-in macOS ambient support with quiet hours, a one-notification-per-day budget,
   short-lived named coarse zones, deterministic background evaluation, and no model call
   in the worker.
-- A **Today** view with one best current action, intervention controls, and a transparent
+- Connections to MCP servers you run, with per-capability grants, a reviewed input-schema
+  hash for each, and no stored credentials.
+- Deterministic detection of calendar overlaps, tight turnarounds, deadline collisions, and
+  unscheduled commitments, delivered through the same gates as every other interruption.
+- A **Today** view with one best current action, external requests awaiting your
+  confirmation with their exact payloads, intervention controls, and a transparent
   progress-and-regret readout.
 - Source transcripts and per-response recall traces for investigating why Zeus answered
   a particular way.
@@ -81,14 +91,21 @@ contextual follow-through.
 
 ```mermaid
 flowchart LR
-    A["Understand\naccepted memory + intentions"] --> B["Notice\nrelevance, timing, conflicts"]
+    A["Understand\naccepted memory + intentions"] --> B["Notice\nrelevance, timing, calendar conflicts"]
     B --> C{"Worth interrupting?"}
     C -->|"no"| D["Stay quiet"]
-    C -->|"yes"| E["Recommend\none useful next action + why"]
+    C -->|"yes"| E["Propose\none next action or signal + why"]
     E --> F{"User decision"}
-    F -->|"authorize preparation"| G["Act\ndraft, research, compare, plan"]
+    F -->|"authorize preparation"| G["Prepare\nresearch, compare, draft the exact request"]
     F -->|"done / snooze / dismiss"| H["Record control outcome"]
-    G --> I["Learn\nsource-backed corrections and outcomes"]
+    G --> J{"Changes something outside Zeus?"}
+    J -->|"no"| I["Learn\nsource-backed corrections and outcomes"]
+    J -->|"yes"| K["Stop\nshow the exact payload"]
+    K --> L{"Confirmed by hash?"}
+    L -->|"no / silence"| M["Nothing happens\ndecline or expire"]
+    L -->|"yes"| N["Send exactly those bytes\nreceipt + undo where possible"]
+    M --> I
+    N --> I
     H --> I
     I --> A
 ```
@@ -203,6 +220,8 @@ group locks private web data until configuration is completed.
 | `ZEUS_MODEL_CALLS_PER_DAY` | No | `500` | Per-account model calls per day |
 | `ZEUS_MODEL_TOKENS_PER_DAY` | No | `2000000` | Per-account model tokens per day |
 | `ZEUS_MAX_CONCURRENT_WORK_RUNS` | No | `2` | Bounded work runs this process executes at once |
+| `ZEUS_CONNECTOR_CALLS_PER_MINUTE` | No | `30` | Calls to connected services per minute |
+| `ZEUS_CONNECTOR_CALLS_PER_DAY` | No | `1000` | Calls to connected services per day |
 | `ZEUS_SYNCHRONOUS` | No | `full` | `full` fsyncs each commit; `normal` trades host-crash durability for speed |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_SCHEDULER` | No | on when hosted | In-process scheduled snapshots (`on`/`off`) |
@@ -497,14 +516,17 @@ items were recalled, accepted, held for review, or superseded.
 
 The main views are:
 
-- **Today** — see one useful next action, choose off/quiet/balanced/proactive intervention,
-  inspect progress, control, and regret signals, and authorize, resume, cancel, or review
-  bounded work and its receipts.
+- **Today** — see one useful next action, confirm or refuse external requests with their
+  exact payloads, choose off/quiet/balanced/proactive intervention, inspect progress,
+  control, and regret signals, and authorize, resume, cancel, or review bounded work and
+  its receipts.
 - **Chat** — converse with Zeus and inspect the memory receipt for each turn.
 - **Memory** — search and curate accepted facts or review pending candidates.
 - **Understanding** — inspect, correct, close, or delete accepted facets; edit and
   review pending inferences or sensitive proposals; optionally start a reflection or
   historical preview.
+- **Settings → Connections** — add, verify, enable, and remove connected services, and
+  grant or withdraw each capability individually.
 - **Open loops** — update goals and commitments, inspect their histories, and snooze
   commitment nudges.
 - **Timeline** — see current and superseded facts in learned-at order.
@@ -558,6 +580,8 @@ The server provides:
 - `zeus_next_action` — select one source-backed follow-through recommendation.
 - `zeus_follow_through_feedback` — record an explicitly authorized decision on that
   recommendation.
+- `zeus_pending_effects` — list external requests prepared but not sent.
+- `zeus_confirm_effect` — confirm one exact request by its payload hash, then send it.
 
 Run `npm run mcp` to launch the same server directly. It writes protocol data only to
 stdout and diagnostics to stderr.
@@ -636,7 +660,8 @@ non-empty arbitrary directory or a symlinked/traversal destination is refused.
 What stays local:
 
 - The SQLite store, transcripts, facts, candidates, intentions, and recall traces.
-- Follow-through proposals, intervention settings, and user decision events.
+- Follow-through proposals, detected signals, intervention settings, and user decisions.
+- Connector configuration, capability grants, prepared external requests, and receipts.
 - FTS5 indexes and embedding vectors.
 - Embedding inference after the model has been downloaded.
 
@@ -648,6 +673,15 @@ What is sent to OpenAI:
   the user messages actually present in that window.
 - Historical user excerpts only after the user explicitly starts the disclosed
   backfill preview.
+- When a calendar is connected: the objective, the step, and the calendar data a bounded
+  run read, so the model can draft the exact request you will be asked to confirm.
+
+What is sent to a connected service:
+
+- Only the calls a capability you granted permits: a bounded read of your calendar window,
+  and — after you confirm one by its hash — exactly the payload you confirmed.
+- Nothing else. A connector never receives your memory, your transcripts, or any
+  environment variable you did not name for it.
 
 Both OpenAI paths use the Responses API with `store: false`. Zeus is local-first, but it
 is **not encrypted at rest**: any process running as your operating-system user can read
@@ -656,9 +690,17 @@ commit them.
 
 ## Known limitations
 
-- Zeus can prepare drafts, research, comparisons, and plans in chat. This repository has
-  no email, calendar, reminder, shopping, or coordination adapters yet, so it never
-  claims those external actions happened.
+- Calendar is the only capability Zeus knows how to fill. There is no email, messaging,
+  reminder, or shopping capability yet, and `purchase` is refused unconditionally — the
+  storage layer will not even record it. Zeus can research and draft around those, but it
+  stops before the action and never claims otherwise.
+- Undoing an external request works only where the service's own answer makes it possible.
+  A created calendar event can be cancelled; a change to an existing one cannot be rolled
+  back, because Zeus never captured the prior state.
+- Detectors read only your calendar and your accepted commitments. They notice overlapping
+  events, tight turnarounds between different places, deadlines on already-full days, and
+  commitments with no time set aside. They are deliberately literal and will not infer that
+  you are running late.
 
 - Natural retraction is intentionally conservative: Zeus closes one multi-valued fact
   only when the subject, predicate, and value resolve to exactly one current claim;

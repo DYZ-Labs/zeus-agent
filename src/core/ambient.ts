@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 
+import { syncCalendar } from "./calendar-sync";
 import type { Db } from "./db";
 import { now } from "./db";
+import { getSignal, runDetectors } from "./detectors";
+import { logEvent } from "./observability";
 import type {
   AmbientDeliveryAttempt,
   AmbientSetting,
@@ -320,8 +323,9 @@ export function resolveTodayOpportunity(
   if (context.trigger !== "today") {
     throw new Error("A Today opportunity requires a Today evaluation context");
   }
+  // May be null when the worker's pick was a detected signal rather than a commitment.
+  // That is the common case for a conflict alert, so it must not short-circuit the reuse.
   const current = recommendNextAction(db, query, { context });
-  if (!current) return null;
   const cutoff = new Date(
     new Date(context.evaluated_at).getTime() - WORKER_OPPORTUNITY_REUSE_MS,
   ).toISOString();
@@ -330,8 +334,8 @@ export function resolveTodayOpportunity(
       `SELECT cycle.id, cycle.policy_version, cycle.trigger, cycle.context_json,
               cycle.query_text, cycle.candidate_scores_json,
               cycle.applied_facet_ids_json, cycle.exclusions_json,
-              cycle.selected_commitment_id, cycle.recommendation_json,
-              cycle.source_message_id, cycle.created_at
+              cycle.selected_commitment_id, cycle.selected_signal_id,
+              cycle.recommendation_json, cycle.source_message_id, cycle.created_at
        FROM recommendation_cycle cycle
        JOIN opportunity_delivery delivery
          ON delivery.opportunity_id = cycle.id AND delivery.channel = 'macos'
@@ -350,10 +354,46 @@ export function resolveTodayOpportunity(
     ) {
       continue;
     }
+    if (cycle.selected_signal_id !== null) {
+      // The notification already started this signal's cooldown, so re-evaluating would
+      // now select nothing and Today would look empty to someone who just tapped through.
+      // Reusing the exact cycle keeps the notification and the card one proposal.
+      const signal = getSignal(db, cycle.selected_signal_id);
+      if (signal && signal.resolved_at === null) return cycle;
+      continue;
+    }
+    if (!current) continue;
     const recommendation = recommendationForOpportunity(db, cycle.id);
     if (recommendation?.commitment_id === current.commitment_id) return cycle;
   }
   return null;
+}
+
+/**
+ * Refresh what Zeus can see, then re-derive what is worth noticing.
+ *
+ * Separate from `runAmbientEvaluation` because the two answer different questions: this
+ * updates the picture, that decides whether to interrupt. Neither calls a model. A failed
+ * refresh is not fatal — detectors simply run against the cache they already have, which
+ * degrades recall rather than inventing a reason to speak up.
+ */
+export async function refreshExternalSignals(
+  db: Db,
+  options: { at?: Date; signal?: AbortSignal } = {},
+): Promise<{ synced: boolean; detected: number; resolved: number }> {
+  const at = options.at ?? new Date();
+  const synced = await syncCalendar(db, { at, signal: options.signal });
+  const result = runDetectors(db, { at });
+  logEvent({
+    event: "detectors_run",
+    outcome: synced ? "ok" : "degraded",
+    count: result.created.length,
+  });
+  return {
+    synced: synced !== null,
+    detected: result.created.length,
+    resolved: result.resolved,
+  };
 }
 
 /**
