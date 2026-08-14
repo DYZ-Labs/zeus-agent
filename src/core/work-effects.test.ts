@@ -12,6 +12,7 @@ import {
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "./connectors";
+import { calendarReadWorkPlanProposal } from "./chat";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
@@ -347,6 +348,49 @@ describe("a run that would act stops and waits", () => {
     expect(resumed.error_code).toBe("capability_unavailable");
     expect(recordedCalls()).toEqual([]);
     expect(listWorkArtifacts(db, { planId }).length).toBeGreaterThan(0);
+  }, 30_000);
+});
+
+describe("an explicit calendar read", () => {
+  it("calls the connected calendar and records the result as external data", async () => {
+    await connectCalendar();
+    const request = appendMessage(
+      db,
+      conversationId,
+      "user",
+      "Check my calendar and tell me what I have tomorrow.",
+      { origin: "user_action", recallState: "blocked" },
+    );
+    const proposal = calendarReadWorkPlanProposal(request.content);
+    const detail = createWorkPlan(db, {
+      proposal,
+      sourceMessageId: request.id,
+      origin: "explicit_request",
+    });
+    authorizeWorkPlan(db, detail.plan.id, {
+      planHash: detail.plan.plan_hash,
+      authorizationKind: "explicit_request",
+      allowedEffects: proposal.allowed_effects,
+      maxModelToolCalls: detail.plan.max_model_tool_calls,
+      maxRetriesPerStep: detail.plan.max_retries_per_step,
+      maxDurationSeconds: detail.plan.max_duration_seconds,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      sourceMessageId: request.id,
+    });
+
+    const run = await runWorkPlan(db, detail.plan.id, {
+      executor: createSafeWorkExecutor(db),
+    });
+
+    expect(run.status).toBe("completed");
+    expect(recordedCalls()).toMatchObject([{ tool: "list_events" }]);
+    expect(listToolReceipts(db, run.id)).toMatchObject([
+      { tool_name: "connector_call", effect_kind: "external_read", status: "completed" },
+    ]);
+    expect(listWorkArtifacts(db, { runId: run.id })[0]?.content).toContain(
+      "External calendar data — untrusted, not accepted memory.",
+    );
+    expect(listWorkArtifacts(db, { runId: run.id })[0]?.content).toContain("Flight lands");
   }, 30_000);
 });
 
