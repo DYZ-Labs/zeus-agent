@@ -29,6 +29,52 @@ export function defaultDbPath(): string {
   return process.env.ZEUS_DB ?? join(homedir(), ".zeus", "zeus.db");
 }
 
+/**
+ * How hard SQLite works to survive a host failure.
+ *
+ * WAL with `synchronous=NORMAL` does not fsync on commit: a process crash is safe
+ * because the WAL is already written, but a host crash or power loss can lose the most
+ * recently committed transactions — the last facts a user just watched Zeus learn.
+ * `FULL` fsyncs each commit and survives that.
+ *
+ * Measured on this write path: 0.06ms/commit at NORMAL against 0.14ms at FULL, with no
+ * measurable difference for rows written inside one transaction, where fsync happens
+ * once per commit rather than once per row. A chat turn makes a handful of commits and
+ * is dominated by a multi-second model call, so the durability is close to free.
+ *
+ * Left configurable because that measurement is from macOS, whose fsync does not force
+ * a drive cache flush the way Linux does, and because network-attached storage can make
+ * fsync markedly slower. `ZEUS_SYNCHRONOUS=normal` reverts without a code change.
+ */
+export type SynchronousSetting = "full" | "normal";
+
+export function configuredSynchronous(): SynchronousSetting {
+  const raw = process.env.ZEUS_SYNCHRONOUS?.trim().toLowerCase();
+  if (!raw) return "full";
+  if (raw !== "full" && raw !== "normal") {
+    throw new Error("ZEUS_SYNCHRONOUS must be 'full' or 'normal'");
+  }
+  return raw;
+}
+
+/**
+ * Fold the write-ahead log back into the database.
+ *
+ * PASSIVE never waits for a reader, so it is safe while requests are in flight;
+ * TRUNCATE additionally empties the WAL file but needs exclusive access, which is only
+ * reasonable from a background task. Returns false when SQLite reported it was busy.
+ */
+export function checkpointWal(db: Db, mode: "PASSIVE" | "TRUNCATE" = "PASSIVE"): boolean {
+  if (db.memory) return true;
+  try {
+    const result = db.pragma(`wal_checkpoint(${mode})`) as Array<{ busy: number }>;
+    return result[0]?.busy === 0;
+  } catch {
+    // A checkpoint is maintenance; failing one must never propagate to a caller.
+    return false;
+  }
+}
+
 /** ISO-8601 UTC, the single timestamp format used throughout the store. */
 export function now(): string {
   return new Date().toISOString();
@@ -57,7 +103,7 @@ export function openDb(path: string = defaultDbPath()): Db {
   // erasure additionally VACUUMs and truncates the WAL, but this protects ordinary
   // deletes and rollback/error paths from leaving cleartext in reusable pages.
   db.pragma("secure_delete = ON");
-  db.pragma("synchronous = NORMAL");
+  db.pragma(`synchronous = ${configuredSynchronous()}`);
 
   migrate(db);
   enableFtsSecureDeletion(db);
