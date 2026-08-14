@@ -39,8 +39,9 @@ vi.mock("@/core/embed", async (importOriginal) => {
 import {
   acceptFacetCandidateAction,
   answerReflectionAction,
-  deleteAllConversationsAction,
+  clearConversationHistoryAction,
   deleteConversationFromHistoryAction,
+  removeConversationFromHistoryAction,
 } from "./actions";
 
 describe("understanding web-action embeddings", () => {
@@ -139,7 +140,7 @@ describe("conversation deletion actions", () => {
     vi.clearAllMocks();
   });
 
-  it("permanently erases every source conversation and its messages", async () => {
+  it("clears every chat from visible history without erasing source messages", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);
     const first = createConversation(db, { title: "First chat" });
@@ -147,16 +148,30 @@ describe("conversation deletion actions", () => {
     appendMessage(db, first.id, "user", "Keep this first transcript.");
     appendMessage(db, second.id, "user", "Keep this second transcript.");
 
-    const form = new FormData();
-    form.set("confirmation", "erase-all-sources");
-    await deleteAllConversationsAction(form);
+    await clearConversationHistoryAction();
 
     expect(listChatHistory(db)).toEqual([]);
-    expect(listConversations(db)).toHaveLength(0);
-    expect(messagesIn(db, first.id)).toHaveLength(0);
-    expect(messagesIn(db, second.id)).toHaveLength(0);
+    expect(listConversations(db)).toHaveLength(2);
+    expect(messagesIn(db, first.id)).toHaveLength(1);
+    expect(messagesIn(db, second.id)).toHaveLength(1);
     expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/settings");
     expect(actionMocks.redirect).not.toHaveBeenCalled();
+  });
+
+  it("removes a recent chat immediately without erasing its source", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const removed = createConversation(db, { title: "Remove me" });
+    const preserved = createConversation(db, { title: "Keep me" });
+    appendMessage(db, removed.id, "user", "Keep this source message.");
+    appendMessage(db, preserved.id, "user", "Keep this chat visible.");
+
+    await removeConversationFromHistoryAction(removed.id);
+
+    expect(listChatHistory(db).map((chat) => chat.id)).toEqual([preserved.id]);
+    expect(getConversation(db, removed.id)).not.toBeNull();
+    expect(messagesIn(db, removed.id)).toHaveLength(1);
+    expect(actionMocks.revalidatePath).toHaveBeenCalledWith("/", "layout");
   });
 
   it("permanently erases only the selected source and its solely evidenced details", async () => {

@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   deleteConversationFromHistoryAction,
+  removeConversationFromHistoryAction,
   renameConversationAction,
 } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
@@ -290,18 +291,13 @@ function RecentChatLink({
   onDeleted: () => void;
 }) {
   const [pending, setPending] = useState(false);
-  const [confirming, setConfirming] = useState(false);
 
   async function deleteChat() {
     if (pending) return;
-    if (!confirming) {
-      setConfirming(true);
-      return;
-    }
 
     setPending(true);
     try {
-      await deleteConversationFromHistoryAction(chat.id, "erase-source");
+      await removeConversationFromHistoryAction(chat.id);
       onDeleted();
     } finally {
       setPending(false);
@@ -324,19 +320,17 @@ function RecentChatLink({
       </Link>
       <button
         type="button"
-        aria-label={confirming
-          ? `Confirm permanently deleting ${chat.title}`
-          : `Permanently delete ${chat.title}`}
-        title={confirming ? "Click again to permanently delete" : "Delete source permanently"}
+        aria-label={`Delete ${chat.title}`}
+        title="Delete chat"
         disabled={pending}
         onClick={() => void deleteChat()}
-        className={`absolute right-1 top-0.5 flex h-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${confirming ? "w-12" : "w-7"} ${
+        className={`absolute right-1 top-0.5 flex h-7 w-7 items-center justify-center rounded-md [color:var(--shell-muted)] transition-all hover:bg-white/[0.09] hover:[color:#ff6767] focus-visible:[color:#ff6767] disabled:cursor-wait disabled:opacity-50 ${
           active
             ? "opacity-100"
             : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
         }`}
       >
-        {confirming ? <span className="text-[10px] font-semibold">Sure?</span> : <TrashIcon />}
+        <TrashIcon />
       </button>
     </li>
   );
