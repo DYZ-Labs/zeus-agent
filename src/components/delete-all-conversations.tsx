@@ -7,6 +7,7 @@ import { clearConversationHistoryAction } from "@/app/actions";
 
 export function DeleteAllConversations({ disabled = false }: { disabled?: boolean }) {
   const router = useRouter();
+  const [confirming, setConfirming] = useState(false);
   const [pending, setPending] = useState(false);
 
   async function deleteAll() {
@@ -19,7 +20,17 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
       router.refresh();
     } finally {
       setPending(false);
+      setConfirming(false);
     }
+  }
+
+  function handleClick() {
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+
+    void deleteAll();
   }
 
   return (
@@ -31,7 +42,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
       <button
         type="button"
         disabled={disabled || pending}
-        onClick={() => void deleteAll()}
+        onClick={handleClick}
         className="h-9 rounded-full border px-3.5 text-sm font-medium transition-colors hover:bg-white/[0.05] disabled:cursor-not-allowed disabled:opacity-40"
         style={{
           background: "var(--shell-panel)",
@@ -39,7 +50,7 @@ export function DeleteAllConversations({ disabled = false }: { disabled?: boolea
           color: "#ff6767",
         }}
       >
-        {pending ? "Clearing…" : "Delete"}
+        {confirming ? "Are you sure?" : "Delete"}
       </button>
     </div>
   );
