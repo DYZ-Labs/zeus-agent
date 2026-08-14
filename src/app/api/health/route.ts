@@ -3,6 +3,7 @@ import { embeddingStatus } from "@/core/embed";
 import { MIGRATIONS } from "@/core/migrations";
 import { errorSignature, logEvent } from "@/core/observability";
 import { hasCredentials } from "@/core/openai";
+import { snapshotReplicationStatus } from "@/core/snapshot-replication";
 import { getAuthConfiguration } from "@/server/auth/config";
 import { getDb } from "@/server/db";
 import { snapshotSchedulerStatus } from "@/server/snapshot-scheduler";
@@ -49,6 +50,10 @@ export async function GET(): Promise<Response> {
       // A backup that quietly stopped running is the failure this whole subsystem
       // exists to prevent, so its state is reported rather than assumed.
       snapshots: snapshotSchedulerStatus(),
+      // A snapshot that only ever exists beside the store is not yet a backup: the
+      // volume that loses one loses both. Whether a copy is configured to leave the box,
+      // and whether the last one did, are reported so a monitor can alert on either.
+      replication: snapshotReplicationStatus(),
     },
     {
       status: healthy ? 200 : 503,

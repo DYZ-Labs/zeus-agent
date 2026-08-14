@@ -217,6 +217,51 @@ Railway's environment log combines lifecycle output from consecutive deployments
 normally belongs to the previous deployment being retired. Open the deployment-specific
 log or filter by replica before treating that sequence as a crash in the new process.
 
+Run **one instance**. The bounded-work concurrency cap and the snapshot scheduler are both
+process-local, so a second replica silently doubles the first and gives the second a rival
+backup timer against the same volume. Zeus does not enforce this, and a mounted volume
+belongs to one service, so it is a setting to confirm rather than a guarantee to assume.
+
+#### Rolling back a release
+
+**A release that contains a migration cannot be rolled back by deploying the previous
+image.** This is the most important operational fact about Zeus, and it is a consequence of
+a deliberate safety property rather than a defect: `validateMigrationLedger` refuses a store
+whose applied ledger is not an exact ordered prefix of the running build, because a build
+that does not recognise the schema in front of it must not write to it. A store migrated by
+release N therefore refuses to open under release N−1.
+
+The failure is quiet in the worst way. `openDb()` migrates on open and `GET /api/health`
+opens the store, so the rolled-back deployment fails its own health check and never becomes
+active. Because a volume-backed service cannot keep two deployments live, there is no
+previous container still serving: the service is down for every account and stays down.
+Railway's Rollback button is the natural reflex after a bad release, and on this deployment
+it makes the incident worse.
+
+**Prefer rolling forward.** Ship a fix on top. It is almost always faster than any restore,
+and it is the only path that does not discard data.
+
+**When you must go back past a migration**, the restore runbook below is the procedure, with
+one hosted-specific complication: `npm run restore` refuses to run while a writer holds the
+store, and on Railway the writer is the service itself — stopping which normally removes the
+shell you would restore from. Break that circle by replacing the process rather than removing
+it:
+
+1. Set the service's start command to `sleep infinity` and redeploy. The container keeps the
+   volume mounted with no Zeus process attached to the store.
+2. `railway ssh` into it, then restore each store explicitly — the primary and every
+   `accounts/<uuid>.db` — using the runbook below. There is deliberately no
+   restore-everything flag; name each store.
+3. Restore the original start command and deploy the older image.
+
+Rehearse this against a staging volume before you need it, and time it. Until it has been
+rehearsed, the recovery time is an assumption rather than a number.
+
+**Design new migrations so this bites less often.** Prefer expand/contract: add nullable
+columns and new tables in one release, and stop reading the old shape in the next. That keeps
+one release of backward compatibility, which turns most rollbacks back into ordinary
+redeploys.
+
 ## Configuration
 
 | Variable | Required | Default | Purpose |
@@ -244,6 +289,8 @@ log or filter by replica before treating that sequence as a crash in the new pro
 | `ZEUS_SNAPSHOT_DIR` | No | `<database directory>/snapshots` | Absolute directory for verified SQLite snapshots |
 | `ZEUS_SNAPSHOT_RETENTION` | No | `14` | Number of newest verified local snapshots to keep |
 | `ZEUS_SNAPSHOT_HOUR` | No | `3` | Local hour (`0`–`23`) for the daily macOS snapshot job |
+| `ZEUS_SNAPSHOT_REPLICA_COMMAND` | Strongly advised when hosted | — | Command run on each verified snapshot to copy it off the volume; no shell, path appended as the last argument |
+| `ONNXRUNTIME_NODE_INSTALL` | Build-time, hosted | — | Set to `skip` so `npm ci` does not fetch ~196MB of unused CUDA libraries from nuget.org |
 | `ZEUS_EMBEDDINGS` | No | enabled | Set to `off` for FTS5 and graph search only |
 | `ZEUS_MODEL_CACHE` | No | `.models` | Embedding-model cache; resolved to an absolute path |
 | `ZEUS_WARM_EMBEDDINGS` | No | on when hosted | Load the model at startup rather than on first search |
@@ -300,6 +347,28 @@ rather than truncated, so a bad call site is visible instead of leaking half a s
 
 Account ids in events are Supabase UUIDs, which are pseudonymous by design; emails and
 display names are never logged.
+
+#### Something has to read it
+
+Railway probes `/api/health` **once**, before routing traffic to a new deployment. It is
+not a continuous check, so after a deploy goes green every state this endpoint exists to
+expose is computed by nobody — and with `restartPolicyMaxRetries` at 3, a crash loop ends
+with the service down and no one told.
+
+[`.github/workflows/health.yml`](.github/workflows/health.yml) is the standing probe. Set
+the repository secret **`ZEUS_HEALTH_URL`** to the deployment's health endpoint and it runs
+every fifteen minutes, failing the workflow — and so notifying you — on a non-200, an
+unopenable store, a snapshot scheduler that is not running, a snapshot run that finished
+`failed` or `partial`, a snapshot that has not run for two intervals, or an off-box copy
+that failed. Degradations that are not outages, such as `embeddings: "unavailable"` or no
+replication command being configured, are raised as warnings so the alarm keeps meaning
+something. With the secret unset the workflow skips rather than fails, so a fork or a
+fresh clone stays green.
+
+GitHub's scheduler is best-effort and disables scheduled workflows on repositories with no
+recent commits, so treat a *missing* run as unknown rather than healthy. This is the
+cheapest useful monitor, not the best one; a dedicated uptime service polling the same
+endpoint is strictly better and reports the outages that take GitHub with them.
 
 ### Model budget and concurrency
 
@@ -504,19 +573,47 @@ verifies the snapshot, so you can confirm a copy is usable before committing to 
 Restore one store at a time and name it explicitly; there is deliberately no
 restore-everything flag.
 
-#### Optional encrypted off-machine copy
+#### Encrypted off-machine copy
 
-Zeus does not upload snapshots or manage encryption keys. For an opt-in off-machine
-copy, run an established encrypted backup tool such as restic only after the local
-snapshot command succeeds. Keep its password in an owner-only file outside the
-repository rather than in a command argument, and target the snapshot directory with a
-dedicated tag or repository. For example, after configuring a restic repository:
+**A snapshot beside the store is not yet a backup.** The volume that loses the database
+loses its snapshots and its pre-migration backups in the same moment, so on a hosted
+deployment an off-machine copy is the difference between an incident and an ending. Zeus
+still does not upload anything itself or manage encryption keys — it runs a command you
+choose, so credentials stay with the tool that owns them.
+
+On a workstation, run an established encrypted backup tool after the local snapshot
+command succeeds. Keep its password in an owner-only file outside the repository rather
+than in a command argument, and target the snapshot directory with a dedicated tag or
+repository:
 
 ```bash
 export RESTIC_PASSWORD_FILE=/absolute/path/to/private-restic-password
 export RESTIC_REPOSITORY=/absolute/path-or-supported-remote
 restic backup /absolute/path/to/zeus-snapshots --tag zeus
 ```
+
+On a hosted deployment there is no shell to chain that to — snapshots run inside the
+server process on a timer — so set **`ZEUS_SNAPSHOT_REPLICA_COMMAND`** instead. Zeus runs
+it once per snapshot, after the copy has been created *and verified*, appending the
+snapshot's absolute path as the final argument:
+
+```bash
+ZEUS_SNAPSHOT_REPLICA_COMMAND=/usr/local/bin/restic backup --tag zeus
+# runs: restic backup --tag zeus /data/snapshots/<store>-<timestamp>-<uuid>.db
+```
+
+The value is split on whitespace into argv and spawned without a shell, so nothing is
+expanded and a path containing spaces or shell characters stays one literal argument.
+There is deliberately no quoting, no pipe, and no chaining: anything that needs them
+belongs in a script you point this at. Give that script its own environment for
+`RESTIC_PASSWORD_FILE` and friends — Zeus reads none of it and stores none of it.
+
+Replication is best effort by design. A snapshot that was created and verified is already
+a success, so a failed copy never turns a good backup into a failed one; it is logged as
+`snapshot_replication_failed` and surfaced on `/api/health` under `replication`, which is
+what the scheduled health workflow alerts on. Verify it is actually working after the
+first deploy rather than assuming — `replication.state` reports whether a command is
+configured at all, which is the failure mode worth catching early.
 
 Off-machine retention and deletion are a separate user-owned boundary. Zeus's explicit
 source deletion removes managed local snapshots, not copies already uploaded elsewhere;

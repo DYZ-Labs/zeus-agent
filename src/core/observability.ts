@@ -39,6 +39,11 @@ export type ZeusEvent = {
   connector_id?: number | null;
   effect_id?: number | null;
   count?: number | null;
+  /**
+   * A child process's exit status. A small integer chosen by a program Zeus itself ran,
+   * never a byte of that program's output.
+   */
+  exit_code?: number | null;
   error_name?: string;
   /** First application stack frame as `src/…:line`. A code location, not user data. */
   error_site?: string;
@@ -80,6 +85,7 @@ const NUMERIC_FIELDS = [
   "connector_id",
   "effect_id",
   "count",
+  "exit_code",
 ] as const;
 
 /** A rejected value reports that it was rejected rather than disappearing silently. */

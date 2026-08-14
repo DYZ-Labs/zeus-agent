@@ -2,7 +2,9 @@ import "server-only";
 
 import { openDb } from "@/core/db";
 import { errorSignature, logEvent } from "@/core/observability";
+import { replicateSnapshot } from "@/core/snapshot-replication";
 import {
+  deploymentSnapshotDirectory,
   SNAPSHOT_CHECK_INTERVAL_MS,
   snapshotScheduleSettings,
   storesDueForSnapshot,
@@ -98,15 +100,24 @@ export function runDueSnapshots(): Promise<void> {
 
 async function executeDueSnapshots(state: SchedulerState): Promise<void> {
   try {
-    const due = storesDueForSnapshot({ intervalHours: state.settings.intervalHours });
+    // Resolved once and handed to both sides. Asking "is one due yet?" and writing the
+    // copy have to name the same directory, and the only way they cannot drift is for
+    // neither to fall back to its own default.
+    const directory = deploymentSnapshotDirectory();
+    const due = storesDueForSnapshot({
+      intervalHours: state.settings.intervalHours,
+      directory,
+    });
     if (due.length === 0) return;
 
     let failed = 0;
     for (const store of due) {
+      let replicable: string | null = null;
       try {
         const db = openDb(store.path);
         try {
-          const result = createVerifiedSnapshot(db);
+          const result = createVerifiedSnapshot(db, { directory });
+          replicable = result.path;
           logEvent({
             event: "snapshot_created",
             outcome: "ok",
@@ -127,6 +138,14 @@ async function executeDueSnapshots(state: SchedulerState): Promise<void> {
           ...errorSignature(error),
         });
       }
+
+      // Deliberately outside the try, and deliberately not counted in `failed`: the copy
+      // leaving the volume is a second, weaker guarantee than the snapshot existing on it.
+      // A verified snapshot is already a success, and reporting it as a failure because an
+      // off-box upload timed out would make the two indistinguishable in the log — exactly
+      // the confusion the health endpoint reports them separately to avoid. The store is
+      // closed by now, so a slow upload holds no connection open.
+      if (replicable !== null) await replicateSnapshot(replicable);
     }
 
     state.lastRunAt = new Date().toISOString();

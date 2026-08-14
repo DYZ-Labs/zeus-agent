@@ -18,6 +18,10 @@ vi.mock("@/server/auth/config", () => ({
 import { openTestDb } from "@/core/db";
 import { MIGRATIONS } from "@/core/migrations";
 import {
+  replicateSnapshot,
+  resetSnapshotReplication,
+} from "@/core/snapshot-replication";
+import {
   resetSnapshotScheduler,
   startSnapshotScheduler,
 } from "@/server/snapshot-scheduler";
@@ -34,6 +38,7 @@ beforeEach(() => {
 
 afterEach(() => {
   resetSnapshotScheduler();
+  resetSnapshotReplication();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -61,6 +66,13 @@ describe("health check", () => {
         lastResult: null,
         lastRunAt: null,
       },
+      // ...and a copy that never leaves the volume it protects is the other half of it.
+      replication: {
+        state: "not_configured",
+        lastResult: null,
+        lastReason: null,
+        lastAttemptAt: null,
+      },
     });
   });
 
@@ -73,6 +85,24 @@ describe("health check", () => {
     // Still serving, so still 200 — but the backups are visibly not running.
     expect(body.status).toBe("ok");
     expect(body.snapshots.state).toBe("disabled");
+  });
+
+  it("surfaces a snapshot copy that never made it off the volume", async () => {
+    vi.stubEnv("ZEUS_SNAPSHOT_REPLICA_COMMAND", "/nonexistent/zeus-replica-tool");
+    await replicateSnapshot("/var/tmp/zeus-snapshot-never-copied.db");
+
+    const body = await (await GET()).json();
+
+    // Still serving, so still 200 — but the only copy of the store is on one volume.
+    expect(body.status).toBe("ok");
+    expect(body.replication).toMatchObject({
+      state: "configured",
+      lastResult: "failed",
+      lastReason: "command_missing",
+    });
+    // The configured command and the snapshot path stay out of an unauthenticated body.
+    expect(JSON.stringify(body)).not.toContain("zeus-replica-tool");
+    expect(JSON.stringify(body)).not.toContain("zeus-snapshot-never-copied");
   });
 
   it("fails with 503 when the store cannot be opened", async () => {

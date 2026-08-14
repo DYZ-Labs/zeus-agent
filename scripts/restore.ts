@@ -2,7 +2,8 @@ import { resolve } from "node:path";
 
 import { defaultDbPath } from "../src/core/db";
 import { restoreDatabaseCopy, planRestore } from "../src/core/restore";
-import { defaultSnapshotDirectory, listRestorableSnapshots } from "../src/core/snapshots";
+import { deploymentSnapshotDirectory } from "../src/core/snapshot-schedule";
+import { listRestorableSnapshots } from "../src/core/snapshots";
 import { loadLocalEnvironment } from "./local-env";
 
 loadLocalEnvironment(resolve(import.meta.dirname, ".."));
@@ -25,9 +26,12 @@ renamed aside, never deleted.
 `;
 
 const target = resolve(option("--db") ?? defaultDbPath());
-const directory = resolve(
-  option("--directory") ?? defaultSnapshotDirectory(defaultDbPath()),
-);
+// `--db` names the store being recovered, which is usually an account store, but every
+// store's copies live in the one directory beside the *primary* store. Deriving the
+// directory from the target instead would look in `accounts/snapshots` and report that
+// a hosted user has no backups at all, which is the moment that report is least
+// survivable. `ZEUS_DB` must therefore name the primary store during a recovery.
+const directory = resolve(option("--directory") ?? deploymentSnapshotDirectory());
 
 if (process.argv.includes("--help")) {
   process.stdout.write(USAGE);

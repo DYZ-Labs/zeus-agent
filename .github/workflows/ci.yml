@@ -22,6 +22,16 @@ jobs:
       # The build prefetches the embedding model; CI does not need 130MB of ONNX
       # weights to typecheck, lint, and test the code that loads them.
       ZEUS_SKIP_MODEL_PREFETCH: "1"
+      # onnxruntime-node arrives as a plain dependency of @huggingface/transformers, and
+      # its postinstall treats every linux/x64 install as a CUDA target: the three
+      # provider libraries it wants are not in the npm tarball, so it fetches ~200MB from
+      # api.nuget.org on a machine that will only ever run the CPU backend. The download
+      # is started without being awaited or caught, which turns a nuget outage, throttle,
+      # or slow mirror into an unhandled rejection, a failed postinstall, and a failed
+      # `npm ci` — a red build and a blocked deploy caused by a third-party CDN we do not
+      # depend on. "skip" is the value the install script tests for before it resolves any
+      # feed, so nothing is requested at all. Do not remove this.
+      ONNXRUNTIME_NODE_INSTALL: skip
     steps:
       - name: Check out the exact revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

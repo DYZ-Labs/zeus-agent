@@ -51,7 +51,7 @@ import { StdioServerTransport } from "${moduleUrl("@modelcontextprotocol/sdk/ser
 import { z } from "${moduleUrl("zod")}";
 import { appendFileSync } from "node:fs";
 
-const log = process.env.ZEUS_TEST_CALL_LOG;
+const log = process.env.FAKE_CALENDAR_CALL_LOG;
 const server = new McpServer({ name: "fake-calendar", version: "0.0.1" });
 
 server.registerTool(
@@ -85,12 +85,12 @@ beforeEach(() => {
   }).id;
   directory = mkdtempSync(join(tmpdir(), "zeus-effects-test-"));
   callLog = join(directory, "calls.log");
-  process.env.ZEUS_TEST_CALL_LOG = callLog;
+  process.env.FAKE_CALENDAR_CALL_LOG = callLog;
 });
 
 afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
-  delete process.env.ZEUS_TEST_CALL_LOG;
+  delete process.env.FAKE_CALENDAR_CALL_LOG;
 });
 
 function recordedCalls(): Array<Record<string, unknown>> {
@@ -139,7 +139,7 @@ async function grantCalendar(): Promise<void> {
     command: process.execPath,
     args: [scriptPath],
     cwd: process.cwd(),
-    envVarNames: ["ZEUS_TEST_CALL_LOG"],
+    envVarNames: ["FAKE_CALENDAR_CALL_LOG"],
     sourceMessageId: userMessageId,
   });
   const { tools } = await verifyConnector(db, connector.id);

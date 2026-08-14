@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 
 import {
   type ConnectorPreset,
+  connectorEnvironmentAllowed,
   getConnectorPreset,
   localConnectorPresetsAllowed,
   presetCapability,
+  stdioConnectorsAllowed,
 } from "./connector-catalog";
 import type { Db } from "./db";
 import { now } from "./db";
@@ -159,6 +161,7 @@ export function createConnector(db: Db, input: CreateConnectorInput): ConnectorV
   let cwd: string | null = null;
   let url: string | null = null;
   if (input.transport === "stdio") {
+    assertStdioConnectorsAllowed();
     command = normalizedCommand(input.command);
     cwd = input.cwd ? normalizedText(input.cwd, MAX_COMMAND, "connector directory") : null;
   } else {
@@ -733,6 +736,7 @@ export function availableCapability(db: Db, slot: CapabilitySlot): BoundCapabili
     const connector = getConnector(db, capability.connector_id);
     if (!connector || connector.enabled !== 1 || connector.status !== "ready") continue;
     if (connector.preset_id !== null && !localConnectorPresetsAllowed()) continue;
+    if (connector.transport === "stdio" && !stdioConnectorsAllowed()) continue;
     if (connector.missingEnvVarNames.length > 0) continue;
     return { capability, connector };
   }
@@ -795,8 +799,16 @@ export function connectorEnvironment(
   connector: ConnectorView,
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, string> {
+  // Asked again on the way out, not only when the row was written. A store configured while
+  // one person ran it can later be opened by a hosted deployment, and it is this call that
+  // decides whether the operator's environment is spent — so a row that predates the rule
+  // resolves to nothing rather than to the credential it names.
+  if (!connectorEnvironmentAllowed(environment)) return {};
+
   const resolved: Record<string, string> = {};
   for (const name of connector.envVarNames) {
+    // The broker's own key is never a connector's to borrow, in either deployment: it
+    // authenticates Zeus to the broker, not this connection to anything.
     if (name === GOOGLE_CALENDAR_BROKER_SERVICE_KEY) continue;
     const value = environment[name];
     if (typeof value === "string") resolved[name] = value;
@@ -811,7 +823,13 @@ function connectorView(db: Db, row: Connector): ConnectorView {
     args: parseStringArray(row.args_json),
     envVarNames,
     missingEnvVarNames: [
-      ...envVarNames.filter((name) => typeof process.env[name] !== "string"),
+      // Answered from what the connector would actually receive, not from what happens to
+      // exist beside Zeus. Where the environment is not the connector's to borrow, every
+      // named variable is missing — otherwise this panel would report which of the
+      // operator's variables are set, which is most of the value of reading them.
+      ...envVarNames.filter(
+        (name) => !connectorEnvironmentAllowed() || typeof process.env[name] !== "string",
+      ),
       ...(row.provider === "google_calendar" &&
       typeof process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] !== "string"
         ? [GOOGLE_CALENDAR_BROKER_SERVICE_KEY]
@@ -865,6 +883,20 @@ function normalizedText(value: string, max: number, subject: string): string {
   return text;
 }
 
+/**
+ * A stored row is a standing permission to run a program, so the deployment has to be one
+ * that may run programs on the user's behalf at the moment it is written. `transportFor`
+ * asks the same question again before a spawn, because a store created locally can later
+ * be opened by a hosted deployment, and only the second check protects the other tenants.
+ */
+function assertStdioConnectorsAllowed(): void {
+  if (stdioConnectorsAllowed()) return;
+  throw new Error(
+    "A connection that runs a command is available only when you run Zeus yourself. " +
+      "Reach this service over https instead.",
+  );
+}
+
 function normalizedCommand(value: string | null | undefined): string {
   const command = normalizedText(value ?? "", MAX_COMMAND, "connector command");
   if (SHELL_METACHARACTER.test(command)) {
@@ -903,7 +935,30 @@ function normalizedEnvVarNames(names: readonly string[]): string[] {
       throw new Error("That environment variable is reserved for a system-managed provider");
     }
   }
+  if (normalized.length > 0) assertConnectorEnvironmentAllowed();
   return [...new Set(normalized)].sort();
+}
+
+/**
+ * Whose environment is being spent.
+ *
+ * Naming a variable is as good as holding the value behind it, because Zeus reads it from
+ * the live process environment at call time. Locally that environment is the user's own and
+ * this is simply how a connector is given its token. Hosted, it is the operator's, and the
+ * same field becomes a way to ask Zeus for a credential it was trusted with — most sharply
+ * on an HTTP connector, where the value comes back out as the bearer token of a request to
+ * a host the user chose.
+ *
+ * Refused wholesale rather than screened, because a screen only covers the namespaces
+ * somebody listed. The operator's environment also carries the variables of everything else
+ * they run beside Zeus, and the one added next month is not on any list.
+ */
+function assertConnectorEnvironmentAllowed(): void {
+  if (connectorEnvironmentAllowed()) return;
+  throw new Error(
+    "A connection cannot borrow this deployment's environment variables. Give the " +
+      "service its own credential, or run Zeus yourself to use your own environment.",
+  );
 }
 
 /**
