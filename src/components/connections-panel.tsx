@@ -1,6 +1,7 @@
 import {
   addConnectorAction,
   bindCapabilityAction,
+  disconnectGoogleCalendarAction,
   removeConnectorAction,
   setCapabilityEnabledAction,
   setConnectorEnabledAction,
@@ -42,15 +43,25 @@ export function ConnectionsPanel({
   connectors,
   errorMessage,
   localMode,
+  successMessage,
+  googleCalendarAvailable,
+  hostedAccount,
 }: {
   connectors: ConnectorView[];
   errorMessage: string | null;
   localMode: boolean;
+  successMessage: string | null;
+  googleCalendarAvailable: boolean;
+  hostedAccount: boolean;
 }) {
-  const googleCalendar =
+  const brokerCalendar = connectors.find(
+    (connector) => connector.provider === "google_calendar",
+  ) ?? null;
+  const localCalendar =
     connectors.find((connector) => connector.preset_id === GOOGLE_CALENDAR_PRESET_ID) ?? null;
-  const customConnectors = connectors.filter((connector) => connector.preset_id === null);
-
+  const customConnectors = connectors.filter(
+    (connector) => connector.provider === "generic" && connector.preset_id === null,
+  );
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
       <h1 className="text-lg font-semibold leading-6">Connections</h1>
@@ -70,19 +81,41 @@ export function ConnectionsPanel({
         </p>
       ) : null}
 
-      <GoogleCalendarConnection
-        key={`${googleCalendar?.id ?? "new"}-${googleCalendar?.updated_at ?? "available"}`}
-        connector={googleCalendar}
-        localMode={localMode}
-      />
+      {successMessage ? (
+        <p
+          className="mt-4 rounded-lg border px-3 py-2 text-[0.82rem] leading-5"
+          style={{ borderColor: "#166534", color: "var(--shell-fg)" }}
+          role="status"
+        >
+          {successMessage}
+        </p>
+      ) : null}
 
-      {customConnectors.length > 0 ? (
+      {localMode ? (
+        <GoogleCalendarConnection
+          key={`${localCalendar?.id ?? "new"}-${localCalendar?.updated_at ?? "available"}`}
+          connector={localCalendar}
+          localMode
+        />
+      ) : (
+        <GoogleCalendarCard
+          connector={brokerCalendar}
+          available={googleCalendarAvailable}
+          hostedAccount={hostedAccount}
+        />
+      )}
+
+      {customConnectors.length === 0 ? (
+        <p className="mt-5 text-[0.84rem] leading-6" style={{ color: "var(--shell-faint)" }}>
+          No advanced MCP connections are configured.
+        </p>
+      ) : (
         <ul className="mt-5 space-y-4">
           {customConnectors.map((connector) => (
             <ConnectorCard key={connector.id} connector={connector} />
           ))}
         </ul>
-      ) : null}
+      )}
 
       <details className="mt-6 border-t pt-4" style={{ borderColor: "var(--shell-line)" }}>
         <summary className="cursor-pointer text-[0.82rem] font-medium">
@@ -95,6 +128,140 @@ export function ConnectionsPanel({
         <AddConnectorForm />
       </details>
     </section>
+  );
+}
+
+function GoogleCalendarCard({
+  connector,
+  available,
+  hostedAccount,
+}: {
+  connector: ConnectorView | null;
+  available: boolean;
+  hostedAccount: boolean;
+}) {
+  const readCapability = connector?.capabilities.find(
+    (entry) => entry.slot === "calendar.list_events",
+  ) ?? null;
+  const writeCapabilities = connector?.capabilities.filter(
+    (entry) =>
+      entry.slot === "calendar.create_event" || entry.slot === "calendar.update_event",
+  ) ?? [];
+  const writeGranted = writeCapabilities.length === 2;
+
+  return (
+    <article
+      className="mt-5 rounded-xl border px-4 py-4"
+      style={{ borderColor: "var(--shell-line-strong)", background: "var(--shell-elevated)" }}
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-[0.95rem] font-medium">Google Calendar</h2>
+        <span className="font-mono text-[0.62rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
+          {connector?.enabled === 1 ? "connected" : connector ? connectorStatusLabel(connector.status) : "not connected"}
+        </span>
+      </div>
+      <p className="mt-1 text-[0.78rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        Connect your own Google account. Google credentials stay in the separate encrypted
+        broker and never enter Zeus memory.
+      </p>
+
+      {!hostedAccount ? (
+        <p className="mt-3 text-[0.78rem]" style={{ color: "var(--shell-faint)" }}>
+          Sign in to the hosted Zeus site to connect a personal calendar.
+        </p>
+      ) : !available ? (
+        <p className="mt-3 text-[0.78rem]" style={{ color: "var(--shell-faint)" }}>
+          The Google Calendar broker is not configured on this deployment yet.
+        </p>
+      ) : !connector ? (
+        <a
+          href="/api/integrations/google-calendar/start?permission=read"
+          className="mt-3 inline-flex rounded-lg px-3 py-2 text-[0.8rem] font-medium"
+          style={{ background: "var(--shell-accent)", color: "#000000" }}
+        >
+          Connect Google Calendar
+        </a>
+      ) : (
+        <div className="mt-4 space-y-3">
+          {connector.status !== "ready" ? (
+            <div>
+              <p className="text-[0.78rem]" style={{ color: "var(--shell-faint)" }}>
+                Google Calendar needs to be reconnected before Zeus can use it.
+              </p>
+              <a
+                href="/api/integrations/google-calendar/start?permission=read"
+                className="mt-2 inline-flex text-[0.78rem] font-medium"
+                style={{ color: "var(--shell-accent)" }}
+              >
+                Reconnect Google Calendar
+              </a>
+            </div>
+          ) : null}
+          <ProviderCapability
+            capability={readCapability}
+            label="Read calendar events"
+            description="Used for calendar-aware plans and deterministic conflict checks."
+          />
+          {writeGranted ? (
+            writeCapabilities.map((capability) => (
+              <ProviderCapability
+                key={capability.id}
+                capability={capability}
+                label={capability.slot === "calendar.create_event" ? "Create events" : "Change events"}
+                description="Every exact request still waits for your confirmation."
+              />
+            ))
+          ) : (
+            <div className="border-t pt-3" style={{ borderColor: "var(--shell-line)" }}>
+              <p className="text-[0.82rem] font-medium">Create and change events</p>
+              <p className="mt-1 text-[0.75rem]" style={{ color: "var(--shell-faint)" }}>
+                Requires a separate Google permission. Every request will still require exact confirmation.
+              </p>
+              <a
+                href="/api/integrations/google-calendar/start?permission=write"
+                className="mt-2 inline-flex text-[0.78rem] font-medium"
+                style={{ color: "var(--shell-accent)" }}
+              >
+                Allow calendar changes
+              </a>
+            </div>
+          )}
+          <form action={disconnectGoogleCalendarAction} className="border-t pt-3" style={{ borderColor: "var(--shell-line)" }}>
+            <button type="submit" className="text-[0.78rem]" style={{ color: "var(--shell-faint)" }}>
+              Disconnect and revoke Google access
+            </button>
+          </form>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function ProviderCapability({
+  capability,
+  label,
+  description,
+}: {
+  capability: ConnectorCapability | null;
+  label: string;
+  description: string;
+}) {
+  if (!capability) return null;
+  return (
+    <div className="border-t pt-3" style={{ borderColor: "var(--shell-line)" }}>
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-[0.82rem] font-medium">{label}</span>
+        <span className="font-mono text-[0.6rem] uppercase" style={{ color: "var(--shell-faint)" }}>
+          {capability.enabled === 1 ? "allowed" : "paused"}
+        </span>
+      </div>
+      <p className="mt-1 text-[0.75rem]" style={{ color: "var(--shell-faint)" }}>{description}</p>
+      <form action={setCapabilityEnabledAction} className="mt-2">
+        <input type="hidden" name="id" value={capability.id} />
+        <input type="hidden" name="enabled" value={capability.enabled === 1 ? "false" : "true"} />
+        <SmallButton label={capability.enabled === 1 ? "Pause" : "Allow"} />
+      </form>
+    </div>
   );
 }
 

@@ -1,25 +1,36 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 
+import Database from "better-sqlite3";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   assertPresetConnectorConfiguration,
   availableCapability,
   availableEffectKinds,
   bindCapability,
   configureConnectorPreset,
+  configureGoogleCalendarCapabilities,
   connectorEnvironment,
   createConnector,
   deleteConnector,
+  deleteGoogleCalendarConnector,
+  GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
+  GOOGLE_CALENDAR_READ_SCOPE,
+  GOOGLE_CALENDAR_WRITE_SCOPE,
   getConnector,
   getConnectorByPresetId,
+  getGoogleCalendarConnector,
   listConnectors,
   recordConnectorVerification,
   setCapabilityEnabled,
   setConnectorEnabled,
   toolSchemaHash,
+  upsertGoogleCalendarConnector,
 } from "./connectors";
 import { GOOGLE_CALENDAR_MCP_URL } from "./connector-catalog";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
+import { MIGRATIONS } from "./migrations";
+import { bindAppOwner } from "./owner";
 
 let db: Db;
 let userMessageId: number;
@@ -76,6 +87,12 @@ describe("connectors hold configuration, never credentials", () => {
     } finally {
       delete process.env.CALENDAR_TOKEN;
     }
+  });
+
+  it("reserves the broker service key from user-configured connectors", () => {
+    expect(() =>
+      stdioConnector({ envVarNames: [GOOGLE_CALENDAR_BROKER_SERVICE_KEY] }),
+    ).toThrow(/reserved for a system-managed provider/u);
   });
 
   it("refuses a command that is really a shell line", () => {
@@ -253,6 +270,165 @@ describe("guided connector presets", () => {
     expect(getConnector(db, connector.id)?.capabilities[0]?.enabled).toBe(1);
   });
 });
+
+describe("the first-party Google Calendar provider", () => {
+  it("upgrades existing connector rows as generic without changing old migrations", () => {
+    const providerMigrationIndex = MIGRATIONS.findIndex(
+      (migration) => migration.id === "025_google_calendar_provider",
+    );
+    const legacy = new Database(":memory:");
+    legacy.pragma("foreign_keys = ON");
+    for (const migration of MIGRATIONS.slice(0, providerMigrationIndex)) {
+      legacy.exec(migration.sql);
+    }
+    const conversation = createConversation(legacy, { title: "Legacy", source: "web" });
+    const source = appendMessage(legacy, conversation.id, "user", "Connect a service", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    const timestamp = new Date().toISOString();
+    const inserted = legacy.prepare(
+      `INSERT INTO connector
+         (label, transport, command, args_json, cwd, url, env_var_names_json,
+          discovered_tools_json, status, enabled, source_message_id, created_at, updated_at)
+       VALUES ('Legacy calendar', 'stdio', 'node', '[]', NULL, NULL, '[]', '[]',
+               'unverified', 0, ?, ?, ?)`,
+    ).run(source.id, timestamp, timestamp);
+
+    expect(MIGRATIONS[providerMigrationIndex]?.id).toBe("025_google_calendar_provider");
+    legacy.exec(MIGRATIONS[providerMigrationIndex]!.sql);
+    expect(getConnector(legacy, Number(inserted.lastInsertRowid))).toMatchObject({
+      provider: "generic",
+      provider_connection_id: null,
+    });
+    legacy.close();
+  });
+
+  it("stores only an opaque broker connection and derives capabilities from OAuth scopes", () => {
+    process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] = "a".repeat(40);
+    try {
+      bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
+      const connectionId = randomUUID();
+      const connector = upsertGoogleCalendarConnector(db, {
+        connectionId,
+        mcpUrl: `https://calendar-dev.zeusagent.dev/mcp/${connectionId}`,
+        sourceMessageId: userMessageId,
+      });
+      expect(connector).toMatchObject({
+        provider: "google_calendar",
+        provider_connection_id: connectionId,
+        envVarNames: [],
+      });
+      expect(JSON.stringify(
+        db.prepare("SELECT * FROM connector WHERE id = ?").get(connector.id),
+      )).not.toContain("a".repeat(40));
+
+      const tools = [
+        tool("list_events", true),
+        tool("create_event", false),
+        tool("update_event", false),
+      ];
+      recordConnectorVerification(db, connector.id, { status: "ready", tools });
+      configureGoogleCalendarCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_CALENDAR_READ_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+      expect(getConnector(db, connector.id)?.capabilities.map((entry) => entry.slot)).toEqual([
+        "calendar.list_events",
+      ]);
+
+      configureGoogleCalendarCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_CALENDAR_WRITE_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+      expect(
+        getConnector(db, connector.id)?.capabilities.map((entry) => entry.slot).sort(),
+      ).toEqual([
+        "calendar.create_event",
+        "calendar.list_events",
+        "calendar.update_event",
+      ]);
+    } finally {
+      delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("cannot be rebound or removed through generic connector actions", () => {
+    process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] = "b".repeat(40);
+    try {
+      const connector = upsertGoogleCalendarConnector(db, {
+        connectionId: randomUUID(),
+        mcpUrl: "https://calendar-dev.zeusagent.dev/mcp/connection",
+        sourceMessageId: userMessageId,
+      });
+      expect(() => bindCapability(db, {
+        connectorId: connector.id,
+        slot: "calendar.list_events",
+        remoteToolName: "not_the_provider_tool",
+        inputSchema: {},
+        sourceMessageId: userMessageId,
+      })).toThrow(/verified OAuth grant/u);
+      expect(deleteConnector(db, connector.id)).toBe(false);
+      expect(getGoogleCalendarConnector(db)?.id).toBe(connector.id);
+      expect(deleteGoogleCalendarConnector(db, connector.id)).toBe(true);
+    } finally {
+      delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("uses the hosted provider when a legacy local preset also exists", () => {
+    const local = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      selectedSlots: ["calendar.list_events"],
+      discoveredTools: [
+        discoveredTool("list_events", {
+          type: "object",
+          properties: { timeMin: { type: "string" } },
+        }),
+      ],
+      sourceMessageId: userMessageId,
+    });
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+    process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] = "c".repeat(40);
+    try {
+      bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
+      const provider = upsertGoogleCalendarConnector(db, {
+        connectionId: randomUUID(),
+        mcpUrl: "https://calendar.zeusagent.dev/mcp/connection",
+        sourceMessageId: userMessageId,
+      });
+      const tools = [tool("list_events", true)];
+      recordConnectorVerification(db, provider.id, { status: "ready", tools });
+      configureGoogleCalendarCapabilities(db, {
+        connectorId: provider.id,
+        tools,
+        scopes: [GOOGLE_CALENDAR_READ_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+
+      expect(local.id).toBeLessThan(provider.id);
+      expect(availableCapability(db, "calendar.list_events")?.connector.id).toBe(provider.id);
+    } finally {
+      delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+      delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
+    }
+  });
+});
+
+function tool(name: string, readOnlyHint: boolean) {
+  const inputSchema = { type: "object", properties: {} };
+  return {
+    name,
+    description: null,
+    inputSchema,
+    schemaHash: toolSchemaHash(inputSchema),
+    readOnlyHint,
+  };
+}
 
 describe("capability binding is a deliberate, reviewable grant", () => {
   it("takes its effect kind from the slot and starts disabled", () => {

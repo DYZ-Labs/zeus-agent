@@ -52,6 +52,13 @@ export const CAPABILITY_SLOTS = [
   "calendar.update_event",
 ] as const satisfies readonly CapabilitySlot[];
 
+export const GOOGLE_CALENDAR_BROKER_SERVICE_KEY =
+  "GOOGLE_CALENDAR_BROKER_SERVICE_KEY";
+export const GOOGLE_CALENDAR_READ_SCOPE =
+  "https://www.googleapis.com/auth/calendar.events.readonly";
+export const GOOGLE_CALENDAR_WRITE_SCOPE =
+  "https://www.googleapis.com/auth/calendar.events";
+
 /** What one handshake found. Advisory: Zeus decides effects from the slot, not from this. */
 export type DiscoveredToolSummary = {
   name: string;
@@ -123,7 +130,8 @@ export type ConnectorVerification =
   | { status: "unreachable"; errorCode: string };
 
 const SELECT_CONNECTOR = `
-  SELECT id, preset_id, label, transport, command, args_json, cwd, url, env_var_names_json,
+  SELECT id, preset_id, label, provider, provider_connection_id, transport, command,
+         args_json, cwd, url, env_var_names_json,
          discovered_tools_json, status, enabled, source_message_id, last_verified_at,
          last_error_code, created_at, updated_at
   FROM connector
@@ -301,6 +309,60 @@ export function assertPresetConnectorConfiguration(
   return preset;
 }
 
+export type UpsertGoogleCalendarConnectorInput = {
+  connectionId: string;
+  mcpUrl: string;
+  sourceMessageId: number;
+};
+
+/**
+ * Create the locked provider row reached only from the signed OAuth callback.
+ *
+ * Reconnecting preserves the connector id but clears every old capability and cached
+ * calendar row until a fresh handshake and scope-derived binding complete.
+ */
+export function upsertGoogleCalendarConnector(
+  db: Db,
+  input: UpsertGoogleCalendarConnectorInput,
+): ConnectorView {
+  assertUserMessage(db, input.sourceMessageId);
+  if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/iu.test(input.connectionId)) {
+    throw new Error("Invalid Google Calendar connection id");
+  }
+  const url = normalizedUrl(input.mcpUrl);
+  const timestamp = now();
+  const connectorId = db.transaction((): number => {
+    const existing = db.prepare<[], { id: number }>(
+      "SELECT id FROM connector WHERE provider = 'google_calendar'",
+    ).get();
+    if (existing) {
+      db.prepare(
+        `UPDATE connector
+         SET label = 'Google Calendar', provider_connection_id = ?, url = ?,
+             discovered_tools_json = '[]', status = 'unverified', enabled = 0,
+             source_message_id = ?, last_verified_at = NULL, last_error_code = NULL,
+             updated_at = ?
+         WHERE id = ?`,
+      ).run(input.connectionId, url, input.sourceMessageId, timestamp, existing.id);
+      db.prepare("DELETE FROM connector_capability WHERE connector_id = ?").run(existing.id);
+      db.prepare("DELETE FROM external_signal WHERE connector_id = ?").run(existing.id);
+      return existing.id;
+    }
+    const inserted = db.prepare(
+      `INSERT INTO connector
+         (label, provider, provider_connection_id, transport, command, args_json, cwd, url,
+          env_var_names_json, discovered_tools_json, status, enabled, source_message_id,
+          created_at, updated_at)
+       VALUES ('Google Calendar', 'google_calendar', ?, 'http', NULL, '[]', NULL, ?,
+               '[]', '[]', 'unverified', 0, ?, ?, ?)`,
+    ).run(input.connectionId, url, input.sourceMessageId, timestamp, timestamp);
+    return Number(inserted.lastInsertRowid);
+  }).immediate();
+  const connector = getConnector(db, connectorId);
+  if (!connector) throw new Error("Google Calendar connector vanished after insertion");
+  return connector;
+}
+
 export function getConnector(db: Db, id: number): ConnectorView | null {
   const row = db.prepare<[number], Connector>(`${SELECT_CONNECTOR} WHERE id = ?`).get(id);
   return row ? connectorView(db, row) : null;
@@ -383,6 +445,13 @@ function discoveredPresetTools(
   return discovered;
 }
 
+export function getGoogleCalendarConnector(db: Db): ConnectorView | null {
+  const row = db.prepare<[], Connector>(
+    `${SELECT_CONNECTOR} WHERE provider = 'google_calendar'`,
+  ).get();
+  return row ? connectorView(db, row) : null;
+}
+
 /**
  * Remove a connector and every capability bound to it.
  *
@@ -390,7 +459,16 @@ function discoveredPresetTools(
  * because the record that Zeus once made a call is history, not configuration.
  */
 export function deleteConnector(db: Db, id: number): boolean {
-  return db.prepare<[number]>("DELETE FROM connector WHERE id = ?").run(id).changes > 0;
+  return db.prepare<[number]>(
+    "DELETE FROM connector WHERE id = ? AND provider = 'generic'",
+  ).run(id).changes > 0;
+}
+
+/** Token revocation in the broker must succeed before this provider row is removed. */
+export function deleteGoogleCalendarConnector(db: Db, id: number): boolean {
+  return db.prepare<[number]>(
+    "DELETE FROM connector WHERE id = ? AND provider = 'google_calendar'",
+  ).run(id).changes > 0;
 }
 
 /** Record the outcome of a live handshake. Only a verified connector may be enabled. */
@@ -463,6 +541,9 @@ export function bindCapability(db: Db, input: BindCapabilityInput): ConnectorCap
   assertUserMessage(db, input.sourceMessageId);
   const connector = getConnector(db, input.connectorId);
   if (!connector) throw new Error("Unknown connector");
+  if (connector.provider !== "generic") {
+    throw new Error("Provider capabilities come only from its verified OAuth grant");
+  }
   const remoteToolName = normalizedText(input.remoteToolName, 200, "remote tool name");
   const effectKind = CAPABILITY_SLOT_EFFECTS[input.slot];
   const schemaJson = canonicalJson(input.inputSchema);
@@ -507,6 +588,69 @@ export function bindCapability(db: Db, input: BindCapabilityInput): ConnectorCap
     if (!capability) throw new Error("Capability vanished after binding");
     return capability;
   })();
+}
+
+/** Bind exactly the tools and scopes the Google OAuth result proved were granted. */
+export function configureGoogleCalendarCapabilities(
+  db: Db,
+  input: {
+    connectorId: number;
+    tools: readonly DiscoveredToolSummary[];
+    scopes: readonly string[];
+    sourceMessageId: number;
+  },
+): ConnectorView {
+  assertUserMessage(db, input.sourceMessageId);
+  const connector = getConnector(db, input.connectorId);
+  if (!connector || connector.provider !== "google_calendar") {
+    throw new Error("Unknown Google Calendar connector");
+  }
+  if (connector.status !== "ready") {
+    throw new Error("Google Calendar must verify before its capabilities are enabled");
+  }
+  const scopeSet = new Set(input.scopes);
+  const canRead =
+    scopeSet.has(GOOGLE_CALENDAR_READ_SCOPE) || scopeSet.has(GOOGLE_CALENDAR_WRITE_SCOPE);
+  const canWrite = scopeSet.has(GOOGLE_CALENDAR_WRITE_SCOPE);
+  if (!canRead) throw new Error("Google Calendar read access was not granted");
+  const desired: Array<[CapabilitySlot, string]> = [["calendar.list_events", "list_events"]];
+  if (canWrite) {
+    desired.push(
+      ["calendar.create_event", "create_event"],
+      ["calendar.update_event", "update_event"],
+    );
+  }
+  const timestamp = now();
+  db.transaction(() => {
+    db.prepare("DELETE FROM connector_capability WHERE connector_id = ?").run(connector.id);
+    for (const [slot, toolName] of desired) {
+      const tool = input.tools.find((entry) => entry.name === toolName);
+      if (!tool) throw new Error(`Google Calendar broker did not expose ${toolName}`);
+      db.prepare(
+        `INSERT INTO connector_capability
+           (connector_id, slot, remote_tool_name, effect_kind, input_schema_json,
+            schema_hash, enabled, source_message_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+      ).run(
+        connector.id,
+        slot,
+        toolName,
+        CAPABILITY_SLOT_EFFECTS[slot],
+        JSON.stringify(tool.inputSchema),
+        tool.schemaHash,
+        input.sourceMessageId,
+        timestamp,
+        timestamp,
+      );
+    }
+    db.prepare(
+      `UPDATE connector SET enabled = 1, source_message_id = ?, updated_at = ?
+       WHERE id = ? AND status = 'ready'`,
+    ).run(input.sourceMessageId, timestamp, connector.id);
+  }).immediate();
+  const configured = getConnector(db, connector.id);
+  if (!configured) throw new Error("Google Calendar connector vanished after configuration");
+  return configured;
 }
 
 export function setCapabilityEnabled(
@@ -556,19 +700,21 @@ export function listCapabilities(db: Db, connectorId?: number): ConnectorCapabil
  * resolves to null, and a null is a refusal, never a fallback to some other tool.
  */
 export function availableCapability(db: Db, slot: CapabilitySlot): BoundCapability | null {
-  const capability = db
+  const capabilities = db
     .prepare<[CapabilitySlot], ConnectorCapability>(
       `${SELECT_CAPABILITY}
        WHERE slot = ? AND enabled = 1
-       ORDER BY id LIMIT 1`,
+       ORDER BY id`,
     )
-    .get(slot);
-  if (!capability) return null;
-  const connector = getConnector(db, capability.connector_id);
-  if (!connector || connector.enabled !== 1 || connector.status !== "ready") return null;
-  if (connector.preset_id !== null && !localConnectorPresetsAllowed()) return null;
-  if (connector.missingEnvVarNames.length > 0) return null;
-  return { capability, connector };
+    .all(slot);
+  for (const capability of capabilities) {
+    const connector = getConnector(db, capability.connector_id);
+    if (!connector || connector.enabled !== 1 || connector.status !== "ready") continue;
+    if (connector.preset_id !== null && !localConnectorPresetsAllowed()) continue;
+    if (connector.missingEnvVarNames.length > 0) continue;
+    return { capability, connector };
+  }
+  return null;
 }
 
 /** Every effect kind Zeus can currently perform through a bound, enabled capability. */
@@ -629,6 +775,7 @@ export function connectorEnvironment(
 ): Record<string, string> {
   const resolved: Record<string, string> = {};
   for (const name of connector.envVarNames) {
+    if (name === GOOGLE_CALENDAR_BROKER_SERVICE_KEY) continue;
     const value = environment[name];
     if (typeof value === "string") resolved[name] = value;
   }
@@ -641,9 +788,13 @@ function connectorView(db: Db, row: Connector): ConnectorView {
     ...row,
     args: parseStringArray(row.args_json),
     envVarNames,
-    missingEnvVarNames: envVarNames.filter(
-      (name) => typeof process.env[name] !== "string",
-    ),
+    missingEnvVarNames: [
+      ...envVarNames.filter((name) => typeof process.env[name] !== "string"),
+      ...(row.provider === "google_calendar" &&
+      typeof process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] !== "string"
+        ? [GOOGLE_CALENDAR_BROKER_SERVICE_KEY]
+        : []),
+    ],
     discoveredTools: parseDiscoveredTools(row.discovered_tools_json),
     capabilities: listCapabilities(db, row.id),
   };
@@ -725,6 +876,9 @@ function normalizedEnvVarNames(names: readonly string[]): string[] {
         `"${name.slice(0, 24)}" is not an environment variable name. ` +
           "Zeus stores names only, never values.",
       );
+    }
+    if (name === GOOGLE_CALENDAR_BROKER_SERVICE_KEY) {
+      throw new Error("That environment variable is reserved for a system-managed provider");
     }
   }
   return [...new Set(normalized)].sort();

@@ -26,6 +26,7 @@ import {
   listFollowThroughEvents,
 } from "@/core/stewardship";
 import { getOwnerAccess, type OwnerAccess } from "@/server/auth/access";
+import { getGoogleCalendarIntegrationConfiguration } from "@/server/google-calendar/config";
 
 export const dynamic = "force-dynamic";
 
@@ -35,7 +36,10 @@ export default async function SettingsPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const access = await getOwnerAccess();
-  const connectorError = (await searchParams).connector_error;
+  const resolvedSearchParams = await searchParams;
+  const connectorError = resolvedSearchParams.connector_error;
+  const connectorSuccess = resolvedSearchParams.connector_success;
+  const googleCalendarConfiguration = getGoogleCalendarIntegrationConfiguration();
   const privateSettings = access.canAccessPrivateData
     ? {
         setting: getStewardshipSetting(access.db),
@@ -72,6 +76,9 @@ export default async function SettingsPage({
             connectors={privateSettings.connectors}
             errorMessage={typeof connectorError === "string" ? connectorError : null}
             localMode={access.state === "local"}
+            successMessage={typeof connectorSuccess === "string" ? connectorSuccess : null}
+            googleCalendarAvailable={googleCalendarConfiguration.state === "ready"}
+            hostedAccount={access.state === "authorized"}
           />
         ) : (
           <LockedSettings />
