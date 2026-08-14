@@ -22,6 +22,12 @@ import { remember } from "../core/chat";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
 import type { Db } from "../core/db";
 import { openDb } from "../core/db";
+import {
+  confirmEffect,
+  executeConfirmedEffect,
+  getProposedEffect,
+  listPendingEffects,
+} from "../core/effects";
 import { logEvent } from "../core/observability";
 import { embed, embedFacet, embedFact, embedPassage } from "../core/embed";
 import { listEntities, resolveEntity, selfEntity } from "../core/entities";
@@ -1487,6 +1493,94 @@ server.registerTool(
       event
         ? `Recorded ${decision} for commitment ${commitment_id} (action source=message:${approval.sourceMessageId}). No external action was performed.`
         : `Commitment ${commitment_id} does not exist or is no longer actionable; nothing changed.`,
+    );
+  },
+);
+
+server.registerTool(
+  "zeus_pending_effects",
+  {
+    title: "List external requests waiting for the user's confirmation",
+    description:
+      "List the exact external requests Zeus has prepared but not sent. Each shows the connected service, the capability, the precise payload, and the confirmation hash. Nothing here has happened; never describe these as done. Read-only.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true },
+  },
+  async () => {
+    const pending = listPendingEffects(db);
+    if (pending.length === 0) {
+      return text("No external request is waiting. Zeus has nothing pending to send.");
+    }
+    const lines = pending.map((effect) =>
+      [
+        `effect:${effect.id} — ${effect.preview_text}`,
+        `  service: ${effect.connector.label} · ${effect.capability.slot} · ${effect.capability.remote_tool_name}`,
+        `  request: ${JSON.stringify(effect.payload)}`,
+        `  confirmation hash: ${effect.payload_hash}`,
+        `  expires: ${effect.expires_at}`,
+      ].join("\n"),
+    );
+    return text(
+      `${pending.length} external request(s) prepared and NOT sent:\n\n${lines.join("\n\n")}`,
+    );
+  },
+);
+
+server.registerTool(
+  "zeus_confirm_effect",
+  {
+    title: "Confirm one exact external request, then send it",
+    description:
+      "Propose confirming one prepared external request. This is the only path by which Zeus changes anything outside its own store. The connected user must directly approve the exact request digest through their client's form, and the confirmation is bound to the payload hash, so an altered request cannot ride an earlier approval.",
+    inputSchema: {
+      effect_id: z.number().int().positive(),
+      payload_hash: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/u)
+        .describe("The exact confirmation hash shown by zeus_pending_effects."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  },
+  async ({ effect_id, payload_hash }) => {
+    const effect = getProposedEffect(db, effect_id);
+    if (!effect || effect.status !== "pending_confirmation") {
+      return text(`effect:${effect_id} is not waiting for confirmation; nothing changed.`);
+    }
+    if (effect.payload_hash !== payload_hash) {
+      return text("That hash does not match this request; nothing changed.");
+    }
+    const approval = await approveMutation(
+      "zeus_confirm_effect",
+      { effect_id, payload_hash },
+      `Send this to ${effect.connector.label}: ${effect.preview_text}\n\nExact request: ${JSON.stringify(effect.payload)}`,
+      `I confirm external request ${payload_hash}.\n${effect.preview_text}`,
+      { kind: "proposed_effect", id: effect_id },
+    );
+    if (!approval) {
+      return text("Nothing was sent. Direct user approval through MCP elicitation is required.");
+    }
+    try {
+      confirmEffect(db, effect_id, payload_hash, approval.sourceMessageId);
+    } catch (error) {
+      finishMutation(approval, "zeus_confirm_effect", "failed", {
+        kind: "proposed_effect",
+        id: effect_id,
+      });
+      return text(
+        `Nothing was sent: ${error instanceof Error ? error.message : "the confirmation was refused"}.`,
+      );
+    }
+    const result = await executeConfirmedEffect(db, effect_id);
+    finishMutation(
+      approval,
+      "zeus_confirm_effect",
+      result.status === "executed" ? "applied" : "failed",
+      { kind: "proposed_effect", id: effect_id },
+    );
+    return text(
+      result.status === "executed"
+        ? `Sent to ${effect.connector.label} (confirmation source=message:${approval.sourceMessageId}). Receipt: effect:${effect_id}.`
+        : `The request was confirmed but not completed (${result.errorCode ?? "unknown"}). Do not assume it took effect; check effect:${effect_id}.`,
     );
   },
 );

@@ -186,6 +186,105 @@ export function responseUsage(response: {
   };
 }
 
+export const DEFAULT_CONNECTOR_CALLS_PER_MINUTE = 30;
+export const DEFAULT_CONNECTOR_CALLS_PER_DAY = 1_000;
+
+export type ConnectorBudgetLimits = {
+  callsPerMinute: number;
+  callsPerDay: number;
+};
+
+export function configuredConnectorBudgetLimits(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): ConnectorBudgetLimits {
+  return {
+    callsPerMinute: positiveInteger(
+      environment.ZEUS_CONNECTOR_CALLS_PER_MINUTE,
+      DEFAULT_CONNECTOR_CALLS_PER_MINUTE,
+      "ZEUS_CONNECTOR_CALLS_PER_MINUTE",
+    ),
+    callsPerDay: positiveInteger(
+      environment.ZEUS_CONNECTOR_CALLS_PER_DAY,
+      DEFAULT_CONNECTOR_CALLS_PER_DAY,
+      "ZEUS_CONNECTOR_CALLS_PER_DAY",
+    ),
+  };
+}
+
+/**
+ * Bound calls out to connected services, for the same reason model calls are bounded and
+ * one more: a loop here is traffic against somebody else's account, under their rate
+ * limits, doing work Zeus cannot see. Counted durably so a restart cannot clear it.
+ */
+export function checkConnectorBudget(
+  db: Db,
+  options: { at?: Date; limits?: ConnectorBudgetLimits } = {},
+): BudgetDecision {
+  const at = options.at ?? new Date();
+  const limits = options.limits ?? configuredConnectorBudgetLimits();
+
+  if (connectorCallsFor(db, "minute", windowStart("minute", at)) >= limits.callsPerMinute) {
+    return {
+      allowed: false,
+      reason: "rate_limited",
+      retryAfterSeconds: secondsUntilNextWindow("minute", at),
+    };
+  }
+  if (connectorCallsFor(db, "day", windowStart("day", at)) >= limits.callsPerDay) {
+    return {
+      allowed: false,
+      reason: "daily_calls_spent",
+      retryAfterSeconds: secondsUntilNextWindow("day", at),
+    };
+  }
+  return { allowed: true };
+}
+
+/** Count one outbound connector call. Counted when it starts, like a model call. */
+export function recordConnectorCall(db: Db, options: { at?: Date } = {}): void {
+  const at = options.at ?? new Date();
+  const timestamp = now();
+  const upsert = db.prepare<[string, string, string]>(
+    `INSERT INTO connector_usage (window_kind, window_start, calls, updated_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT (window_kind, window_start) DO UPDATE SET
+       calls = calls + 1,
+       updated_at = excluded.updated_at`,
+  );
+  db.transaction(() => {
+    for (const kind of ["minute", "day"] as const) {
+      upsert.run(kind, windowStart(kind, at), timestamp);
+    }
+    db.prepare<[string]>(
+      "DELETE FROM connector_usage WHERE window_kind = 'minute' AND window_start < ?",
+    ).run(windowStart("minute", new Date(at.getTime() - 5 * 60_000)));
+    db.prepare<[string]>(
+      "DELETE FROM connector_usage WHERE window_kind = 'day' AND window_start < ?",
+    ).run(windowStart("day", new Date(at.getTime() - 2 * 86_400_000)));
+  })();
+}
+
+export function connectorUsageSnapshot(
+  db: Db,
+  options: { at?: Date } = {},
+): { minute: number; day: number } {
+  const at = options.at ?? new Date();
+  return {
+    minute: connectorCallsFor(db, "minute", windowStart("minute", at)),
+    day: connectorCallsFor(db, "day", windowStart("day", at)),
+  };
+}
+
+function connectorCallsFor(db: Db, kind: WindowKind, start: string): number {
+  return (
+    db
+      .prepare<[string, string], { calls: number }>(
+        `SELECT calls FROM connector_usage WHERE window_kind = ? AND window_start = ?`,
+      )
+      .get(kind, start)?.calls ?? 0
+  );
+}
+
 /** Current usage, for the health endpoint and for tests. */
 export function modelUsageSnapshot(
   db: Db,

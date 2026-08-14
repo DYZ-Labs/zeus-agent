@@ -17,6 +17,27 @@ import {
 } from "@/core/backfill";
 import { updateAmbientSetting } from "@/core/ambient";
 import {
+  CAPABILITY_SLOTS,
+  bindCapability,
+  createConnector,
+  deleteConnector,
+  getCapability,
+  getConnector,
+  setCapabilityEnabled,
+  setConnectorEnabled,
+} from "@/core/connectors";
+import { getSignal } from "@/core/detectors";
+import {
+  confirmEffect,
+  declineEffect,
+  executeConfirmedEffect,
+  getProposedEffect,
+  revertEffect,
+} from "@/core/effects";
+import { verifyConnector } from "@/core/mcp-client";
+import { createSafeWorkExecutor } from "@/core/work-execution";
+import { resumeWorkRun } from "@/core/work-plans";
+import {
   appendMessage,
   createConversation,
   getConversation,
@@ -92,6 +113,7 @@ import { StructuredFacetCondition as StructuredFacetConditionSchema } from "@/co
 import {
   recommendationForCommitment,
   recordFollowThroughDecision,
+  recordSignalDecision,
   setStewardshipMode,
 } from "@/core/stewardship";
 import { requireOwnerDb } from "@/server/auth/access";
@@ -759,6 +781,237 @@ export async function setSummaryAction(formData: FormData): Promise<void> {
 
   setEntitySummary(await requireOwnerDb(), id, summary || null);
   if (slug) revalidatePath(`/entity/${slug}`);
+}
+
+/**
+ * Connections and external requests.
+ *
+ * Everything here is an explicit user act, so every one of these writes a real user
+ * message first and passes its id down as provenance. That is what lets the store answer
+ * "who allowed this?" for a connector, a capability, and — most importantly — for each
+ * individual external request Zeus was permitted to send.
+ */
+
+export async function addConnectorAction(formData: FormData): Promise<void> {
+  const label = normalizedText(formData.get("label"), 120);
+  const transport = String(formData.get("transport") ?? "stdio");
+  if (!label || (transport !== "stdio" && transport !== "http")) return;
+  const db = await requireOwnerDb();
+  const envVarNames = String(formData.get("envVarNames") ?? "")
+    .split(/[\s,]+/u)
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  const source = curationMessage(db, `Connect the service "${label}".`);
+  try {
+    createConnector(db, {
+      label,
+      transport,
+      command: normalizedText(formData.get("command"), 500),
+      args: String(formData.get("args") ?? "")
+        .split(/\s+/u)
+        .map((arg) => arg.trim())
+        .filter((arg) => arg.length > 0),
+      cwd: normalizedText(formData.get("cwd"), 500) || null,
+      url: normalizedText(formData.get("url"), 2000) || null,
+      envVarNames,
+      sourceMessageId: source.id,
+    });
+  } catch (error) {
+    // Surfacing the reason matters here: "names only, never values" is a rule the user
+    // has to understand, not just obey.
+    redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
+  }
+  revalidatePath("/settings");
+}
+
+export async function verifyConnectorAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  try {
+    await verifyConnector(db, id);
+  } catch (error) {
+    redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
+  }
+  revalidatePath("/settings");
+}
+
+/**
+ * Bind a discovered tool to a capability slot.
+ *
+ * The schema comes from what the connector actually offers, not from the form: the hash
+ * stored here is what a later drift check compares against, so it has to describe a real
+ * contract the user could have read.
+ */
+export async function bindCapabilityAction(formData: FormData): Promise<void> {
+  const connectorId = Number(formData.get("connectorId"));
+  const slot = String(formData.get("slot") ?? "");
+  const remoteToolName = normalizedText(formData.get("remoteToolName"), 200);
+  if (!Number.isInteger(connectorId) || !remoteToolName) return;
+  if (!CAPABILITY_SLOTS.includes(slot as (typeof CAPABILITY_SLOTS)[number])) return;
+  const db = await requireOwnerDb();
+  const connector = getConnector(db, connectorId);
+  const discovered = connector?.discoveredTools.find((tool) => tool.name === remoteToolName);
+  if (!discovered) {
+    redirect(
+      `/settings?connector_error=${encodeURIComponent(
+        `Verify the connection first, then pick a tool it actually offers.`,
+      )}#connections`,
+    );
+  }
+  const source = curationMessage(
+    db,
+    `Allow "${remoteToolName}" to fill the ${slot} capability.`,
+  );
+  bindCapability(db, {
+    connectorId,
+    slot: slot as (typeof CAPABILITY_SLOTS)[number],
+    remoteToolName,
+    inputSchema: discovered.inputSchema,
+    sourceMessageId: source.id,
+  });
+  revalidatePath("/settings");
+}
+
+export async function setConnectorEnabledAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const enabled = String(formData.get("enabled") ?? "") === "true";
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  const source = curationMessage(
+    db,
+    enabled ? `Enable connected service ${id}.` : `Disable connected service ${id}.`,
+  );
+  try {
+    setConnectorEnabled(db, id, enabled, source.id);
+  } catch (error) {
+    redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
+  }
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
+export async function setCapabilityEnabledAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const enabled = String(formData.get("enabled") ?? "") === "true";
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  const capability = getCapability(db, id);
+  if (!capability) return;
+  const source = curationMessage(
+    db,
+    enabled
+      ? `Allow Zeus to use ${capability.slot} through "${capability.remote_tool_name}".`
+      : `Stop allowing ${capability.slot}.`,
+  );
+  try {
+    setCapabilityEnabled(db, id, enabled, source.id);
+  } catch (error) {
+    redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
+  }
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
+export async function removeConnectorAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  curationMessage(db, `Remove connected service ${id}.`);
+  deleteConnector(db, id);
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
+/**
+ * Confirm one exact external request, then let it happen.
+ *
+ * The confirming message contains the payload hash because that is what makes it a
+ * confirmation rather than a general assent — `confirmEffect` refuses anything else. The
+ * send and the run's resumption follow only after that record exists.
+ */
+export async function confirmEffectAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const payloadHash = String(formData.get("payloadHash") ?? "");
+  if (!Number.isInteger(id) || !/^[0-9a-f]{64}$/u.test(payloadHash)) return;
+  const db = await requireOwnerDb();
+  const effect = getProposedEffect(db, id);
+  if (!effect || effect.status !== "pending_confirmation") return;
+  // The decision is the first line and nothing echoed back can influence it; the
+  // description follows as context so the message still reads as a record of what
+  // was agreed to.
+  const source = curationMessage(
+    db,
+    `I confirm external request ${payloadHash}.\n${effect.preview_text}`,
+  );
+  try {
+    confirmEffect(db, id, payloadHash, source.id);
+  } catch (error) {
+    redirect(`/today?effect_error=${encodeURIComponent(connectorErrorMessage(error))}#confirmations`);
+  }
+  const result = await executeConfirmedEffect(db, id);
+  if (result.status === "executed") {
+    // The run was parked waiting for exactly this. Resuming here means the user sees the
+    // finished work rather than having to ask for it again.
+    await resumeWorkRun(db, effect.work_run_id, {
+      executor: createSafeWorkExecutor(db),
+    }).catch(() => undefined);
+  }
+  revalidatePath("/today");
+  revalidatePath("/");
+}
+
+export async function declineEffectAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const reason = normalizedText(formData.get("reason"), 500);
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  const effect = getProposedEffect(db, id);
+  if (!effect || effect.status !== "pending_confirmation") return;
+  const source = curationMessage(db, `Do not send this external request: ${effect.preview_text}`);
+  declineEffect(db, id, source.id, reason || undefined);
+  revalidatePath("/today");
+}
+
+export async function revertEffectAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  if (!Number.isInteger(id)) return;
+  const db = await requireOwnerDb();
+  const effect = getProposedEffect(db, id);
+  if (!effect || effect.status !== "executed") return;
+  const source = curationMessage(db, `Undo this external change: ${effect.preview_text}`);
+  try {
+    await revertEffect(db, id, source.id);
+  } catch (error) {
+    redirect(`/today?effect_error=${encodeURIComponent(connectorErrorMessage(error))}#confirmations`);
+  }
+  revalidatePath("/today");
+}
+
+export async function signalDecisionAction(formData: FormData): Promise<void> {
+  const id = Number(formData.get("id"));
+  const decision = String(formData.get("decision") ?? "") as FollowThroughEventType;
+  const reason = normalizedText(formData.get("reason"), 1000);
+  if (!Number.isInteger(id)) return;
+  if (!["accepted", "dismissed", "snoozed", "completed", "regretted"].includes(decision)) return;
+  const db = await requireOwnerDb();
+  const signal = getSignal(db, id);
+  if (!signal) return;
+  const source = curationMessage(db, `Recorded "${decision}" on: ${signal.why}`);
+  recordSignalDecision(db, {
+    signalId: id,
+    decision: decision as Exclude<FollowThroughEventType, "surfaced">,
+    sourceMessageId: source.id,
+    userReason: reason || null,
+  });
+  revalidatePath("/today");
+  revalidatePath("/settings");
+}
+
+/** Show why a connection or request was refused, without leaking anything it contained. */
+function connectorErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "That did not work.";
+  return message.slice(0, 200);
 }
 
 function curationMessage(db: Db, content: string) {

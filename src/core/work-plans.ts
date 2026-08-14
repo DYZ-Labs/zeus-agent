@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { availableCapabilityForEffect, isConnectorEffect } from "./connectors";
 import type { Db } from "./db";
 import { now } from "./db";
 import type {
   EffectKind,
   EvaluationContext,
+  ToolName,
   ToolReceipt,
   WorkArtifact,
   WorkArtifactKind,
@@ -18,12 +20,13 @@ import type {
   WorkStep,
 } from "./schema";
 import {
+  EffectKind as EffectKindSchema,
   EvaluationContext as EvaluationContextSchema,
   WorkPlanProposal as WorkPlanProposalSchema,
 } from "./schema";
 
 const MAX_STEPS = 12;
-const MAX_MODEL_TOOL_CALLS = 20;
+export const MAX_MODEL_TOOL_CALLS = 20;
 const MAX_RETRIES_PER_STEP = 2;
 const MAX_DURATION_SECONDS = 15 * 60;
 const MAX_ARTIFACT_CONTENT = 250_000;
@@ -217,7 +220,8 @@ const SELECT_ARTIFACT = `
 `;
 
 const SELECT_RECEIPT = `
-  SELECT id, work_run_id, work_step_id, tool_name, effect_kind, call_index,
+  SELECT id, work_run_id, work_step_id, tool_name, effect_kind,
+         connector_capability_id, proposed_effect_id, call_index,
          input_json, output_json, citations_json, status, error_code,
          error_message, idempotency_key, started_at, completed_at
   FROM tool_receipt
@@ -227,6 +231,8 @@ const SELECT_RECEIPT = `
 export function createWorkPlan(db: Db, input: CreateWorkPlanInput): WorkPlanDetail {
   assertUserMessage(db, input.sourceMessageId);
   const proposal = normalizeProposal(input.proposal);
+  assertAuthorizableEffects(db, proposal.allowed_effects);
+  assertRunnableLimits(proposal);
   const generationProvenance = input.generationProvenance
     ? normalizeGenerationProvenance(db, input.generationProvenance)
     : null;
@@ -539,7 +545,7 @@ export function authorizeWorkPlan(
   const expiresAt = normalizeFutureDate(input.expiresAt, "authorization expiry");
   const planEffects = parseEffects(detail.plan.allowed_effects_json);
   const allowedEffects = uniqueEffects(input.allowedEffects);
-  assertSafeEffects(allowedEffects);
+  assertAuthorizableEffects(db, allowedEffects);
   if (!sameStringSet(planEffects, allowedEffects)) {
     throw new Error("Authorization effects must exactly match the work plan effects");
   }
@@ -732,8 +738,9 @@ export function listToolReceipts(db: Db, runId: number): ToolReceipt[] {
 }
 
 /**
- * Begin an authorized run and carry it as far as the available safe adapter allows.
- * With no adapter Zeus durably pauses; it never substitutes an arbitrary capability.
+ * Begin an authorized run and carry it as far as the granted capabilities allow. Without a
+ * capability, or when a write step needs the user's word on its payload, Zeus durably
+ * pauses; it never substitutes an arbitrary capability and never proceeds unconfirmed.
  */
 export async function runWorkPlan(
   db: Db,
@@ -1042,12 +1049,33 @@ async function executeRun(
     const providerRequestKey = createHash("sha256")
       .update(`${run.plan_hash}:${run.id}:${step.id}:logical-step`)
       .digest("hex");
+    // A connector-backed step resolves its grant before it can even open a receipt. A
+    // capability withdrawn since authorization pauses the run at its checkpoint rather
+    // than failing it: reconnecting the service is a repair the user can make.
+    let connectorCapabilityId: number | null = null;
+    if (isConnectorEffect(step.effect_kind)) {
+      const available = availableCapabilityForEffect(db, step.effect_kind);
+      if (!available) {
+        pauseStepAndRun(
+          db,
+          run.id,
+          detail.plan.id,
+          step.id,
+          "capability_unavailable",
+          `No connected service currently provides ${step.effect_kind}`,
+        );
+        return requireWorkRun(db, run.id);
+      }
+      connectorCapabilityId = available.capability.id;
+    }
+
     const toolName = toolNameFor(step.effect_kind);
     const receipt = beginAttempt(
       db,
       run,
       step,
       toolName,
+      connectorCapabilityId,
       attempt,
       idempotencyKey,
       lease.token,
@@ -1240,10 +1268,14 @@ async function executeRun(
   }
 }
 
+/**
+ * Shape only. Whether these effects may run is asked separately, at creation and at
+ * authorization, so that recomputing a stored plan's hash never depends on today's
+ * configuration.
+ */
 function normalizeProposal(input: WorkPlanProposal): WorkPlanProposal {
   const parsed = WorkPlanProposalSchema.parse(input);
   const allowedEffects = uniqueEffects(parsed.allowed_effects);
-  assertSafeEffects(allowedEffects);
   const steps = parsed.steps.map((step) => ({
     ...step,
     title: step.title.trim(),
@@ -1880,7 +1912,8 @@ function beginAttempt(
   db: Db,
   run: WorkRun,
   step: WorkStepWithDependencies,
-  toolName: SafeToolName,
+  toolName: ToolName,
+  connectorCapabilityId: number | null,
   attempt: number,
   idempotencyKey: string,
   runnerToken: string,
@@ -1908,8 +1941,9 @@ function beginAttempt(
         [
           number,
           number,
-          SafeToolName,
-          SafeEffectKind,
+          ToolName,
+          EffectKind,
+          number | null,
           number,
           string,
           string,
@@ -1917,15 +1951,16 @@ function beginAttempt(
         ]
       >(
         `INSERT INTO tool_receipt
-           (work_run_id, work_step_id, tool_name, effect_kind, call_index,
-            input_json, status, idempotency_key, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'started', ?, ?)`,
+           (work_run_id, work_step_id, tool_name, effect_kind, connector_capability_id,
+            call_index, input_json, status, idempotency_key, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)`,
       )
       .run(
         run.id,
         step.id,
         toolName,
-        assertSafeEffect(step.effect_kind),
+        step.effect_kind,
+        connectorCapabilityId,
         callIndex,
         JSON.stringify(
           sanitizeForReceipt({
@@ -2137,14 +2172,13 @@ function normalizeExecutionResult(result: SafeStepExecutionResult): Required<
   Pick<SafeStepExecutionResult, "modelCalls" | "toolCalls" | "citations" | "artifacts">
 > &
   Pick<SafeStepExecutionResult, "output" | "pause"> {
+  // An executor that reports nothing is still charged one call, so forgetting to account
+  // for work cannot make it free. Claiming zero explicitly is a different, legitimate
+  // claim: a step that spans a confirmation only re-reads the request it already made when
+  // the run resumes, and the send itself was the user's instruction rather than the
+  // autonomous work this budget exists to bound.
   const modelCalls = boundedCount(result.modelCalls ?? 0, "modelCalls");
   const toolCalls = boundedCount(result.toolCalls ?? 1, "toolCalls");
-  if (modelCalls + toolCalls < 1) {
-    throw new WorkStepExecutionError("A safe executor must account for its call", {
-      code: "invalid_call_accounting",
-      toolCalls: 1,
-    });
-  }
   return {
     output: result.output,
     citations: result.citations ?? [],
@@ -2213,46 +2247,104 @@ function normalizeArtifactMemorySources(
   return [...byKey.values()].sort(compareMemorySources);
 }
 
-function toolNameFor(effect: EffectKind): SafeToolName {
-  switch (assertSafeEffect(effect)) {
+function toolNameFor(effect: EffectKind): ToolName {
+  switch (effect) {
     case "memory_read":
       return "memory_recall";
     case "web_read":
       return "web_search";
     case "prepare_local":
       return "local_artifact";
+    case "external_read":
+      return "connector_call";
+    default:
+      // A write effect prepares a request and stops. Only the later confirmed send is a
+      // `connector_call`, so the step that produced the proposal must not claim to be one.
+      return "effect_proposal";
   }
 }
 
 function minimumCallCostForEffect(effect: EffectKind): number {
-  return assertSafeEffect(effect) === "memory_read" ? 1 : 2;
+  return effect === "memory_read" ? 1 : 2;
 }
 
-function assertSafeEffect(effect: EffectKind): SafeEffectKind {
-  if ((SAFE_EFFECT_KINDS as readonly EffectKind[]).includes(effect)) {
-    return effect as SafeEffectKind;
+/**
+ * The smallest call budget under which every step could still run.
+ *
+ * Exported because the model picks its own limits and can lowball them. A plan whose own
+ * ceiling cannot cover its own steps is dead on arrival — and it fails late, after
+ * spending calls and producing artifacts, which is the worst moment to find out.
+ */
+export function minimumCallBudgetForSteps(
+  steps: readonly { effect_kind: EffectKind }[],
+): number {
+  return steps.reduce((total, step) => total + minimumCallCostForEffect(step.effect_kind), 0);
+}
+
+/**
+ * Refuse a plan that could never finish.
+ *
+ * Checked at creation rather than discovered mid-run: a plan that runs out of budget on
+ * its last step has already spent model calls and left artifacts, and when that last step
+ * is the one that would have asked the user to confirm an action, the user is left with a
+ * failure instead of a decision.
+ */
+function assertRunnableLimits(proposal: WorkPlanProposal): void {
+  const required = minimumCallBudgetForSteps(proposal.steps);
+  if (required > MAX_MODEL_TOOL_CALLS) {
+    throw new Error(
+      `This plan needs at least ${required} model/tool calls, above the ${MAX_MODEL_TOOL_CALLS} ceiling`,
+    );
   }
-  throw new Error(`Effect ${effect} is unavailable without an external-action adapter`);
+  if (proposal.limits.max_model_tool_calls < required) {
+    throw new Error(
+      `This plan allows ${proposal.limits.max_model_tool_calls} model/tool calls but its steps need at least ${required}`,
+    );
+  }
 }
 
-function assertSafeEffects(effects: readonly EffectKind[]): asserts effects is readonly SafeEffectKind[] {
-  for (const effect of effects) assertSafeEffect(effect);
+/**
+ * What this store may authorize right now.
+ *
+ * Deliberately separate from parsing: an effect becomes authorizable only when a bound,
+ * enabled capability provides it, and that can change after a plan is written. `purchase`
+ * is refused unconditionally — money is a different threat model and has no slot.
+ */
+function assertAuthorizableEffects(db: Db, effects: readonly EffectKind[]): void {
+  for (const effect of effects) {
+    if ((SAFE_EFFECT_KINDS as readonly EffectKind[]).includes(effect)) continue;
+    if (effect === "purchase") {
+      throw new Error("Zeus cannot be authorized to spend money");
+    }
+    if (!isConnectorEffect(effect) || !availableCapabilityForEffect(db, effect)) {
+      throw new Error(
+        `Effect ${effect} is unavailable without a connected service that provides it`,
+      );
+    }
+  }
 }
 
 function uniqueEffects(effects: readonly EffectKind[]): EffectKind[] {
   return [...new Set(effects)].sort();
 }
 
+/**
+ * Read stored effects without judging them.
+ *
+ * Policy deliberately lives at authorize and execute time instead. A plan written when a
+ * calendar was connected must still *load* after that connector is removed — its hash,
+ * its authorization record, and its receipts are audit data, and history that stops being
+ * readable when configuration changes is not an audit trail.
+ */
 function parseEffects(json: string): EffectKind[] {
   const value: unknown = JSON.parse(json);
   if (!Array.isArray(value)) throw new Error("Invalid stored work-plan effects");
   const effects = value.map((entry) => {
-    if (typeof entry !== "string") throw new Error("Invalid stored work-plan effect");
-    return entry as EffectKind;
+    const parsed = EffectKindSchema.safeParse(entry);
+    if (!parsed.success) throw new Error("Invalid stored work-plan effect");
+    return parsed.data;
   });
-  const unique = uniqueEffects(effects);
-  assertSafeEffects(unique);
-  return unique;
+  return uniqueEffects(effects);
 }
 
 function parseStringArray(json: string): string[] {

@@ -193,6 +193,169 @@ describe("serialized migrations and verified backups", () => {
   });
 });
 
+// 023 relaxes a CHECK on work_step, which SQLite can only do by swapping the table out.
+// Four tables reference it, so a modern RENAME would repoint them at the legacy copy and
+// then cascade their rows away on DROP. These assertions are the reason the migration
+// brackets itself in legacy_alter_table.
+describe("external-action migration rebuilds work_step in place", () => {
+  const upToTwentyTwo = MIGRATIONS.filter(
+    (migration) => migration.id !== "023_external_actions",
+  );
+  const externalActions = MIGRATIONS.find(
+    (migration) => migration.id === "023_external_actions",
+  );
+
+  function storeAtTwentyTwo(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db, upToTwentyTwo);
+    db.exec(`
+      INSERT INTO conversation (id, title, source, started_at, updated_at)
+      VALUES (1, 'Work requests', 'web', '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z');
+      INSERT INTO message (id, conversation_id, role, content, created_at)
+      VALUES (1, 1, 'user', 'compare the options', '2026-08-14T00:00:00.000Z');
+      INSERT INTO work_plan
+        (id, objective, status, plan_hash, allowed_effects_json, completion_criteria_json,
+         max_steps, max_model_tool_calls, max_retries_per_step, max_duration_seconds,
+         source_message_id, origin, created_at, updated_at)
+      VALUES (1, 'compare', 'authorized', '${"a".repeat(64)}', '["memory_read"]', '["done"]',
+              12, 20, 2, 900, 1, 'explicit_request', '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z');
+      INSERT INTO work_step (id, work_plan_id, position, title, instruction, effect_kind, status)
+      VALUES (10, 1, 1, 'recall', 'recall memory', 'memory_read', 'completed'),
+             (11, 1, 2, 'draft', 'draft a brief', 'prepare_local', 'pending');
+      INSERT INTO work_step_dependency (work_step_id, depends_on_step_id) VALUES (11, 10);
+      INSERT INTO work_authorization
+        (id, work_plan_id, plan_hash, authorization_kind, allowed_effects_json,
+         max_model_tool_calls, max_retries_per_step, max_duration_seconds, expires_at,
+         source_message_id, created_at)
+      VALUES (1, 1, '${"a".repeat(64)}', 'explicit_request', '["memory_read"]', 20, 2, 900,
+              '2099-01-01T00:00:00.000Z', 1, '2026-08-14T00:00:00.000Z');
+      INSERT INTO work_run
+        (id, work_plan_id, authorization_id, plan_hash, status, model_call_count,
+         tool_call_count, started_at, updated_at, deadline_at)
+      VALUES (1, 1, 1, '${"a".repeat(64)}', 'completed', 0, 1, '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
+      INSERT INTO work_artifact
+        (id, work_plan_id, work_run_id, work_step_id, kind, title, content, citations_json,
+         created_at, updated_at)
+      VALUES (1, 1, 1, 10, 'research_notes', 'notes', 'body', '[]',
+              '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+      INSERT INTO tool_receipt
+        (id, work_run_id, work_step_id, tool_name, effect_kind, call_index, input_json,
+         output_json, citations_json, status, idempotency_key, started_at, completed_at)
+      VALUES (1, 1, 10, 'memory_recall', 'memory_read', 1, '{}', '{}', '[]', 'completed',
+              'idem-1', '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+    `);
+    return db;
+  }
+
+  it("keeps every dependent row and reference across the swap", () => {
+    if (!externalActions) throw new Error("023_external_actions is missing");
+    const db = storeAtTwentyTwo();
+
+    migrate(db, MIGRATIONS);
+
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+    expect(db.prepare("SELECT id FROM work_step ORDER BY id").pluck().all()).toEqual([10, 11]);
+    expect(db.prepare("SELECT depends_on_step_id FROM work_step_dependency").pluck().all())
+      .toEqual([10]);
+    expect(db.prepare("SELECT work_step_id FROM work_artifact").pluck().all()).toEqual([10]);
+    expect(db.prepare("SELECT work_step_id FROM tool_receipt").pluck().all()).toEqual([10]);
+    const dependencySql = db
+      .prepare("SELECT sql FROM sqlite_master WHERE name = 'work_step_dependency'")
+      .pluck()
+      .get() as string;
+    expect(dependencySql).toMatch(/REFERENCES work_step\s*\(/u);
+    expect(dependencySql).not.toMatch(/safe_legacy/u);
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'work_step_plan_idx'",
+        )
+        .pluck()
+        .get(),
+    ).toBe("work_step_plan_idx");
+    db.close();
+  });
+
+  it("admits external reads while still refusing to record a purchase", () => {
+    const db = storeAtTwentyTwo();
+    migrate(db, MIGRATIONS);
+
+    db.exec(
+      `INSERT INTO work_step (work_plan_id, position, title, instruction, effect_kind)
+       VALUES (1, 3, 'calendar', 'read the calendar', 'external_read')`,
+    );
+
+    expect(
+      db.prepare("SELECT effect_kind FROM work_step WHERE position = 3").pluck().get(),
+    ).toBe("external_read");
+    expect(() =>
+      db.exec(
+        `INSERT INTO tool_receipt
+           (work_run_id, tool_name, effect_kind, call_index, input_json, status,
+            idempotency_key, started_at)
+         VALUES (1, 'connector_call', 'purchase', 2, '{}', 'started', 'idem-2',
+                 '2026-08-14T00:00:00.000Z')`,
+      ),
+    ).toThrow(/CHECK constraint failed/u);
+    expect(() =>
+      db.exec(
+        `INSERT INTO tool_receipt
+           (work_run_id, tool_name, effect_kind, call_index, input_json, status,
+            idempotency_key, started_at)
+         VALUES (1, 'connector_call', 'schedule', 3, '{}', 'started', 'idem-3',
+                 '2026-08-14T00:00:00.000Z')`,
+      ),
+    ).toThrow(/CHECK constraint failed/u);
+    db.close();
+  });
+
+  it("refuses an effect decision that cites an assistant message", () => {
+    const db = storeAtTwentyTwo();
+    migrate(db, MIGRATIONS);
+    db.exec(`
+      INSERT INTO message (id, conversation_id, role, content, created_at)
+      VALUES (2, 1, 'assistant', 'I have scheduled it', '2026-08-14T00:00:00.000Z');
+      INSERT INTO connector
+        (id, label, transport, command, source_message_id, status, created_at, updated_at)
+      VALUES (1, 'Calendar', 'stdio', 'node', 1, 'ready', '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z');
+      INSERT INTO connector_capability
+        (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json,
+         schema_hash, enabled, source_message_id, created_at, updated_at)
+      VALUES (1, 1, 'calendar.create_event', 'create_event', 'schedule', '{}',
+              '${"b".repeat(64)}', 1, 1, '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z');
+      INSERT INTO proposed_effect
+        (id, work_run_id, work_step_id, connector_capability_id, effect_kind, payload_json,
+         payload_hash, preview_text, idempotency_key, provider_request_key, expires_at,
+         created_at, updated_at)
+      VALUES (1, 1, 11, 1, 'schedule', '{"title":"Dinner"}', '${"c".repeat(64)}',
+              'Create Dinner', 'effect-1', 'req-1', '2099-01-01T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+    `);
+
+    expect(() =>
+      db.exec(
+        `INSERT INTO effect_event (proposed_effect_id, event_type, source_message_id, created_at)
+         VALUES (1, 'confirmed', 2, '2026-08-14T00:00:00.000Z')`,
+      ),
+    ).toThrow(/must cite a user message/u);
+
+    db.exec(
+      `INSERT INTO effect_event (proposed_effect_id, event_type, source_message_id, created_at)
+       VALUES (1, 'confirmed', 1, '2026-08-14T00:00:00.000Z')`,
+    );
+    expect(() =>
+      db.exec("UPDATE effect_event SET event_type = 'declined' WHERE proposed_effect_id = 1"),
+    ).toThrow(/append-only/u);
+    db.close();
+  });
+});
+
 describe("managed migration backup cleanup", () => {
   it("purges only regular backups belonging to the exact database", () => {
     const directory = temporaryDirectory();

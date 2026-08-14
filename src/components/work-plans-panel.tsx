@@ -110,9 +110,10 @@ export function WorkPlansPanel({
         <div>
           <h2 className="text-[1rem] font-medium">Bounded work</h2>
           <p className="mt-1 max-w-[68ch] text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
-            Resumable plans can recall accepted memory, research the web read-only, and prepare
-            local drafts or reports. They cannot send, schedule, purchase, or modify anything
-            outside Zeus.
+            Resumable plans can recall accepted memory, research the web read-only, prepare
+            local drafts or reports, and read a connected service. A plan that would change
+            anything outside Zeus stops and shows you the exact request first; nothing is
+            sent until you confirm it.
           </p>
         </div>
       </div>

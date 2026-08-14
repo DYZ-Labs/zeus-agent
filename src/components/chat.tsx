@@ -513,6 +513,7 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
   const completed = status === "completed";
   const closed = completed || status === "cancelled";
   const canResume = ["queued", "running", "paused"].includes(status);
+  const awaitingConfirmation = errorCode === "effect_confirmation_required";
 
   async function act(action: "resume" | "cancel") {
     if (busy) return;
@@ -554,10 +555,23 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
       </p>
       <p className="mt-2 text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
         {completed
-          ? "Zeus completed the authorized read-only research and local preparation steps."
-          : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
+          ? "Zeus completed the authorized research and local preparation steps."
+          : awaitingConfirmation
+            ? "Zeus prepared an external request and stopped. Nothing has been sent."
+            : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
       </p>
-      {!closed && (
+      {awaitingConfirmation && (
+        // Resuming here would be misleading: the run is not stuck, it is waiting on a
+        // decision only the user can make, and that decision lives with the payload.
+        <a
+          href="/today#confirmations"
+          className="mt-3 inline-block text-[0.74rem] font-medium"
+          style={{ color: "var(--shell-accent)" }}
+        >
+          Review the exact request →
+        </a>
+      )}
+      {!closed && !awaitingConfirmation && (
         <div className="mt-3 flex flex-wrap gap-4 text-[0.74rem]">
           {canResume && (
             <button

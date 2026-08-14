@@ -222,7 +222,8 @@ describe("work-plan proposal and authorization", () => {
       }),
     ).toThrow(/acyclic/u);
 
-    for (const effect of ["send", "schedule", "purchase", "modify_external"] as const) {
+    // With nothing connected, every external effect is refused for want of a capability.
+    for (const effect of ["send", "schedule", "modify_external", "external_read"] as const) {
       expect(() =>
         createWorkPlan(db, {
           proposal: proposal({
@@ -239,8 +240,28 @@ describe("work-plan proposal and authorization", () => {
           sourceMessageId: source.id,
           origin: "explicit_request",
         }),
-      ).toThrow(/unavailable without an external-action adapter/u);
+      ).toThrow(/unavailable without a connected service/u);
     }
+
+    // Money is refused for a different reason, and no connector can ever supply it:
+    // there is no slot that produces `purchase`.
+    expect(() =>
+      createWorkPlan(db, {
+        proposal: proposal({
+          steps: [
+            {
+              title: "Try purchase",
+              instruction: "Buy the ticket.",
+              effect_kind: "purchase",
+              depends_on: [],
+            },
+          ],
+          allowed_effects: ["purchase"],
+        }),
+        sourceMessageId: source.id,
+        origin: "explicit_request",
+      }),
+    ).toThrow(/cannot be authorized to spend money/u);
   });
 
   it("binds authorization to the exact hash, safe effects, limits, expiry, and user source", () => {
@@ -407,6 +428,8 @@ describe("bounded work execution", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
     const db = openTestDb();
+    // A plan must be runnable to exist at all, so the shortfall comes from the user
+    // narrowing autonomy at authorization — which is the real way a run runs out.
     const { source, detail } = createPlan(db, proposal({
       steps: [{
         title: "Research",
@@ -416,12 +439,12 @@ describe("bounded work execution", () => {
       }],
       allowed_effects: ["web_read"],
       limits: {
-        max_model_tool_calls: 1,
+        max_model_tool_calls: 2,
         max_retries_per_step: 0,
         max_duration_seconds: 900,
       },
     }));
-    authorize(db, detail, source.id);
+    authorize(db, detail, source.id, { maxModelToolCalls: 1 });
     let invoked = 0;
     const run = await runWorkPlan(db, detail.plan.id, {
       executor: async () => {
@@ -701,13 +724,15 @@ describe("bounded work execution", () => {
         ],
         allowed_effects: ["memory_read", "prepare_local"],
         limits: {
-          max_model_tool_calls: 1,
+          max_model_tool_calls: 3,
           max_retries_per_step: 0,
           max_duration_seconds: 900,
         },
       }),
     );
-    authorize(db, detail, source.id);
+    // The plan itself is runnable; the user authorized less than it needs, so the second
+    // step is refused before it starts rather than half-run.
+    authorize(db, detail, source.id, { maxModelToolCalls: 1 });
     const run = await runWorkPlan(db, detail.plan.id, {
       executor: async ({ step }) => ({
         toolCalls: 1,

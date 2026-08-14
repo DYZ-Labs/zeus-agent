@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+import { cacheCalendarEvents } from "./calendar-sync";
+import {
+  bindCapability,
+  createConnector,
+  listConnectors,
+  recordConnectorVerification,
+} from "./connectors";
 import { appendMessage, createConversation, getMessage } from "./conversations";
 import { openTestDb } from "./db";
 import { upsertEntity } from "./entities";
@@ -96,6 +103,48 @@ describe("bounded-work retention", () => {
       db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM tool_receipt").get()
         ?.count,
     ).toBe(0);
+  });
+
+  it("withdraws a connection and its cache when the record of allowing it is erased", () => {
+    const db = openTestDb();
+    const conversation = createConversation(db, { title: "Connections" });
+    const source = appendMessage(db, conversation.id, "user", "Connect my calendar.", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    const connector = createConnector(db, {
+      label: "Calendar",
+      transport: "stdio",
+      command: "node",
+      args: ["calendar.js"],
+      sourceMessageId: source.id,
+    });
+    recordConnectorVerification(db, connector.id, { status: "ready" });
+    bindCapability(db, {
+      connectorId: connector.id,
+      slot: "calendar.list_events",
+      remoteToolName: "list_events",
+      inputSchema: { type: "object" },
+      sourceMessageId: source.id,
+    });
+    cacheCalendarEvents(db, connector.id, {
+      events: [{ id: "evt-a", summary: "Private meeting", start: "2026-08-20T09:00:00Z" }],
+    });
+
+    deleteConversationWithMemory(db, conversation.id);
+
+    // The grant is gone rather than left unattributed, and no meeting title survives.
+    expect(listConnectors(db)).toEqual([]);
+    expect(
+      db.prepare<[], { count: number }>(
+        "SELECT COUNT(*) AS count FROM connector_capability",
+      ).get()?.count,
+    ).toBe(0);
+    expect(
+      db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM external_signal").get()
+        ?.count,
+    ).toBe(0);
+    expect(getMessage(db, source.id)).toBeNull();
   });
 
   it("invalidates surviving plans before deleted lifecycle links are cleared", async () => {

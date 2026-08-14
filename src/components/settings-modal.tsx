@@ -3,15 +3,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-type SettingsSection = "account" | "follow-through" | "data";
+type SettingsSection = "account" | "follow-through" | "connections" | "data";
+
+const SECTIONS: readonly SettingsSection[] = [
+  "account",
+  "follow-through",
+  "connections",
+  "data",
+];
 
 export function SettingsModal({
   account,
   followThrough,
+  connections,
   dataControls,
 }: {
   account: React.ReactNode;
   followThrough: React.ReactNode;
+  connections: React.ReactNode;
   dataControls: React.ReactNode;
 }) {
   const router = useRouter();
@@ -37,12 +46,8 @@ export function SettingsModal({
 
   useEffect(() => {
     function syncSectionFromHash() {
-      const requestedSection = window.location.hash.slice(1);
-      setActiveSection(
-        requestedSection === "follow-through" || requestedSection === "data"
-          ? requestedSection
-          : "account",
-      );
+      const requestedSection = window.location.hash.slice(1) as SettingsSection;
+      setActiveSection(SECTIONS.includes(requestedSection) ? requestedSection : "account");
     }
 
     syncSectionFromHash();
@@ -155,6 +160,12 @@ export function SettingsModal({
               onSelect={() => selectSection("follow-through")}
             />
             <SettingsSectionButton
+              label="Connections"
+              icon={<ConnectionsIcon />}
+              active={activeSection === "connections"}
+              onSelect={() => selectSection("connections")}
+            />
+            <SettingsSectionButton
               label="Data controls"
               icon={<DataControlsIcon />}
               active={activeSection === "data"}
@@ -168,7 +179,9 @@ export function SettingsModal({
             ? account
             : activeSection === "follow-through"
               ? followThrough
-              : dataControls}
+              : activeSection === "connections"
+                ? connections
+                : dataControls}
         </div>
       </section>
     </div>
@@ -225,6 +238,16 @@ function FollowThroughIcon() {
     <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
       <circle cx="12" cy="12" r="8" />
       <path d="m8.5 12 2.2 2.2 4.8-5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ConnectionsIcon() {
+  return (
+    <svg aria-hidden viewBox="0 0 24 24" className="h-[18px] w-[18px]" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M9.5 14.5 6.8 17.2a3.8 3.8 0 0 1-5.4-5.4l2.7-2.7" strokeLinecap="round" />
+      <path d="M14.5 9.5l2.7-2.7a3.8 3.8 0 0 1 5.4 5.4l-2.7 2.7" strokeLinecap="round" />
+      <path d="m9.2 14.8 5.6-5.6" strokeLinecap="round" />
     </svg>
   );
 }

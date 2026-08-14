@@ -2,16 +2,62 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
+import {
+  bindCapability,
+  createConnector,
+  getConnector,
+  setCapabilityEnabled,
+  setConnectorEnabled,
+} from "../core/connectors";
 import { appendMessage, createConversation } from "../core/conversations";
 import { openDb } from "../core/db";
+import { proposeEffect } from "../core/effects";
 import { upsertEntityWithEvidence } from "../core/entities";
 import { createCommitment, createGoal } from "../core/intentions";
+import { verifyConnector } from "../core/mcp-client";
 import { createProject, recordProjectProgress } from "../core/projects";
 import { runWorkPlan } from "../core/work-plans";
+
+/**
+ * A real MCP calendar server, written to the test's own directory. Bare specifiers cannot
+ * resolve from there, so its imports are absolute file URLs into this repository.
+ */
+function calendarServerSource(): string {
+  const require = createRequire(import.meta.url);
+  const moduleUrl = (specifier: string): string =>
+    pathToFileURL(require.resolve(specifier)).href;
+  return `
+import { McpServer } from "${moduleUrl("@modelcontextprotocol/sdk/server/mcp.js")}";
+import { StdioServerTransport } from "${moduleUrl("@modelcontextprotocol/sdk/server/stdio.js")}";
+import { z } from "${moduleUrl("zod")}";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+
+const store = process.env.FAKE_CALENDAR_STORE;
+const log = process.env.FAKE_CALENDAR_LOG;
+const server = new McpServer({ name: "fake-calendar", version: "1.0.0" });
+
+server.registerTool(
+  "create_event",
+  { title: "Create event", inputSchema: { title: z.string(), start: z.string() } },
+  async (args) => {
+    if (log) appendFileSync(log, JSON.stringify(args) + "\\n");
+    const data = JSON.parse(readFileSync(store, "utf8"));
+    const created = { id: "evt-" + (data.events.length + 1), ...args };
+    data.events.push(created);
+    writeFileSync(store, JSON.stringify(data));
+    return { content: [{ type: "text", text: JSON.stringify(created) }] };
+  },
+);
+
+await server.connect(new StdioServerTransport());
+`;
+}
 
 type CreatedPlan = {
   id: number;
@@ -237,6 +283,215 @@ describe("Zeus MCP personal-agent operations", () => {
     ).toBe(messagesBefore + 1);
     cancelledDb.close();
   }, 20_000);
+
+  /**
+   * The second front door to changing something outside Zeus.
+   *
+   * The web path shows the payload and takes a hash-bearing message; MCP has to reach the
+   * same bar through a different mechanism, so these assert on the calendar itself — what
+   * actually left the machine — rather than on what the tool said.
+   */
+  describe("external requests through MCP", () => {
+    let calendarStore: string;
+    let calendarLog: string;
+
+    beforeEach(async () => {
+      calendarStore = join(directory, "calendar.json");
+      calendarLog = join(directory, "calls.log");
+      writeFileSync(join(directory, "calendar-server.mjs"), calendarServerSource(), {
+        mode: 0o600,
+      });
+      writeFileSync(calendarStore, JSON.stringify({ events: [] }), { mode: 0o600 });
+      process.env.FAKE_CALENDAR_STORE = calendarStore;
+      process.env.FAKE_CALENDAR_LOG = calendarLog;
+      // The Zeus MCP server inherits its environment at spawn time, and a connector is
+      // only available when the variables it names are present in that process. Respawn
+      // so these tests run against a server that can actually reach the calendar.
+      await client.close();
+      client = await connectClient(databasePath, () => approvalAction);
+    });
+
+    afterEach(() => {
+      delete process.env.FAKE_CALENDAR_STORE;
+      delete process.env.FAKE_CALENDAR_LOG;
+    });
+
+    function sentEvents(): Array<Record<string, unknown>> {
+      return (
+        JSON.parse(readFileSync(calendarStore, "utf8")) as {
+          events: Array<Record<string, unknown>>;
+        }
+      ).events;
+    }
+
+    /** Seed a pending request the same way a paused run would leave one. */
+    async function seedPendingEffect(): Promise<{ id: number; hash: string }> {
+      const db = openDb(databasePath);
+      try {
+        const conversation = createConversation(db, { title: "Work requests", source: "web" });
+        const source = appendMessage(db, conversation.id, "user", "hold a slot for me", {
+          origin: "user_action",
+          recallState: "blocked",
+        });
+        const connector = createConnector(db, {
+          label: "Test calendar",
+          transport: "stdio",
+          command: process.execPath,
+          args: [join(directory, "calendar-server.mjs")],
+          cwd: process.cwd(),
+          envVarNames: ["FAKE_CALENDAR_STORE", "FAKE_CALENDAR_LOG"],
+          sourceMessageId: source.id,
+        });
+        const { tools } = await verifyConnector(db, connector.id);
+        const createTool = tools.find((tool) => tool.name === "create_event");
+        if (!createTool) throw new Error("fake calendar exposed no create_event");
+        bindCapability(db, {
+          connectorId: connector.id,
+          slot: "calendar.create_event",
+          remoteToolName: "create_event",
+          inputSchema: createTool.inputSchema,
+          sourceMessageId: source.id,
+        });
+        setConnectorEnabled(db, connector.id, true, source.id);
+        for (const capability of getConnector(db, connector.id)?.capabilities ?? []) {
+          setCapabilityEnabled(db, capability.id, true, source.id);
+        }
+
+        const hash = "e".repeat(64);
+        db.exec(`
+          INSERT INTO work_plan
+            (id, objective, status, plan_hash, allowed_effects_json, completion_criteria_json,
+             max_steps, max_model_tool_calls, max_retries_per_step, max_duration_seconds,
+             source_message_id, origin, created_at, updated_at)
+          VALUES (1, 'hold a slot', 'running', '${hash}', '["schedule"]', '["held"]', 12, 20, 2,
+                  900, ${source.id}, 'explicit_request', '2026-08-14T00:00:00.000Z',
+                  '2026-08-14T00:00:00.000Z');
+          INSERT INTO work_step (id, work_plan_id, position, title, instruction, effect_kind, status)
+          VALUES (1, 1, 1, 'hold', 'hold the slot', 'schedule', 'running');
+          INSERT INTO work_authorization
+            (id, work_plan_id, plan_hash, authorization_kind, allowed_effects_json,
+             max_model_tool_calls, max_retries_per_step, max_duration_seconds, expires_at,
+             source_message_id, created_at)
+          VALUES (1, 1, '${hash}', 'explicit_request', '["schedule"]', 20, 2, 900,
+                  '2099-01-01T00:00:00.000Z', ${source.id}, '2026-08-14T00:00:00.000Z');
+          INSERT INTO work_run
+            (id, work_plan_id, authorization_id, plan_hash, status, model_call_count,
+             tool_call_count, started_at, updated_at, deadline_at)
+          VALUES (1, 1, 1, '${hash}', 'paused', 0, 0, '2026-08-14T00:00:00.000Z',
+                  '2026-08-14T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
+        `);
+        const effect = proposeEffect(db, {
+          workRunId: 1,
+          workStepId: 1,
+          slot: "calendar.create_event",
+          payload: { title: "Buffer after landing", start: "2026-08-20T18:40:00Z" },
+          previewText: "Create “Buffer after landing” at 18:40 on 20 August.",
+          providerRequestKey: "mcp-test-1",
+        });
+        return { id: effect.id, hash: effect.payload_hash };
+      } finally {
+        db.close();
+      }
+    }
+
+    it("lists a prepared request without implying it happened", async () => {
+      const effect = await seedPendingEffect();
+
+      const listed = await callText(client, "zeus_pending_effects", {});
+
+      expect(listed).toContain("prepared and NOT sent");
+      expect(listed).toContain(`effect:${effect.id}`);
+      expect(listed).toContain("Buffer after landing");
+      expect(listed).toContain(effect.hash);
+      expect(sentEvents()).toEqual([]);
+    }, 30_000);
+
+    it("fails closed without elicitation and sends nothing", async () => {
+      const effect = await seedPendingEffect();
+      await client.close();
+      client = await connectClient(databasePath);
+
+      const refused = await callText(client, "zeus_confirm_effect", {
+        effect_id: effect.id,
+        payload_hash: effect.hash,
+      });
+
+      expect(refused).toContain("Nothing was sent");
+      expect(refused).toContain("Direct user approval through MCP elicitation is required");
+      expect(sentEvents()).toEqual([]);
+      const db = openDb(databasePath);
+      expect(db.prepare("SELECT status FROM proposed_effect WHERE id = ?").get(effect.id))
+        .toMatchObject({ status: "pending_confirmation" });
+      expect(
+        db
+          .prepare<[], { count: number }>(
+            `SELECT COUNT(*) AS count FROM effect_event WHERE event_type = 'confirmed'`,
+          )
+          .get()?.count,
+      ).toBe(0);
+      db.close();
+    }, 30_000);
+
+    it("sends nothing when the user declines, or when the hash does not match", async () => {
+      const effect = await seedPendingEffect();
+
+      const wrongHash = await callText(client, "zeus_confirm_effect", {
+        effect_id: effect.id,
+        payload_hash: "a".repeat(64),
+      });
+      expect(wrongHash).toContain("does not match");
+      expect(sentEvents()).toEqual([]);
+
+      approvalAction = "decline";
+      const declined = await callText(client, "zeus_confirm_effect", {
+        effect_id: effect.id,
+        payload_hash: effect.hash,
+      });
+
+      expect(declined).toContain("Nothing was sent");
+      expect(sentEvents()).toEqual([]);
+    }, 30_000);
+
+    it("sends exactly the confirmed request, with a user message naming its hash", async () => {
+      const effect = await seedPendingEffect();
+
+      const sent = await callText(client, "zeus_confirm_effect", {
+        effect_id: effect.id,
+        payload_hash: effect.hash,
+      });
+
+      expect(sent).toContain("Sent to Test calendar");
+      expect(sentEvents()).toEqual([
+        expect.objectContaining({
+          title: "Buffer after landing",
+          start: "2026-08-20T18:40:00Z",
+        }),
+      ]);
+
+      const db = openDb(databasePath);
+      expect(db.prepare("SELECT status FROM proposed_effect WHERE id = ?").get(effect.id))
+        .toMatchObject({ status: "executed" });
+      // The consent record has to be the user's own, and has to name the exact bytes.
+      const confirmation = db
+        .prepare<[number], { role: string; origin: string; content: string }>(
+          `SELECT message.role, message.origin, message.content
+           FROM effect_event
+           JOIN message ON message.id = effect_event.source_message_id
+           WHERE effect_event.proposed_effect_id = ? AND effect_event.event_type = 'confirmed'`,
+        )
+        .get(effect.id);
+      expect(confirmation).toMatchObject({ role: "user", origin: "user_action" });
+      expect(confirmation?.content).toContain(effect.hash);
+      expect(
+        db
+          .prepare<[], { count: number }>(
+            `SELECT COUNT(*) AS count FROM tool_receipt WHERE tool_name = 'connector_call'`,
+          )
+          .get()?.count,
+      ).toBe(1);
+      db.close();
+    }, 30_000);
+  });
 
   it("returns project confidence, learned dates, and source-backed lifecycle history", async () => {
     const seed = openDb(databasePath);

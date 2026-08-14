@@ -98,16 +98,27 @@ export type StewardshipMode = z.infer<typeof StewardshipMode>;
 export const TriggerKind = z.enum(["chat", "today", "mcp", "worker"]);
 export type TriggerKind = z.infer<typeof TriggerKind>;
 
+/**
+ * The unit of authorization for work. `external_read` is deliberately separate from
+ * `web_read`: reading the user's calendar through a connected service is a different
+ * grant from searching the public web, and a plan approved for one must not thereby
+ * reach the other.
+ */
 export const EffectKind = z.enum([
   "memory_read",
   "web_read",
   "prepare_local",
+  "external_read",
   "send",
   "schedule",
   "purchase",
   "modify_external",
 ]);
 export type EffectKind = z.infer<typeof EffectKind>;
+
+/** Effects that change state outside Zeus, and therefore need a confirmed payload. */
+export const WriteEffectKind = z.enum(["send", "schedule", "modify_external"]);
+export type WriteEffectKind = z.infer<typeof WriteEffectKind>;
 
 export const Weekday = z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
 export type Weekday = z.infer<typeof Weekday>;
@@ -581,6 +592,8 @@ export const RecommendationCycle = z
     applied_facet_ids_json: z.string(),
     exclusions_json: z.string(),
     selected_commitment_id: z.number().int().nullable(),
+    /** One opportunity pipeline, two possible subjects: a commitment or a detected signal. */
+    selected_signal_id: z.number().int().nullable(),
     recommendation_json: z.string().nullable(),
     source_message_id: z.number().int().nullable(),
     created_at: z.string(),
@@ -874,13 +887,36 @@ export const WorkArtifactMemorySource = z
   .strict();
 export type WorkArtifactMemorySource = z.infer<typeof WorkArtifactMemorySource>;
 
+/**
+ * `effect_proposal` prepared an external request and stopped; only `connector_call` means
+ * bytes left the machine. The distinction is what makes the receipt log answerable.
+ */
+export const ToolName = z.enum([
+  "memory_recall",
+  "web_search",
+  "local_artifact",
+  "effect_proposal",
+  "connector_call",
+]);
+export type ToolName = z.infer<typeof ToolName>;
+
 export const ToolReceipt = z
   .object({
     id: z.number().int(),
     work_run_id: z.number().int(),
     work_step_id: z.number().int().nullable(),
-    tool_name: z.enum(["memory_recall", "web_search", "local_artifact"]),
-    effect_kind: z.enum(["memory_read", "web_read", "prepare_local"]),
+    tool_name: ToolName,
+    effect_kind: z.enum([
+      "memory_read",
+      "web_read",
+      "prepare_local",
+      "external_read",
+      "send",
+      "schedule",
+      "modify_external",
+    ]),
+    connector_capability_id: z.number().int().nullable(),
+    proposed_effect_id: z.number().int().nullable(),
     call_index: z.number().int().positive(),
     input_json: z.string(),
     output_json: z.string().nullable(),
@@ -894,6 +930,205 @@ export const ToolReceipt = z
   })
   .strict();
 export type ToolReceipt = z.infer<typeof ToolReceipt>;
+
+// ---------------------------------------------------------------------------
+// Connectors and external effects
+// ---------------------------------------------------------------------------
+
+export const ConnectorTransport = z.enum(["stdio", "http"]);
+export type ConnectorTransport = z.infer<typeof ConnectorTransport>;
+
+export const ConnectorStatus = z.enum(["unverified", "ready", "unreachable", "disabled"]);
+export type ConnectorStatus = z.infer<typeof ConnectorStatus>;
+
+/**
+ * The capability slots Zeus knows how to fill. A slot fixes its effect kind, so reviewing
+ * the bound slots is enough to understand everything a connector is allowed to do.
+ */
+export const CapabilitySlot = z.enum([
+  "calendar.list_events",
+  "calendar.create_event",
+  "calendar.update_event",
+]);
+export type CapabilitySlot = z.infer<typeof CapabilitySlot>;
+
+export const CAPABILITY_SLOT_EFFECTS = {
+  "calendar.list_events": "external_read",
+  "calendar.create_event": "schedule",
+  "calendar.update_event": "modify_external",
+} as const satisfies Record<CapabilitySlot, EffectKind>;
+
+export const Sha256Hex = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/u, "Expected a lowercase 64-character SHA-256 digest");
+
+/**
+ * A user-configured MCP server. It records how to reach the server and the *names* of the
+ * environment variables it needs — never their values. Zeus holds no third-party
+ * credential, so deleting a connector cannot leave one behind.
+ */
+export const Connector = z
+  .object({
+    id: z.number().int(),
+    label: z.string(),
+    transport: ConnectorTransport,
+    command: z.string().nullable(),
+    args_json: z.string(),
+    cwd: z.string().nullable(),
+    url: z.string().nullable(),
+    env_var_names_json: z.string(),
+    discovered_tools_json: z.string(),
+    status: ConnectorStatus,
+    enabled: z.number().int().min(0).max(1),
+    source_message_id: z.number().int(),
+    last_verified_at: z.string().nullable(),
+    last_error_code: z.string().nullable(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type Connector = z.infer<typeof Connector>;
+
+export const ConnectorCapability = z
+  .object({
+    id: z.number().int(),
+    connector_id: z.number().int(),
+    slot: CapabilitySlot,
+    remote_tool_name: z.string(),
+    effect_kind: z.enum(["external_read", "schedule", "modify_external"]),
+    input_schema_json: z.string(),
+    schema_hash: Sha256Hex,
+    enabled: z.number().int().min(0).max(1),
+    source_message_id: z.number().int(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type ConnectorCapability = z.infer<typeof ConnectorCapability>;
+
+export const ProposedEffectStatus = z.enum([
+  "pending_confirmation",
+  "confirmed",
+  "declined",
+  "expired",
+  "executed",
+  "failed",
+  "reverted",
+]);
+export type ProposedEffectStatus = z.infer<typeof ProposedEffectStatus>;
+
+/**
+ * The payload gate. Authorizing a plan approves a scope; this row is the exact request
+ * that scope produced. Only the bytes hashed here can ever be sent.
+ */
+export const ProposedEffect = z
+  .object({
+    id: z.number().int(),
+    work_run_id: z.number().int(),
+    work_step_id: z.number().int(),
+    connector_capability_id: z.number().int(),
+    effect_kind: WriteEffectKind,
+    payload_json: z.string(),
+    payload_hash: Sha256Hex,
+    preview_text: z.string(),
+    reversal_json: z.string().nullable(),
+    status: ProposedEffectStatus,
+    idempotency_key: z.string(),
+    provider_request_key: z.string(),
+    expires_at: z.string(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type ProposedEffect = z.infer<typeof ProposedEffect>;
+
+export const EffectEventType = z.enum([
+  "proposed",
+  "confirmed",
+  "declined",
+  "expired",
+  "executed",
+  "failed",
+  "reverted",
+]);
+export type EffectEventType = z.infer<typeof EffectEventType>;
+
+export const EffectEvent = z
+  .object({
+    id: z.number().int(),
+    proposed_effect_id: z.number().int(),
+    event_type: EffectEventType,
+    source_message_id: z.number().int().nullable(),
+    detail_json: z.string().nullable(),
+    created_at: z.string(),
+  })
+  .strict();
+export type EffectEvent = z.infer<typeof EffectEvent>;
+
+export const ExternalSignalKind = z.enum(["calendar_event"]);
+export type ExternalSignalKind = z.infer<typeof ExternalSignalKind>;
+
+/**
+ * A disposable copy of what a connector reported. Never evidence: an invite someone else
+ * wrote is not the user speaking, so it may shape a plan but can never become memory.
+ */
+export const ExternalSignal = z
+  .object({
+    id: z.number().int(),
+    connector_id: z.number().int(),
+    kind: ExternalSignalKind,
+    external_id: z.string(),
+    starts_at: z.string().nullable(),
+    ends_at: z.string().nullable(),
+    location: z.string().nullable(),
+    payload_json: z.string(),
+    fetched_at: z.string(),
+    expires_at: z.string(),
+  })
+  .strict();
+export type ExternalSignal = z.infer<typeof ExternalSignal>;
+
+export const DetectorKind = z.enum([
+  "calendar_overlap",
+  "travel_gap",
+  "deadline_collision",
+  "commitment_unscheduled",
+]);
+export type DetectorKind = z.infer<typeof DetectorKind>;
+
+export const DetectedSignal = z
+  .object({
+    id: z.number().int(),
+    detector: DetectorKind,
+    dedupe_key: z.string(),
+    subject_json: z.string(),
+    commitment_id: z.number().int().nullable(),
+    severity: z.number().int().min(0).max(100),
+    why: z.string(),
+    suggested_action: z.string(),
+    effect_kind: EffectKind,
+    occurs_at: z.string().nullable(),
+    detected_at: z.string(),
+    snoozed_until: z.string().nullable(),
+    last_surfaced_at: z.string().nullable(),
+    resolved_at: z.string().nullable(),
+  })
+  .strict();
+export type DetectedSignal = z.infer<typeof DetectedSignal>;
+
+export const SignalEvent = z
+  .object({
+    id: z.number().int(),
+    detected_signal_id: z.number().int(),
+    event_type: FollowThroughEventType,
+    detail_json: z.string().nullable(),
+    response_message_id: z.number().int().nullable(),
+    source_message_id: z.number().int().nullable(),
+    source_kind: z.enum(["system", "message", "user_action"]),
+    created_at: z.string(),
+  })
+  .strict();
+export type SignalEvent = z.infer<typeof SignalEvent>;
 
 export const WorkStepDefinition = z
   .object({

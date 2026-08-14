@@ -88,16 +88,34 @@ npm run mcp            # stdio MCP server
 - `src/core/context.ts` — canonical prompt context and response trace writes.
 - `src/core/response-context.ts` — read-side reconstruction of recalled items.
 - `src/core/intentions.ts` — goals, commitments, priorities, and append-only lifecycle events.
-- `src/core/stewardship.ts` — priority-aware next-action selection, intervention settings,
-  permission boundaries, user decisions, and progress/regret signals.
+- `src/core/projects.ts` — source-backed project lifecycles and progress history.
+- `src/core/stewardship.ts` — priority-aware next-action selection, signal selection,
+  intervention settings, permission boundaries, user decisions, and progress/regret signals.
+- `src/core/personalization.ts` — read model over accepted memory, plus behavioral-policy
+  proposals that may only ever reduce interruptions.
+- `src/core/ambient.ts` — opt-in background evaluation, quiet hours, one-per-day delivery
+  claims, and the deterministic refresh that precedes them.
+- `src/core/work-plans.ts` — immutable plan hashes, exact-hash authorization, runner leases,
+  checkpoints, receipts, and artifacts.
+- `src/core/work-execution.ts` — plan generation and the bounded step executor.
+- `src/core/connectors.ts` — configured MCP servers and the capability slots granted to them.
+- `src/core/mcp-client.ts` — the only outbound-network module in core.
+- `src/core/effects.ts` — proposed external requests and the payload confirmation gate.
+- `src/core/calendar-sync.ts` — the disposable external read cache.
+- `src/core/detectors.ts` — deterministic conflict detection over that cache.
+- `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
+  run capacity.
 - `src/core/retention.ts` — explicit source deletion and evidence-aware cleanup.
+- `src/core/snapshots.ts`, `src/core/restore.ts` — verified snapshots and restore.
+- `src/core/observability.ts` — allowlisted operational events; never free-form text.
 - `src/core/chat.ts` — retrieve → stream → trace → extract → apply turn loop.
 - `src/core/openai.ts` — lazy OpenAI client and response/refusal checks.
-- `src/app/actions.ts` — explicit curation and destructive user actions.
+- `src/app/actions.ts` — explicit curation, connection, and destructive user actions.
 - `src/app/`, `src/components/` — routes and UI.
 - `src/server/db.ts` — process-wide database handle for Next.js.
+- `src/server/auth/` — Supabase-backed account boundary for the web front door.
 - `src/mcp/server.ts` — stdio MCP server, the second front door.
-- `scripts/` — demo seed, offline trust evaluation, reindex, and export.
+- `scripts/` — demo seed, offline trust evaluation, reindex, export, snapshots, ambient worker.
 
 Tests are colocated with the core modules they protect.
 
@@ -173,10 +191,10 @@ Goals and commitments have their own lifecycle tables and append-only event tabl
 not encode the same item as a generic fact. Updates must preserve owners, dates, statuses,
 source messages, and history.
 
-Zeus may surface at most one eligible follow-through recommendation during a chat turn.
-The current repository has no external action adapters: Zeus can prepare, suggest, or
-clarify, but must not claim it sent, scheduled, purchased, or changed anything outside
-the local store.
+Zeus may surface at most one eligible proposal during a chat turn — either a
+follow-through recommendation or a detected signal, never both. It must not claim it sent,
+scheduled, purchased, or changed anything outside the local store unless a stored receipt
+records that it completed.
 
 ### Follow-through proposals are not memory
 
@@ -192,13 +210,74 @@ still serving as its source-backed basis. Record acceptance, completion, snooze,
 and regret as append-only user-control events. Do not infer those outcomes from silence or
 from the assistant's own text.
 
-Zeus may draft, research, compare, or plan inside the conversation after authorization.
-Sending, scheduling, purchasing, reminding, coordinating, or any other external state
-change requires explicit confirmation and an available tool. No adapter means no action.
-
 Measure assisted progress, control signals, and regret separately. Do not replace them with
 conversation count, time spent, tasks surfaced, or a composite engagement score that could
-reward interruption.
+reward interruption. Declines and reversals of external requests are regret signals and
+must stay separately visible.
+
+### Detected signals are proposals too
+
+A detector may notice something the user never wrote down — two calendar events claiming
+the same minutes, a deadline with no time set aside. That output is assistant-authored
+proposal data with its own append-only ledger in `signal_event`, never a fact and never a
+commitment. It is deliberately not merged into `follow_through_event`, because the
+behavioral-policy machinery reasons about commitments the user made.
+
+Detectors are pure functions over the local store and must make no model call. A signal
+reaches the user only through the existing opportunity pipeline, so intervention mode,
+quiet hours, the one-per-day budget, cooldown, snooze, dismissal, and facet blocks all
+apply unchanged. Do not add a second interruption path.
+
+### External action passes two gates, never one
+
+Authorizing a work plan approves a *scope*. It cannot approve a *payload*, because the
+concrete request only exists once earlier steps have run. Treating scope approval as
+payload approval is the failure the whole design prevents.
+
+- **Scope, up front.** `authorizeWorkPlan` binds an exact plan hash, effects, limits, and
+  expiry to a real user message. An effectful kind is authorizable only when a bound,
+  enabled `connector_capability` provides it. `purchase` is refused unconditionally.
+- **Payload, at execution.** A write step must not call the connector. It materializes the
+  exact request into `proposed_effect` and returns a pause, so the run parks at its durable
+  checkpoint. `confirmEffect` requires a stored **user** message containing the exact
+  payload hash — the same proof `assertExactApprovalMessage` requires for a plan. The hash
+  is recomputed from storage immediately before dispatch, so an edited payload fails closed.
+
+Silence is never consent: an unanswered request expires rather than escalating. An
+assistant message can never confirm anything; a database trigger enforces that
+independently of the write path.
+
+`external_read` is a distinct effect kind rather than a widening of `web_read`, because the
+effect kind is the unit of authorization: a plan approved for public web research must not
+thereby reach the user's calendar. Reads need no per-use confirmation — connecting the
+service was the consent — but writes always do.
+
+In the receipt log, `connector_call` is the only tool name that means bytes left the
+machine. `effect_proposal` means a request was prepared and stopped. Keep them distinct.
+
+### Zeus stores no third-party credential
+
+A connector records a command, arguments, a URL, and the *names* of environment variables.
+There is nowhere to put a value, and there must not be. Values are read from the process
+environment at call time and never persisted, logged, or exported.
+
+A stdio connector is spawned without a shell, with explicit argv, and receives only the
+SDK's safe default environment plus exactly the variables the user named — never the whole
+environment Zeus is running with. An HTTP connector must use https, except on loopback.
+
+Discovering a remote tool is not granting it. A capability binds one discovered tool to one
+slot, the slot fixes the effect kind, and the tool's input schema is hashed at bind time:
+a server that later changes what "create an event" accepts is disabled and re-reviewed
+rather than silently obeyed.
+
+### External data is never evidence
+
+Calendar text is somebody else's writing — anyone who can send an invite can author it. It
+may inform a plan, appear in an artifact, or trip a detector. It must never become a fact,
+facet, goal, commitment, or candidate, it never enters `extract()`, and it never enters the
+`<memory>` block. `external_signal` is a disposable, expiring cache with no path to any
+evidence table; keep it that way. Run every external payload through
+`inspectUntrustedWorkData` before it reaches a model.
 
 ### Response provenance is persistent
 
