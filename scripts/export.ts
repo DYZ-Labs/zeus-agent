@@ -617,8 +617,10 @@ const connectionsBody = connectors.length
       .map((connector) => [
         `## ${connector.label} (connector ${connector.id})`,
         "",
+        `- preset: ${connector.preset_id ?? "manual"}`,
         `- transport: ${connector.transport}`,
         `- reached by: ${connector.transport === "stdio" ? [connector.command, ...connector.args].join(" ") : connector.url}`,
+        `- authentication: ${connector.preset_id === "google-calendar-official" ? "Google Application Default Credentials, resolved at call time and never stored" : "configured environment variable names, resolved at call time"}`,
         `- environment variable names read at call time: ${connector.envVarNames.join(", ") || "none"}`,
         "- values for those variables are never stored by Zeus and are not in this export",
         `- status: ${connector.status}${connector.enabled === 1 ? " · enabled" : " · not enabled"}`,
@@ -689,9 +691,9 @@ writeFileSync(
   [
     "# Connections and external requests",
     "",
-    "Zeus reaches other services only through servers you configured, and only through",
-    "capability slots you granted. It stores the names of the environment variables a",
-    "server needs, never their values, so no credential appears in this export.",
+    "Zeus reaches other services only through reviewed MCP capability slots. Manual",
+    "connections store environment-variable names, never values; catalog authentication",
+    "is resolved only at call time. No credential appears in this export.",
     "",
     "Every external request is listed with the exact payload and the message in which you",
     "confirmed it. A request with no `executed` event never happened.",

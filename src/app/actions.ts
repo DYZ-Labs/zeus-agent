@@ -18,14 +18,18 @@ import {
 import { updateAmbientSetting } from "@/core/ambient";
 import {
   CAPABILITY_SLOTS,
+  ConnectorPresetError,
   bindCapability,
+  configureConnectorPreset,
   createConnector,
   deleteConnector,
   getCapability,
   getConnector,
+  getConnectorByPresetId,
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "@/core/connectors";
+import { GOOGLE_CALENDAR_PRESET_ID } from "@/core/connector-catalog";
 import { getSignal } from "@/core/detectors";
 import {
   confirmEffect,
@@ -34,7 +38,7 @@ import {
   getProposedEffect,
   revertEffect,
 } from "@/core/effects";
-import { verifyConnector } from "@/core/mcp-client";
+import { ConnectorError, probeConnectorPreset, verifyConnector } from "@/core/mcp-client";
 import { createSafeWorkExecutor } from "@/core/work-execution";
 import { resumeWorkRun } from "@/core/work-plans";
 import {
@@ -116,7 +120,7 @@ import {
   recordSignalDecision,
   setStewardshipMode,
 } from "@/core/stewardship";
-import { requireOwnerDb } from "@/server/auth/access";
+import { getOwnerAccess, requireOwnerDb } from "@/server/auth/access";
 
 /**
  * Curation actions.
@@ -792,6 +796,118 @@ export async function setSummaryAction(formData: FormData): Promise<void> {
  * individual external request Zeus was permitted to send.
  */
 
+export type ConnectorSetupCode =
+  | "idle"
+  | "connected"
+  | "updated"
+  | "local_only"
+  | "invalid_request"
+  | "invalid_preset"
+  | "invalid_permissions"
+  | "gcloud_missing"
+  | "gcloud_unavailable"
+  | "project_missing"
+  | "adc_missing"
+  | "scope_missing"
+  | "api_or_iam_missing"
+  | "server_unreachable"
+  | "tool_contract_changed"
+  | "already_connected";
+
+export type ConnectorSetupState = {
+  status: "idle" | "success" | "error";
+  code: ConnectorSetupCode;
+  message: string;
+};
+
+/**
+ * Probe and apply the complete catalog decision in one user action.
+ *
+ * The network handshake happens before any write. Once it succeeds, the curation source,
+ * connector, live schema bindings, and enabled grants are committed together, so neither
+ * a failed provider check nor a partial database update can leave misleading state.
+ */
+export async function configureConnectorPresetAction(
+  _previousState: ConnectorSetupState,
+  formData: FormData,
+): Promise<ConnectorSetupState> {
+  const presetId = String(formData.get("presetId") ?? "");
+  const rawSlots = formData.getAll("slots").map(String);
+  if (
+    rawSlots.length === 0 ||
+    rawSlots.some(
+      (slot) => !CAPABILITY_SLOTS.includes(slot as (typeof CAPABILITY_SLOTS)[number]),
+    )
+  ) {
+    return connectorSetupError("invalid_permissions");
+  }
+  const selectedSlots = [...new Set(rawSlots)] as (typeof CAPABILITY_SLOTS)[number][];
+  const expectedIdText = String(formData.get("connectorId") ?? "").trim();
+  const expectedConnectorId = expectedIdText ? Number(expectedIdText) : undefined;
+  if (
+    presetId !== GOOGLE_CALENDAR_PRESET_ID ||
+    (expectedConnectorId !== undefined && !Number.isInteger(expectedConnectorId))
+  ) {
+    return connectorSetupError(
+      presetId === GOOGLE_CALENDAR_PRESET_ID ? "invalid_request" : "invalid_preset",
+    );
+  }
+
+  const access = await getOwnerAccess();
+  if (access.state !== "local") return connectorSetupError("local_only");
+  const db = access.db;
+  const existing = getConnectorByPresetId(db, presetId);
+  if (expectedConnectorId === undefined && existing) {
+    return connectorSetupError("already_connected");
+  }
+  if (
+    expectedConnectorId !== undefined &&
+    (!existing || existing.id !== expectedConnectorId)
+  ) {
+    return connectorSetupError("invalid_request");
+  }
+
+  let tools: Awaited<ReturnType<typeof probeConnectorPreset>>["tools"];
+  try {
+    ({ tools } = await probeConnectorPreset(presetId, selectedSlots, {
+      tokenFailureCode: existing ? "scope_missing" : "adc_missing",
+    }));
+  } catch (error) {
+    return connectorSetupStateForError(error);
+  }
+
+  try {
+    db.transaction(() => {
+      const decision = selectedSlots.join(", ");
+      const source = curationMessage(
+        db,
+        existing
+          ? `Set Google Calendar permissions to: ${decision}.`
+          : `Connect Google Calendar with permissions: ${decision}.`,
+      );
+      configureConnectorPreset(db, {
+        presetId,
+        selectedSlots,
+        discoveredTools: tools,
+        sourceMessageId: source.id,
+        connectorId: existing?.id,
+      });
+    })();
+  } catch (error) {
+    return connectorSetupStateForError(error);
+  }
+
+  revalidatePath("/settings");
+  revalidatePath("/today");
+  return {
+    status: "success",
+    code: existing ? "updated" : "connected",
+    message: existing
+      ? "Google Calendar permissions were updated."
+      : "Google Calendar is connected.",
+  };
+}
+
 export async function addConnectorAction(formData: FormData): Promise<void> {
   const label = normalizedText(formData.get("label"), 120);
   const transport = String(formData.get("transport") ?? "stdio");
@@ -1012,6 +1128,57 @@ export async function signalDecisionAction(formData: FormData): Promise<void> {
 function connectorErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "That did not work.";
   return message.slice(0, 200);
+}
+
+function connectorSetupStateForError(error: unknown): ConnectorSetupState {
+  if (error instanceof ConnectorError || error instanceof ConnectorPresetError) {
+    return connectorSetupError(
+      isConnectorSetupErrorCode(error.code) ? error.code : "invalid_request",
+    );
+  }
+  return connectorSetupError("invalid_request");
+}
+
+function isConnectorSetupErrorCode(value: string): value is Exclude<
+  ConnectorSetupCode,
+  "idle" | "connected" | "updated"
+> {
+  return [
+    "local_only",
+    "invalid_request",
+    "invalid_preset",
+    "invalid_permissions",
+    "gcloud_missing",
+    "gcloud_unavailable",
+    "project_missing",
+    "adc_missing",
+    "scope_missing",
+    "api_or_iam_missing",
+    "server_unreachable",
+    "tool_contract_changed",
+    "already_connected",
+  ].includes(value);
+}
+
+function connectorSetupError(
+  code: Exclude<ConnectorSetupCode, "idle" | "connected" | "updated">,
+): ConnectorSetupState {
+  const messages: Record<typeof code, string> = {
+    local_only: "Guided Google Calendar setup is available only in local mode.",
+    invalid_request: "That connection request was invalid. Refresh Settings and try again.",
+    invalid_preset: "That connection preset is not available.",
+    invalid_permissions: "Select at least one Google Calendar permission.",
+    gcloud_missing: "Install the Google Cloud CLI, then run the setup check again.",
+    gcloud_unavailable: "The Google Cloud CLI did not answer safely. Try its commands in a terminal.",
+    project_missing: "Select an active Google Cloud project before connecting Calendar.",
+    adc_missing: "Create Application Default Credentials with the generated Calendar scopes.",
+    scope_missing: "Your Application Default Credentials need the newly selected Calendar scopes.",
+    api_or_iam_missing: "Check that both APIs and the required IAM roles are enabled in the active project.",
+    server_unreachable: "Zeus could not reach Google's Calendar MCP server. No connection was saved.",
+    tool_contract_changed: "Google's Calendar tool contract changed, so Zeus left the permission disabled for review.",
+    already_connected: "Google Calendar is already connected. Refresh Settings to manage its permissions.",
+  };
+  return { status: "error", code, message: messages[code] };
 }
 
 function curationMessage(db: Db, content: string) {

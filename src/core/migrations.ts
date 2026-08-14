@@ -1777,6 +1777,19 @@ CREATE TABLE connector_usage (
 );
 `;
 
+/**
+ * Catalog connectors retain the same reviewed-capability model as manual MCP servers.
+ * The nullable id identifies code-owned configuration without changing legacy rows; the
+ * partial unique index permits any number of manual connectors but only one instance of
+ * each preset.
+ */
+const CONNECTOR_PRESETS = `
+ALTER TABLE connector ADD COLUMN preset_id TEXT;
+CREATE UNIQUE INDEX connector_preset_unique_idx
+ON connector(preset_id)
+WHERE preset_id IS NOT NULL;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1801,4 +1814,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "021_snapshot_destinations", sql: SNAPSHOT_DESTINATIONS },
   { id: "022_model_usage", sql: MODEL_USAGE },
   { id: "023_external_actions", sql: EXTERNAL_ACTIONS },
+  { id: "024_connector_presets", sql: CONNECTOR_PRESETS },
 ];

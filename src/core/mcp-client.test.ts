@@ -15,7 +15,13 @@ import {
 } from "./connectors";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
-import { ConnectorError, callCapability, revalidateCapabilitySchemas, verifyConnector } from "./mcp-client";
+import {
+  ConnectorError,
+  callCapability,
+  googleCalendarAdcHeaders,
+  revalidateCapabilitySchemas,
+  verifyConnector,
+} from "./mcp-client";
 
 /**
  * These spawn a real stdio MCP server rather than injecting a fake transport. The parts
@@ -233,4 +239,64 @@ describe("reaching a connected service", () => {
     );
     expect(getConnector(db, connectorId)?.status).toBe("unreachable");
   }, 30_000);
+});
+
+describe("Google Application Default Credentials", () => {
+  it("requests only the fixed project and minimum-scope token commands", async () => {
+    const calls: string[][] = [];
+    const headers = await googleCalendarAdcHeaders(["calendar.list_events"], {
+      environment: {},
+      commandRunner: async (args) => {
+        calls.push([...args]);
+        return {
+          stdout: args[0] === "config"
+            ? "zeus-calendar-project\n"
+            : "short-lived-access-token-12345\n",
+        };
+      },
+    });
+
+    expect(calls[0]).toEqual(["config", "get-value", "project", "--quiet"]);
+    expect(calls[1]?.slice(0, 3)).toEqual([
+      "auth",
+      "application-default",
+      "print-access-token",
+    ]);
+    expect(calls[1]?.[3]).toContain("calendar.events.readonly");
+    expect(calls[1]?.[3]).not.toContain("auth/calendar.events,");
+    expect(headers).toEqual({
+      Authorization: "Bearer short-lived-access-token-12345",
+      "x-goog-user-project": "zeus-calendar-project",
+    });
+  });
+
+  it("returns an allowlisted failure without echoing command output", async () => {
+    let call = 0;
+    const failure = googleCalendarAdcHeaders(["calendar.create_event"], {
+      environment: {},
+      tokenFailureCode: "scope_missing",
+      commandRunner: async () => {
+        call += 1;
+        if (call === 1) return { stdout: "zeus-calendar-project" };
+        throw new Error("ya29.secret-provider-output");
+      },
+    });
+
+    await expect(failure).rejects.toMatchObject({ code: "scope_missing" });
+    await expect(failure).rejects.not.toThrow(/secret-provider-output/u);
+  });
+
+  it("refuses process-wide ADC outside local mode before running gcloud", async () => {
+    let called = false;
+    await expect(
+      googleCalendarAdcHeaders(["calendar.list_events"], {
+        environment: { NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co" },
+        commandRunner: async () => {
+          called = true;
+          return { stdout: "must-not-run" };
+        },
+      }),
+    ).rejects.toMatchObject({ code: "local_only" });
+    expect(called).toBe(false);
+  });
 });

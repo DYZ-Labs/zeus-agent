@@ -101,8 +101,10 @@ export default async function EffectPage({
         </Section>
 
         <p className="mt-8 max-w-[68ch] text-[0.78rem] leading-6" style={{ color: "var(--shell-faint)" }}>
-          Zeus stores no credential for {effect.connector.label}. It reached the service
-          through a server you configured, using values from your own environment.
+          Zeus stores no credential for {effect.connector.label}. It reached the service{" "}
+          {effect.connector.preset_id === "google-calendar-official"
+            ? "with a short-lived Google ADC token resolved in memory for that call."
+            : "through a server you configured, using only the environment values you named."}
         </p>
       </div>
     </div>

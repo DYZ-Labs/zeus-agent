@@ -199,7 +199,9 @@ describe("serialized migrations and verified backups", () => {
 // brackets itself in legacy_alter_table.
 describe("external-action migration rebuilds work_step in place", () => {
   const upToTwentyTwo = MIGRATIONS.filter(
-    (migration) => migration.id !== "023_external_actions",
+    (migration) =>
+      migration.id !== "023_external_actions" &&
+      migration.id !== "024_connector_presets",
   );
   const externalActions = MIGRATIONS.find(
     (migration) => migration.id === "023_external_actions",
@@ -352,6 +354,52 @@ describe("external-action migration rebuilds work_step in place", () => {
     expect(() =>
       db.exec("UPDATE effect_event SET event_type = 'declined' WHERE proposed_effect_id = 1"),
     ).toThrow(/append-only/u);
+    db.close();
+  });
+});
+
+describe("connector preset migration", () => {
+  it("preserves manual connectors and permits only one row per preset", () => {
+    const beforePresets = MIGRATIONS.filter(
+      (migration) => migration.id !== "024_connector_presets",
+    );
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db, beforePresets);
+    db.exec(`
+      INSERT INTO conversation (id, title, source, started_at, updated_at)
+      VALUES (1001, 'Connections', 'web', '2026-08-14T00:00:00.000Z',
+              '2026-08-14T00:00:00.000Z');
+      INSERT INTO message (id, conversation_id, role, content, created_at)
+      VALUES (1001, 1001, 'user', 'connect my calendar', '2026-08-14T00:00:00.000Z');
+      INSERT INTO connector
+        (id, label, transport, command, source_message_id, created_at, updated_at)
+      VALUES (1001, 'Manual calendar', 'stdio', 'node', 1001,
+              '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+    `);
+
+    migrate(db, MIGRATIONS);
+
+    expect(
+      db.prepare("SELECT preset_id FROM connector WHERE id = 1001").get(),
+    ).toEqual({ preset_id: null });
+    db.exec(`
+      UPDATE connector SET preset_id = 'google-calendar-official' WHERE id = 1001;
+      INSERT INTO connector
+        (id, label, transport, command, source_message_id, created_at, updated_at)
+      VALUES (1002, 'Another manual server', 'stdio', 'node', 1001,
+              '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+    `);
+    expect(() =>
+      db.exec(`
+        UPDATE connector
+        SET preset_id = 'google-calendar-official'
+        WHERE id = 1002;
+      `),
+    ).toThrow(/UNIQUE constraint failed/u);
+    expect(
+      db.prepare("SELECT COUNT(*) FROM connector WHERE preset_id IS NULL").pluck().get(),
+    ).toBe(1);
     db.close();
   });
 });

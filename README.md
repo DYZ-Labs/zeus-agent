@@ -46,9 +46,10 @@ contextual follow-through.
   not doing. Every external request stops with the exact payload shown, and only a message
   of yours naming that payload's hash lets it be sent. Silence is not consent: an
   unanswered request expires.
-- **No credentials in the store.** Zeus reaches other services through MCP servers you
-  configure. It records the command and the *names* of the environment variables a server
-  needs, never their values, and hands a server only the variables you named.
+- **No credentials in the store.** Zeus reaches other services through reviewed MCP
+  capabilities. Manual connections record only commands, URLs, and environment-variable
+  names. The guided Google Calendar connection asks `gcloud` for a short-lived ADC token
+  in memory; Zeus never stores the token, OAuth client JSON, or active project.
 - **Outcomes without hiding regret.** Follow-through offers and user decisions form an
   append-only audit trail. Progress, control signals, and regret remain separately
   visible instead of collapsing into an engagement score.
@@ -76,8 +77,8 @@ contextual follow-through.
 - Opt-in macOS ambient support with quiet hours, a one-notification-per-day budget,
   short-lived named coarse zones, deterministic background evaluation, and no model call
   in the worker.
-- Connections to MCP servers you run, with per-capability grants, a reviewed input-schema
-  hash for each, and no stored credentials.
+- A local-first guided Google Calendar connection plus advanced custom MCP servers, with
+  per-capability grants, live input-schema hashes, and no stored credentials.
 - Deterministic detection of calendar overlaps, tight turnarounds, deadline collisions, and
   unscheduled commitments, delivered through the same gates as every other interruption.
 - A **Today** view with one best current action, external requests awaiting your
@@ -537,8 +538,9 @@ The main views are:
 - **Understanding** — inspect, correct, close, or delete accepted facets; edit and
   review pending inferences or sensitive proposals; optionally start a reflection or
   historical preview.
-- **Settings → Connections** — add, verify, enable, and remove connected services, and
-  grant or withdraw each capability individually.
+- **Settings → Connections** — connect Google Calendar through a guided read-only-by-default
+  checklist, manage its permissions, or open Advanced to configure and review a custom MCP
+  server capability by capability.
 - **Open loops** — update goals and commitments, inspect their histories, and snooze
   commitment nudges.
 - **Timeline** — see current and superseded facts in learned-at order.
@@ -550,6 +552,14 @@ supported memory survives with a remaining real source; intention fields are rep
 from surviving events rather than retaining deleted-source state. Permanent deletion
 also checkpoints and truncates SQLite's WAL, rebuilds FTS, vacuums and verifies the store,
 and removes Zeus-managed pre-migration backups that could retain the erased source.
+
+The guided Google Calendar preset is available only in loopback/local mode. It targets
+Google's official Developer Preview MCP endpoint and verifies the live `list_events`,
+`create_event`, and `update_event` schemas before saving a grant. Google Cloud project,
+API, IAM, Desktop OAuth client, and Application Default Credentials setup remains an
+explicit user-run prerequisite; Zeus provides copyable commands but never changes those
+resources. A selected write permission still stops at Zeus's exact-payload confirmation
+gate before any calendar mutation.
 
 ## MCP integration
 

@@ -1,19 +1,23 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+  assertPresetConnectorConfiguration,
   availableCapability,
   availableEffectKinds,
   bindCapability,
+  configureConnectorPreset,
   connectorEnvironment,
   createConnector,
   deleteConnector,
   getConnector,
+  getConnectorByPresetId,
   listConnectors,
   recordConnectorVerification,
   setCapabilityEnabled,
   setConnectorEnabled,
   toolSchemaHash,
 } from "./connectors";
+import { GOOGLE_CALENDAR_MCP_URL } from "./connector-catalog";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 
@@ -115,6 +119,138 @@ describe("connectors hold configuration, never credentials", () => {
     expect(() => stdioConnector({ sourceMessageId: assistant.id })).toThrow(
       /stored user message/u,
     );
+  });
+
+  it("keeps manual connectors outside catalog authentication", () => {
+    const connector = stdioConnector();
+    expect(connector.preset_id).toBeNull();
+    expect(assertPresetConnectorConfiguration(connector)).toBeNull();
+  });
+});
+
+describe("guided connector presets", () => {
+  const discoveredTools = [
+    discoveredTool("list_events", { type: "object", properties: { timeMin: { type: "string" } } }),
+    discoveredTool("create_event", { type: "object", properties: { summary: { type: "string" } } }),
+    discoveredTool("update_event", { type: "object", properties: { eventId: { type: "string" } } }),
+  ];
+
+  it("creates one sourced, verified, read-only connection from live discovery", () => {
+    const connector = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      selectedSlots: ["calendar.list_events"],
+      discoveredTools,
+      sourceMessageId: userMessageId,
+    });
+
+    expect(connector.preset_id).toBe("google-calendar-official");
+    expect(connector.url).toBe(GOOGLE_CALENDAR_MCP_URL);
+    expect(connector.status).toBe("ready");
+    expect(connector.enabled).toBe(1);
+    expect(connector.envVarNames).toEqual([]);
+    expect(connector.capabilities).toMatchObject([
+      {
+        slot: "calendar.list_events",
+        remote_tool_name: "list_events",
+        effect_kind: "external_read",
+        enabled: 1,
+        source_message_id: userMessageId,
+      },
+    ]);
+    expect(getConnectorByPresetId(db, "google-calendar-official")?.id).toBe(connector.id);
+  });
+
+  it("rejects unknown presets, empty permissions, duplicates, and modified destinations", () => {
+    expect(() =>
+      configureConnectorPreset(db, {
+        presetId: "unknown",
+        selectedSlots: ["calendar.list_events"],
+        discoveredTools,
+        sourceMessageId: userMessageId,
+      }),
+    ).toThrow(/not available/u);
+    expect(() =>
+      configureConnectorPreset(db, {
+        presetId: "google-calendar-official",
+        selectedSlots: [],
+        discoveredTools,
+        sourceMessageId: userMessageId,
+      }),
+    ).toThrow(/at least one/u);
+
+    const connector = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      selectedSlots: ["calendar.list_events"],
+      discoveredTools,
+      sourceMessageId: userMessageId,
+    });
+    expect(() =>
+      configureConnectorPreset(db, {
+        presetId: "google-calendar-official",
+        selectedSlots: ["calendar.list_events"],
+        discoveredTools,
+        sourceMessageId: userMessageId,
+      }),
+    ).toThrow(/already connected/u);
+
+    db.prepare("UPDATE connector SET url = 'https://attacker.example/mcp' WHERE id = ?")
+      .run(connector.id);
+    expect(() =>
+      assertPresetConnectorConfiguration(getConnector(db, connector.id)!),
+    ).toThrow(/trusted catalog/u);
+  });
+
+  it("updates the complete permission set while preserving disabled bindings", () => {
+    const connector = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      selectedSlots: ["calendar.list_events"],
+      discoveredTools,
+      sourceMessageId: userMessageId,
+    });
+    const conversation = createConversation(db, { title: "Permission update", source: "web" });
+    const updateSource = appendMessage(
+      db,
+      conversation.id,
+      "user",
+      "allow creating and updating events",
+      { origin: "user_action", recallState: "blocked" },
+    );
+
+    const updated = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      connectorId: connector.id,
+      selectedSlots: ["calendar.create_event", "calendar.update_event"],
+      discoveredTools,
+      sourceMessageId: updateSource.id,
+    });
+    const bySlot = new Map(updated.capabilities.map((capability) => [capability.slot, capability]));
+    expect(bySlot.get("calendar.list_events")?.enabled).toBe(0);
+    expect(bySlot.get("calendar.list_events")?.source_message_id).toBe(updateSource.id);
+    expect(bySlot.get("calendar.create_event")?.enabled).toBe(1);
+    expect(bySlot.get("calendar.update_event")?.enabled).toBe(1);
+    expect(updated.source_message_id).toBe(updateSource.id);
+  });
+
+  it("refuses to silently accept drift in an existing live schema", () => {
+    const connector = configureConnectorPreset(db, {
+      presetId: "google-calendar-official",
+      selectedSlots: ["calendar.list_events"],
+      discoveredTools,
+      sourceMessageId: userMessageId,
+    });
+    const drifted = [
+      discoveredTool("list_events", { type: "object", properties: { changed: { type: "boolean" } } }),
+    ];
+    expect(() =>
+      configureConnectorPreset(db, {
+        presetId: "google-calendar-official",
+        connectorId: connector.id,
+        selectedSlots: ["calendar.list_events"],
+        discoveredTools: drifted,
+        sourceMessageId: userMessageId,
+      }),
+    ).toThrow(/changed a selected tool contract/u);
+    expect(getConnector(db, connector.id)?.capabilities[0]?.enabled).toBe(1);
   });
 });
 
@@ -244,3 +380,13 @@ describe("availability is the whole permission answer", () => {
     ).toEqual({ count: 0 });
   });
 });
+
+function discoveredTool(name: string, inputSchema: unknown) {
+  return {
+    name,
+    description: null,
+    inputSchema,
+    schemaHash: toolSchemaHash(inputSchema),
+    readOnlyHint: name === "list_events" ? true : false,
+  };
+}

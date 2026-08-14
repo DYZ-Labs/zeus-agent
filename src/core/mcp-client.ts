@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   StdioClientTransport,
@@ -8,8 +10,17 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import { checkConnectorBudget, recordConnectorCall } from "./budget";
 import {
+  type ConnectorPreset,
+  connectorPresetScopes,
+  getConnectorPreset,
+  localConnectorPresetsAllowed,
+  presetCapability,
+} from "./connector-catalog";
+import {
   type BoundCapability,
+  ConnectorPresetError,
   type ConnectorView,
+  assertPresetConnectorConfiguration,
   availableCapability,
   connectorEnvironment,
   getCapability,
@@ -39,6 +50,20 @@ import type { CapabilitySlot } from "./schema";
 const CONNECT_TIMEOUT_MS = 15_000;
 const CALL_TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 200_000;
+const GCLOUD_TIMEOUT_MS = 10_000;
+const MAX_GCLOUD_OUTPUT_BYTES = 8_192;
+
+export type GoogleCloudCommandResult = { stdout: string };
+export type GoogleCloudCommandRunner = (
+  args: readonly string[],
+) => Promise<GoogleCloudCommandResult>;
+
+type PresetClientOptions = {
+  signal?: AbortSignal;
+  commandRunner?: GoogleCloudCommandRunner;
+  environment?: Readonly<Record<string, string | undefined>>;
+  tokenFailureCode?: "adc_missing" | "scope_missing";
+};
 
 export type DiscoveredTool = {
   name: string;
@@ -67,6 +92,123 @@ export class ConnectorError extends Error {
 }
 
 /**
+ * Probe a code-owned preset before any connector row or provenance message is written.
+ * Unknown ids, modified configuration, and missing tools all fail before a credential is
+ * materialized or persisted state is touched.
+ */
+export async function probeConnectorPreset(
+  presetId: string,
+  slots: readonly CapabilitySlot[],
+  options: PresetClientOptions = {},
+): Promise<{ tools: DiscoveredTool[] }> {
+  const preset = getConnectorPreset(presetId);
+  if (!preset) {
+    throw new ConnectorError("invalid_preset", "That connection preset is not available.");
+  }
+  if (!localConnectorPresetsAllowed(options.environment)) {
+    throw new ConnectorError(
+      "local_only",
+      "Guided Google Calendar connections are available only in local mode.",
+    );
+  }
+  const uniqueSlots = [...new Set(slots)];
+  if (uniqueSlots.length === 0 || uniqueSlots.some((slot) => !presetCapability(preset, slot))) {
+    throw new ConnectorError(
+      "invalid_permissions",
+      "Select at least one permission offered by this connection.",
+    );
+  }
+
+  try {
+    const transport = await presetTransport(preset, uniqueSlots, options);
+    const tools = await withTransport(transport, options.signal, listClientTools);
+    const names = new Set(tools.map((tool) => tool.name));
+    for (const slot of uniqueSlots) {
+      const mapping = presetCapability(preset, slot)!;
+      if (!names.has(mapping.remoteToolName)) {
+        throw new ConnectorError(
+          "tool_contract_changed",
+          `Google's ${mapping.remoteToolName} tool is not currently available.`,
+        );
+      }
+    }
+    return { tools };
+  } catch (error) {
+    if (error instanceof ConnectorError) throw error;
+    const status = numericErrorStatus(error);
+    throw new ConnectorError(
+      status === 401 || status === 403 ? "api_or_iam_missing" : "server_unreachable",
+      status === 401 || status === 403
+        ? "Google rejected this setup. Check the enabled APIs, project, and IAM roles."
+        : "Zeus could not reach Google's Calendar MCP server.",
+    );
+  }
+}
+
+/** Resolve the two non-secret Google headers without retaining either beyond the caller. */
+export async function googleCalendarAdcHeaders(
+  slots: readonly CapabilitySlot[],
+  options: Omit<PresetClientOptions, "signal"> = {},
+): Promise<Record<string, string>> {
+  if (!localConnectorPresetsAllowed(options.environment)) {
+    throw new ConnectorError(
+      "local_only",
+      "Process-wide Google credentials are disabled outside local mode.",
+    );
+  }
+  const preset = getConnectorPreset("google-calendar-official");
+  if (!preset) throw new ConnectorError("invalid_preset", "Google Calendar is unavailable.");
+  let scopes: string[];
+  try {
+    scopes = connectorPresetScopes(preset, slots);
+  } catch {
+    throw new ConnectorError("invalid_permissions", "Those Calendar permissions are invalid.");
+  }
+
+  const runner = options.commandRunner ?? runGoogleCloudCommand;
+  const project = (
+    await safeGoogleCloudCommand(
+      runner,
+      ["config", "get-value", "project", "--quiet"],
+      "project_missing",
+    )
+  ).stdout.trim();
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u.test(project)) {
+    throw new ConnectorError(
+      "project_missing",
+      "Set an active Google Cloud project before connecting Calendar.",
+    );
+  }
+
+  const tokenFailureCode = options.tokenFailureCode ?? "adc_missing";
+  const token = (
+    await safeGoogleCloudCommand(
+      runner,
+      [
+        "auth",
+        "application-default",
+        "print-access-token",
+        `--scopes=${scopes.join(",")}`,
+      ],
+      tokenFailureCode,
+    )
+  ).stdout.trim();
+  if (token.length < 20 || token.length > MAX_GCLOUD_OUTPUT_BYTES || /\s/u.test(token)) {
+    throw new ConnectorError(
+      tokenFailureCode,
+      tokenFailureCode === "scope_missing"
+        ? "Application Default Credentials do not include the selected Calendar scopes."
+        : "Application Default Credentials are missing or invalid.",
+    );
+  }
+
+  return {
+    Authorization: `Bearer ${token}`,
+    "x-goog-user-project": project,
+  };
+}
+
+/**
  * Open the connector, list its tools, and record the outcome.
  *
  * Verification is the only way a connector becomes eligible to be enabled, so an
@@ -92,24 +234,15 @@ export async function verifyConnector(
   }
 
   try {
-    const tools = await withClient(connector, options.signal, async (client) => {
-      const listed = await client.listTools(
-        {},
-        { signal: options.signal, timeout: CALL_TIMEOUT_MS },
-      );
-      return listed.tools.map(
-        (tool): DiscoveredTool => ({
-          name: tool.name,
-          description: typeof tool.description === "string" ? tool.description : null,
-          inputSchema: tool.inputSchema,
-          schemaHash: toolSchemaHash(tool.inputSchema),
-          readOnlyHint:
-            typeof tool.annotations?.readOnlyHint === "boolean"
-              ? tool.annotations.readOnlyHint
-              : null,
-        }),
-      );
-    });
+    const slots = connector.capabilities.length > 0
+      ? connector.capabilities.map((capability) => capability.slot)
+      : (["calendar.list_events"] as const);
+    const tools = await withClient(
+      connector,
+      slots,
+      options.signal,
+      listClientTools,
+    );
     const verified = recordConnectorVerification(db, id, { status: "ready", tools });
     logEvent({
       event: "connector_verified",
@@ -148,6 +281,7 @@ export async function callCapability(
   options: { signal?: AbortSignal; capabilityId?: number } = {},
 ): Promise<CapabilityCallResult> {
   const bound = resolveCapability(db, slot, options.capabilityId);
+  const preset = presetForCapability(bound, slot);
   const decision = checkConnectorBudget(db);
   if (!decision.allowed) {
     logEvent({
@@ -166,7 +300,19 @@ export async function callCapability(
   recordConnectorCall(db);
   const startedAt = Date.now();
   try {
-    const result = await withClient(bound.connector, options.signal, async (client) => {
+    const result = await withClient(bound.connector, [slot], options.signal, async (client) => {
+      if (preset) {
+        const tools = await listClientTools(client);
+        recordConnectorVerification(db, bound.connector.id, { status: "ready", tools });
+        const live = tools.find((tool) => tool.name === bound.capability.remote_tool_name);
+        if (!live || live.schemaHash !== bound.capability.schema_hash) {
+          disableDriftedCapability(db, bound, live ? "schema_changed" : "tool_missing");
+          throw new ConnectorError(
+            "tool_contract_changed",
+            "Google changed the reviewed Calendar tool contract. Zeus disabled this permission before dispatch.",
+          );
+        }
+      }
       const response = await client.callTool(
         { name: bound.capability.remote_tool_name, arguments: args },
         undefined,
@@ -265,6 +411,16 @@ function resolveCapability(
 
 async function withClient<T>(
   connector: ConnectorView,
+  slots: readonly CapabilitySlot[],
+  signal: AbortSignal | undefined,
+  run: (client: Client) => Promise<T>,
+): Promise<T> {
+  const transport = await transportFor(connector, slots);
+  return withTransport(transport, signal, run);
+}
+
+async function withTransport<T>(
+  transport: Transport,
   signal: AbortSignal | undefined,
   run: (client: Client) => Promise<T>,
 ): Promise<T> {
@@ -272,7 +428,6 @@ async function withClient<T>(
     { name: "zeus", version: "0.1.0" },
     { capabilities: {} },
   );
-  const transport = transportFor(connector);
   try {
     await client.connect(transport, { signal, timeout: CONNECT_TIMEOUT_MS });
     return await run(client);
@@ -284,7 +439,20 @@ async function withClient<T>(
   }
 }
 
-function transportFor(connector: ConnectorView): Transport {
+async function transportFor(
+  connector: ConnectorView,
+  slots: readonly CapabilitySlot[],
+): Promise<Transport> {
+  let preset: ConnectorPreset | null;
+  try {
+    preset = assertPresetConnectorConfiguration(connector);
+  } catch (error) {
+    throw error instanceof ConnectorPresetError
+      ? new ConnectorError("invalid_connector", error.message)
+      : error;
+  }
+  if (preset) return presetTransport(preset, slots);
+
   if (connector.transport === "stdio") {
     if (!connector.command) {
       throw new ConnectorError("invalid_connector", "That connector has no command");
@@ -307,6 +475,142 @@ function transportFor(connector: ConnectorView): Transport {
   return new StreamableHTTPClientTransport(new URL(connector.url), {
     requestInit: { headers: bearerHeaders(connector) },
   });
+}
+
+async function presetTransport(
+  preset: ConnectorPreset,
+  slots: readonly CapabilitySlot[],
+  options: PresetClientOptions = {},
+): Promise<Transport> {
+  if (preset.authentication !== "google_adc") {
+    throw new ConnectorError("invalid_preset", "That preset authentication is unsupported.");
+  }
+  const headers = await googleCalendarAdcHeaders(slots, options);
+  return new StreamableHTTPClientTransport(new URL(preset.url), {
+    requestInit: { headers },
+  });
+}
+
+async function listClientTools(client: Client): Promise<DiscoveredTool[]> {
+  const listed = await client.listTools({}, { timeout: CALL_TIMEOUT_MS });
+  return listed.tools.map(
+    (tool): DiscoveredTool => ({
+      name: tool.name,
+      description: typeof tool.description === "string" ? tool.description : null,
+      inputSchema: tool.inputSchema,
+      schemaHash: toolSchemaHash(tool.inputSchema),
+      readOnlyHint:
+        typeof tool.annotations?.readOnlyHint === "boolean"
+          ? tool.annotations.readOnlyHint
+          : null,
+    }),
+  );
+}
+
+function presetForCapability(
+  bound: BoundCapability,
+  slot: CapabilitySlot,
+): ConnectorPreset | null {
+  let preset: ConnectorPreset | null;
+  try {
+    preset = assertPresetConnectorConfiguration(bound.connector);
+  } catch (error) {
+    throw error instanceof ConnectorPresetError
+      ? new ConnectorError("invalid_connector", error.message)
+      : error;
+  }
+  if (!preset) return null;
+  const mapping = presetCapability(preset, slot);
+  if (!mapping || mapping.remoteToolName !== bound.capability.remote_tool_name) {
+    throw new ConnectorError(
+      "invalid_connector",
+      "That preset capability no longer matches Zeus's trusted catalog.",
+    );
+  }
+  return preset;
+}
+
+function disableDriftedCapability(
+  db: Db,
+  bound: BoundCapability,
+  reason: "schema_changed" | "tool_missing",
+): void {
+  db.prepare<[string, number]>(
+    "UPDATE connector_capability SET enabled = 0, updated_at = ? WHERE id = ?",
+  ).run(new Date().toISOString(), bound.capability.id);
+  logEvent({
+    event: "connector_capability_drifted",
+    outcome: "degraded",
+    reason,
+    slot: bound.capability.slot,
+    connector_id: bound.connector.id,
+  });
+}
+
+async function safeGoogleCloudCommand(
+  runner: GoogleCloudCommandRunner,
+  args: readonly string[],
+  failureCode: "project_missing" | "adc_missing" | "scope_missing",
+): Promise<GoogleCloudCommandResult> {
+  try {
+    const result = await runner(args);
+    if (result.stdout.length > MAX_GCLOUD_OUTPUT_BYTES) throw new Error("output_too_large");
+    return result;
+  } catch (error) {
+    const code = stringErrorCode(error);
+    if (code === "ENOENT") {
+      throw new ConnectorError("gcloud_missing", "Install the Google Cloud CLI, then try again.");
+    }
+    if (code === "ETIMEDOUT" || code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+      throw new ConnectorError("gcloud_unavailable", "The Google Cloud CLI did not answer safely.");
+    }
+    throw new ConnectorError(
+      failureCode,
+      failureCode === "project_missing"
+        ? "Set an active Google Cloud project before connecting Calendar."
+        : failureCode === "scope_missing"
+          ? "Application Default Credentials do not include the selected Calendar scopes."
+          : "Application Default Credentials are missing or invalid.",
+    );
+  }
+}
+
+function runGoogleCloudCommand(args: readonly string[]): Promise<GoogleCloudCommandResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "gcloud",
+      [...args],
+      {
+        encoding: "utf8",
+        env: getDefaultEnvironment() as NodeJS.ProcessEnv,
+        shell: false,
+        timeout: GCLOUD_TIMEOUT_MS,
+        maxBuffer: MAX_GCLOUD_OUTPUT_BYTES,
+        windowsHide: true,
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve({ stdout });
+      },
+    );
+  });
+}
+
+function stringErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function numericErrorStatus(error: unknown, depth = 0): number | null {
+  if (!error || typeof error !== "object" || depth > 3) return null;
+  const record = error as { status?: unknown; code?: unknown; cause?: unknown };
+  if (typeof record.status === "number") return record.status;
+  if (typeof record.code === "number") return record.code;
+  return numericErrorStatus(record.cause, depth + 1);
 }
 
 /**
