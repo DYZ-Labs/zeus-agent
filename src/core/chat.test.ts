@@ -39,7 +39,11 @@ vi.mock("./extract", () => ({
   startExtractionRun: mocks.startExtractionRun,
 }));
 
-import { isExplicitBoundedWorkRequest, streamTurn } from "./chat";
+import {
+  isExplicitBoundedWorkRequest,
+  isExplicitCalendarReadRequest,
+  streamTurn,
+} from "./chat";
 import { createConversation, messagesIn } from "./conversations";
 import { openTestDb } from "./db";
 
@@ -194,6 +198,26 @@ describe("streamTurn cancellation", () => {
 });
 
 describe("bounded work request authorization", () => {
+  it("recognizes direct read-only requests for the user's calendar", () => {
+    expect(
+      isExplicitCalendarReadRequest(
+        "Check my calendar and tell me what do I have tomorrow.",
+      ),
+    ).toBe(true);
+    expect(isExplicitCalendarReadRequest("What's on my schedule next week?")).toBe(true);
+    expect(isExplicitCalendarReadRequest("Could you show my Google Calendar for today?")).toBe(
+      true,
+    );
+  });
+
+  it("does not turn calendar writes or indirect mentions into read authorization", () => {
+    expect(isExplicitCalendarReadRequest("Add dinner to my calendar tomorrow.")).toBe(false);
+    expect(isExplicitCalendarReadRequest("Don't check my calendar.")).toBe(false);
+    expect(isExplicitCalendarReadRequest('Quote this: "check my calendar tomorrow".')).toBe(false);
+    expect(isExplicitCalendarReadRequest("What if I check my calendar tomorrow?")).toBe(false);
+    expect(isExplicitCalendarReadRequest("Check my manager's calendar tomorrow.")).toBe(false);
+  });
+
   it("accepts narrow, direct multi-step requests", () => {
     expect(
       isExplicitBoundedWorkRequest("Research local backup options and draft a recommendation."),

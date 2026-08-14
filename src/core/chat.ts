@@ -30,7 +30,7 @@ import type { ApplyResult } from "./extract";
 import { facetSearchText } from "./facets";
 import { factSearchText } from "./facts";
 import { blockMessageRecall, passagesForMessage } from "./passages";
-import type { Message, SearchHit } from "./schema";
+import type { Message, SearchHit, WorkPlanProposal } from "./schema";
 import type { WorkArtifact, WorkRun } from "./schema";
 import { generateWorkPlanProposal, createSafeWorkExecutor } from "./work-execution";
 import {
@@ -161,15 +161,18 @@ async function maybeExecuteBoundedWork(
   db: Db,
   sourceMessage: Message,
 ): Promise<TurnResult["work"]> {
-  if (!isExplicitBoundedWorkRequest(sourceMessage.content)) return null;
+  const calendarRead = isExplicitCalendarReadRequest(sourceMessage.content);
+  if (!calendarRead && !isExplicitBoundedWorkRequest(sourceMessage.content)) return null;
   try {
-    const generated = await generateWorkPlanProposal(db, sourceMessage.content);
-    const proposal = generated.proposal;
+    const generated = calendarRead
+      ? null
+      : await generateWorkPlanProposal(db, sourceMessage.content);
+    const proposal = generated?.proposal ?? calendarReadWorkPlanProposal(sourceMessage.content);
     const detail = createWorkPlan(db, {
       proposal,
       sourceMessageId: sourceMessage.id,
       origin: "explicit_request",
-      generationProvenance: generated.provenance,
+      generationProvenance: generated?.provenance,
     });
     authorizeWorkPlan(db, detail.plan.id, {
       planHash: detail.plan.plan_hash,
@@ -204,6 +207,64 @@ async function maybeExecuteBoundedWork(
     });
     return null;
   }
+}
+
+/**
+ * Recognize a direct request to inspect the signed-in user's calendar.
+ *
+ * Connecting the service is consent for reads, but the chat message still has to request
+ * one. Keep this deterministic and deliberately narrow: requests that write, hypothetical
+ * or quoted examples, negations, and requests about another person's calendar stay in
+ * ordinary chat instead of reaching a connector.
+ */
+export function isExplicitCalendarReadRequest(input: string): boolean {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  if (!normalized || normalized.length > 2_000) return false;
+  if (
+    /^(?:do not|don['’]t|dont|never|stop|avoid|without|if |unless |what if )/iu.test(
+      normalized,
+    ) ||
+    /^(?:he|she|they|zeus|the user|my (?:manager|colleague|client|friend))\b/iu.test(normalized) ||
+    /^(?:quote|quoted|example|for example|someone said)\b/iu.test(normalized)
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:add|create|book|move|reschedule|cancel|delete|remove|update|edit|invite)\b/iu.test(
+      normalized,
+    )
+  ) {
+    return false;
+  }
+
+  const ownCalendar = /\bmy\s+(?:(?:google|work|personal)\s+)?(?:calendar|schedule|meetings?|appointments?|events?)\b/iu;
+  const readRequest = /\b(?:check|read|show|view|open|list|look\s+(?:at|up)|tell\s+me|what|which|when|where|how\s+many|do\s+i\s+have|am\s+i\s+free)\b/iu;
+  return ownCalendar.test(normalized) && readRequest.test(normalized);
+}
+
+/** One explicit calendar question needs one read-only, auditable connector step. */
+export function calendarReadWorkPlanProposal(objective: string): WorkPlanProposal {
+  return {
+    objective,
+    steps: [
+      {
+        title: "Read Google Calendar",
+        instruction:
+          "Read the connected Google Calendar so the chat can answer this request. Do not create, change, or delete events.",
+        effect_kind: "external_read",
+        depends_on: [],
+      },
+    ],
+    allowed_effects: ["external_read"],
+    completion_criteria: [
+      "The connected calendar was read and its events were returned only as untrusted external data.",
+    ],
+    limits: {
+      max_model_tool_calls: 2,
+      max_retries_per_step: 2,
+      max_duration_seconds: 60,
+    },
+  };
 }
 
 export function isExplicitBoundedWorkRequest(input: string): boolean {
