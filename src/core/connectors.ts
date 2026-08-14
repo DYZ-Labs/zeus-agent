@@ -318,8 +318,10 @@ export type UpsertGoogleCalendarConnectorInput = {
 /**
  * Create the locked provider row reached only from the signed OAuth callback.
  *
- * Reconnecting preserves the connector id but clears every old capability and cached
- * calendar row until a fresh handshake and scope-derived binding complete.
+ * Reconnecting preserves the connector and capability ids but disables every old grant
+ * and clears cached calendar rows until a fresh handshake and scope-derived binding
+ * complete. Capability ids are audit references, so replacing them would detach or block
+ * historical tool receipts.
  */
 export function upsertGoogleCalendarConnector(
   db: Db,
@@ -344,7 +346,11 @@ export function upsertGoogleCalendarConnector(
              updated_at = ?
          WHERE id = ?`,
       ).run(input.connectionId, url, input.sourceMessageId, timestamp, existing.id);
-      db.prepare("DELETE FROM connector_capability WHERE connector_id = ?").run(existing.id);
+      db.prepare(
+        `UPDATE connector_capability
+         SET enabled = 0, source_message_id = ?, updated_at = ?
+         WHERE connector_id = ?`,
+      ).run(input.sourceMessageId, timestamp, existing.id);
       db.prepare("DELETE FROM external_signal WHERE connector_id = ?").run(existing.id);
       return existing.id;
     }
@@ -622,7 +628,15 @@ export function configureGoogleCalendarCapabilities(
   }
   const timestamp = now();
   db.transaction(() => {
-    db.prepare("DELETE FROM connector_capability WHERE connector_id = ?").run(connector.id);
+    // Permission changes replace the active grant, not its audit identity. Disable every
+    // prior slot first, then update desired slots in place and insert only genuinely new
+    // slots. A successful calendar read may already have a receipt referencing the read
+    // capability, so deleting and recreating it would violate that preserved history.
+    db.prepare(
+      `UPDATE connector_capability
+       SET enabled = 0, source_message_id = ?, updated_at = ?
+       WHERE connector_id = ?`,
+    ).run(input.sourceMessageId, timestamp, connector.id);
     for (const [slot, toolName] of desired) {
       const tool = input.tools.find((entry) => entry.name === toolName);
       if (!tool) throw new Error(`Google Calendar broker did not expose ${toolName}`);
@@ -630,7 +644,15 @@ export function configureGoogleCalendarCapabilities(
         `INSERT INTO connector_capability
            (connector_id, slot, remote_tool_name, effect_kind, input_schema_json,
             schema_hash, enabled, source_message_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+         ON CONFLICT(connector_id, slot) DO UPDATE SET
+           remote_tool_name = excluded.remote_tool_name,
+           effect_kind = excluded.effect_kind,
+           input_schema_json = excluded.input_schema_json,
+           schema_hash = excluded.schema_hash,
+           enabled = 1,
+           source_message_id = excluded.source_message_id,
+           updated_at = excluded.updated_at`,
       ).run(
         connector.id,
         slot,

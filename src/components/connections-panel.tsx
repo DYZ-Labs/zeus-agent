@@ -147,7 +147,8 @@ function GoogleCalendarCard({
     (entry) =>
       entry.slot === "calendar.create_event" || entry.slot === "calendar.update_event",
   ) ?? [];
-  const writeGranted = writeCapabilities.length === 2;
+  const writeGranted =
+    writeCapabilities.length === 2 && writeCapabilities.every((capability) => capability.enabled === 1);
 
   return (
     <article
