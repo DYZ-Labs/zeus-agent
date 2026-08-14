@@ -93,6 +93,9 @@ export async function startGoogleAuthAction(formData: FormData): Promise<void> {
     provider: "google",
     options: {
       redirectTo: `${configuration.siteUrl}/auth/callback`,
+      queryParams: {
+        prompt: "select_account",
+      },
     },
   });
 
