@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createServerClient: vi.fn(),
@@ -24,14 +24,57 @@ const CONFIGURED = {
   allowedSignupEmails: [],
 };
 
+const SESSION_COOKIE = "sb-project-auth-token";
+
+/**
+ * @supabase/ssr 0.12.4 hands `setAll` these defaults with the client-level
+ * `cookieOptions` merged over them — and then puts its own 400-day `maxAge` back on
+ * top, which is why the lifetime has to be capped in the callback rather than declared
+ * once on the client.
+ */
+const LIBRARY_COOKIE_DEFAULTS = {
+  path: "/",
+  sameSite: "lax",
+  httpOnly: false,
+  maxAge: 400 * 24 * 60 * 60,
+};
+
+type CookieAttributes = {
+  path?: string;
+  sameSite?: string;
+  httpOnly?: boolean;
+  secure?: boolean;
+  maxAge?: number;
+};
+
+type ServerClientOptions = {
+  cookieOptions?: CookieAttributes;
+  global?: { fetch?: typeof fetch };
+  cookies: {
+    getAll: () => { name: string; value: string }[];
+    setAll: (
+      cookies: { name: string; value: string; options: CookieAttributes }[],
+      headers: Record<string, string>,
+    ) => void;
+  };
+};
+
+let clientOptions: ServerClientOptions | null = null;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  clientOptions = null;
   mocks.getAuthConfiguration.mockReturnValue(CONFIGURED);
   mocks.getClaims.mockResolvedValue({
     data: { claims: null },
     error: new Error("signed out"),
   });
-  mocks.createServerClient.mockReturnValue({ auth: { getClaims: mocks.getClaims } });
+  mocks.createServerClient.mockImplementation(
+    (_url: string, _key: string, options: ServerClientOptions) => {
+      clientOptions = options;
+      return { auth: { getClaims: mocks.getClaims } };
+    },
+  );
 });
 
 describe("health check reachability", () => {
@@ -251,6 +294,124 @@ describe("configured proxy API boundary", () => {
     });
   });
 });
+
+describe("session cookie hardening", () => {
+  it("writes the refreshed session as HttpOnly, Secure, and short-lived", async () => {
+    refreshSessionCookieOnClaims();
+
+    const response = await proxy(
+      new NextRequest("https://zeus.example/today", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+    const setCookie = response.headers.get("set-cookie") ?? "";
+
+    expect(setCookie).toContain(`${SESSION_COOKIE}=refreshed`);
+    // Nothing in Zeus reads the session from JavaScript, so an XSS must not be able to
+    // either, and a cookie lifted from the wire must not outlive the month.
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("Secure");
+    expect(setCookie).toContain(`Max-Age=${30 * 24 * 60 * 60}`);
+    expect(setCookie.toLowerCase()).toContain("samesite=lax");
+    expect(clientOptions?.cookieOptions).toMatchObject({ httpOnly: true, secure: true });
+  });
+
+  it("omits Secure for a plaintext loopback origin so local login still works", async () => {
+    mocks.getAuthConfiguration.mockReturnValue({
+      ...CONFIGURED,
+      siteUrl: "http://127.0.0.1:3000",
+    });
+    refreshSessionCookieOnClaims();
+
+    const response = await proxy(
+      new NextRequest("http://127.0.0.1:3000/today", {
+        headers: { host: "127.0.0.1:3000", "sec-fetch-site": "none" },
+      }),
+    );
+    const setCookie = response.headers.get("set-cookie") ?? "";
+
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).not.toContain("Secure");
+    expect(clientOptions?.cookieOptions).toMatchObject({ httpOnly: true, secure: false });
+  });
+});
+
+describe("account verification deadline", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("aborts a hanging Supabase call and reports it as unavailable, not signed out", async () => {
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    let reached = () => {};
+    const fetchReached = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    vi.stubGlobal("fetch", (_input: RequestInfo | URL, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        reached();
+      });
+    });
+    mocks.getClaims.mockImplementation(async () => {
+      const bounded = clientOptions?.global?.fetch;
+      // Without a bounded fetch there is nothing to abort, and the hang is the bug.
+      if (!bounded) return { data: { claims: { sub: "owner" } }, error: null };
+      try {
+        await bounded("https://project.supabase.co/auth/v1/user");
+        return { data: { claims: { sub: "owner" } }, error: null };
+      } catch {
+        // auth-js converts every transport failure into this returned error rather
+        // than a rejection.
+        return {
+          data: null,
+          error: Object.assign(new Error("Failed to fetch"), {
+            name: "AuthRetryableFetchError",
+          }),
+        };
+      }
+    });
+
+    const pending = proxy(request("/api/chat"));
+    await fetchReached;
+    deadline.abort(new DOMException("The operation timed out.", "TimeoutError"));
+    const response = await pending;
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: "Account verification is temporarily unavailable.",
+    });
+    const deadlineMs = timeout.mock.calls[0]?.[0] ?? 0;
+    expect(deadlineMs).toBeGreaterThan(0);
+    expect(deadlineMs).toBeLessThanOrEqual(15_000);
+  });
+});
+
+/**
+ * Stand in for a token refresh: the library writes cookies through `setAll` in the
+ * middle of the auth call, while the proxy still owns the response.
+ */
+function refreshSessionCookieOnClaims(): void {
+  mocks.getClaims.mockImplementation(async () => {
+    clientOptions?.cookies.setAll(
+      [
+        {
+          name: SESSION_COOKIE,
+          value: "refreshed",
+          options: {
+            ...LIBRARY_COOKIE_DEFAULTS,
+            ...clientOptions.cookieOptions,
+            maxAge: LIBRARY_COOKIE_DEFAULTS.maxAge,
+          },
+        },
+      ],
+      {},
+    );
+    return { data: { claims: { sub: "owner" } }, error: null };
+  });
+}
 
 function localPost(origin?: string): NextRequest {
   return new NextRequest("http://127.0.0.1:3000/api/chat", {

@@ -75,8 +75,8 @@ server.registerTool(
     content: [{
       type: "text",
       text: JSON.stringify({
-        named: process.env.ZEUS_TEST_CALENDAR_TOKEN ?? null,
-        unrelated: process.env.ZEUS_TEST_UNRELATED_SECRET ?? null,
+        named: process.env.FAKE_CALENDAR_TOKEN ?? null,
+        unrelated: process.env.FAKE_UNRELATED_SECRET ?? null,
       }),
     }],
   }),
@@ -104,8 +104,9 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
-  delete process.env.ZEUS_TEST_CALENDAR_TOKEN;
-  delete process.env.ZEUS_TEST_UNRELATED_SECRET;
+  delete process.env.FAKE_CALENDAR_TOKEN;
+  delete process.env.FAKE_UNRELATED_SECRET;
+  delete process.env.NEXT_PUBLIC_SUPABASE_URL;
 });
 
 function calendarConnector(
@@ -179,9 +180,9 @@ describe("reaching a connected service", () => {
   }, 30_000);
 
   it("hands the child only the environment variables the user named", async () => {
-    process.env.ZEUS_TEST_CALENDAR_TOKEN = "named-value";
-    process.env.ZEUS_TEST_UNRELATED_SECRET = "must-not-leak";
-    const connectorId = calendarConnector(CALENDAR_SERVER, ["ZEUS_TEST_CALENDAR_TOKEN"]);
+    process.env.FAKE_CALENDAR_TOKEN = "named-value";
+    process.env.FAKE_UNRELATED_SECRET = "must-not-leak";
+    const connectorId = calendarConnector(CALENDAR_SERVER, ["FAKE_CALENDAR_TOKEN"]);
     await grant(connectorId, "calendar.list_events", "echo_environment");
 
     const result = await callCapability(db, "calendar.list_events", {});
@@ -231,11 +232,29 @@ describe("reaching a connected service", () => {
     ).rejects.toBeInstanceOf(ConnectorError);
   }, 30_000);
 
+  it("will not spawn a stored command connector once the deployment is hosted", async () => {
+    const connectorId = calendarConnector();
+    expect((await verifyConnector(db, connectorId)).connector.status).toBe("ready");
+
+    // The row was written on a laptop; the same store is now one account among many. If the
+    // child ran here it would read every other account's memory, so the handshake that just
+    // succeeded must stop succeeding.
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+
+    await expect(verifyConnector(db, connectorId)).rejects.toMatchObject({
+      code: "local_only",
+    });
+    expect(getConnector(db, connectorId)?.status).toBe("unreachable");
+    await expect(
+      callCapability(db, "calendar.list_events", { from: "a", to: "b" }),
+    ).rejects.toBeInstanceOf(ConnectorError);
+  }, 30_000);
+
   it("refuses to verify while a named environment variable is absent", async () => {
-    const connectorId = calendarConnector(CALENDAR_SERVER, ["ZEUS_TEST_CALENDAR_TOKEN"]);
+    const connectorId = calendarConnector(CALENDAR_SERVER, ["FAKE_CALENDAR_TOKEN"]);
 
     await expect(verifyConnector(db, connectorId)).rejects.toThrow(
-      /ZEUS_TEST_CALENDAR_TOKEN/u,
+      /FAKE_CALENDAR_TOKEN/u,
     );
     expect(getConnector(db, connectorId)?.status).toBe("unreachable");
   }, 30_000);

@@ -15,6 +15,7 @@ import {
   getConnectorPreset,
   localConnectorPresetsAllowed,
   presetCapability,
+  stdioConnectorsAllowed,
 } from "./connector-catalog";
 import {
   type BoundCapability,
@@ -477,6 +478,16 @@ async function transportFor(
   }
   if (preset) return presetTransport(preset, slots);
   if (connector.transport === "stdio") {
+    // Asked here and not only when the row was created, because a store written on a laptop
+    // can later be opened by a hosted deployment where every account's memory sits in one
+    // directory owned by one OS user. Whatever was configured back then, a child process is
+    // never spawned once Zeus is holding somebody else's data too.
+    if (!stdioConnectorsAllowed()) {
+      throw new ConnectorError(
+        "local_only",
+        "Connections that run a command are disabled outside local mode.",
+      );
+    }
     if (!connector.command) {
       throw new ConnectorError("invalid_connector", "That connector has no command");
     }

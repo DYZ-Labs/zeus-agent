@@ -117,16 +117,32 @@ export function ConnectionsPanel({
         </ul>
       )}
 
-      <details className="mt-6 border-t pt-4" style={{ borderColor: "var(--shell-line)" }}>
-        <summary className="cursor-pointer text-[0.82rem] font-medium">
-          Advanced: custom MCP server
-        </summary>
-        <p className="mt-2 max-w-[60ch] text-[0.75rem] leading-5" style={{ color: "var(--shell-faint)" }}>
-          Add a server manually when it is not in the guided catalog. You will verify its
-          live tools and grant each Zeus capability separately.
+      {/*
+        A custom connection is a command Zeus runs, which only makes sense where the machine
+        is the user's own. Hiding the form on the hosted site is a courtesy so nobody fills
+        in a form that cannot succeed; the refusal itself lives in core, which turns the
+        same request down however it arrives.
+      */}
+      {localMode ? (
+        <details className="mt-6 border-t pt-4" style={{ borderColor: "var(--shell-line)" }}>
+          <summary className="cursor-pointer text-[0.82rem] font-medium">
+            Advanced: custom MCP server
+          </summary>
+          <p className="mt-2 max-w-[60ch] text-[0.75rem] leading-5" style={{ color: "var(--shell-faint)" }}>
+            Add a server manually when it is not in the guided catalog. You will verify its
+            live tools and grant each Zeus capability separately.
+          </p>
+          <AddConnectorForm />
+        </details>
+      ) : (
+        <p
+          className="mt-6 max-w-[60ch] border-t pt-4 text-[0.75rem] leading-5"
+          style={{ borderColor: "var(--shell-line)", color: "var(--shell-faint)" }}
+        >
+          Custom MCP servers run a command on the machine Zeus is installed on, so they are
+          available only when you run Zeus yourself.
         </p>
-        <AddConnectorForm />
-      </details>
+      )}
     </section>
   );
 }

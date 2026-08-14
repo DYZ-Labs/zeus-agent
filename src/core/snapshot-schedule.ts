@@ -63,6 +63,25 @@ export function snapshotScheduleSettings(
 }
 
 /**
+ * The single directory every store in this deployment snapshots into.
+ *
+ * Snapshot filenames are scoped by a hash of their source path, so one directory holds
+ * every store's copies without one store's retention pruning another's. That scoping is
+ * what makes a shared directory the unit an operator replicates off-machine, and it is
+ * the layout `npm run snapshot` and `npm run restore` already assume.
+ *
+ * Resolving it from the *primary* store rather than from each store's own path is the
+ * whole point of the function existing. `defaultSnapshotDirectory(store.path)` looks
+ * harmless and is what an account store's own path implies, but it puts hosted users'
+ * backups in `accounts/snapshots`, where neither the freshness check below nor the
+ * documented recovery command looks — a backup that runs, reports success, and cannot
+ * be restored. Every side of the schedule must resolve the directory through here.
+ */
+export function deploymentSnapshotDirectory(primaryPath: string = defaultDbPath()): string {
+  return defaultSnapshotDirectory(primaryPath);
+}
+
+/**
  * Which stores have gone longer than the interval without a snapshot.
  *
  * Every store is considered independently, so an account added today is backed up today
@@ -81,7 +100,7 @@ export function storesDueForSnapshot(
   const primaryPath = options.primaryPath ?? defaultDbPath();
   let directory: string;
   try {
-    directory = options.directory ?? defaultSnapshotDirectory(primaryPath);
+    directory = options.directory ?? deploymentSnapshotDirectory(primaryPath);
   } catch {
     return [];
   }

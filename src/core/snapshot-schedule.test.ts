@@ -1,12 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { openDb } from "./db";
 import {
   DEFAULT_SNAPSHOT_INTERVAL_HOURS,
+  deploymentSnapshotDirectory,
   snapshotScheduleSettings,
   storesDueForSnapshot,
 } from "./snapshot-schedule";
@@ -14,7 +15,14 @@ import { createVerifiedSnapshot, latestSnapshotTime } from "./snapshots";
 
 const temporaryDirectories: string[] = [];
 
+beforeEach(() => {
+  // These tests are about where the default layout puts a copy, so the override has to be
+  // pinned off. Left ambient, they would quietly assert whoever's shell started vitest.
+  vi.stubEnv("ZEUS_SNAPSHOT_DIR", undefined);
+});
+
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -160,6 +168,30 @@ describe("hosted snapshot scheduling", () => {
     expect(latestSnapshotTime(account, directory)).toBeNull();
     snapshot(account, directory);
     expect(latestSnapshotTime(account, directory)).toBeInstanceOf(Date);
+  });
+
+  it("resolves one directory for every store, beside the primary one", () => {
+    const { primary, account } = deployment();
+
+    // An account store's own path implies `accounts/snapshots`, and resolving it that
+    // way is how the write side and the read side came apart. Every store's copies
+    // belong beside the primary store, where retention keeps them apart by source hash
+    // and where a single directory is what an operator replicates off-machine.
+    expect(deploymentSnapshotDirectory(primary)).toBe(join(dirname(primary), "snapshots"));
+    expect(deploymentSnapshotDirectory(primary)).not.toBe(
+      join(dirname(account), "snapshots"),
+    );
+  });
+
+  it("finds an account store's copies without being told where to look", () => {
+    const { primary, account } = deployment();
+    snapshot(account, deploymentSnapshotDirectory(primary));
+
+    // The scheduler asks without passing a directory, so the default it falls back to
+    // has to be the same one the snapshot was written into.
+    const due = storesDueForSnapshot({ primaryPath: primary });
+
+    expect(due.map((store) => store.path)).toEqual([primary]);
   });
 
   it("keeps one store's freshness from vouching for another's", () => {

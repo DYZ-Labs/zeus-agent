@@ -1,0 +1,207 @@
+name: Health
+
+# Railway probes /api/health once, before it routes traffic to a new deployment; it is not
+# a continuous check. With a restart policy that gives up after three attempts, a crash
+# loop ends with the service down and nobody told. This workflow is the standing probe:
+# it fails loudly so GitHub's own failed-run notification reaches a person, instead of the
+# outage being discovered by whoever tries to use Zeus next.
+
+on:
+  # GitHub's scheduler is best-effort. A run can be delayed by many minutes under load, and
+  # scheduled workflows are disabled altogether on a repository with no recent commits, so
+  # a missing run means "unknown", never "healthy". Ten to fifteen minutes is the practical
+  # floor; asking for more often does not produce more runs.
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: health-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe the deployment health endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # `github`, not `runner`: the `runner` context is not available in a job-level `env:`
+      # block, so `${{ runner.temp }}` would expand to nothing and leave this pointing at
+      # /health.json, which the job cannot write.
+      HEALTH_BODY: ${{ github.workspace }}/health.json
+    steps:
+      # An unconfigured repository must stay green. Turning every fork and every clone red
+      # for not having a deployment would train people to ignore this workflow, which is
+      # the one thing a monitor cannot survive.
+      - name: Check whether a target is configured
+        id: target
+        env:
+          ZEUS_HEALTH_URL: ${{ secrets.ZEUS_HEALTH_URL }}
+        run: |
+          if [ -z "${ZEUS_HEALTH_URL:-}" ]; then
+            echo "::notice::ZEUS_HEALTH_URL is not set; skipping the health probe."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Use Node.js 22
+        if: steps.target.outputs.configured == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Fetch the health endpoint
+        if: steps.target.outputs.configured == 'true'
+        env:
+          ZEUS_HEALTH_URL: ${{ secrets.ZEUS_HEALTH_URL }}
+        run: |
+          # curl quotes the URL in its own diagnostics, so stderr is discarded and the exit
+          # code reported instead. The health payload is designed to contain no user data,
+          # but the address of someone's personal memory store is still not something to
+          # publish in a public build log, and an exit code says just as much about why a
+          # request failed. A couple of retries absorb a single dropped connection: an
+          # alarm that fires on ordinary network noise gets muted by the person reading it.
+          code=0
+          status=$(curl --silent --location --max-time 30 \
+            --retry 2 --retry-delay 5 --retry-connrefused \
+            --header 'Accept: application/json' \
+            --output "$HEALTH_BODY" \
+            --write-out '%{http_code}' \
+            "$ZEUS_HEALTH_URL" 2>/dev/null) || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "::error::Health probe could not reach the deployment (curl exit ${code})."
+            exit 1
+          fi
+          echo "HTTP ${status}"
+          if [ "$status" != "200" ]; then
+            echo "::error::Health endpoint returned HTTP ${status}."
+            exit 1
+          fi
+
+      # A 200 is the weaker half of this check. /api/health answers 200 whenever the store
+      # opens, which it does while backups have silently stopped running — exactly the
+      # failure the snapshot scheduler was built to make visible. So the body is read too.
+      - name: Check the health payload for degradation
+        if: steps.target.outputs.configured == 'true'
+        run: |
+          cat > "${RUNNER_TEMP}/health-check.mjs" <<'CHECK'
+          import { readFileSync } from "node:fs";
+
+          // Only the fields this workflow understands are inspected, and an unrecognised or
+          // absent key is never read as a failure. The payload is expected to keep growing,
+          // and a monitor that goes red the moment the service gains a field is worse than
+          // no monitor.
+
+          const failures = [];
+          const notes = [];
+          let body = null;
+
+          try {
+            body = JSON.parse(readFileSync(process.env.HEALTH_BODY, "utf8"));
+          } catch {
+            failures.push("the response body is not valid JSON");
+          }
+
+          // Everything below reports values that arrived over the network. A workflow
+          // command is newline-delimited, so a field containing one could close this
+          // annotation and open its own — `::stop-commands::` would silence the rest of
+          // the run. Reported values are flattened and bounded before they are printed.
+          const safe = (value) =>
+            String(value).replace(/[\r\n]+/gu, " ").replace(/::/gu, ":").slice(0, 80);
+
+          if (body === null) {
+            // nothing further to inspect
+          } else if (typeof body !== "object" || Array.isArray(body)) {
+            // A 200 carrying valid JSON that is not an object would otherwise skip every
+            // check below and be reported as perfectly healthy.
+            failures.push("the response body is not a health object");
+          } else {
+            const status = typeof body.status === "string" ? body.status : "missing";
+            if (status !== "ok") failures.push(`overall status is "${safe(status)}"`);
+
+            const store = body.store?.status ?? "missing";
+            if (store !== "ok") {
+              // errorSignature() returns an error class name and a code site rather than a
+              // message, precisely so this kind of report can repeat it.
+              const signature = body.store?.error_name;
+              failures.push(`store is "${safe(store)}"` + (signature ? ` (${safe(signature)})` : ""));
+            }
+
+            const snapshots = body.snapshots;
+            if (snapshots === undefined || snapshots === null) {
+              failures.push("the snapshot scheduler status is missing from the payload");
+            } else {
+              // "not_started" means the scheduler never came up, "disabled" means it was
+              // switched off. On a hosted deployment either one means the volume is not
+              // being backed up, which is the whole reason this status is reported.
+              if (snapshots.state !== "running") {
+                failures.push(`snapshot scheduler state is "${safe(snapshots.state ?? "missing")}"`);
+              }
+              // A null last result means no store has come due since the process started,
+              // which is the ordinary state after every deploy and for most of an interval.
+              // Only a run that finished badly is evidence of a problem.
+              if (snapshots.lastResult === "failed" || snapshots.lastResult === "partial") {
+                failures.push(`the last snapshot run finished "${safe(snapshots.lastResult)}"`);
+              }
+              const stale = staleness(snapshots);
+              if (stale !== null) failures.push(stale);
+            }
+
+            // Retrieval falls back to full-text search when the local model cannot load, so
+            // this is worth seeing without being an outage; the endpoint answers 200 on
+            // purpose. Raising it as an error here would make the alarm mean less.
+            if (body.embeddings === "unavailable") {
+              notes.push("embeddings are unavailable; retrieval is running on full-text only");
+            }
+
+            // A snapshot that never leaves the volume is lost with the volume it protects.
+            // An attempt that failed is an error: the operator asked for the copy and did
+            // not get it. Replication never being configured is a standing choice rather
+            // than a regression, so it warns — a monitor that is red every run until
+            // someone changes a setting is a monitor people learn to ignore.
+            const replication = body.replication;
+            if (replication !== undefined && replication !== null) {
+              if (replication.lastResult === "failed") {
+                const reason = replication.lastReason;
+                failures.push(
+                  "the last off-box snapshot copy failed" + (reason ? ` (${safe(reason)})` : ""),
+                );
+              } else if (replication.state === "not_configured") {
+                notes.push(
+                  "no off-box snapshot copy is configured; backups live only on the volume they protect",
+                );
+              }
+            }
+          }
+
+          function staleness(snapshots) {
+            if (typeof snapshots.lastRunAt !== "string") return null;
+            const ran = Date.parse(snapshots.lastRunAt);
+            if (Number.isNaN(ran)) return "the last snapshot timestamp is unparseable";
+            const hours =
+              typeof snapshots.intervalHours === "number" && snapshots.intervalHours > 0
+                ? snapshots.intervalHours
+                : 24;
+            // The scheduler records a run only when some store was actually due, so a
+            // perfectly healthy deployment's last run is up to one full interval old at any
+            // given moment. Two intervals plus an hour is the first age the schedule itself
+            // cannot explain.
+            const limitMs = (hours * 2 + 1) * 3_600_000;
+            const ageMs = Date.now() - ran;
+            if (ageMs <= limitMs) return null;
+            const ageHours = Math.round(ageMs / 3_600_000);
+            return `no snapshot has run for about ${ageHours}h (interval ${hours}h)`;
+          }
+
+          for (const note of notes) console.log(`::warning::${note}`);
+          for (const failure of failures) {
+            console.log(`::error::Health check failed: ${failure}`);
+          }
+          if (failures.length > 0) process.exit(1);
+          console.log("Health endpoint reports a healthy store and a running snapshot scheduler.");
+          CHECK
+          node "${RUNNER_TEMP}/health-check.mjs"
