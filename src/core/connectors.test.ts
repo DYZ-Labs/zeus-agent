@@ -31,6 +31,13 @@ import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import { MIGRATIONS } from "./migrations";
 import { bindAppOwner } from "./owner";
+import type { WorkPlanProposal } from "./schema";
+import {
+  authorizeWorkPlan,
+  createWorkPlan,
+  listToolReceipts,
+  runWorkPlan,
+} from "./work-plans";
 
 let db: Db;
 let userMessageId: number;
@@ -352,6 +359,99 @@ describe("the first-party Google Calendar provider", () => {
         "calendar.list_events",
         "calendar.update_event",
       ]);
+    } finally {
+      delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("preserves a read receipt when write permission adds capabilities", async () => {
+    process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY] = "d".repeat(40);
+    try {
+      const connector = upsertGoogleCalendarConnector(db, {
+        connectionId: randomUUID(),
+        mcpUrl: "https://calendar.zeusagent.dev/mcp/connection",
+        sourceMessageId: userMessageId,
+      });
+      const tools = [
+        tool("list_events", true),
+        tool("create_event", false),
+        tool("update_event", false),
+      ];
+      recordConnectorVerification(db, connector.id, { status: "ready", tools });
+      configureGoogleCalendarCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_CALENDAR_READ_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+      const readCapability = availableCapability(db, "calendar.list_events")?.capability;
+      if (!readCapability) throw new Error("read capability missing");
+
+      const proposal: WorkPlanProposal = {
+        objective: "Read tomorrow's calendar",
+        steps: [{
+          title: "Read calendar",
+          instruction: "Read the connected calendar.",
+          effect_kind: "external_read",
+          depends_on: [],
+        }],
+        allowed_effects: ["external_read"],
+        completion_criteria: ["Calendar data was returned as an external artifact."],
+        limits: {
+          max_model_tool_calls: 2,
+          max_retries_per_step: 0,
+          max_duration_seconds: 60,
+        },
+      };
+      const plan = createWorkPlan(db, {
+        proposal,
+        sourceMessageId: userMessageId,
+        origin: "explicit_request",
+      });
+      authorizeWorkPlan(db, plan.plan.id, {
+        planHash: plan.plan.plan_hash,
+        authorizationKind: "explicit_request",
+        allowedEffects: proposal.allowed_effects,
+        maxModelToolCalls: plan.plan.max_model_tool_calls,
+        maxRetriesPerStep: plan.plan.max_retries_per_step,
+        maxDurationSeconds: plan.plan.max_duration_seconds,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        sourceMessageId: userMessageId,
+      });
+      const run = await runWorkPlan(db, plan.plan.id, {
+        executor: async (input) => ({
+          output: { event_count: 0 },
+          artifacts: [{
+            kind: "research_notes",
+            title: input.step.title,
+            content: "External calendar data — no events.",
+            citations: [],
+          }],
+          toolCalls: 1,
+          modelCalls: 0,
+        }),
+      });
+      expect(listToolReceipts(db, run.id)[0]?.connector_capability_id).toBe(readCapability.id);
+
+      const upgradeSource = appendMessage(
+        db,
+        createConversation(db, { title: "Permission upgrade", source: "web" }).id,
+        "user",
+        "Allow Google Calendar changes.",
+        { origin: "user_action", recallState: "blocked" },
+      );
+      const upgraded = configureGoogleCalendarCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_CALENDAR_WRITE_SCOPE],
+        sourceMessageId: upgradeSource.id,
+      });
+
+      expect(
+        upgraded.capabilities.find((capability) => capability.slot === "calendar.list_events")?.id,
+      ).toBe(readCapability.id);
+      expect(upgraded.capabilities.filter((capability) => capability.enabled === 1)).toHaveLength(3);
+      expect(listToolReceipts(db, run.id)[0]?.connector_capability_id).toBe(readCapability.id);
     } finally {
       delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
     }
