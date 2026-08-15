@@ -22,10 +22,7 @@ import {
   NEW_CHAT_EVENT,
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
-import {
-  receiptSummaryParts,
-  type ChatReceipt,
-} from "@/components/chat-receipt";
+import { type ChatReceipt } from "@/components/chat-receipt";
 // Imported rather than restated. A hand-copied duplicate is how a new status ends up
 // rendering the catch-all sentence in CARD_COPY.stoppedShort, which for read_only would
 // be actively false.
@@ -344,7 +341,6 @@ export function Chat({
                     ) : (
                       <AssistantTurn
                         text={turn.text}
-                        receipt={turn.receipt}
                         recommendation={turn.recommendation}
                         recommendationDecision={turn.recommendationDecision}
                         onRecommendationDecision={(recommendation, decision, userReason) =>
@@ -510,7 +506,6 @@ function UserTurn({ text }: { text: string }) {
 
 function AssistantTurn({
   text,
-  receipt,
   recommendation,
   recommendationDecision,
   onRecommendationDecision,
@@ -520,7 +515,6 @@ function AssistantTurn({
   pending,
 }: {
   text: string;
-  receipt?: Turn["receipt"];
   recommendation?: FollowThroughRecommendation;
   recommendationDecision?: RecommendationDecision;
   onRecommendationDecision: (
@@ -559,7 +553,6 @@ function AssistantTurn({
         ) : (
           workPlan && <WorkPlanCard workPlan={workPlan} />
         )}
-        {receipt && <Receipt {...receipt} />}
       </div>
     </div>
   );
@@ -1182,84 +1175,6 @@ function ThinkingIndicator() {
         />
       ))}
     </span>
-  );
-}
-
-/** The memory changes made by a turn, kept inspectable without crowding the reply. */
-function Receipt({
-  messageId,
-  recalled,
-  recalledFacts,
-  recalledEpisodes,
-  recalledFacets,
-  accepted,
-  acceptedFacets,
-  pending,
-  pendingFacets,
-  goalsUpdated,
-  commitmentsUpdated,
-  projectsUpdated,
-  superseded,
-  failed,
-}: NonNullable<Turn["receipt"]>) {
-  const parts = receiptSummaryParts({
-    messageId,
-    recalled,
-    recalledFacts,
-    recalledEpisodes,
-    recalledFacets,
-    accepted,
-    acceptedFacets,
-    pending,
-    pendingFacets,
-    goalsUpdated,
-    commitmentsUpdated,
-    superseded,
-    failed,
-  });
-
-  if (parts.length === 0) {
-    return (
-      <a
-        href={`/response/${messageId}`}
-        className="mt-3 inline-block font-mono text-[0.66rem] underline underline-offset-2"
-        style={{ color: "var(--shell-faint)" }}
-      >
-        response sources
-      </a>
-    );
-  }
-
-  return (
-    <details className="mt-3 font-mono text-[0.66rem]" style={{ color: "var(--shell-faint)" }}>
-      <summary className="inline-flex cursor-pointer list-none rounded-md py-1 hover:text-white">
-        {parts.join("  ·  ")}
-      </summary>
-      <div
-        className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 border-l pl-3"
-        style={{ borderColor: "var(--shell-line-strong)" }}
-      >
-        <span>{recalledFacts} facts</span>
-        <span>{recalledEpisodes} passages</span>
-        <span>{recalledFacets} understanding facets</span>
-        {acceptedFacets > 0 && <span>{acceptedFacets} facets accepted</span>}
-        {goalsUpdated > 0 && <span>{goalsUpdated} goals updated</span>}
-        {commitmentsUpdated > 0 && <span>{commitmentsUpdated} commitments updated</span>}
-        {projectsUpdated > 0 && <span>{projectsUpdated} projects updated</span>}
-        <a href={`/response/${messageId}`} className="underline underline-offset-2" style={{ color: "var(--shell-fg)" }}>
-          sources used
-        </a>
-        {(accepted > 0 || pending > 0) && (
-          <a
-            href={pendingFacets > 0 ? "/understanding" : pending > 0 ? "/memory?view=review" : "/memory"}
-            className="underline underline-offset-2"
-            style={{ color: "var(--shell-fg)" }}
-          >
-            {pendingFacets > 0 ? "review understanding" : "review saved details"}
-          </a>
-        )}
-      </div>
-    </details>
   );
 }
 
