@@ -122,6 +122,7 @@ import {
   recordFollowThroughDecision,
   recordSignalDecision,
   setStewardshipMode,
+  signalChatPrompt,
 } from "@/core/stewardship";
 import { getOwnerAccess, requireOwnerDb } from "@/server/auth/access";
 import {
@@ -1177,6 +1178,13 @@ export async function signalDecisionAction(formData: FormData): Promise<void> {
   });
   revalidatePath("/today");
   revalidatePath("/settings");
+  // "Help me fix this" used to record the decision and stop there, which made the most
+  // action-shaped button on the page the one that did the least. Accepting a signal now
+  // opens chat on the request itself, the same handoff a follow-through acceptance makes.
+  // Still only a prefilled prompt: the turn it starts is bound by every gate a typed one is.
+  if (decision === "accepted") {
+    redirect(`/?prompt=${encodeURIComponent(signalChatPrompt(signal))}`);
+  }
 }
 
 /** Show why a connection or request was refused, without leaking anything it contained. */

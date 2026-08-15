@@ -23,6 +23,11 @@ export async function register(): Promise<void> {
   const { startDurabilityMaintenance } = await import("./server/durability");
   startDurabilityMaintenance();
 
+  // Keep the cached calendar current where no LaunchAgent does it, so the detectors this
+  // deployment ships actually run. Refresh only; nothing here interrupts anyone.
+  const { startAmbientScheduler } = await import("./server/ambient-scheduler");
+  startAmbientScheduler();
+
   // Deliberately not awaited: the model download must never delay the server coming up
   // or keep it from coming up at all. Search answers from full-text until it lands.
   const { startEmbeddingWarmup } = await import("./server/embedding-warmup");

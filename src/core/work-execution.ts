@@ -38,6 +38,7 @@ import {
   type PersonalizationProfileItem,
 } from "./personalization";
 import type {
+  CapabilitySlot,
   EffectKind,
   EvaluationContext,
   RecallItem,
@@ -652,6 +653,15 @@ async function prepareExternalRequest(
     };
   }
 
+  const illegible = illegiblePayloadEffect(available.capability.slot, drafted.payload);
+  if (illegible) {
+    return {
+      pause: { code: "payload_effect_not_legible", message: illegible },
+      modelCalls: 1,
+      toolCalls: 0,
+    };
+  }
+
   const effect = proposeEffect(db, {
     workRunId: input.run.id,
     workStepId: input.step.id,
@@ -1047,6 +1057,31 @@ function calendarArtifact(
 }
 
 /**
+ * Refuse a payload whose real effect the confirmation screen cannot convey.
+ *
+ * The two-gate design rests on the user reading the exact request and knowing what
+ * confirming it does. That holds while the bytes and the consequence match. `attendees` on
+ * an update is where they come apart: Google's PATCH *replaces* the guest list, so an
+ * omitted name is an uninvitation and `"attendees": []` silently clears the room. Someone
+ * reading that payload sees a list, not a removal, and confirms a change nobody described.
+ *
+ * A chat sentence authorizes a change of time. Rewriting who is in the meeting is a
+ * different act, and it is not one Zeus can put behind a hash and call informed.
+ *
+ * Only the model-authored path needs this. A resolved calendar action builds its payload in
+ * `buildCalendarPayload`, where the field simply does not exist — the stronger guarantee,
+ * and the reason this check is a backstop rather than the primary defence.
+ */
+export function illegiblePayloadEffect(
+  slot: CapabilitySlot,
+  payload: Record<string, unknown>,
+): string | null {
+  if (slot !== "calendar.update_event") return null;
+  if (payload.attendees === undefined) return null;
+  return "The prepared change would replace the event's guest list, which confirming it would not make obvious";
+}
+
+/**
  * A shallow structural check against the schema the user reviewed.
  *
  * Deliberately not a full JSON Schema validator — that would be a new dependency for a
@@ -1116,6 +1151,19 @@ function recallItemSourceMessageId(item: Exclude<RecallItem, { kind: "episode" }
   return item.project.source_message_id;
 }
 
+/**
+ * Everything earlier steps produced, trimmed so that every artifact survives.
+ *
+ * The budget is shared out per artifact rather than taken off the end. Truncating the
+ * serialized whole looks equivalent and is not: artifacts come back in id order, so one
+ * verbose early step — a calendar read can be hundreds of events — would push every later
+ * artifact past the cut and out of existence. The step that then runs sees a plausible,
+ * complete-looking input with the most considered part of the plan missing, and nothing
+ * anywhere reports a problem. That is the failure mode worth designing against.
+ *
+ * Small artifacts never lose their unused share; it is redistributed to the large ones, so
+ * the common case of a short summary beside a long transcript keeps the summary whole.
+ */
 function priorArtifactData(
   db: Db,
   input: SafeStepExecutionInput,
@@ -1128,7 +1176,82 @@ function priorArtifactData(
       content: artifact.content,
       citations: parseJsonArray(artifact.citations_json),
     }));
-  return JSON.stringify(priorArtifacts).slice(0, MAX_PRIOR_ARTIFACT_CHARS);
+  return serializePriorArtifacts(priorArtifacts);
+}
+
+export type PriorArtifactEntry = {
+  id: number;
+  kind: string;
+  title: string;
+  content: string;
+  citations: unknown[];
+};
+
+/** The budget arithmetic, separated from the query so it can be exercised directly. */
+export function serializePriorArtifacts(
+  priorArtifacts: readonly PriorArtifactEntry[],
+): string {
+  if (priorArtifacts.length === 0) return JSON.stringify(priorArtifacts);
+
+  const lengths = priorArtifacts.map((artifact) => artifact.content.length);
+  const envelope = JSON.stringify(
+    priorArtifacts.map((artifact) => ({ ...artifact, content: "" })),
+  ).length;
+
+  let budget = Math.max(0, MAX_PRIOR_ARTIFACT_CHARS - envelope);
+  let serialized = "";
+  // JSON escaping inflates content unpredictably, so converge on a budget that fits
+  // instead of assuming one does. Three passes is ample; the fallback still keeps a
+  // proportional share of every artifact rather than dropping the tail.
+  for (let pass = 0; pass < 3; pass += 1) {
+    const allocation = shareBudget(lengths, budget);
+    serialized = JSON.stringify(
+      priorArtifacts.map((artifact, index) => ({
+        ...artifact,
+        content: truncateContent(artifact.content, allocation[index] ?? 0),
+      })),
+    );
+    if (serialized.length <= MAX_PRIOR_ARTIFACT_CHARS) return serialized;
+    budget = Math.floor(budget * (MAX_PRIOR_ARTIFACT_CHARS / serialized.length) * 0.95);
+    if (budget <= 0) break;
+  }
+  return serialized.slice(0, MAX_PRIOR_ARTIFACT_CHARS);
+}
+
+const TRUNCATION_MARKER = "\n…[truncated]";
+
+function truncateContent(content: string, allowance: number): string {
+  if (content.length <= allowance) return content;
+  const room = allowance - TRUNCATION_MARKER.length;
+  return room <= 0 ? TRUNCATION_MARKER.trimStart() : `${content.slice(0, room)}${TRUNCATION_MARKER}`;
+}
+
+/**
+ * Share a character budget across items, giving back what the small ones do not need.
+ *
+ * Repeated equal division: anything that fits inside the current fair share is settled at
+ * its true size, and the remainder is divided again among what is left.
+ */
+function shareBudget(lengths: readonly number[], total: number): number[] {
+  const allocation = new Array<number>(lengths.length).fill(0);
+  let remaining = Math.max(0, total);
+  let pending = lengths.map((_, index) => index);
+
+  while (pending.length > 0) {
+    const share = Math.floor(remaining / pending.length);
+    if (share <= 0) break;
+    const settled = pending.filter((index) => (lengths[index] ?? 0) <= share);
+    if (settled.length === 0) {
+      for (const index of pending) allocation[index] = share;
+      break;
+    }
+    for (const index of settled) {
+      allocation[index] = lengths[index] ?? 0;
+      remaining -= lengths[index] ?? 0;
+    }
+    pending = pending.filter((index) => (lengths[index] ?? 0) > share);
+  }
+  return allocation;
 }
 
 function priorArtifactSourceMessageIds(db: Db, input: SafeStepExecutionInput): number[] {

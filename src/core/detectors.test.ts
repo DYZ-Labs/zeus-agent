@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { resolveTodayOpportunity } from "./ambient";
+import { mayBeCalendarRequest } from "./calendar-intent";
 import { cacheCalendarEvents } from "./calendar-sync";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
@@ -15,6 +16,7 @@ import {
   recordSignalDecision,
   setStewardshipMode,
   signalAlertForOpportunity,
+  signalChatPrompt,
 } from "./stewardship";
 
 /**
@@ -346,5 +348,74 @@ describe("signals enter through the existing gates, or not at all", () => {
         sourceMessageId: assistant,
       }),
     ).toThrow();
+  });
+});
+
+describe("handing a detected signal to chat", () => {
+  it("phrases a clash as a request the calendar router will act on", () => {
+    cache([FLIGHT, DINNER]);
+    const overlap = runDetectors(db, { at: NOW }).created.find(
+      (signal) => signal.detector === "calendar_overlap",
+    );
+    expect(overlap).toBeDefined();
+
+    const prompt = signalChatPrompt(overlap!);
+
+    expect(mayBeCalendarRequest(prompt)).toBe(true);
+    // The why rides along, because it names both events and their times — the context the
+    // calendar path needs to resolve which event to move.
+    expect(prompt).toContain("Flight lands");
+    expect(prompt).toContain("Dinner with Sam");
+    expect(prompt).toContain("without my explicit confirmation");
+  });
+
+  it("does not depend on the event titles happening to sound like a calendar", () => {
+    // "Decide which of “Aurora” and “Borealis” to move." carries no calendar noun, so the
+    // detector's own wording falls below the router's prefilter and the turn it opens is
+    // ordinary conversation about the clash. The asked-for version never depends on what
+    // the user happened to name their meetings.
+    cache([
+      { ...FLIGHT, title: "Aurora" },
+      { ...DINNER, title: "Borealis" },
+    ]);
+    const overlap = runDetectors(db, { at: NOW }).created.find(
+      (signal) => signal.detector === "calendar_overlap",
+    );
+
+    expect(mayBeCalendarRequest(overlap!.suggested_action)).toBe(false);
+    expect(mayBeCalendarRequest(signalChatPrompt(overlap!))).toBe(true);
+  });
+
+  it("asks for time to be held when a commitment has none", () => {
+    const source = appendMessage(db, conversationId, "user", "I owe Sam the deck by Monday", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    createCommitment(db, {
+      title: "Send Sam the deck",
+      dueAt: "2026-08-17T09:00:00.000Z",
+      sourceMessageId: source.id,
+    });
+
+    const unscheduled = runDetectors(db, { at: NOW }).created.find(
+      (signal) => signal.detector === "commitment_unscheduled",
+    );
+
+    expect(mayBeCalendarRequest(signalChatPrompt(unscheduled!))).toBe(true);
+  });
+
+  it("leaves a full day in the detector's own words rather than inventing a target", () => {
+    // Nothing here is one event to move, so there is nothing honest to ask the calendar
+    // path for. The prompt stays descriptive instead of sending it hunting.
+    expect(
+      signalChatPrompt({
+        detector: "deadline_collision",
+        why: "“Ship the report” is due on 2026-08-20, which already has 420 booked minutes.",
+        suggested_action: "Start “Ship the report” earlier, or move its deadline.",
+      }),
+    ).toBe(
+      "Start “Ship the report” earlier, or move its deadline. " +
+        "Nothing outside this conversation changes without my explicit confirmation.",
+    );
   });
 });

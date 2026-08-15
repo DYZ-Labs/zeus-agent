@@ -3,8 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildWorkPlanGenerationInput,
   createSafeWorkExecutor,
+  illegiblePayloadEffect,
   inspectUntrustedWorkData,
+  serializePriorArtifacts,
 } from "./work-execution";
+import type { PriorArtifactEntry } from "./work-execution";
 import { appendMessage, createConversation } from "./conversations";
 import { openTestDb } from "./db";
 import { recordFacet } from "./facets";
@@ -198,5 +201,89 @@ describe("work-plan generation personalization", () => {
       }),
     ]));
     expect(generated.provenance.evaluationContext).toEqual(context);
+  });
+});
+
+describe("carrying earlier artifacts into a later step", () => {
+  const artifact = (id: number, title: string, content: string): PriorArtifactEntry => ({
+    id,
+    kind: "research_notes",
+    title,
+    content,
+    citations: [],
+  });
+
+  it("keeps the last artifact even behind an enormous first one", () => {
+    // A calendar read is hundreds of events. Truncating the serialized whole would drop
+    // everything after it, and the drafting step would never see the part that mattered.
+    const serialized = serializePriorArtifacts([
+      artifact(1, "External calendar data", "e".repeat(200_000)),
+      artifact(2, "Locally computed availability", "Free at 16:00."),
+    ]);
+    const parsed = JSON.parse(serialized) as PriorArtifactEntry[];
+
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1]?.content).toBe("Free at 16:00.");
+    expect(parsed[0]?.content).toMatch(/truncated/u);
+    expect(serialized.length).toBeLessThanOrEqual(40_000);
+  });
+
+  it("gives a small artifact its full text rather than an equal share", () => {
+    const serialized = serializePriorArtifacts([
+      artifact(1, "Big", "b".repeat(100_000)),
+      artifact(2, "Small", "exactly this"),
+      artifact(3, "Also big", "c".repeat(100_000)),
+    ]);
+    const parsed = JSON.parse(serialized) as PriorArtifactEntry[];
+
+    expect(parsed[1]?.content).toBe("exactly this");
+    expect(parsed[0]?.content.length).toBeGreaterThan(1_000);
+    expect(parsed[2]?.content.length).toBeGreaterThan(1_000);
+  });
+
+  it("leaves everything intact when it all fits", () => {
+    const entries = [artifact(1, "One", "first"), artifact(2, "Two", "second")];
+    expect(JSON.parse(serializePriorArtifacts(entries))).toEqual(entries);
+    expect(serializePriorArtifacts([])).toBe("[]");
+  });
+});
+
+describe("a payload whose effect the confirmation screen cannot convey", () => {
+  it("refuses to rewrite a guest list behind a time change", () => {
+    // Google's PATCH replaces the attendee list, so an empty one clears the room. The
+    // bytes look like a list; the consequence is a removal nobody described.
+    expect(
+      illegiblePayloadEffect("calendar.update_event", {
+        event_id: "e1",
+        start: "2026-08-17T08:00:00Z",
+        end: "2026-08-17T09:00:00Z",
+        attendees: [],
+      }),
+    ).toMatch(/guest list/u);
+  });
+
+  it("leaves an ordinary reschedule and a cancellation alone", () => {
+    expect(
+      illegiblePayloadEffect("calendar.update_event", {
+        event_id: "e1",
+        start: "2026-08-17T08:00:00Z",
+        end: "2026-08-17T09:00:00Z",
+      }),
+    ).toBeNull();
+    expect(
+      illegiblePayloadEffect("calendar.update_event", { event_id: "e1", status: "cancelled" }),
+    ).toBeNull();
+  });
+
+  it("does not interfere with inviting people to a new event", () => {
+    // On a create the list is additive and the preview says so; nothing is being removed.
+    expect(
+      illegiblePayloadEffect("calendar.create_event", {
+        title: "Kickoff",
+        start: "2026-08-17T08:00:00Z",
+        end: "2026-08-17T09:00:00Z",
+        attendees: [{ email: "sam@example.com" }],
+      }),
+    ).toBeNull();
   });
 });
