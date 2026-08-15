@@ -57,7 +57,8 @@ export async function syncCalendar(
       signal: options.signal,
       capabilityId: available.capability.id,
     });
-    const events = cacheCalendarEvents(db, available.connector.id, result.value, at);
+    if (result.isError) throw new Error("calendar_tool_reported_error");
+    const events = cacheCalendarEvents(db, available.connector.id, result.value, at, window);
     logEvent({
       event: "calendar_synced",
       outcome: "ok",
@@ -212,22 +213,30 @@ export function cachedEvents(
 
 /**
  * Read the shapes a calendar server plausibly returns and keep only the fields Zeus uses.
- *
- * Anything without an id is dropped: without a stable identifier a later read would
- * duplicate it rather than update it, and a detector would raise the same conflict twice.
+ * Every returned entry needs a stable id. Silently dropping an unidentifiable entry could
+ * turn a malformed non-empty response into proof that the calendar was empty and clear a
+ * conflicting write, so the whole read fails closed instead.
  */
 export function parseCalendarEvents(value: unknown): CalendarEvent[] {
   const list = Array.isArray(value)
     ? value
     : value && typeof value === "object" && Array.isArray((value as { events?: unknown }).events)
       ? (value as { events: unknown[] }).events
-      : [];
+      : null;
+  // An invalid response is not an empty calendar. Throw before cacheCalendarEvents opens its
+  // transaction, so neither event rows nor the proof-of-read row can be written.
+  if (list === null) throw new Error("Calendar response did not contain an event list");
+  if (list.length > MAX_EVENTS) {
+    throw new Error("Calendar response exceeded the complete event limit");
+  }
   const events: CalendarEvent[] = [];
-  for (const entry of list.slice(0, MAX_EVENTS)) {
-    if (entry === null || typeof entry !== "object") continue;
+  for (const entry of list) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("Calendar response contained an invalid event");
+    }
     const record = entry as Record<string, unknown>;
     const id = firstString(record, ["id", "event_id", "eventId", "uid"]);
-    if (id === null) continue;
+    if (id === null) throw new Error("Calendar response contained an event without an id");
     events.push({
       id,
       title: firstString(record, ["title", "summary", "name"]),

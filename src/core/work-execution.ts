@@ -15,11 +15,11 @@ import {
   checkCalendarConflicts,
   resolveTargetEvent,
 } from "./calendar-conflicts";
-import type { CalendarCoverage } from "./calendar-conflicts";
+import type { CalendarCoverage, FreeSlot } from "./calendar-conflicts";
 import { directExecutionAllowance, getCalendarActionSetting } from "./calendar-policy";
 import { cacheCalendarEvents, cachedEvents, calendarWindow, readCalendarCoverage } from "./calendar-sync";
 import type { CachedEvent } from "./calendar-time";
-import { availableCapabilityForEffect, availableEffectKinds } from "./connectors";
+import { availableCapabilityForEffect, availableEffectKinds, getConnector } from "./connectors";
 import type { BoundCapability } from "./connectors";
 import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
@@ -59,7 +59,6 @@ import type {
 } from "./work-plans";
 import {
   MAX_MODEL_TOOL_CALLS,
-  WorkStepExecutionError,
   listWorkArtifacts,
   minimumCallBudgetForSteps,
 } from "./work-plans";
@@ -493,19 +492,36 @@ async function executeExternalRead(
       capabilityId: available.capability.id,
     });
   } catch (error) {
-    throw new WorkStepExecutionError(
-      "The connected calendar could not be read",
-      {
-        code: error instanceof ConnectorError ? error.code : "connector_call_failed",
-        transient: error instanceof ConnectorError && error.code === "rate_limited",
-        toolCalls: 1,
-      },
+    return calendarReadFailure(
+      input,
+      error instanceof ConnectorError ? error.code : "connector_call_failed",
+      1,
+    );
+  }
+
+  if (result.isError) {
+    // A tool-level error is still a completed MCP exchange. It is not a successful calendar
+    // read, and must never be normalized into an empty event list or a coverage row.
+    const connector = getConnector(db, available.connector.id);
+    return calendarReadFailure(
+      input,
+      connector?.last_error_code === "reconnect_required"
+        ? "reconnect_required"
+        : "remote_reported_error",
+      1,
     );
   }
 
   // The window is passed through rather than recomputed, so the coverage row records the
   // window that was actually asked for.
-  const events = cacheCalendarEvents(db, available.connector.id, result.value, new Date(), window);
+  let events: ReturnType<typeof cacheCalendarEvents>;
+  try {
+    events = cacheCalendarEvents(db, available.connector.id, result.value, new Date(), window);
+  } catch {
+    // Parsing happens before the cache transaction. A malformed success response therefore
+    // proves neither an empty calendar nor that the requested window was covered.
+    return calendarReadFailure(input, "invalid_calendar_response", 1);
+  }
   const content = JSON.stringify({ window, event_count: events.length, events }, null, 2);
   const unsafe = inspectUntrustedWorkData(content);
   if (unsafe) return sensitivePause(db, input, unsafe, 0, 1);
@@ -526,6 +542,27 @@ async function executeExternalRead(
     ],
     modelCalls: 0,
     toolCalls: 1,
+  };
+}
+
+function calendarReadFailure(
+  input: SafeStepExecutionInput,
+  reason: string,
+  toolCalls: number,
+): SafeStepExecutionResult {
+  return {
+    output: { read: false, reason },
+    artifacts: [calendarArtifact(input, "Calendar could not be verified", {
+      reason,
+      coverage: null,
+      detail: "Zeus could not verify the calendar, so it did not change anything.",
+    })],
+    toolCalls,
+    pause: {
+      code: "calendar_unverifiable",
+      message: "The connected calendar could not be verified",
+      requiresReauthorization: false,
+    },
   };
 }
 
@@ -652,20 +689,35 @@ async function prepareExternalRequest(
 /**
  * The deterministic calendar write: read, check, then act — or stop and say why.
  *
- * This is the function that replaces the confirmation prompt, so it carries the weight the
- * prompt used to. Three refusals happen before a payload is even proposed, and each of them
- * ends the run rather than degrading into a send:
+ * This is the function that decides whether an exact request may execute directly, must wait
+ * for one explicit override, or cannot safely be proposed. Three stops happen before a
+ * payload is proposed:
  *
  * - the target cannot be resolved to exactly one event, or resolves to none;
- * - the requested time collides with something already there;
  * - the calendar could not be verified — no read, a stale read, or a read that never covered
  *   the requested time.
  *
- * `proposed_effect` therefore keeps meaning "a request Zeus intended to make". A refusal
- * leaves an artifact and no row, so the receipt log never has to be interpreted.
+ * A verified collision is different: Zeus can prepare the exact payload and explain the
+ * consequence, but it may not dispatch until the user confirms that exact request. Ambiguity
+ * and unverifiable reads remain non-overridable refusals with no proposed effect.
  */
 type CalendarGate =
-  | { status: "clear"; target: CachedEvent | null; events: number; coverage: CalendarCoverage | null }
+  | {
+      status: "clear";
+      target: CachedEvent | null;
+      events: number;
+      coverage: CalendarCoverage | null;
+      checkedAt: string;
+    }
+  | {
+      status: "conflict";
+      target: CachedEvent | null;
+      events: number;
+      coverage: CalendarCoverage;
+      checkedAt: string;
+      conflicts: CachedEvent[];
+      alternatives: FreeSlot[];
+    }
   | { status: "refused"; result: SafeStepExecutionResult };
 
 /**
@@ -776,20 +828,24 @@ function calendarGate(
     }
     if (check.status === "conflict") {
       return {
-        status: "refused",
-        result: calendarRefusal(input, "calendar_conflict", {
-          request,
-          conflicts: check.conflicts,
-          alternatives: check.alternatives,
-          coverage: check.coverage,
-          considered_events: events.length,
-          detail: "The requested time is already taken.",
-        }),
+        status: "conflict",
+        target,
+        events: events.length,
+        coverage: check.coverage,
+        checkedAt: at.toISOString(),
+        conflicts: check.conflicts,
+        alternatives: check.alternatives,
       };
     }
   }
 
-  return { status: "clear", target, events: events.length, coverage };
+  return {
+    status: "clear",
+    target,
+    events: events.length,
+    coverage,
+    checkedAt: at.toISOString(),
+  };
 }
 
 /** The checking step: same gate, no capability needed, and it never sends anything. */
@@ -800,8 +856,27 @@ function checkCalendarStep(
 ): SafeStepExecutionResult {
   const gate = calendarGate(db, input, request);
   if (gate.status === "refused") return gate.result;
+  if (gate.status === "conflict") {
+    return {
+      output: {
+        checked: true,
+        status: "conflict",
+        considered_events: gate.events,
+      },
+      artifacts: [calendarArtifact(input, pendingConflictHeading(request.kind), {
+        request,
+        target: gate.target,
+        reason: "calendar_conflict",
+        conflicts: gate.conflicts,
+        alternatives: gate.alternatives,
+        coverage: gate.coverage,
+        considered_events: gate.events,
+      })],
+      toolCalls: 0,
+    };
+  }
   return {
-    output: { checked: true, considered_events: gate.events },
+    output: { checked: true, status: "clear", considered_events: gate.events },
     artifacts: [calendarArtifact(input, "The requested time is free", {
       request,
       target: gate.target,
@@ -840,11 +915,37 @@ async function executeCalendarWrite(
     requestMessageId: input.plan.source_message_id,
     priorState: priorStateOf(target),
     conflictCheck: {
-      checked_at: new Date().toISOString(),
+      status: gate.status,
+      checked_at: gate.checkedAt,
       coverage,
       considered_events: gate.events,
+      conflicts: gate.status === "conflict" ? gate.conflicts : [],
     },
   });
+
+  if (gate.status === "conflict") {
+    // The conflict is verified and the payload is complete, so one exact confirmation can
+    // override it. Standing policy is intentionally never consulted on this branch.
+    return {
+      output: { proposed_effect_id: effect.id, payload_hash: effect.payload_hash },
+      artifacts: [calendarArtifact(input, pendingConflictHeading(request.kind), {
+        request,
+        target,
+        effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
+        reason: "calendar_conflict",
+        conflicts: gate.conflicts,
+        alternatives: gate.alternatives,
+        coverage,
+        considered_events: gate.events,
+      })],
+      toolCalls: 0,
+      pause: {
+        code: "effect_confirmation_required",
+        message: "The destination is occupied and this exact change needs confirmation",
+        requiresReauthorization: false,
+      },
+    };
+  }
 
   const allowance = directExecutionAllowance(db);
   if (!allowance.allowed || input.plan.source_message_id === null) {
@@ -903,6 +1004,12 @@ async function executeCalendarWrite(
     })],
     toolCalls: 1,
   };
+}
+
+function pendingConflictHeading(kind: CalendarWriteRequest["kind"]): string {
+  if (kind === "reschedule") return "Not moved yet — the destination is occupied";
+  if (kind === "create") return "Not added yet — the requested time is occupied";
+  return "Not changed yet — the requested time is occupied";
 }
 
 function calendarRefusal(

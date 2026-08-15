@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   containsCalendarRefusalSignal,
+  isCalendarCapabilityQuestion,
   localToUtc,
   mayBeCalendarRequest,
   refusalIsSpoken,
@@ -39,6 +40,19 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
 }
 
 describe("noticing that a message might be about a calendar", () => {
+  it.each([
+    "is Google Calendar connected?",
+    "do you have access to my calendar",
+    "is the calendar integration enabled",
+  ])("treats %j as a capability question", (message) => {
+    expect(isCalendarCapabilityQuestion(message)).toBe(true);
+  });
+
+  it("does not confuse a contents question with a connection question", () => {
+    expect(isCalendarCapabilityQuestion("what is on my calendar tomorrow?")).toBe(false);
+    expect(isCalendarCapabilityQuestion("what times are available on my calendar?")).toBe(false);
+  });
+
   // Each of these is a phrasing the regexes this module replaces would have dropped on the
   // floor, because they required the message to begin with a create verb.
   it.each([

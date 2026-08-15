@@ -66,7 +66,7 @@ export type ProposeEffectInput = {
   requestMessageId?: number | null;
   /** What the read cache held about the target, captured before anything changed it. */
   priorState?: Record<string, unknown> | null;
-  /** The deterministic check that ran in place of asking. */
+  /** The deterministic calendar check persisted with the exact payload. */
   conflictCheck?: Record<string, unknown> | null;
 };
 
@@ -277,8 +277,9 @@ export function confirmEffect(
  * never `confirmed`. Whoever reads the effect page later can still tell exactly what
  * happened.
  *
- * Callers are responsible for the two conditions this cannot see: that the conflict gate
- * returned `clear`, and that direct execution is permitted right now.
+ * The stored effect itself proves that the conflict gate returned `clear`; a caller cannot
+ * widen that result by passing a friendlier detail object. Callers remain responsible for
+ * checking that direct execution is permitted right now.
  */
 export function authorizeEffectByPolicy(
   db: Db,
@@ -296,6 +297,7 @@ export function authorizeEffectByPolicy(
     if (effect.payload_hash !== payloadHashToAuthorize) {
       throw new Error("That authorization does not match this exact external request");
     }
+    assertStoredCalendarCheckIsClear(effect);
     const message = db
       .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
       .get(input.requestMessageId);
@@ -325,6 +327,29 @@ export function authorizeEffectByPolicy(
     });
     return requireView(db, id);
   })();
+}
+
+function assertStoredCalendarCheckIsClear(effect: ProposedEffect): void {
+  if (effect.effect_kind !== "schedule" && effect.effect_kind !== "modify_external") {
+    throw new Error("Standing policy can authorize only a calendar request");
+  }
+  if (!effect.conflict_check_json) {
+    throw new Error("Standing policy requires a stored clear calendar conflict check");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(effect.conflict_check_json);
+  } catch {
+    throw new Error("Standing policy requires a stored clear calendar conflict check");
+  }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as Record<string, unknown>).status !== "clear"
+  ) {
+    throw new Error("Standing policy requires a stored clear calendar conflict check");
+  }
 }
 
 export function declineEffect(

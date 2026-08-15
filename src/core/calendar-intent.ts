@@ -43,6 +43,8 @@ const SYSTEM_PROMPT = `You classify whether the user's latest message asks for s
 
 Return intent "create" to add a new event, "reschedule" to move an existing one, "cancel" to remove one, "read" to look at the calendar, and "none" for everything else. "none" is the right answer far more often than not: ordinary conversation that merely mentions a time, a date, or a meeting is not a request to change anything.
 
+A question about whether Calendar is connected, linked, permitted, or available is intent "none". It asks about Zeus's capability, not about the contents of the calendar, and must not trigger a calendar read.
+
 Resolve times to local wall-clock in the supplied timezone, formatted YYYY-MM-DDTHH:mm. Never include an offset or a Z suffix. Use the supplied local date and time to resolve relative expressions such as "tomorrow", "next Tuesday", or "tonight". If the user gave no end time, leave ends_at_local null rather than inventing one.
 
 For "reschedule" and "cancel", describe how the user referred to the existing event in the target field — its title words, its start time, or its date. Never invent an identifier; the system resolves which event they meant.
@@ -120,6 +122,21 @@ export function mayBeCalendarRequest(input: string): boolean {
     (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized))) ||
     (shortReply && (temporal.test(normalized) || hourRange.test(normalized)))
   );
+}
+
+/** A capability question is answered from the live <capabilities> block, without opening Calendar. */
+export function isCalendarCapabilityQuestion(input: string): boolean {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
+  const namesCalendar = /\b(?:google\s+)?calendar\b/iu.test(normalized);
+  const asksAboutAccess =
+    /\b(?:connected|connection|connectivity|linked|linking|access|permission|permissions|integration|enabled)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:is|can\s+you\s+use)\s+(?:my\s+|google\s+)?calendar(?:\s+integration)?\s+(?:available|working)\b/iu.test(
+      normalized,
+    );
+  return namesCalendar && asksAboutAccess;
 }
 
 /**

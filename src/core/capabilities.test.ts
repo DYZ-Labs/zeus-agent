@@ -8,6 +8,7 @@ import {
   recordConnectorVerification,
   setCapabilityEnabled,
   setConnectorEnabled,
+  upsertGoogleCalendarConnector,
 } from "./connectors";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
@@ -117,9 +118,46 @@ describe("what Zeus can actually do, stated rather than implied", () => {
     });
     const state = calendarCapabilityState(db);
     expect(state).toMatchObject({ connected: true, canRead: false, canCreate: false });
+    expect(state.unusableReason).toBe("connect_failed");
     const block = renderCapabilityBlock(state, CONTEXT);
     expect(block).toContain("connected but cannot be used");
+    expect(block).toContain("Not reachable");
     expect(block).not.toContain("not connected");
+  });
+
+  it("recognizes a configured Google connection before any capability is usable", () => {
+    upsertGoogleCalendarConnector(db, {
+      connectionId: "12345678-1234-1234-1234-123456789abc",
+      mcpUrl: "https://calendar.example.test/mcp",
+      sourceMessageId: userMessageId,
+    });
+
+    const state = calendarCapabilityState(db);
+    expect(state).toMatchObject({
+      connected: true,
+      canRead: false,
+      canCreate: false,
+      canUpdate: false,
+      unusableStatus: "unverified",
+      unusableReason: "unverified",
+    });
+    expect(renderCapabilityBlock(state, CONTEXT)).toContain("connected but cannot be used");
+  });
+
+  it("distinguishes a disabled connection from one that needs reconnecting", () => {
+    const disabledId = connectorWith(["calendar.list_events"]);
+    setConnectorEnabled(db, disabledId, false, userMessageId);
+    const disabled = calendarCapabilityState(db);
+    expect(disabled.unusableReason).toBe("disabled");
+    expect(renderCapabilityBlock(disabled, CONTEXT)).toContain("(Disabled)");
+
+    recordConnectorVerification(db, disabledId, {
+      status: "unreachable",
+      errorCode: "reconnect_required",
+    });
+    const reconnect = calendarCapabilityState(db);
+    expect(reconnect.unusableReason).toBe("reconnect_required");
+    expect(renderCapabilityBlock(reconnect, CONTEXT)).toContain("Reconnect required");
   });
 
   it("carries the turn's own date, which the cached system prompt cannot", () => {

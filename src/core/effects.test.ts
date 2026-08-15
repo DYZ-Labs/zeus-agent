@@ -188,6 +188,18 @@ function propose() {
     payload: { title: "Dinner with Sam", starts_at: "2026-08-20T18:30:00Z" },
     previewText: "Create “Dinner with Sam” on 20 August at 18:30.",
     providerRequestKey: "req-1",
+    conflictCheck: {
+      status: "clear",
+      checked_at: "2026-08-20T18:00:00.000Z",
+      coverage: {
+        from: "2026-08-20T00:00:00.000Z",
+        to: "2026-08-21T00:00:00.000Z",
+        fetchedAt: "2026-08-20T18:00:00.000Z",
+        eventCount: 0,
+      },
+      considered_events: 0,
+      conflicts: [],
+    },
   });
 }
 
@@ -523,6 +535,41 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
     ).toThrow(/does not match this exact external request/u);
   }, 30_000);
 
+  it("cannot authorize a conflicting request even when the caller claims it was clear", async () => {
+    await grantCalendar();
+    const { runId, stepId } = workRun();
+    const effect = proposeEffect(db, {
+      workRunId: runId,
+      workStepId: stepId,
+      slot: "calendar.create_event",
+      payload: { title: "Dinner", starts_at: "2026-08-20T18:30:00Z" },
+      previewText: "Create Dinner.",
+      providerRequestKey: "req-conflict",
+      conflictCheck: {
+        status: "conflict",
+        checked_at: "2026-08-20T18:00:00.000Z",
+        coverage: {
+          from: "2026-08-20T00:00:00.000Z",
+          to: "2026-08-21T00:00:00.000Z",
+          fetchedAt: "2026-08-20T18:00:00.000Z",
+          eventCount: 1,
+        },
+        considered_events: 1,
+        conflicts: [{ external_id: "busy", starts_at: "2026-08-20T18:00:00Z" }],
+      },
+    });
+
+    expect(() =>
+      authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+        requestMessageId: userMessageId,
+        policy: "calendar_direct_execution",
+        detail: { conflict_check: "clear" },
+      }),
+    ).toThrow(/stored clear calendar conflict check/u);
+    expect(effect.status).toBe("pending_confirmation");
+    expect(recordedCalls()).toEqual([]);
+  }, 30_000);
+
   it("authorizes an external request once, one way", async () => {
     await grantCalendar();
     const effect = propose();
@@ -564,6 +611,12 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
         start: "2026-08-20T15:00:00Z",
         end: "2026-08-20T16:00:00Z",
       },
+      conflictCheck: {
+        status: "clear",
+        coverage: {},
+        considered_events: 1,
+        conflicts: [],
+      },
     });
     authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
       requestMessageId: userMessageId,
@@ -593,6 +646,12 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
       payload: { event_id: "evt-2", start: "2026-08-20T16:00:00Z" },
       previewText: "Move an event.",
       providerRequestKey: "req-blind",
+      conflictCheck: {
+        status: "clear",
+        coverage: {},
+        considered_events: 1,
+        conflicts: [],
+      },
     });
     authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
       requestMessageId: userMessageId,
