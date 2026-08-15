@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { confirmEffectAction, declineEffectAction, revertEffectAction } from "@/app/actions";
+import { confirmEffectAction, declineEffectAction } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CHAT_UPDATED_EVENT,
@@ -580,8 +580,59 @@ function CalendarActionCard({
   outcome: CalendarOutcome;
   onReply: (text: string) => void;
 }) {
+  const [decided, setDecided] = useState<"executed" | "declined" | "reverted" | null>(null);
+  const [busy, setBusy] = useState<"confirm" | "decline" | "revert" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const done = workPlan.completedEffects ?? [];
   const pending = workPlan.pendingEffects[0];
+
+  async function decide(action: "confirm" | "decline" | "revert", effectId: number, hash?: string) {
+    if (busy) return;
+    setBusy(action);
+    setActionError(null);
+    try {
+      const response = await fetch(`/api/effects/${effectId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, payloadHash: hash }),
+      });
+      const body = (await response.json().catch(() => null)) as {
+        error?: string;
+        outcome?: string;
+      } | null;
+      if (!response.ok || !body?.outcome) {
+        throw new Error(body?.error ?? "That action could not be completed.");
+      }
+      if (body.outcome === "executed" || body.outcome === "declined" || body.outcome === "reverted") {
+        setDecided(body.outcome);
+      } else {
+        throw new Error("The change did not go through.");
+      }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "That action could not be completed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (decided) {
+    return (
+      <aside
+        className="mt-4 rounded-xl border px-4 py-3.5"
+        style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+        aria-label="Calendar change"
+      >
+        <p className="text-[0.85rem] leading-6">
+          {decided === "executed"
+            ? "Done. It is on your calendar."
+            : decided === "reverted"
+              ? "Undone."
+              : "Nothing was sent."}
+        </p>
+      </aside>
+    );
+  }
+
   return (
     <aside
       className="mt-4 rounded-xl border px-4 py-3.5"
@@ -610,12 +661,19 @@ function CalendarActionCard({
                 Receipt
               </a>
               {done[0].reversible && (
-                <form action={revertEffectAction}>
-                  <input type="hidden" name="id" value={done[0].id} />
-                  <button type="submit" className="underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
-                    {outcome.kind === "cancel" ? "Restore this event" : "Undo"}
-                  </button>
-                </form>
+                <button
+                  type="button"
+                  disabled={busy !== null}
+                  onClick={() => void decide("revert", done[0]!.id)}
+                  className="underline underline-offset-2 disabled:opacity-50"
+                  style={{ color: "var(--shell-muted)" }}
+                >
+                  {busy === "revert"
+                    ? "Undoing…"
+                    : outcome.kind === "cancel"
+                      ? "Restore this event"
+                      : "Undo"}
+                </button>
               )}
             </div>
           )}
@@ -698,28 +756,34 @@ function CalendarActionCard({
             Nothing has been sent yet.
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
-            <form action={confirmEffectAction}>
-              <input type="hidden" name="id" value={pending.id} />
-              <input type="hidden" name="payloadHash" value={pending.payloadHash} />
-              <button
-                type="submit"
-                className="rounded-md px-3 py-1.5 font-medium"
-                style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
-              >
-                Confirm
-              </button>
-            </form>
-            <form action={declineEffectAction}>
-              <input type="hidden" name="id" value={pending.id} />
-              <button type="submit" className="underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
-                Don&apos;t
-              </button>
-            </form>
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => void decide("confirm", pending.id, pending.payloadHash)}
+              className="rounded-md px-3 py-1.5 font-medium disabled:opacity-50"
+              style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
+            >
+              {busy === "confirm" ? "Sending…" : "Confirm"}
+            </button>
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => void decide("decline", pending.id)}
+              className="underline underline-offset-2 disabled:opacity-50"
+              style={{ color: "var(--shell-muted)" }}
+            >
+              Don&apos;t
+            </button>
           </div>
         </>
       ) : (
         <p className="text-[0.85rem] leading-6">
           Nothing changed. Zeus stopped before making the change.
+        </p>
+      )}
+      {actionError && (
+        <p className="mt-2 text-[0.72rem]" role="alert" style={{ color: "#f3a6a6" }}>
+          {actionError}
         </p>
       )}
     </aside>
