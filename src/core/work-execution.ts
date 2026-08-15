@@ -8,7 +8,9 @@ import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
 import { effectsForRun, proposeEffect } from "./effects";
 import { ConnectorError, callCapability } from "./mcp-client";
+import { logEvent } from "./observability";
 import { MODEL, assertResponseComplete, openai } from "./openai";
+import { accountEvent } from "./owner";
 import {
   computePersonalizationProfile,
   type PersonalizationProfileItem,
@@ -322,7 +324,7 @@ async function executeSafeStep(
       })),
     ];
     const unsafe = inspectUntrustedWorkData(content);
-    if (unsafe) return sensitivePause(unsafe, 0, 1);
+    if (unsafe) return sensitivePause(db, input, unsafe, 0, 1);
     return {
       output: { recalled_items: recalled.length },
       artifacts: [
@@ -344,7 +346,7 @@ async function executeSafeStep(
   const priorSourceMessageIds = priorArtifactSourceMessageIds(db, input);
   const priorMemorySources = priorArtifactMemorySources(db, input);
   const unsafePrior = inspectUntrustedWorkData(priorArtifacts);
-  if (unsafePrior) return sensitivePause(unsafePrior, 0, 0);
+  if (unsafePrior) return sensitivePause(db, input, unsafePrior, 0, 0);
 
   if (effect === "send" || effect === "schedule" || effect === "modify_external") {
     return prepareExternalRequest(db, input, priorArtifacts);
@@ -372,7 +374,7 @@ async function executeSafeStep(
     const unsafe = inspectUntrustedWorkData(
       `${response.output_text}\n${JSON.stringify(webSearch)}`,
     );
-    if (unsafe) return sensitivePause(unsafe, 1, 1);
+    if (unsafe) return sensitivePause(db, input, unsafe, 1, 1);
     const citations = responseCitations(response.output);
     return {
       output: { text: response.output_text, citations, web_search: webSearch },
@@ -412,7 +414,7 @@ async function executeSafeStep(
   recordModelCall(db, responseUsage(response));
   assertResponseComplete(response);
   const unsafe = inspectUntrustedWorkData(response.output_text);
-  if (unsafe) return sensitivePause(unsafe, 1, 1);
+  if (unsafe) return sensitivePause(db, input, unsafe, 1, 1);
   const citations = responseCitations(response.output);
   return {
     output: { text: response.output_text, citations },
@@ -472,7 +474,7 @@ async function executeExternalRead(
   const events = cacheCalendarEvents(db, available.connector.id, result.value);
   const content = JSON.stringify({ window, event_count: events.length, events }, null, 2);
   const unsafe = inspectUntrustedWorkData(content);
-  if (unsafe) return sensitivePause(unsafe, 0, 1);
+  if (unsafe) return sensitivePause(db, input, unsafe, 0, 1);
 
   return {
     output: { window, event_count: events.length },
@@ -555,7 +557,7 @@ async function prepareExternalRequest(
     };
   }
   const unsafe = inspectUntrustedWorkData(JSON.stringify(drafted));
-  if (unsafe) return sensitivePause(unsafe, 1, 0);
+  if (unsafe) return sensitivePause(db, input, unsafe, 1, 0);
 
   const mismatch = payloadSchemaMismatch(
     available.capability.input_schema_json,
@@ -904,10 +906,25 @@ export function inspectUntrustedWorkData(value: string): UntrustedWorkDataIssue 
 }
 
 function sensitivePause(
+  db: Db,
+  input: SafeStepExecutionInput,
   issue: UntrustedWorkDataIssue,
   modelCalls: number,
   toolCalls: number,
 ): SafeStepExecutionResult {
+  // The guard stops quietly by design, which also makes it invisible: a store where every
+  // run parks on the same untrusted input reads exactly like a store nobody asked to do
+  // any work. The issue is one of the two values this module names itself, and the effect
+  // kind is a fixed enum — the data that tripped the guard never reaches the log.
+  logEvent({
+    event: "work_untrusted_data_blocked",
+    outcome: "degraded",
+    reason: issue,
+    effect: input.step.effect_kind,
+    plan_id: input.plan.id,
+    run_id: input.run.id,
+    ...accountEvent(db),
+  });
   return {
     pause: {
       code: issue === "sensitive_data"

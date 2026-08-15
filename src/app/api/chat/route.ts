@@ -6,6 +6,7 @@ import { createConversation, getConversation } from "@/core/conversations";
 import type { Db } from "@/core/db";
 import { errorSignature, logEvent } from "@/core/observability";
 import { MissingCredentialsError, RefusedError, hasCredentials } from "@/core/openai";
+import { accountEvent } from "@/core/owner";
 import { getBrowserOwnerAccess } from "@/server/auth/access";
 
 export const runtime = "nodejs";
@@ -182,6 +183,20 @@ function privateChatResponse(
             : null,
           extractionFailed: result.learned === null,
         });
+
+        // A turn is done when the terminal frame is written, not when the first token
+        // is: retrieval, the whole stream, extraction, and any bounded work run all
+        // happen before it, and they are what the person waited for. Recorded on the way
+        // out as well as on the way to the failure below, because a count of errors with
+        // no denominator cannot say whether five in an hour are an incident or a
+        // rounding error.
+        logEvent({
+          event: "chat_turn",
+          outcome: "ok",
+          conversation_id: conversationId,
+          duration_ms: Date.now() - startedAt,
+          ...accountEvent(db),
+        });
       } catch (error) {
         if (!turnAbort.signal.aborted) {
           // The message goes to the person whose memory it is; the log gets only the
@@ -193,6 +208,7 @@ function privateChatResponse(
             conversation_id: conversationId,
             duration_ms: Date.now() - startedAt,
             ...errorSignature(error),
+            ...accountEvent(db),
           });
           send({
             type: "error",

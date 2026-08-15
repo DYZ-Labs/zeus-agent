@@ -45,6 +45,21 @@ export type ZeusEvent = {
    */
   exit_code?: number | null;
   error_name?: string;
+  /**
+   * The machine code a library attached to the error it threw.
+   *
+   * A full volume, a damaged store, writer contention, and a read-only remount all reach
+   * Zeus as one `SqliteError`, and they call for four different responses — free the
+   * volume, restore a snapshot, tune concurrency, remount. Node's `ENOSPC`, `EROFS`, and
+   * `EACCES` flatten behind one class the same way. Without the code those incidents are
+   * indistinguishable in the log, which is how an operator ends up tuning concurrency
+   * while a disk is full.
+   *
+   * Deliberately narrow: a code Zeus itself authored, such as a connector's
+   * `handshake_failed`, is a `reason` and belongs in that field. Keeping someone else's
+   * vocabulary separate from ours is worth more than sharing a column.
+   */
+  error_code?: string;
   /** First application stack frame as `src/…:line`. A code location, not user data. */
   error_site?: string;
   model?: string;
@@ -65,6 +80,11 @@ const FIELD_PATTERNS = {
   method: /^[A-Z]{3,7}$/u,
   account: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
   error_name: /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u,
+  // `code` belongs to whichever library threw and is typed `unknown`, so nothing stops a
+  // dependency putting a sentence, a path, or an address there. Only a short
+  // SCREAMING_SNAKE token is a library code — a lowercase one is a Zeus `reason` in the
+  // wrong field — and anything else is reported as rejected.
+  error_code: /^[A-Z][A-Z0-9_]{0,47}$/u,
   error_site: /^[A-Za-z0-9/_\-.]{1,128}:\d{1,6}$/u,
   // Slashes are legitimate in a model id (`Xenova/bge-small-en-v1.5`) and carry
   // no user data; without them a real value would be reported as "invalid".
@@ -118,21 +138,37 @@ export function serializeEvent(event: ZeusEvent): Record<string, string | number
 }
 
 /**
- * Identify an error by its class and the first line of Zeus code in its stack.
+ * Identify an error by its class, its machine code, and the first line of Zeus code in
+ * its stack.
  *
  * Deliberately omits the message. A stack frame is a code location the operator wrote;
  * a message may be a sentence the user wrote.
  */
 export function errorSignature(error: unknown): {
   error_name: string;
+  error_code?: string;
   error_site?: string;
 } {
   if (!(error instanceof Error)) return { error_name: "NonError" };
+  const code = machineErrorCode(error);
   const site = applicationStackFrame(error.stack);
   return {
     error_name: error.name || "Error",
+    ...(code ? { error_code: code } : {}),
     ...(site ? { error_site: site } : {}),
   };
+}
+
+/**
+ * A code is a token or it is nothing at all. A non-string in that property means the
+ * library is using it for something other than a code, so the value is reported as
+ * rejected rather than coerced into the log; the field's pattern has the last word on
+ * the strings.
+ */
+function machineErrorCode(error: Error): string | undefined {
+  const code: unknown = (error as { code?: unknown }).code;
+  if (code === undefined || code === null) return undefined;
+  return typeof code === "string" ? code : REJECTED;
 }
 
 function applicationStackFrame(stack: string | undefined): string | undefined {

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 
 import { databaseFilePath, migrate, openDb, type Db } from "@/core/db";
 import { MIGRATIONS } from "@/core/migrations";
+import { errorSignature, logEvent } from "@/core/observability";
 import { getAppOwner } from "@/core/owner";
 import { z } from "zod";
 
@@ -71,7 +72,7 @@ export function getAccountDb(identity: AccountIdentity): Db {
   const accountDbs = (globalForDb.zeusAccountDbs ??= new Map());
   const cached = accountDbs.get(path);
   if (!cached) {
-    const db = openDb(path);
+    const db = openAccountStore(path, parsed.supabaseUserId);
     accountDbs.set(path, { db, latestMigrationId });
     return db;
   }
@@ -80,6 +81,51 @@ export function getAccountDb(identity: AccountIdentity): Db {
     cached.latestMigrationId = latestMigrationId;
   }
   return cached.db;
+}
+
+/**
+ * Open one account's store, and say so the first time this process does.
+ *
+ * A deploy migrates the primary store while the health check is still running, and every
+ * other account's store on that account's next request — which may be days later, in a
+ * process nobody is watching. The deploy is therefore called healthy on the strength of
+ * one store, and without this line nothing anywhere records how much of the fleet has
+ * actually reached the new schema, or that one account cannot open theirs at all while
+ * everyone else is fine. It costs one line per account per process: an ordinary request
+ * reuses the cached handle and says nothing.
+ *
+ * The account's own pseudonymous UUID, already validated as one, is what identifies it.
+ * The path it came from is deliberately not logged — that is the same id inside a
+ * directory a person named.
+ */
+function openAccountStore(path: string, account: string): Db {
+  const startedAt = Date.now();
+  try {
+    const db = openDb(path);
+    logEvent({
+      event: "store_opened",
+      outcome: "ok",
+      store: "account",
+      account,
+      // Cold-open cost, migration included, which is the only place the lazy per-account
+      // migration shows up as latency somebody paid for.
+      duration_ms: Date.now() - startedAt,
+    });
+    return db;
+  } catch (error) {
+    // Which account cannot load their memory is the first question an incident raises,
+    // and `migrate()` cannot answer it: a store whose schema is too old to hold an owner
+    // row has nothing to attribute itself with. Here the identity is already known.
+    logEvent({
+      event: "store_open_failed",
+      outcome: "error",
+      store: "account",
+      account,
+      duration_ms: Date.now() - startedAt,
+      ...errorSignature(error),
+    });
+    throw error;
+  }
 }
 
 /**
