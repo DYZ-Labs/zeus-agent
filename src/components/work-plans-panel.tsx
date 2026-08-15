@@ -3,8 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+import { EffectKind } from "@/core/schema";
 import type {
-  EffectKind,
   WorkArtifact,
   WorkPlan,
   WorkRun,
@@ -364,15 +364,24 @@ async function requestJson(url: string, init: RequestInit): Promise<unknown> {
   return body;
 }
 
+/**
+ * Read a plan's allowed effects back exactly as stored.
+ *
+ * This deliberately accepts every effect kind, including the connector ones. It used to
+ * keep only the three local effects, which quietly broke the two things it feeds: the
+ * "Allowed effects" line under-reported a plan's real scope, and reauthorization sent a
+ * narrowed set that `authorizeWorkPlan` rejects for not matching the plan exactly — so any
+ * calendar plan that needed reapproving could never be reapproved from here. Disclosure has
+ * to show the whole scope; filtering it is how a scope stops being disclosed.
+ */
 function parseEffects(value: string): EffectKind[] {
   try {
     const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter(
-          (effect): effect is EffectKind =>
-            effect === "memory_read" || effect === "web_read" || effect === "prepare_local",
-        )
-      : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((effect) => {
+      const result = EffectKind.safeParse(effect);
+      return result.success ? [result.data] : [];
+    });
   } catch {
     return [];
   }

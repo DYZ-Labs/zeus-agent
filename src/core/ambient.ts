@@ -377,6 +377,61 @@ export function resolveTodayOpportunity(
  * refresh is not fatal — detectors simply run against the cache they already have, which
  * degrades recall rather than inventing a reason to speak up.
  */
+export type AmbientRefreshSettings = {
+  enabled: boolean;
+  intervalMinutes: number;
+  reason: string;
+};
+
+const DEFAULT_REFRESH_MINUTES = 15;
+const MIN_REFRESH_MINUTES = 5;
+const MAX_REFRESH_MINUTES = 180;
+
+/**
+ * Whether this process is the one responsible for refreshing signals.
+ *
+ * Locally a macOS LaunchAgent already runs `refreshExternalSignals` on a timer, so the
+ * server doing it too would spend a second set of calls against the same connector budget
+ * to learn the same thing. Hosted, nothing runs it at all — which is why a hosted
+ * deployment never noticed a double-booking no matter how long it was left running. The
+ * default follows that split, and `ZEUS_SIGNAL_REFRESH` overrides it in either direction
+ * for the deployment that does not match the assumption.
+ */
+export function ambientRefreshSettings(
+  configuration: { mode: string },
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): AmbientRefreshSettings {
+  const intervalMinutes = refreshIntervalSetting(environment.ZEUS_SIGNAL_REFRESH_MINUTES);
+  const configured = environment.ZEUS_SIGNAL_REFRESH?.trim().toLowerCase();
+
+  if (configured === "off") {
+    return { enabled: false, intervalMinutes, reason: "explicitly_disabled" };
+  }
+  if (configured === "on") {
+    return { enabled: true, intervalMinutes, reason: "explicitly_enabled" };
+  }
+  if (configured !== undefined && configured !== "") {
+    throw new Error("ZEUS_SIGNAL_REFRESH must be 'on' or 'off'");
+  }
+
+  const hosted =
+    configuration.mode === "configured" && environment.NODE_ENV === "production";
+  return {
+    enabled: hosted,
+    intervalMinutes,
+    reason: hosted ? "hosted" : "not_hosted",
+  };
+}
+
+function refreshIntervalSetting(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_REFRESH_MINUTES;
+  if (!/^\d+$/u.test(trimmed)) {
+    throw new Error("ZEUS_SIGNAL_REFRESH_MINUTES must be a whole number of minutes");
+  }
+  return Math.min(MAX_REFRESH_MINUTES, Math.max(MIN_REFRESH_MINUTES, Number(trimmed)));
+}
+
 export async function refreshExternalSignals(
   db: Db,
   options: { at?: Date; signal?: AbortSignal } = {},

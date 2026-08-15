@@ -490,13 +490,48 @@ function selectSignalAlert(
       suggested_action: signal.suggested_action,
       effect_kind: signal.effect_kind,
       requires_confirmation: requiresEffectConfirmation(signal.effect_kind),
-      chat_prompt:
-        `${signal.suggested_action} Nothing outside this conversation changes ` +
-        "without my explicit confirmation.",
+      chat_prompt: signalChatPrompt(signal),
       score,
     };
   }
   return best;
+}
+
+/**
+ * What "help me fix this" should actually say once it lands in chat.
+ *
+ * A detector's `suggested_action` is written to be read on a card — "Decide which of X and
+ * Y to move." It describes the problem to a person. Sent into chat as a prompt it describes
+ * nothing to the router, which is looking for a request, so the turn that was supposed to
+ * fix the clash became ordinary conversation about it.
+ *
+ * These phrase the same finding as the request the user is making by clicking. The `why`
+ * rides along because it already names both events and their times, which is the context
+ * the calendar path needs to resolve a target. The confirmation sentence stays on every
+ * variant: the button is a request for help, never a standing permission to act.
+ */
+export function signalChatPrompt(
+  signal: Pick<DetectedSignal, "detector" | "why" | "suggested_action">,
+): string {
+  const ask = calendarSignalAsk(signal.detector);
+  const body = ask ? `${ask} ${signal.why}` : signal.suggested_action;
+  return `${body} Nothing outside this conversation changes without my explicit confirmation.`;
+}
+
+function calendarSignalAsk(detector: DetectorKind): string | null {
+  if (detector === "calendar_overlap") {
+    return "Move one of these two events in my calendar to a time that is free.";
+  }
+  if (detector === "travel_gap") {
+    return "Move one of these two events in my calendar so there is time to travel between them.";
+  }
+  if (detector === "commitment_unscheduled") {
+    return "Add an event to my calendar to hold time for this before it is due.";
+  }
+  // A deadline collision is about a day that is already too full. There is no single event
+  // to move, so the honest prompt is the detector's own wording rather than an invented
+  // instruction that would send the calendar path hunting for a target that does not exist.
+  return null;
 }
 
 /** A signal is raised at most once per cooldown window, on the same clock as a nudge. */
