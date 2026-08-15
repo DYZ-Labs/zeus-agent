@@ -7,6 +7,17 @@ afterEach(() => vi.restoreAllMocks());
 /** A sentence of the kind Zeus's own error strings can quote back. */
 const MEMORY_TEXT = "Jane Okafor moved to 12 Elm Street after leaving Acme";
 
+/** An error carrying whatever the throwing library chose to put in `code`. */
+function coded(code: unknown, name = "SqliteError"): Error {
+  const error = new Error(MEMORY_TEXT);
+  error.name = name;
+  error.stack = [
+    `${name}: ${MEMORY_TEXT}`,
+    "    at recordFact (/app/src/core/facts.ts:88:3)",
+  ].join("\n");
+  return Object.assign(error, { code });
+}
+
 describe("allowlisted operational events", () => {
   it("emits one JSON line on stderr, never stdout", () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -140,5 +151,103 @@ describe("error identification without error text", () => {
   it("labels a thrown non-error rather than serializing it", () => {
     expect(errorSignature({ secret: MEMORY_TEXT })).toEqual({ error_name: "NonError" });
     expect(errorSignature(MEMORY_TEXT)).toEqual({ error_name: "NonError" });
+  });
+
+  it("omits the code when the error carries none", () => {
+    const error = new Error(MEMORY_TEXT);
+    error.stack = `Error: ${MEMORY_TEXT}\n    at run (/app/src/core/chat.ts:9:1)`;
+
+    expect(errorSignature(error)).toEqual({
+      error_name: "Error",
+      error_site: "src/core/chat.ts:9",
+    });
+    expect(errorSignature(coded(""))).not.toHaveProperty("error_code");
+  });
+});
+
+// A full volume, a damaged store, writer contention, and a read-only mount all arrive as
+// SqliteError, and they call for four different responses. Collapsing them into one log
+// line is how an operator ends up tuning concurrency while the disk is full.
+describe("machine codes that separate incidents sharing an error class", () => {
+  it("keeps the SQLite condition alongside the class", () => {
+    expect(
+      serializeEvent({
+        event: "fact_write_failed",
+        outcome: "error",
+        ...errorSignature(coded("SQLITE_FULL")),
+      }),
+    ).toEqual({
+      event: "fact_write_failed",
+      outcome: "error",
+      error_name: "SqliteError",
+      error_code: "SQLITE_FULL",
+      error_site: "src/core/facts.ts:88",
+    });
+
+    expect(
+      ["SQLITE_CORRUPT", "SQLITE_BUSY", "SQLITE_READONLY"].map(
+        (code) => errorSignature(coded(code)).error_code,
+      ),
+    ).toEqual(["SQLITE_CORRUPT", "SQLITE_BUSY", "SQLITE_READONLY"]);
+  });
+
+  it("keeps the errno behind a filesystem failure", () => {
+    for (const code of ["ENOSPC", "EROFS", "EACCES", "ERR_MODULE_NOT_FOUND"]) {
+      expect(
+        serializeEvent({ event: "store_open_failed", ...errorSignature(coded(code, "Error")) })
+          .error_code,
+      ).toBe(code);
+    }
+  });
+
+  it("refuses anything in `code` that is not a machine token", () => {
+    // `code` belongs to whichever library threw, so it is not a trusted field.
+    const hostile = [
+      MEMORY_TEXT,
+      "SQLITE_FULL: attempt to write Jane Okafor to a full disk",
+      "/Users/jane/.zeus/zeus.db",
+      "jane@example.com",
+      "SELECT * FROM fact WHERE object = 'Elm Street'",
+    ];
+
+    for (const code of hostile) {
+      const payload = serializeEvent({
+        event: "store_write_failed",
+        ...errorSignature(coded(code)),
+      });
+      expect(payload.error_code).toBe("invalid");
+      const serialized = JSON.stringify(payload);
+      expect(serialized).not.toContain("Elm");
+      expect(serialized).not.toContain("Jane");
+      expect(serialized).not.toContain("jane");
+      expect(serialized).not.toContain(".zeus");
+    }
+  });
+
+  it("keeps a code Zeus authored out of the field for someone else's", () => {
+    // A connector's `handshake_failed` is a reason, and is already logged as one.
+    expect(
+      serializeEvent({
+        event: "connector_verified",
+        outcome: "error",
+        reason: "handshake_failed",
+        ...errorSignature(coded("handshake_failed", "ConnectorError")),
+      }),
+    ).toMatchObject({
+      reason: "handshake_failed",
+      error_name: "ConnectorError",
+      error_code: "invalid",
+    });
+  });
+
+  it("reports a non-string code as rejected rather than coercing it", () => {
+    for (const code of [{ detail: MEMORY_TEXT }, [MEMORY_TEXT], 28, true]) {
+      const payload = serializeEvent({
+        event: "store_write_failed",
+        ...errorSignature(coded(code)),
+      });
+      expect(payload.error_code).toBe("invalid");
+      expect(JSON.stringify(payload)).not.toContain("Elm");
+    }
   });
 });

@@ -18,6 +18,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { MIGRATIONS, type Migration } from "./migrations";
+import { errorSignature, logEvent, type ZeusEvent } from "./observability";
 
 export type Db = Database.Database;
 
@@ -129,6 +130,31 @@ function enableFtsSecureDeletion(db: Db): void {
   }
 }
 
+/**
+ * Why a migration stopped, in a fixed vocabulary an operator can act on.
+ *
+ * These call for different responses and the log may never quote the error text that
+ * would otherwise tell them apart. A ledger that is not a prefix of this build means the
+ * deploy went backwards: the store is ahead of the code, and the fix is to roll the code
+ * forward again, never to touch the store. A refused backup means the volume is out of
+ * room, which is fixed on the host and will recur on every deploy until it is. A dangling
+ * reference means provenance did not survive the schema change — on a hosted deployment,
+ * one account unable to load their memory while everyone else is fine.
+ *
+ * Each step records what a failure from that point on means, because once the error is in
+ * hand nothing but its message distinguishes them.
+ */
+type MigrationFailure =
+  | "reservation_failed"
+  | "store_not_zeus"
+  | "ledger_unreadable"
+  | "ledger_mismatch"
+  | "backup_space"
+  | "backup_failed"
+  | "apply_failed"
+  | "dangling_references"
+  | "commit_failed";
+
 /** Serialize and atomically apply every migration this database has not seen. */
 export function migrate(
   db: Db,
@@ -148,13 +174,30 @@ export function migrate(
   const legacyAlterTable = db.pragma("legacy_alter_table", { simple: true });
   if (enforcedForeignKeys) db.pragma("foreign_keys = OFF");
   db.pragma("legacy_alter_table = ON");
+
+  // An in-memory store is created, migrated from empty, and discarded inside a single
+  // process: it has no path, no operator, and nothing anyone can act on later. Reporting
+  // one would add two lines for every test and every scratch database, which is how the
+  // one migration that does matter gets lost.
+  const reportable = !db.memory;
+  const origin: MigrationStore = reportable ? migrationStoreKind(db) : {};
+  const startedAt = Date.now();
+  let pendingCount = 0;
+  // Nothing has been attempted yet but taking the reservation, and on a hosted deployment
+  // that is the likeliest failure of the lot: a deploy migrating while the MCP process, the
+  // snapshot scheduler, and every account's first request want the same writer. Named for
+  // what it is, because `reason` is the field an operator groups on, and reporting lock
+  // contention as a store that is not Zeus sends them to inspect the wrong thing entirely.
+  let failure: MigrationFailure = "reservation_failed";
   try {
     // One writer reservation covers pending detection, backup, and application. A
     // second Zeus process waits at BEGIN IMMEDIATE, then rechecks the ledger instead
     // of racing the same DDL or taking a backup of a half-migrated schema.
     db.exec("BEGIN IMMEDIATE");
     try {
+      failure = "store_not_zeus";
       ensureZeusApplicationId(db);
+      failure = "ledger_unreadable";
       db.exec(`
         CREATE TABLE IF NOT EXISTS schema_migration (
           id          TEXT PRIMARY KEY,
@@ -162,13 +205,26 @@ export function migrate(
         );
       `);
       const applied = appliedMigrationLedger(db);
+      failure = "ledger_mismatch";
       validateMigrationLedger(applied, migrations);
       const pending = migrations.slice(applied.length);
       if (pending.length === 0) {
+        // Nothing is reported from here: an up-to-date store is every ordinary open, and
+        // an event per connection would bury the one migration that changed something.
+        failure = "commit_failed";
         db.exec("COMMIT");
         return;
       }
+      pendingCount = pending.length;
+      // Written from inside the reservation, before the first schema change, because a
+      // migration that never returns — killed mid-deploy, or still queued behind another
+      // writer — is exactly the incident this line exists to explain, and a line written
+      // afterwards cannot describe one.
+      if (reportable) {
+        reportMigration({ event: "migration_started", ...origin, count: pendingCount });
+      }
 
+      failure = "backup_failed";
       if (!db.memory && applied.length > 0 && statSync(databaseFilePath(db)).size > 0) {
         const databasePath = databaseFilePath(db);
         // Prune before writing rather than after. Stale copies are the likeliest reason
@@ -177,10 +233,15 @@ export function migrate(
         // Verification makes this list expensive, which is affordable here because a
         // migration is rare — never do it on an ordinary open.
         pruneManagedMigrationBackups(databasePath, configuredMigrationBackupRetention() - 1);
+        // Held apart from every other backup failure: a full volume is fixed on the host
+        // rather than in the store, and it is the one that repeats on every deploy.
+        failure = "backup_space";
         assertRoomForMigrationBackup(databasePath);
+        failure = "backup_failed";
         createVerifiedPreMigrationBackup(db, applied);
       }
 
+      failure = "apply_failed";
       const record = db.prepare<[string, string]>(
         "INSERT INTO schema_migration (id, applied_at) VALUES (?, ?)",
       );
@@ -188,15 +249,102 @@ export function migrate(
         db.exec(migration.sql);
         record.run(migration.id, now());
       }
+      failure = "dangling_references";
       if (enforcedForeignKeys) assertNoDanglingReferences(db);
+      failure = "commit_failed";
       db.exec("COMMIT");
     } catch (error) {
       if (db.inTransaction) db.exec("ROLLBACK");
       throw error;
     }
+  } catch (error) {
+    if (reportable) {
+      reportMigration({
+        event: "migration_failed",
+        outcome: "error",
+        reason: failure,
+        ...origin,
+        // A failure before the work was counted has no count. Zero would read as
+        // "nothing was pending", which is a different incident entirely.
+        count: pendingCount > 0 ? pendingCount : null,
+        duration_ms: Date.now() - startedAt,
+        ...errorSignature(error),
+      });
+    }
+    throw error;
   } finally {
     db.pragma(`legacy_alter_table = ${legacyAlterTable === 1 ? "ON" : "OFF"}`);
     if (enforcedForeignKeys) db.pragma("foreign_keys = ON");
+  }
+
+  // Only ever reached once the transaction has committed, so a store is never reported
+  // as migrated before it is.
+  if (reportable) {
+    reportMigration({
+      event: "migration_applied",
+      outcome: "ok",
+      ...origin,
+      count: pendingCount,
+      // Measured from entry, so the wait for another process's writer reservation is
+      // part of what an operator sees: a slow migration and a queued one look identical
+      // from the outside and are fixed differently.
+      duration_ms: Date.now() - startedAt,
+    });
+  }
+}
+
+/**
+ * Describe a migration without ever becoming the reason one failed.
+ *
+ * The start line is written from inside the writer reservation, where an exception would
+ * abort the very transaction it is describing. Nothing about writing a diagnostic to
+ * stderr may cost a store its schema change: a closed pipe on a redirected log is not a
+ * reason to leave a database half-migrated.
+ */
+function reportMigration(event: ZeusEvent): void {
+  try {
+    logEvent(event);
+  } catch {
+    // A migration that succeeds unobserved beats one that fails observed.
+  }
+}
+
+/**
+ * The sibling directory a multi-account deployment gives each account's store. Named
+ * here only to label an event; `listStores` owns the layout itself, and cannot be
+ * imported back into the module it is built on.
+ */
+const ACCOUNT_STORE_DIRECTORY = "accounts";
+
+/**
+ * Which store this is, in the two words the log has for them.
+ *
+ * The path itself is never logged: it ends in an account's UUID on a hosted deployment
+ * and sits under somebody's home directory on a laptop. The layout is what separates
+ * them — one primary store, and one database per account in a sibling directory beside
+ * it — so the parent directory answers the question without quoting any of it.
+ */
+type MigrationStore = { store?: "primary" | "account"; account?: string };
+
+function migrationStoreKind(db: Db): MigrationStore {
+  try {
+    const path = databaseFilePath(db);
+    if (basename(dirname(path)) !== ACCOUNT_STORE_DIRECTORY) return { store: "primary" };
+    // Which account, not merely that it was one. "One account cannot open their memory"
+    // and "every account is broken" are the same line without it, and that is the first
+    // question an incident raises.
+    //
+    // The file name is the account's own pseudonymous UUID, which is exactly what the
+    // `account` field carries elsewhere — and core cannot ask `owner.ts` for it, because
+    // owner.ts imports `now` from this module and the back-import would cycle in the one
+    // module every entry point loads first. Reading it off the path needs no import at
+    // all. A directory holding something that is not a UUID cannot leak a name through
+    // this field either: the allowlist's pattern rejects it and reports `invalid`.
+    return { store: "account", account: basename(path, ".db") };
+  } catch {
+    // Labelling is not worth failing a migration over, and an unlabelled event still
+    // reports that a migration happened.
+    return {};
   }
 }
 

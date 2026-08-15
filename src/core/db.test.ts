@@ -27,8 +27,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { basename, dirname, join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_MIGRATION_BACKUP_RETENTION,
@@ -38,6 +38,7 @@ import {
   purgeManagedMigrationBackups,
 } from "./db";
 import { MIGRATIONS, type Migration } from "./migrations";
+import { ACCOUNTS_DIRECTORY } from "./stores";
 
 const FIRST: Migration = {
   id: "001_init",
@@ -47,8 +48,32 @@ const SECOND: Migration = {
   id: "002_seed",
   sql: "ALTER TABLE private_memory ADD COLUMN category TEXT;",
 };
+const THIRD: Migration = {
+  id: "003_note",
+  sql: "ALTER TABLE private_memory ADD COLUMN note TEXT;",
+};
+/** A pair that leaves a child row pointing at a parent that was never written. */
+const LINKED: Migration = {
+  id: "004_link",
+  sql: `
+    CREATE TABLE evidence (id INTEGER PRIMARY KEY);
+    CREATE TABLE claim (id INTEGER PRIMARY KEY, evidence_id INTEGER REFERENCES evidence(id));
+  `,
+};
+const ORPHANED: Migration = {
+  id: "005_orphan",
+  sql: "INSERT INTO claim (id, evidence_id) VALUES (1, 404);",
+};
+
+const ACCOUNT_ID = "019ff232-f8e0-7ce2-8e83-d416444aed06";
 
 const temporaryDirectories: string[] = [];
+
+beforeEach(() => {
+  // Migrating an on-disk store reports itself. Capture those lines rather than letting
+  // every store test in this file print them.
+  vi.spyOn(console, "error").mockImplementation(() => {});
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -189,6 +214,174 @@ describe("serialized migrations and verified backups", () => {
         db.prepare(`SELECT v FROM ${table}_config WHERE k = 'secure-delete'`).pluck().get(),
       ).toBe(1);
     }
+    db.close();
+  });
+});
+
+// A hosted deployment migrates its primary store during the health check, and every
+// other account's store on that account's next request — possibly days later, in a
+// process nobody is watching. These are the only lines that say a schema change happened
+// at all, so they have to be present, distinguishable, and free of the store's path.
+describe("visibility of a schema change", () => {
+  it("reports the start of pending work and the end of it", () => {
+    const { db } = existingStore();
+    forgetEvents();
+
+    migrate(db, [FIRST, SECOND]);
+
+    const events = emittedEvents();
+    expect(events).toEqual([
+      // No outcome on the start line: there is not one yet, and a migration killed
+      // between these two lines is exactly what the first one is for.
+      { event: "migration_started", store: "primary", count: 1 },
+      {
+        event: "migration_applied",
+        outcome: "ok",
+        store: "primary",
+        count: 1,
+        duration_ms: expect.any(Number),
+      },
+    ]);
+    db.close();
+  });
+
+  it("counts the whole backlog when a store has fallen several releases behind", () => {
+    const { db } = existingStore();
+    forgetEvents();
+
+    migrate(db, [FIRST, SECOND, THIRD]);
+
+    expect(emittedEvents().map((event) => event.count)).toEqual([2, 2]);
+    db.close();
+  });
+
+  it("stays silent for a store that is already current", () => {
+    const { db } = existingStore();
+    forgetEvents();
+
+    migrate(db, [FIRST]);
+
+    // An event per connection would drown the log and hide the one migration that
+    // matters; every ordinary open of a healthy store lands here.
+    expect(emittedEvents()).toEqual([]);
+    db.close();
+  });
+
+  it("keeps a throwaway in-memory store out of the log entirely", () => {
+    // openTestDb() applies the whole ledger, and every suite in the repository calls it.
+    const memory = openTestDb();
+
+    expect(emittedEvents()).toEqual([]);
+    memory.close();
+  });
+
+  it("names the rollback case rather than reporting a generic failure", () => {
+    const path = join(temporaryDirectory(), "drifted.db");
+    const db = database(path);
+    db.exec("CREATE TABLE schema_migration (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);");
+    const insert = db.prepare("INSERT INTO schema_migration (id, applied_at) VALUES (?, ?)");
+    for (const id of [FIRST.id, "999_unknown"]) insert.run(id, "2026-08-12T00:00:00.000Z");
+    forgetEvents();
+
+    expect(() => migrate(db, [FIRST, SECOND])).toThrow(/exact ordered prefix/u);
+
+    // The store is ahead of the code: the fix is to roll the deploy forward, never to
+    // touch the database. Nothing else in the log says that.
+    expect(emittedEvents()).toEqual([
+      {
+        event: "migration_failed",
+        outcome: "error",
+        reason: "ledger_mismatch",
+        store: "primary",
+        duration_ms: expect.any(Number),
+        error_name: "Error",
+        error_site: expect.stringMatching(/^src\/core\/db\.ts:\d+$/u),
+      },
+    ]);
+    db.close();
+  });
+
+  it("separates a volume with no room from a store that cannot migrate", () => {
+    const { db } = storeAtMigration(1);
+    fsMocks.statfs = () => ({ bavail: 0, bsize: 4096 });
+    forgetEvents();
+
+    expect(() => migrate(db, MIGRATIONS.slice(0, 2))).toThrow(/Not enough free space/u);
+
+    const events = emittedEvents();
+    expect(events.map((event) => event.event)).toEqual([
+      "migration_started",
+      "migration_failed",
+    ]);
+    expect(events[1]).toMatchObject({
+      outcome: "error",
+      reason: "backup_space",
+      store: "primary",
+      // The work that was pending when it failed, not a guess at what got applied.
+      count: 1,
+    });
+    db.close();
+  });
+
+  it("reports provenance that did not survive the schema change", () => {
+    const db = database(join(temporaryDirectory(), "linked.db"));
+    forgetEvents();
+
+    expect(() => migrate(db, [LINKED, ORPHANED])).toThrow(/dangling references/u);
+
+    // One account's evidence links broken while every other account is fine: without
+    // this the only symptom is that person's memory never loading.
+    expect(emittedEvents()[1]).toMatchObject({
+      event: "migration_failed",
+      outcome: "error",
+      reason: "dangling_references",
+      count: 2,
+    });
+    db.close();
+  });
+
+  it("distinguishes an account store from the primary one", () => {
+    const directory = temporaryDirectory();
+    mkdirSync(join(directory, ACCOUNTS_DIRECTORY));
+    const path = join(directory, ACCOUNTS_DIRECTORY, `${ACCOUNT_ID}.db`);
+    const db = database(path);
+    forgetEvents();
+
+    migrate(db, [FIRST]);
+
+    const events = emittedEvents();
+    expect(events.map((event) => event.store)).toEqual(["account", "account"]);
+    // Which account, not merely that it was one: "this person cannot open their memory"
+    // and "nobody can" are the same line without it. The file name is the account's own
+    // pseudonymous UUID, which is what the `account` field carries everywhere else — so
+    // it is reported through that field, where the allowlist validates its shape, rather
+    // than as part of a path.
+    expect(events.map((event) => event.account)).toEqual([ACCOUNT_ID, ACCOUNT_ID]);
+    db.close();
+  });
+
+  it("never writes a store's location, however the migration ends", () => {
+    const { db, path } = existingStore();
+    forgetEvents();
+
+    migrate(db, [FIRST, SECOND]);
+    fsMocks.statfs = () => ({ bavail: 0, bsize: 4096 });
+    // This failure's own message quotes the database file name; the log may not.
+    expect(() => migrate(db, [FIRST, SECOND, THIRD])).toThrow(/zeus\.db/u);
+
+    const events = emittedEvents();
+    // Anchored before the absence is asserted. An empty array contains no path either, so
+    // without this the whole check would keep passing if the events stopped being emitted
+    // at all — reading as assurance while proving nothing.
+    expect(events.map((event) => event.event)).toContain("migration_failed");
+    expect(events.length).toBeGreaterThan(1);
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(path);
+    expect(serialized).not.toContain(dirname(path));
+    expect(serialized).not.toContain(basename(path));
+    expect(serialized).not.toContain(basename(dirname(path)));
+    expect(serialized).not.toContain(tmpdir());
     db.close();
   });
 });
@@ -548,6 +741,17 @@ function temporaryDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "zeus-db-test-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function emittedEvents(): Array<Record<string, unknown>> {
+  return vi
+    .mocked(console.error)
+    .mock.calls.map((call) => JSON.parse(call[0] as string) as Record<string, unknown>);
+}
+
+/** Discard what setting the store up emitted; the assertions are about what follows. */
+function forgetEvents(): void {
+  vi.mocked(console.error).mockClear();
 }
 
 function spawnMigrationWriter(path: string): {

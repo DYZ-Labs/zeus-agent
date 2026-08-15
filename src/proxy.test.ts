@@ -389,6 +389,226 @@ describe("account verification deadline", () => {
   });
 });
 
+describe("auth outage visibility", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reports an unreachable auth service rather than only telling the visitor", async () => {
+    const events = captureEvents();
+    mocks.getClaims.mockResolvedValue({ data: null, error: transportFailure() });
+
+    const response = await proxy(request("/api/chat"));
+
+    expect(response.status).toBe(503);
+    // The visitor-facing 503 reaches nobody who can fix it; this line is the one an
+    // operator can alert on, and it names the failing dependency's own error class.
+    expect(events().find((line) => line.event === "auth_unavailable")).toMatchObject({
+      event: "auth_unavailable",
+      outcome: "error",
+      reason: "transport_failure",
+      status: 503,
+      method: "POST",
+      route: "/api/chat",
+      error_name: "AuthRetryableFetchError",
+    });
+  });
+
+  it("separates a fault in the auth path from the auth service being down", async () => {
+    const events = captureEvents();
+    mocks.getClaims.mockRejectedValue(new TypeError("cannot read properties of undefined"));
+
+    const response = await proxy(request("/api/chat"));
+
+    expect(response.status).toBe(503);
+    expect(events().find((line) => line.event === "auth_unavailable")).toMatchObject({
+      reason: "unexpected_error",
+      error_name: "TypeError",
+    });
+  });
+
+  it("reports a still-served public page as degraded, not as a failure", async () => {
+    const events = captureEvents();
+    mocks.getClaims.mockResolvedValue({ data: null, error: transportFailure() });
+
+    const response = await proxy(
+      new NextRequest("https://zeus.example/", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+
+    // The visitor still gets the page, anonymously. Calling that an error next to a
+    // refused API call would report one rate for two different experiences.
+    expect(response.status).toBe(200);
+    expect(events().find((line) => line.event === "auth_unavailable")).toMatchObject({
+      outcome: "degraded",
+      status: 200,
+      route: "/",
+    });
+  });
+
+  it("names the route template, never the path that resolved it", async () => {
+    const events = captureEvents();
+    mocks.getClaims.mockResolvedValue({ data: null, error: transportFailure() });
+
+    const response = await proxy(
+      new NextRequest("https://zeus.example/entity/jane-okafor?view=history", {
+        headers: { host: "zeus.example", "sec-fetch-site": "none" },
+      }),
+    );
+
+    expect(response.status).toBe(307);
+    // An entity slug is `slugify(entity.name)` — a person out of the user's own memory,
+    // in the path rather than the query, and a value the `route` pattern accepts without
+    // complaint. The redirect still carries it, because the visitor asked for it; the log
+    // must carry only the shape.
+    expect(response.headers.get("location")).toContain("jane-okafor");
+    const serialized = JSON.stringify(events());
+    expect(serialized).not.toContain("jane");
+    expect(serialized).not.toContain("okafor");
+    expect(serialized).not.toContain("history");
+    expect(events().find((line) => line.event === "auth_unavailable")).toMatchObject({
+      outcome: "error",
+      status: 307,
+      route: "/entity/[slug]",
+    });
+  });
+
+  it("separates a Supabase server error from never having reached it", async () => {
+    const events = captureEvents();
+    mocks.getClaims.mockResolvedValue({ data: null, error: transportFailure(503) });
+
+    expect((await proxy(request("/api/chat"))).status).toBe(503);
+    // One class, no code, and a stack inside a dependency: without this the two are the
+    // same line, and they are repaired by different people.
+    expect(events().find((line) => line.event === "auth_unavailable")).toMatchObject({
+      reason: "upstream_5xx",
+      error_name: "AuthRetryableFetchError",
+    });
+  });
+
+  it("reports the outage once even when the write to stderr fails", async () => {
+    mocks.getClaims.mockResolvedValue({ data: null, error: transportFailure() });
+    let attempts = 0;
+    vi.spyOn(console, "error").mockImplementation(() => {
+      attempts += 1;
+      throw new Error("stderr is gone");
+    });
+
+    await expect(proxy(request("/api/chat"))).rejects.toThrow("stderr is gone");
+    // The reporting sits outside the handler it reports on. Inside it, a failed write
+    // would be caught by that handler, which would run the failure path a second time
+    // and file the outage under the logger's own error instead of Supabase's.
+    expect(attempts).toBe(1);
+  });
+
+  it("stays silent for an ordinary signed-out request", async () => {
+    const events = captureEvents();
+
+    for (const path of ["/api/chat", "/api/follow-through"]) {
+      expect((await proxy(request(path))).status).toBe(401);
+    }
+
+    // A logged-out caller is the ordinary state of a working deployment. One line per
+    // request here would be the loudest thing in the log and the least actionable.
+    expect(events()).toEqual([]);
+  });
+
+  it("attributes no account to an origin refusal, having verified none", async () => {
+    const events = captureEvents();
+
+    const response = await proxy(
+      new NextRequest("https://zeus.example/settings", {
+        method: "POST",
+        headers: {
+          host: "zeus.example",
+          origin: "https://attacker.example",
+          "sec-fetch-site": "cross-site",
+        },
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(events()).toEqual([
+      {
+        event: "http_denied",
+        outcome: "error",
+        reason: "forbidden_origin",
+        status: 403,
+        method: "POST",
+        route: "/settings",
+      },
+    ]);
+  });
+
+  it("keeps a private page's path out of a 403 as well as out of an outage", async () => {
+    const events = captureEvents();
+
+    const response = await proxy(hostilePost("/entity/jane-okafor"));
+
+    expect(response.status).toBe(403);
+    // The older of the two call sites, and the same exposure: a denial names the route
+    // shape, and the name in the path it was asked for stays out of the file.
+    expect(events()).toEqual([
+      {
+        event: "http_denied",
+        outcome: "error",
+        reason: "forbidden_origin",
+        status: 403,
+        method: "POST",
+        route: "/entity/[slug]",
+      },
+    ]);
+  });
+
+  it("collapses a path this deployment does not serve into one fixed token", async () => {
+    const events = captureEvents();
+
+    const response = await proxy(hostilePost("/jane-okafor/notes"));
+
+    expect(response.status).toBe(403);
+    // The vocabulary is closed, so an unrecognised path reports its absence rather than
+    // itself. A route added to `src/app/` without being listed lands here too — the
+    // failure mode is a less specific line, never a leaked one.
+    expect(events()[0]).toMatchObject({ route: "/unmatched" });
+    expect(JSON.stringify(events())).not.toContain("okafor");
+  });
+});
+
+/**
+ * What auth-js returns for a timeout, a refused connection, or a Supabase 5xx: one class
+ * for all three, with the status it attached the only thing telling them apart.
+ */
+function transportFailure(status = 0): Error {
+  return Object.assign(new Error("Failed to fetch"), {
+    name: "AuthRetryableFetchError",
+    status,
+  });
+}
+
+/** A cross-site POST, which the mutation boundary refuses before any identity exists. */
+function hostilePost(path: string): NextRequest {
+  return new NextRequest(`https://zeus.example${path}`, {
+    method: "POST",
+    headers: {
+      host: "zeus.example",
+      origin: "https://attacker.example",
+      "sec-fetch-site": "cross-site",
+    },
+  });
+}
+
+/**
+ * Read back the lines the proxy actually wrote. Asserting on the serialized JSON rather
+ * than on the call arguments is the point: the allowlist runs during serialization, so
+ * only the written line proves what an operator would receive.
+ */
+function captureEvents(): () => Record<string, unknown>[] {
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+  return () =>
+    stderr.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+}
+
 /**
  * Stand in for a token refresh: the library writes cookies through `setAll` in the
  * middle of the auth call, while the proxy still owns the response.
