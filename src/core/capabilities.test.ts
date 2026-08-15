@@ -114,15 +114,48 @@ describe("what Zeus can actually do, stated rather than implied", () => {
     const connectorId = connectorWith(["calendar.list_events"]);
     recordConnectorVerification(db, connectorId, {
       status: "unreachable",
-      errorCode: "connect_failed",
+      errorCode: "reconnect_required",
     });
     const state = calendarCapabilityState(db);
     expect(state).toMatchObject({ connected: true, canRead: false, canCreate: false });
-    expect(state.unusableReason).toBe("connect_failed");
+    expect(state.unusableReason).toBe("reconnect_required");
     const block = renderCapabilityBlock(state, CONTEXT);
     expect(block).toContain("connected but cannot be used");
-    expect(block).toContain("Not reachable");
+    expect(block).toContain("Reconnect required");
     expect(block).not.toContain("not connected");
+  });
+
+  it("does not send the user to Settings over a service that did not answer", () => {
+    const connectorId = connectorWith(["calendar.list_events"]);
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "connect_failed",
+    });
+
+    const state = calendarCapabilityState(db);
+    expect(state).toMatchObject({
+      connected: true,
+      canRead: false,
+      temporarilyUnreachable: true,
+    });
+    const block = renderCapabilityBlock(state, CONTEXT);
+    // The failure this replaces: an intact connection described as one to go and repair,
+    // which is what a person reads as "Zeus has lost my calendar".
+    expect(block).toContain("needs nothing from the user");
+    expect(block).not.toContain("cannot be used");
+    expect(block).not.toContain("Settings");
+  });
+
+  it("still asks for a reconnection when the authorization is the thing that failed", () => {
+    const connectorId = connectorWith(["calendar.list_events"]);
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "reconnect_required",
+    });
+
+    const state = calendarCapabilityState(db);
+    expect(state.temporarilyUnreachable).toBe(false);
+    expect(renderCapabilityBlock(state, CONTEXT)).toContain("Reconnect required");
   });
 
   it("recognizes a configured Google connection before any capability is usable", () => {

@@ -119,7 +119,10 @@ function calendarFailure(
   input: Pick<Parameters<typeof createGoogleCalendarMcpServer>[0], "grant" | "store">,
   error: unknown,
 ) {
-  if (error instanceof GoogleCalendarError && error.code === "refresh_failed") {
+  // Only a grant Google itself has invalidated is retired here. Marking one unusable is a
+  // one-way door — the user has to go back through consent to reopen it — so it must never
+  // be the response to Google merely being unavailable.
+  if (error instanceof GoogleCalendarError && error.code === "refresh_revoked") {
     input.store.markReconnectRequired(input.grant.id, input.grant.accountId);
   }
   return failure(

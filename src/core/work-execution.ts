@@ -486,18 +486,38 @@ async function executeExternalRead(
     };
   }
   const window = calendarWindow();
+  // A read that stops is a turn that tells the user their calendar could not be checked, so
+  // it is worth one more attempt before saying so. The plan's own retry budget cannot help
+  // here: a pause is a deliberate stop rather than a failure, and the runner only retries
+  // what was thrown — which is how a single timed-out handshake became a refusal.
+  //
+  // Bounded, and only for reasons a second attempt could plausibly change. A revoked grant,
+  // a withdrawn capability, or a spent budget is answered immediately; retrying those would
+  // add latency to a turn whose answer is already known.
+  let attempts = 0;
   let result;
-  try {
-    result = await callCapability(db, "calendar.list_events", { ...window }, {
-      signal: input.signal,
-      capabilityId: available.capability.id,
-    });
-  } catch (error) {
-    return calendarReadFailure(
-      input,
-      error instanceof ConnectorError ? error.code : "connector_call_failed",
-      1,
-    );
+  for (;;) {
+    attempts += 1;
+    try {
+      result = await callCapability(db, "calendar.list_events", { ...window }, {
+        signal: input.signal,
+        capabilityId: available.capability.id,
+      });
+      break;
+    } catch (error) {
+      const code = error instanceof ConnectorError ? error.code : "connector_call_failed";
+      if (attempts >= CALENDAR_READ_ATTEMPTS || !calendarReadWorthRetrying(input, code)) {
+        return calendarReadFailure(input, code, attempts);
+      }
+      logEvent({
+        event: "calendar_read_retried",
+        outcome: "degraded",
+        reason: code,
+        plan_id: input.plan.id,
+        connector_id: available.connector.id,
+        count: attempts,
+      });
+    }
   }
 
   if (result.isError) {
@@ -509,7 +529,7 @@ async function executeExternalRead(
       connector?.last_error_code === "reconnect_required"
         ? "reconnect_required"
         : "remote_reported_error",
-      1,
+      attempts,
     );
   }
 
@@ -521,7 +541,7 @@ async function executeExternalRead(
   } catch {
     // Parsing happens before the cache transaction. A malformed success response therefore
     // proves neither an empty calendar nor that the requested window was covered.
-    return calendarReadFailure(input, "invalid_calendar_response", 1);
+    return calendarReadFailure(input, "invalid_calendar_response", attempts);
   }
   const content = JSON.stringify({ window, event_count: events.length, events }, null, 2);
   const unsafe = inspectUntrustedWorkData(content);
@@ -542,9 +562,43 @@ async function executeExternalRead(
       },
     ],
     modelCalls: 0,
-    toolCalls: 1,
+    toolCalls: attempts,
   };
 }
+
+/** Total calls a single read step may make. One retry, not a queue. */
+const CALENDAR_READ_ATTEMPTS = 2;
+
+/**
+ * Whether trying the same read again could plausibly answer differently.
+ *
+ * The excluded codes are the ones a second call would only confirm: the grant is gone, the
+ * binding no longer matches what the user reviewed, the ceiling is spent, or the caller has
+ * already given up on this turn. Everything else is the network, and the network changes.
+ */
+function calendarReadWorthRetrying(input: SafeStepExecutionInput, code: string): boolean {
+  if (input.signal.aborted) return false;
+  // A retry is another tool call, and a step that overruns its budget is failed by the
+  // runner rather than reported. Spending the last of it here would replace an honest
+  // "could not read your calendar" with a budget error nobody can act on.
+  if (input.remainingCallBudget < CALENDAR_READ_ATTEMPTS) return false;
+  return !TERMINAL_CALENDAR_READ_FAILURES.has(code);
+}
+
+const TERMINAL_CALENDAR_READ_FAILURES: ReadonlySet<string> = new Set([
+  "reconnect_required",
+  "capability_unavailable",
+  "capability_changed",
+  "tool_contract_changed",
+  "invalid_connector",
+  "invalid_preset",
+  "invalid_permissions",
+  "unknown_connector",
+  "missing_environment",
+  "local_only",
+  "rate_limited",
+  "daily_calls_spent",
+]);
 
 function calendarReadFailure(
   input: SafeStepExecutionInput,

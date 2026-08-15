@@ -18,6 +18,7 @@ import { calendarCapabilityState, renderCapabilityBlock } from "./capabilities";
 import { appendMessage, recentMessages } from "./conversations";
 import { recordModelCall, responseUsage } from "./budget";
 import type { Db } from "./db";
+import { restoreConnectorReachability } from "./mcp-client";
 import { errorSignature, logEvent } from "./observability";
 import { effectsForRun } from "./effects";
 import type { ProposedEffectView } from "./effects";
@@ -267,6 +268,12 @@ async function maybeExecuteBoundedWork(
   const note = resolution?.status === "request" ? resolution.note : null;
 
   if (calendarRequest) {
+    // A calendar the user connected and Zeus later found unreachable gets one handshake
+    // before this turn reports it as unusable. Placed ahead of the capability check on
+    // purpose: the check reads stored state, and stored state is exactly what a stale
+    // failure has made wrong. Only a recognized calendar request pays for it, and a
+    // connection that is already available costs nothing.
+    await restoreConnectorReachability(db, "calendar.list_events");
     // Checked here rather than before classification: `mayBeCalendarRequest` is
     // over-inclusive by design, so a pre-classification check would put "connect a calendar"
     // under every mention of dinner. Checked here rather than only in the catch below,
@@ -372,6 +379,12 @@ function missingCalendarCapability(
   if (!state.canRead) {
     if (state.unusableReason === "reconnect_required") {
       return { status: "unverifiable", reason: "reconnect_required" };
+    }
+    // Distinct from `connector_unavailable`, which sends the user to Settings. A service
+    // that did not answer needs nothing from them, and a turn that already retried once
+    // should say so rather than describe an intact connection as one to go and review.
+    if (state.temporarilyUnreachable) {
+      return { status: "unverifiable", reason: "provider_unavailable" };
     }
     if (state.unusableReason !== null || state.unusableStatus !== null) {
       return { status: "unverifiable", reason: "connector_unavailable" };

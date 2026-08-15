@@ -23,11 +23,13 @@ import {
   type ConnectorView,
   assertPresetConnectorConfiguration,
   availableCapability,
+  connectorAwaitingReachability,
   connectorEnvironment,
   GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
   getCapability,
   getConnector,
   recordConnectorVerification,
+  restoreConnectorAfterReachability,
   toolSchemaHash,
 } from "./connectors";
 import type { Db } from "./db";
@@ -273,6 +275,58 @@ export async function verifyConnector(
 }
 
 /**
+ * Give a service the user has already connected one handshake before Zeus says it is unusable.
+ *
+ * A connector that stopped answering stays `unreachable` until something re-verifies it, and
+ * nothing did: verification was reachable only from a button in Settings and from the OAuth
+ * callback. So a single failed call could end a connection, and every conversation afterwards
+ * opened by announcing that a calendar the user plainly had connected could not be used.
+ *
+ * Deliberately narrow. It runs only for a connector whose consent is intact and whose last
+ * failure was not the user's to fix, only on a turn that already needs the calendar, and only
+ * once — a handshake that fails again simply records why, and the turn reports it. It grants
+ * nothing: the capability rows it re-exposes are the ones the user bound, and the state it
+ * clears is state Zeus itself wrote.
+ *
+ * Its own deadline, shorter than an ordinary verification's, because someone is waiting on a
+ * reply. This is an opportunistic repair on the way to answering, not the deliberate check a
+ * person asked for by pressing Verify, and it must not turn "your calendar is down" into a
+ * turn that also takes a quarter of a minute to say so.
+ */
+const REVIVE_TIMEOUT_MS = 8_000;
+
+export async function restoreConnectorReachability(
+  db: Db,
+  slot: CapabilitySlot,
+  options: { signal?: AbortSignal } = {},
+): Promise<boolean> {
+  if (availableCapability(db, slot)) return true;
+  // Read before the handshake, deliberately: a successful verification clears the very
+  // error code that says this connector is safe to put back, so the decision has to be
+  // made against the state that recorded the failure.
+  const connector = connectorAwaitingReachability(db, slot);
+  if (!connector) return false;
+  const deadline = AbortSignal.timeout(REVIVE_TIMEOUT_MS);
+  try {
+    await verifyConnector(db, connector.id, {
+      signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
+    });
+  } catch {
+    // Already recorded by verifyConnector, and the caller's own report is the user-facing
+    // account of it. Nothing here should replace an ordinary turn with an exception.
+    return false;
+  }
+  restoreConnectorAfterReachability(db, connector);
+  logEvent({
+    event: "connector_reachability_restored",
+    outcome: "ok",
+    slot,
+    connector_id: connector.id,
+  });
+  return availableCapability(db, slot) !== null;
+}
+
+/**
  * Call one bound capability.
  *
  * Resolution happens here, not at the call site: a caller names a slot, and only an
@@ -335,15 +389,22 @@ export async function callCapability(
     const text = boundedText(result.content);
     const value =
       result.structuredContent !== undefined ? result.structuredContent : parsedOrText(text);
-    if (
-      result.isError === true &&
-      bound.connector.provider === "google_calendar" &&
-      /^(?:reconnect_required|refresh_failed):/u.test(text)
-    ) {
-      recordConnectorVerification(db, bound.connector.id, {
-        status: "unreachable",
-        errorCode: "reconnect_required",
-      });
+    // The broker names its own failures, and only two of them mean the authorization is
+    // gone. `refresh_unavailable` is Google declining to mint a token this minute; recording
+    // it as a reconnection would tell the user to redo consent over a transient outage.
+    if (result.isError === true && bound.connector.provider === "google_calendar") {
+      const remote = /^([a-z_]{1,64}):/u.exec(text)?.[1] ?? null;
+      if (remote === "reconnect_required" || remote === "refresh_revoked") {
+        recordConnectorVerification(db, bound.connector.id, {
+          status: "unreachable",
+          errorCode: "reconnect_required",
+        });
+      } else if (remote === "refresh_unavailable") {
+        recordConnectorVerification(db, bound.connector.id, {
+          status: "unreachable",
+          errorCode: "provider_unavailable",
+        });
+      }
     }
     logEvent({
       event: "connector_call",

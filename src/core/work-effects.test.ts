@@ -64,9 +64,18 @@ const CALENDAR_SERVER = `
 import { McpServer } from "${moduleUrl("@modelcontextprotocol/sdk/server/mcp.js")}";
 import { StdioServerTransport } from "${moduleUrl("@modelcontextprotocol/sdk/server/stdio.js")}";
 import { z } from "${moduleUrl("zod")}";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 
 const log = process.env.FAKE_CALENDAR_CALL_LOG;
+
+// A service that is briefly unavailable. Each call spawns a fresh child, so a marker file
+// is what carries "this has already failed once" between them.
+const failOnce = process.env.FAKE_CALENDAR_FAIL_ONCE;
+if (failOnce && !existsSync(failOnce)) {
+  writeFileSync(failOnce, "1");
+  process.exit(1);
+}
+
 const server = new McpServer({ name: "fake-calendar", version: "0.0.1" });
 
 const DEFAULT_EVENTS = [
@@ -160,6 +169,7 @@ afterEach(() => {
   delete process.env.FAKE_CALENDAR_CALL_LOG;
   delete process.env.FAKE_CALENDAR_EVENTS;
   delete process.env.FAKE_CALENDAR_RESULT_MODE;
+  delete process.env.FAKE_CALENDAR_FAIL_ONCE;
 });
 
 function recordedCalls(): Array<Record<string, unknown>> {
@@ -698,6 +708,67 @@ describe("an explicit calendar read", () => {
     );
     expect(listWorkArtifacts(db, { runId: run.id })[0]?.content).toContain("Flight lands");
   }, 30_000);
+
+  it("tries once more when the service did not answer the first time", async () => {
+    // The step's own answer used to be a pause, and the runner only retries what was
+    // thrown — so a single timed-out handshake was reported to the user as a calendar that
+    // could not be read, on a connection that was working a second later.
+    process.env.FAKE_CALENDAR_FAIL_ONCE = join(directory, "failed-once");
+    await connectCalendar();
+
+    const run = await readCalendar();
+
+    expect(run.status).toBe("completed");
+    expect(run.error_code).toBeNull();
+    expect(listWorkArtifacts(db, { runId: run.id })[0]?.content).toContain("Flight lands");
+  }, 30_000);
+
+  it("stops after the retry rather than trying forever", async () => {
+    await connectCalendar();
+    // Broken for good, not for a moment.
+    writeFileSync(join(directory, "calendar-server.mjs"), "process.exit(1);", { mode: 0o600 });
+
+    const run = await readCalendar();
+
+    expect(run.status).toBe("paused");
+    expect(run.error_code).toBe("calendar_unverifiable");
+    // The artifact still explains the stop, so the turn reports an honest "I could not
+    // check" rather than a retry loop or a bare failure.
+    expect(listWorkArtifacts(db, { runId: run.id })[0]?.content).toContain(
+      "did not change anything",
+    );
+  }, 30_000);
+
+  /** The plan Zeus builds for "what's on my calendar?", run against the fake service. */
+  async function readCalendar() {
+    const request = appendMessage(
+      db,
+      conversationId,
+      "user",
+      "Check my calendar and tell me what I have tomorrow.",
+      { origin: "user_action", recallState: "blocked" },
+    );
+    const proposal = calendarActionWorkPlanProposal(
+      { kind: "read", from: "2026-08-14T00:00:00.000Z", to: "2026-09-13T00:00:00.000Z", timezone: "UTC" },
+      request.content,
+    );
+    const detail = createWorkPlan(db, {
+      proposal,
+      sourceMessageId: request.id,
+      origin: "explicit_request",
+    });
+    authorizeWorkPlan(db, detail.plan.id, {
+      planHash: detail.plan.plan_hash,
+      authorizationKind: "explicit_request",
+      allowedEffects: proposal.allowed_effects,
+      maxModelToolCalls: detail.plan.max_model_tool_calls,
+      maxRetriesPerStep: detail.plan.max_retries_per_step,
+      maxDurationSeconds: detail.plan.max_duration_seconds,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      sourceMessageId: request.id,
+    });
+    return runWorkPlan(db, detail.plan.id, { executor: createSafeWorkExecutor(db) });
+  }
 });
 
 describe("a request the user is asked to confirm must be able to succeed", () => {

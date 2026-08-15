@@ -309,6 +309,13 @@ service was the consent — but writes always do.
 In the receipt log, `connector_call` is the only tool name that means bytes left the
 machine. `effect_proposal` means a request was prepared and stopped. Keep them distinct.
 
+The read step retries once on a transient connector failure, and only there. A pause is a
+deliberate stop rather than a thrown failure, so `max_retries_per_step` never covered it —
+which meant a single timed-out handshake reached the user as a calendar that could not be
+read. Terminal reasons (a revoked grant, a withdrawn capability, a spent ceiling) are
+answered immediately; the retry must never grow into a loop, and must never make a *write*
+attempt twice.
+
 ### Zeus stores no third-party credential
 
 A connector records a preset id or a command, arguments, URL, and the *names* of environment
@@ -326,6 +333,32 @@ Discovering a remote tool is not granting it. A capability binds one discovered 
 slot, the slot fixes the effect kind, and the tool's input schema is hashed at bind time:
 a server that later changes what "create an event" accepts is disabled and re-reviewed
 rather than silently obeyed.
+
+### An outage is not a withdrawn permission
+
+A connector that cannot be reached is taken out of service — `status` leaves `ready`, the
+schema's `enabled = 0 OR status = 'ready'` follows, and `availableCapability` stops offering
+it. That much must never soften. What must not happen is the *grant* going with it.
+
+`connector_capability.enabled` records which tools the user reviewed and accepted. A timeout
+is not that user changing their mind, and nothing could ever put it back: a later successful
+handshake sets `status` and has no user message to cite for consent, so one bad minute cost
+a full re-authorization. `reachabilityFailureWithdrawsGrant` is the code-owned split — a
+revoked authorization, missing credentials, a configuration Zeus may no longer run, or a
+drifted tool contract clear the capabilities and wait for a person; everything else leaves
+them standing.
+
+Recovery follows from that. `restoreConnectorReachability` gives a connector in that state
+one bounded handshake on a turn that already needs it, then
+`restoreConnectorAfterReachability` puts it back into service against the state observed
+*before* verifying — which is what keeps a connection the user deliberately switched off,
+whose `status` is still `ready`, out of scope. It re-enables no capability row, so it can
+never widen a grant.
+
+Say which it is, too. A service that did not answer needs nothing from the user, and telling
+them to go and reconnect an intact calendar is the failure this whole section exists to
+prevent: `temporarilyUnreachable` and the `provider_unavailable` outcome carry that
+distinction into the `<capabilities>` block and the calendar card.
 
 ### External data is never evidence
 

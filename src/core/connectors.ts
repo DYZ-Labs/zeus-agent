@@ -500,20 +500,114 @@ export function recordConnectorVerification(
       id,
     );
   } else {
-    // Losing reachability also withdraws the grant. A capability that cannot be reached
-    // must not keep looking available to the planner.
+    // Losing reachability takes the connector out of service. The schema insists on it —
+    // `enabled = 0 OR status = 'ready'` — and so does the planner, which must never be
+    // offered a capability nothing can reach.
+    //
+    // What it no longer does is throw away the *grants*. Those rows record which slots the
+    // user reviewed and accepted, and a server having a bad minute is not the user changing
+    // their mind about any of it. Clearing them was unrecoverable in practice: a later
+    // successful handshake sets `status` and has no user message to cite for consent, so one
+    // timed-out request cost a full re-authorization — and until someone noticed, every new
+    // conversation opened by announcing that a plainly connected calendar could not be used.
+    const withdrawsGrant = reachabilityFailureWithdrawsGrant(verification.errorCode);
     db.transaction(() => {
       db.prepare<[string, string, number]>(
         `UPDATE connector
          SET status = 'unreachable', enabled = 0, last_error_code = ?, updated_at = ?
          WHERE id = ?`,
       ).run(verification.errorCode.slice(0, 64), timestamp, id);
+      if (!withdrawsGrant) return;
       db.prepare<[string, number]>(
         "UPDATE connector_capability SET enabled = 0, updated_at = ? WHERE connector_id = ?",
       ).run(timestamp, id);
     })();
   }
   return getConnector(db, id);
+}
+
+/**
+ * Failures that mean the grant is gone, rather than that the network was.
+ *
+ * Code-owned and deliberately explicit. Each of these is something the user or the operator
+ * must act on before Zeus could legitimately call the service again: a revoked or expired
+ * authorization, credentials this process does not have, a configuration that no longer
+ * describes a service Zeus may reach, or a remote tool that no longer matches what was
+ * reviewed. Discarding the reviewed capabilities is right for exactly those, because the
+ * next successful handshake must not silently resurrect a permission whose basis changed.
+ *
+ * Everything else — a handshake that timed out, a server that did not answer, a token
+ * endpoint having a bad minute — leaves the grants standing, to be put back into service by
+ * the next handshake that works.
+ */
+const GRANT_WITHDRAWING_FAILURES: ReadonlySet<string> = new Set([
+  "reconnect_required",
+  "refresh_revoked",
+  "api_or_iam_missing",
+  "scope_missing",
+  "adc_missing",
+  "project_missing",
+  "missing_environment",
+  "invalid_connector",
+  "invalid_preset",
+  "invalid_permissions",
+  "tool_contract_changed",
+  "local_only",
+]);
+
+export function reachabilityFailureWithdrawsGrant(errorCode: string): boolean {
+  return GRANT_WITHDRAWING_FAILURES.has(errorCode);
+}
+
+/**
+ * A connector whose grants are intact and which simply stopped answering.
+ *
+ * The one unusable state worth retrying without asking anyone: out of service for a reason
+ * that is not the user's to fix, still holding the capability they granted for this slot.
+ * Everything else — a connector the user disabled, one whose authorization Google retired,
+ * one whose tools drifted — is left exactly where it is.
+ */
+export function connectorAwaitingReachability(db: Db, slot: CapabilitySlot): ConnectorView | null {
+  for (const connector of listConnectors(db)) {
+    if (connector.status !== "unreachable" || connector.last_error_code === null) continue;
+    if (reachabilityFailureWithdrawsGrant(connector.last_error_code)) continue;
+    if (!connector.capabilities.some((entry) => entry.slot === slot && entry.enabled === 1)) {
+      continue;
+    }
+    return connector;
+  }
+  return null;
+}
+
+/**
+ * Put a connector back into service after a handshake proved it is answering again.
+ *
+ * Not a new grant, and it cannot become one. `prior` is the row as it stood *before* the
+ * handshake, and it is the whole authority for acting: only a connector that was
+ * `unreachable` for a reason outside the user's control is restored. A connector the user
+ * switched off is `ready`, so it fails that check and is left exactly as they left it — the
+ * distinction this argument exists to make impossible to lose.
+ *
+ * No capability row is touched, so nothing here can enable a permission the user never
+ * bound, and the consent standing behind the connector is the `source_message_id` already on
+ * it: their own message, unchanged. `setConnectorEnabled` is deliberately not reused,
+ * because it requires a fresh user message — right for a person turning something on, wrong
+ * for handing back what a timeout took.
+ */
+export function restoreConnectorAfterReachability(
+  db: Db,
+  prior: ConnectorView,
+): ConnectorView | null {
+  if (
+    prior.status === "unreachable" &&
+    prior.last_error_code !== null &&
+    !reachabilityFailureWithdrawsGrant(prior.last_error_code)
+  ) {
+    db.prepare<[string, number]>(
+      "UPDATE connector SET enabled = 1, updated_at = ? WHERE id = ? AND status = 'ready'",
+    ).run(now(), prior.id);
+  }
+  return getConnector(db, prior.id);
 }
 
 export function setConnectorEnabled(

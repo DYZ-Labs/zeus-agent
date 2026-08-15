@@ -9,6 +9,7 @@ import {
   bindCapability,
   configureConnectorPreset,
   configureGoogleCalendarCapabilities,
+  connectorAwaitingReachability,
   connectorEnvironment,
   createConnector,
   deleteConnector,
@@ -21,6 +22,7 @@ import {
   getGoogleCalendarConnector,
   listConnectors,
   recordConnectorVerification,
+  restoreConnectorAfterReachability,
   setCapabilityEnabled,
   setConnectorEnabled,
   toolSchemaHash,
@@ -671,8 +673,8 @@ describe("capability binding is a deliberate, reviewable grant", () => {
 });
 
 describe("availability is the whole permission answer", () => {
-  function boundAndEnabled(): number {
-    const connector = stdioConnector();
+  function boundAndEnabled(label = "Calendar"): number {
+    const connector = stdioConnector({ label });
     bindCapability(db, {
       connectorId: connector.id,
       slot: "calendar.list_events",
@@ -704,7 +706,7 @@ describe("availability is the whole permission answer", () => {
     );
   });
 
-  it("withdraws every grant when the connector stops answering", () => {
+  it("takes a connector out of service when it stops answering, and keeps its grants", () => {
     const connectorId = boundAndEnabled();
 
     recordConnectorVerification(db, connectorId, {
@@ -714,7 +716,109 @@ describe("availability is the whole permission answer", () => {
 
     const connector = getConnector(db, connectorId);
     expect(connector?.enabled).toBe(0);
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+    // The grants survive, because a server that did not answer is not the user withdrawing
+    // a permission they reviewed. Clearing these was unrecoverable: a later handshake has no
+    // user message to cite as consent, so one timeout used to cost a re-authorization.
+    expect(connector?.capabilities.every((entry) => entry.enabled === 1)).toBe(true);
+    expect(connectorAwaitingReachability(db, "calendar.list_events")?.id).toBe(connectorId);
+  });
+
+  it("withdraws every grant when the reason is one the user has to act on", () => {
+    const connectorId = boundAndEnabled();
+
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "reconnect_required",
+    });
+
+    const connector = getConnector(db, connectorId);
+    expect(connector?.enabled).toBe(0);
     expect(connector?.capabilities.every((entry) => entry.enabled === 0)).toBe(true);
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+    // Nothing here is safe to put back without the user, so it is not offered for retry.
+    expect(connectorAwaitingReachability(db, "calendar.list_events")).toBeNull();
+  });
+
+  it("puts a connector back into service once it answers again", () => {
+    const connectorId = boundAndEnabled();
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "handshake_failed",
+    });
+    const prior = getConnector(db, connectorId)!;
+
+    recordConnectorVerification(db, connectorId, { status: "ready", tools: [] });
+    // Deliberately two steps: verification proves reachability, and only then is the grant
+    // the user already gave allowed back into service.
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+    restoreConnectorAfterReachability(db, prior);
+
+    expect(getConnector(db, connectorId)?.enabled).toBe(1);
+    expect(availableCapability(db, "calendar.list_events")).not.toBeNull();
+  });
+
+  it("will not put a connector into service while it is still unreachable", () => {
+    const connectorId = boundAndEnabled();
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "handshake_failed",
+    });
+
+    restoreConnectorAfterReachability(db, getConnector(db, connectorId)!);
+
+    expect(getConnector(db, connectorId)?.enabled).toBe(0);
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+  });
+
+  it("leaves a connector the user switched off alone", () => {
+    const connectorId = boundAndEnabled();
+    setConnectorEnabled(db, connectorId, false, userMessageId);
+    const prior = getConnector(db, connectorId)!;
+
+    // A deliberate disable is not an outage: it leaves `status` at 'ready', so neither the
+    // retry candidate nor the restore mistakes it for something to quietly turn back on.
+    expect(connectorAwaitingReachability(db, "calendar.list_events")).toBeNull();
+    restoreConnectorAfterReachability(db, prior);
+    expect(getConnector(db, connectorId)?.enabled).toBe(0);
+  });
+
+  it("gives back grants an older build withdrew over an outage", () => {
+    // The store the reported failure leaves behind: capabilities cleared by a build that
+    // did that for any handshake failure at all, with nothing anywhere able to put them
+    // back. 028 restores exactly the ones whose recorded reason was not the user's to fix.
+    const transient = boundAndEnabled("Calendar that timed out");
+    const withdrawn = boundAndEnabled("Calendar whose grant expired");
+    for (const [id, errorCode] of [
+      [transient, "handshake_failed"],
+      [withdrawn, "reconnect_required"],
+    ] as const) {
+      recordConnectorVerification(db, id, { status: "unreachable", errorCode });
+      db.prepare("UPDATE connector_capability SET enabled = 0 WHERE connector_id = ?").run(id);
+    }
+
+    db.exec(MIGRATIONS.find((migration) => migration.id.startsWith("028_"))!.sql);
+
+    expect(getConnector(db, transient)?.capabilities.every((e) => e.enabled === 1)).toBe(true);
+    expect(getConnector(db, withdrawn)?.capabilities.every((e) => e.enabled === 0)).toBe(true);
+    // Neither becomes callable: both are still out of service until a handshake succeeds.
+    expect(getConnector(db, transient)?.enabled).toBe(0);
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+    expect(connectorAwaitingReachability(db, "calendar.list_events")?.id).toBe(transient);
+  });
+
+  it("will not restore a connector whose authorization is what failed", () => {
+    const connectorId = boundAndEnabled();
+    recordConnectorVerification(db, connectorId, {
+      status: "unreachable",
+      errorCode: "reconnect_required",
+    });
+    const prior = getConnector(db, connectorId)!;
+
+    recordConnectorVerification(db, connectorId, { status: "ready", tools: [] });
+    restoreConnectorAfterReachability(db, prior);
+
+    expect(getConnector(db, connectorId)?.enabled).toBe(0);
     expect(availableCapability(db, "calendar.list_events")).toBeNull();
   });
 

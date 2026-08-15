@@ -1990,6 +1990,42 @@ CREATE TABLE calendar_outcome (
 );
 `;
 
+/**
+ * Give back the grants a network failure took away.
+ *
+ * `recordConnectorVerification` used to clear `enabled` on every capability of a connector
+ * whose handshake failed, for any reason at all. Those rows are the record of which slots
+ * the user reviewed and accepted, and nothing could put them back: a later successful
+ * handshake sets `status` and has no user message to cite as consent. So one timed-out
+ * request permanently cost a full re-authorization, and a store left in that state greets
+ * every new conversation by saying a plainly connected calendar cannot be used.
+ *
+ * Restored only where the recorded reason was not the user's to fix. A revoked grant, absent
+ * credentials, a configuration Zeus may no longer run, or a remote tool that stopped matching
+ * what was reviewed all stay withdrawn: those genuinely need someone to act. Capabilities
+ * disabled by schema drift or by the user are untouched too, since neither of those leaves
+ * the connector `unreachable`.
+ *
+ * Note what this does not do: the connector's own `enabled` is left at 0, as the schema's
+ * `enabled = 0 OR status = 'ready'` requires. Nothing here becomes callable. The connector
+ * must still answer a handshake before it is put back into service.
+ */
+const CONNECTOR_REACHABILITY_IS_NOT_CONSENT = `
+UPDATE connector_capability
+SET enabled = 1, updated_at = ${NOW}
+WHERE enabled = 0
+  AND connector_id IN (
+    SELECT id FROM connector
+    WHERE status = 'unreachable'
+      AND last_error_code IS NOT NULL
+      AND last_error_code NOT IN (
+        'reconnect_required','refresh_revoked','api_or_iam_missing','scope_missing',
+        'adc_missing','project_missing','missing_environment','invalid_connector',
+        'invalid_preset','invalid_permissions','tool_contract_changed','local_only'
+      )
+  );
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2018,4 +2054,8 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "025_google_calendar_provider", sql: GOOGLE_CALENDAR_PROVIDER },
   { id: "026_calendar_direct_execution", sql: CALENDAR_DIRECT_EXECUTION },
   { id: "027_calendar_turn_outcome", sql: CALENDAR_TURN_OUTCOME },
+  {
+    id: "028_connector_reachability_is_not_consent",
+    sql: CONNECTOR_REACHABILITY_IS_NOT_CONSENT,
+  },
 ];

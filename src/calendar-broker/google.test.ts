@@ -122,6 +122,35 @@ describe("Google OAuth and Calendar API", () => {
       "request",
     )).rejects.toMatchObject({ code: "insufficient_scope" });
   });
+
+  // Retiring a grant is a one-way door: the user has to go back through consent to reopen
+  // it. Everything below exists so that door is only opened by Google saying the token is
+  // dead, and never by Google having a bad minute.
+  it("retires the grant only when Google says the refresh token is invalid", async () => {
+    const api = new GoogleCalendarApi(
+      OAUTH,
+      googleFetch([Response.json({ error: "invalid_grant" }, { status: 400 })]),
+    );
+
+    await expect(
+      api.listEvents(grant([CALENDAR_READ_SCOPE]), "2026-08-15", "2026-08-16"),
+    ).rejects.toMatchObject({ code: "refresh_revoked" });
+  });
+
+  it("treats a token endpoint that is merely unavailable as unavailable", async () => {
+    for (const response of [
+      Response.json({ error: "internal_failure" }, { status: 500 }),
+      Response.json({ error: "rate_limit_exceeded" }, { status: 429 }),
+      // An operator's broken OAuth client. No amount of user re-consent fixes it, and
+      // revoking their grant over it would only bury the real fault.
+      Response.json({ error: "invalid_client" }, { status: 401 }),
+    ]) {
+      const api = new GoogleCalendarApi(OAUTH, googleFetch([response]));
+      await expect(
+        api.listEvents(grant([CALENDAR_READ_SCOPE]), "2026-08-15", "2026-08-16"),
+      ).rejects.toMatchObject({ code: "refresh_unavailable" });
+    }
+  });
 });
 
 function grant(scopes: string[]): CalendarGrant {
