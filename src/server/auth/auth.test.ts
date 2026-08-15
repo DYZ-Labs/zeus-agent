@@ -35,6 +35,12 @@ import { safeNextPath } from "./paths";
 
 const OWNER_ID = "019ff232-f8e0-7ce2-8e83-d416444aed06";
 const OTHER_ID = "12f81434-e99b-4208-a1a2-0a216579e393";
+const THIRD_ID = "4bd0a8a6-1c47-4a2e-9a3f-6f2f1f0c5e77";
+/**
+ * A clock the rate-limited refusals can be walked across rather than waited out. It starts
+ * beyond real time so that no window an earlier test opened is still open.
+ */
+let clock = Date.now() + 24 * 60 * 60 * 1000;
 const AUTH_KEYS = [
   "NEXT_PUBLIC_SUPABASE_URL",
   "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
@@ -421,6 +427,241 @@ describe("session client hardening", () => {
   }
 });
 
+describe("auth boundary visibility", () => {
+  beforeEach(() => {
+    // The windows that bound a repeating refusal live in module state, which outlives a
+    // single test. Starting each one an hour on leaves no window open behind it.
+    clock += 60 * 60 * 1000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reports an unreachable auth service so an operator can alert on it", async () => {
+    configureAuth();
+    const events = captureEvents();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        // What `createSupabaseServerClient` rethrows for a timeout, a refused
+        // connection, or a Supabase 5xx.
+        getUser: async () => {
+          throw Object.assign(new Error("Failed to fetch"), {
+            name: "AuthRetryableFetchError",
+          });
+        },
+      },
+    });
+
+    const access = await getOwnerAccess();
+
+    expect(access.state).toBe("unavailable");
+    // Every account is locked out of its own memory, and the sentence explaining that
+    // reaches only the person who cannot fix it.
+    expect(events()).toEqual([
+      { event: "owner_access_denied", outcome: "error", reason: "unavailable", count: 1 },
+    ]);
+  });
+
+  it("states a persisting condition once a window, with the refusals it stands for", async () => {
+    configureAuth();
+    const events = captureEvents();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: async () => {
+          throw Object.assign(new Error("Failed to fetch"), {
+            name: "AuthRetryableFetchError",
+          });
+        },
+      },
+    });
+
+    // Two page renders' worth: the dynamic root layout asks, then the page asks again.
+    for (let render = 0; render < 8; render += 1) {
+      expect((await getOwnerAccess()).state).toBe("unavailable");
+    }
+    expect(events()).toHaveLength(1);
+
+    clock += 6 * 60 * 1000;
+    expect((await getOwnerAccess()).state).toBe("unavailable");
+
+    // An outage is a condition, not an event. The operator needs to know it started and
+    // roughly how hard it is being hit — not to receive it once per render until it ends.
+    expect(events()).toEqual([
+      { event: "owner_access_denied", outcome: "error", reason: "unavailable", count: 1 },
+      { event: "owner_access_denied", outcome: "error", reason: "unavailable", count: 8 },
+    ]);
+  });
+
+  it("separates a boundary being tested from a confirmation link nobody clicked", () => {
+    configureAuth();
+    const events = captureEvents();
+
+    // The visitor is told to confirm their address, and nothing reached a store it was
+    // not entitled to.
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com", false)).state).toBe(
+      "wrong_account",
+    );
+    expect(events()).toEqual([]);
+
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe("authorized");
+    mocks.getAccountDb.mockReturnValue(db);
+
+    // A store bound to one identity, reached by another. Recorded with the account that
+    // reached it, because "somebody" is not a thing an operator can investigate.
+    expect(authorizeSupabaseUser(user(OTHER_ID, "stranger@example.com")).state).toBe(
+      "wrong_account",
+    );
+    expect(events()).toEqual([
+      {
+        event: "owner_access_denied",
+        outcome: "error",
+        reason: "wrong_account",
+        account: OTHER_ID,
+      },
+    ]);
+  });
+
+  it("reports every store reached by an identity it is not bound to, not one a window", () => {
+    configureAuth();
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe("authorized");
+    const events = captureEvents();
+    mocks.getAccountDb.mockReturnValue(db);
+
+    expect(authorizeSupabaseUser(user(OTHER_ID, "stranger@example.com")).state).toBe(
+      "wrong_account",
+    );
+    expect(authorizeSupabaseUser(user(THIRD_ID, "other-stranger@example.com")).state).toBe(
+      "wrong_account",
+    );
+
+    // A window keeps the first caller and drops the rest. For the one refusal here that
+    // means a boundary was tested, the account is what the line is for.
+    expect(events().map((line) => line.account)).toEqual([OTHER_ID, THIRD_ID]);
+  });
+
+  it("records a stranger asking an invite-only deployment for a store", () => {
+    configureAuth();
+    const events = captureEvents();
+    mocks.accountDbExists.mockReturnValue(false);
+
+    expect(authorizeSupabaseUser(user(OTHER_ID, "stranger@example.com")).state).toBe(
+      "wrong_account",
+    );
+
+    // On an allowlisted deployment this is the only state a stranger can reach: with no
+    // store, the identity never gets as far as `wrong_account`. Silence here would mean a
+    // deployment whose whole door is the allowlist reports nobody trying it.
+    expect(events()).toEqual([
+      {
+        event: "owner_access_denied",
+        outcome: "error",
+        reason: "not_invited",
+        count: 1,
+        account: OTHER_ID,
+      },
+    ]);
+
+    // The signup page is public, so the rate belongs to whoever is signing up.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      authorizeSupabaseUser(user(OTHER_ID, "stranger@example.com"));
+    }
+    expect(events()).toHaveLength(1);
+  });
+
+  it("distinguishes a provider that supplies no address from an unconfirmed one", () => {
+    configureAuth();
+    const events = captureEvents();
+
+    const withoutEmail = { ...user(OTHER_ID, "stranger@example.com"), email: undefined } as User;
+    expect(authorizeSupabaseUser(withoutEmail).state).toBe("wrong_account");
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com", false)).state).toBe(
+      "wrong_account",
+    );
+
+    // "Confirm your email" is not advice anyone can act on when the provider never sends
+    // one; only whoever configured it can. The two refusals cannot share a reason.
+    expect(events()).toEqual([
+      {
+        event: "owner_access_denied",
+        outcome: "error",
+        reason: "missing_provider_email",
+        count: 1,
+        account: OTHER_ID,
+      },
+    ]);
+  });
+
+  it("records a private request refused at the browser origin boundary", async () => {
+    const events = captureEvents();
+
+    const access = await getBrowserOwnerAccess(
+      new Request("http://attacker.example/api/chat", {
+        method: "POST",
+        headers: {
+          host: "attacker.example",
+          origin: "http://attacker.example",
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+      "private-mutation",
+    );
+
+    expect(access.state).toBe("forbidden_origin");
+    expect(events()).toEqual([
+      { event: "owner_access_denied", outcome: "error", reason: "forbidden_origin" },
+    ]);
+  });
+
+  it("stays silent through a signed-out visitor's whole session", async () => {
+    configureAuth();
+    const events = captureEvents();
+    mocks.createSupabaseServerClient.mockResolvedValue({
+      auth: {
+        getUser: async () => ({
+          data: { user: null },
+          error: Object.assign(new Error("Auth session missing!"), {
+            name: "AuthSessionMissingError",
+          }),
+        }),
+      },
+    });
+
+    // One line per page render and per API request would be the loudest thing in the
+    // log and the one nobody can act on; "log in" is already the whole resolution.
+    for (let request = 0; request < 5; request += 1) {
+      expect((await getOwnerAccess()).state).toBe("signed_out");
+    }
+    expect(events()).toEqual([]);
+  });
+
+  it("never lets an email or a display name reach a written line", () => {
+    configureAuth();
+    expect(authorizeSupabaseUser(user(OWNER_ID, "owner@example.com")).state).toBe("authorized");
+    const events = captureEvents();
+    mocks.getAccountDb.mockReturnValue(db);
+
+    const intruder = {
+      ...user(OTHER_ID, "jane.okafor@example.com"),
+      user_metadata: {
+        full_name: "Jane Okafor",
+        avatar_url: "https://cdn.example/jane-okafor.png",
+      },
+    } as User;
+    expect(authorizeSupabaseUser(intruder).state).toBe("wrong_account");
+
+    // The denial carries an `AccountSummary`, which names the person three ways. Only
+    // the pseudonymous UUID may be written, and the check is on the written line rather
+    // than on what the call site passed.
+    const serialized = JSON.stringify(events());
+    expect(serialized).not.toContain("jane.okafor@example.com");
+    expect(serialized).not.toContain("Jane Okafor");
+    expect(serialized).not.toContain("cdn.example");
+    expect(serialized).toContain(OTHER_ID);
+  });
+});
+
 describe("auth redirects", () => {
   it("keeps local relative destinations and rejects open redirects", () => {
     expect(safeNextPath("/memory?view=review")).toBe("/memory?view=review");
@@ -432,6 +673,17 @@ describe("auth redirects", () => {
     expect(safeNextPath("javascript:alert(1)")).toBe("/");
   });
 });
+
+/**
+ * Read back the lines the boundary actually wrote. Asserting on the serialized JSON
+ * rather than on the call arguments is the point: the allowlist runs during
+ * serialization, so only the written line proves what an operator would receive.
+ */
+function captureEvents(): () => Record<string, unknown>[] {
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+  return () =>
+    stderr.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+}
 
 function configureAuth() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";

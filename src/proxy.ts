@@ -1,7 +1,7 @@
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-import { logEvent } from "@/core/observability";
+import { errorSignature, logEvent } from "@/core/observability";
 import { getAuthConfiguration, type AuthConfiguration } from "@/server/auth/config";
 import {
   applyBrowserSecurityHeaders,
@@ -120,7 +120,14 @@ async function routeRequest(
     },
   });
 
-  const verificationUnavailable = (): NextResponse => {
+  const verificationUnavailable = (
+    reason: AuthUnavailableReason,
+    error: unknown,
+  ): NextResponse => {
+    // A public page is still served during the outage; the other two exits refuse the
+    // request, and the status records which of the three the visitor actually met.
+    const status = isApi ? 503 : isPublicPage ? 200 : 307;
+    logAuthUnavailable(request, reason, error, status);
     if (isApi) {
       return copySession(
         Response.json({ error: "Account verification is temporarily unavailable." }, { status: 503 }),
@@ -134,25 +141,37 @@ async function routeRequest(
     );
   };
 
+  // The handler covers the outbound call and nothing else. Reporting the outage from
+  // inside it would put the log call under its own catch: one throw there would run the
+  // failure path a second time, and that second throw has no handler left above it, so an
+  // outage Zeus otherwise degrades gracefully would become a middleware 500 on every
+  // request for as long as it lasted.
+  let answer: Awaited<ReturnType<typeof supabase.auth.getClaims>> | undefined;
+  let fault: unknown;
   try {
-    const { data, error } = await supabase.auth.getClaims();
-    // A transport failure never reaches the catch below: auth-js converts it into a
-    // returned error, where it is indistinguishable from "no session". Reported that
-    // way, a Supabase slowdown would look like every account signing itself out.
-    if (error && isTransportFailure(error)) return verificationUnavailable();
-    if (error || !data?.claims) {
-      if (isApi) {
-        return copySession(
-          Response.json({ error: "Authentication required." }, { status: 401 }),
-          sessionResponse,
-        );
-      }
-      if (!isPublicPage) {
-        return copySession(loginRedirect(request), sessionResponse);
-      }
+    answer = await supabase.auth.getClaims();
+  } catch (error) {
+    fault = error;
+  }
+  if (!answer) return verificationUnavailable("unexpected_error", fault);
+
+  const { data, error } = answer;
+  // A transport failure never reaches the catch above: auth-js converts it into a
+  // returned error, where it is indistinguishable from "no session". Reported that
+  // way, a Supabase slowdown would look like every account signing itself out.
+  if (error && isTransportFailure(error)) {
+    return verificationUnavailable(transportReason(error), error);
+  }
+  if (error || !data?.claims) {
+    if (isApi) {
+      return copySession(
+        Response.json({ error: "Authentication required." }, { status: 401 }),
+        sessionResponse,
+      );
     }
-  } catch {
-    return verificationUnavailable();
+    if (!isPublicPage) {
+      return copySession(loginRedirect(request), sessionResponse);
+    }
   }
 
   return sessionResponse;
@@ -209,6 +228,22 @@ function isTransportFailure(error: { name?: string }): boolean {
   return error.name === "AuthRetryableFetchError";
 }
 
+type AuthUnavailableReason = "transport_failure" | "upstream_5xx" | "unexpected_error";
+
+/**
+ * Which transport failure it was. Not a detail: "Supabase never answered" and "Supabase
+ * answered 503" are repaired by different people, and the class alone cannot tell them
+ * apart — auth-js builds the same `AuthRetryableFetchError`, carrying no code, for both.
+ * The one discriminator it does carry is the status it attached: 0 when nothing answered
+ * at all, and the upstream status when the service answered with a server error. That
+ * cannot go in `status`, which is already the status Zeus returned to the visitor, so it
+ * survives as a reason Zeus itself names.
+ */
+function transportReason(error: unknown): "transport_failure" | "upstream_5xx" {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" && status >= 500 ? "upstream_5xx" : "transport_failure";
+}
+
 export const config = {
   matcher: [
     "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
@@ -231,8 +266,115 @@ function logDenial(request: NextRequest, reason: string, status: number): void {
     reason,
     status,
     method: request.method,
-    route: request.nextUrl.pathname,
+    route: routeTemplate(request.nextUrl.pathname),
+    // No account: this boundary is deliberately checked before any identity exists. The
+    // session cookie is not one — a subject Zeus has not verified would let a caller
+    // choose whose name a security event is filed under — and verifying one here would
+    // make every rejected request pay for an outbound auth call. The owner boundary
+    // reports the refusals that do have a verified identity behind them.
   });
+}
+
+/**
+ * An auth service that stops answering locks every account out of its own memory, and
+ * until now the only place that said so was the visitor's screen. This is the line to
+ * alert on, and the one that separates "Supabase is down" from every account genuinely
+ * signing out at once.
+ *
+ * A public page is still served during the outage — anonymously, which is a degradation
+ * rather than a failure — so it is reported as one, while a refused API call and a
+ * redirect away from a private page are outright failures. The reason then separates the
+ * three incidents behind that one visitor-facing sentence: nothing answered, Supabase
+ * answered badly, or this code path is itself broken. The error's signature is carried
+ * alongside rather than instead — for a returned transport failure it is the same class
+ * every time, constructed inside a dependency, so on its own it names no incident.
+ */
+function logAuthUnavailable(
+  request: NextRequest,
+  reason: AuthUnavailableReason,
+  error: unknown,
+  status: number,
+): void {
+  logEvent({
+    event: "auth_unavailable",
+    outcome: status === 200 ? "degraded" : "error",
+    reason,
+    status,
+    method: request.method,
+    route: routeTemplate(request.nextUrl.pathname),
+    ...errorSignature(error),
+  });
+}
+
+/**
+ * Every route shape this deployment serves, written the way Next.js names them and the way
+ * the rest of Zeus already reports them — `logBudgetDenial("/api/work-plans/[id]/run", …)`.
+ * A route added to `src/app/` belongs here too; until it is, it reports as unmatched.
+ */
+const ROUTE_TEMPLATES = [
+  "/",
+  "/auth/callback",
+  "/auth/confirm",
+  "/auth/login",
+  "/auth/signup",
+  "/conversations",
+  "/effects/[id]",
+  "/entity/[slug]",
+  "/memory",
+  "/open-loops",
+  "/response/[id]",
+  "/settings",
+  "/source/[id]",
+  "/timeline",
+  "/today",
+  "/understanding",
+  "/understanding/backfill",
+  "/work-artifacts/[id]",
+  "/api/chat",
+  "/api/follow-through",
+  "/api/health",
+  "/api/integrations/google-calendar/callback",
+  "/api/integrations/google-calendar/start",
+  "/api/location",
+  "/api/opportunities/[id]/delivery",
+  "/api/work-artifacts/[id]",
+  "/api/work-plans",
+  "/api/work-plans/[id]",
+  "/api/work-plans/[id]/authorize",
+  "/api/work-plans/[id]/run",
+  "/api/work-runs/[id]",
+] as const;
+
+/** One token for everything this deployment does not serve, so a stray path cannot describe itself. */
+const UNMATCHED_ROUTE = "/unmatched";
+
+/**
+ * Name the route a request asked for without quoting the request.
+ *
+ * A resolved path is not a safe value here. `/entity/[slug]` resolves to
+ * `slugify(entity.name)` — a person out of the user's own memory — and `/source/[id]`
+ * numbers one of their stored conversations; both satisfy the `route` pattern perfectly,
+ * because a pattern can only say what a value looks like, never where it came from. So the
+ * path is matched against the closed vocabulary above and the *template* is what is
+ * reported. That makes the guarantee structural rather than careful: every value that can
+ * leave here is one of those literals or the single unmatched token, which is also what a
+ * route nobody listed reports. Stripping the dynamic segment with a regex would instead be
+ * a denylist, and would leak the first time a route did not fit its shape.
+ *
+ * The query is not represented at all, in any form. It carries the destination the caller
+ * asked for and whatever else a link put there.
+ */
+function routeTemplate(pathname: string): string {
+  const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  const segments = path.split("/");
+  const match = ROUTE_TEMPLATES.find((template) => {
+    const parts = template.split("/");
+    return (
+      parts.length === segments.length &&
+      parts.every((part, index) => part === segments[index] || part.startsWith("["))
+    );
+  });
+  return match ?? UNMATCHED_ROUTE;
 }
 
 function boundaryDenied(request: NextRequest, message: string): NextResponse {

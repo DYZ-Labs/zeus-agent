@@ -1,8 +1,10 @@
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 
-import { openTestDb } from "./db";
+import { migrate, openTestDb } from "./db";
 import { MIGRATIONS } from "./migrations";
-import { bindAppOwner, getAppOwner } from "./owner";
+import { serializeEvent } from "./observability";
+import { accountEvent, bindAppOwner, getAppOwner } from "./owner";
 
 const FIRST_ID = "019ff232-f8e0-7ce2-8e83-d416444aed06";
 const OTHER_ID = "12f81434-e99b-4208-a1a2-0a216579e393";
@@ -93,5 +95,72 @@ describe("app owner binding", () => {
     ).toThrow();
     expect(() => bindAppOwner(db, { supabaseUserId: FIRST_ID, email: "not-email" })).toThrow();
     expect(getAppOwner(db)).toBeNull();
+  });
+});
+
+// One store per account is what makes this possible: the handle already carries the
+// identity, so an operator can tell one broken account from every account broken without
+// an account argument anywhere in core.
+describe("account attribution for operational events", () => {
+  function ownedStore(id = FIRST_ID) {
+    const db = openTestDb();
+    bindAppOwner(db, { supabaseUserId: id, email: "owner@example.com" });
+    return db;
+  }
+
+  it("names the account a store belongs to, in a form the log accepts", () => {
+    const db = ownedStore();
+
+    expect(accountEvent(db)).toEqual({ account: FIRST_ID });
+    expect(serializeEvent({ event: "chat_turn", ...accountEvent(db) })).toEqual({
+      event: "chat_turn",
+      account: FIRST_ID,
+    });
+  });
+
+  it("distinguishes one account's events from another's", () => {
+    expect(accountEvent(ownedStore(OTHER_ID))).toEqual({ account: OTHER_ID });
+  });
+
+  it("leaves an unclaimed single-user store unattributed", () => {
+    expect(accountEvent(openTestDb())).toEqual({});
+    expect(serializeEvent({ event: "chat_turn", ...accountEvent(openTestDb()) })).toEqual({
+      event: "chat_turn",
+    });
+  });
+
+  it("starts attributing as soon as an unbound store is claimed", () => {
+    const db = openTestDb();
+    expect(accountEvent(db)).toEqual({});
+
+    bindAppOwner(db, { supabaseUserId: FIRST_ID, email: "owner@example.com" });
+
+    expect(accountEvent(db)).toEqual({ account: FIRST_ID });
+  });
+
+  it("answers from memory once resolved, without querying the store again", () => {
+    const db = ownedStore();
+    expect(accountEvent(db)).toEqual({ account: FIRST_ID });
+
+    db.exec("DROP TABLE app_owner");
+
+    expect(accountEvent(db)).toEqual({ account: FIRST_ID });
+  });
+
+  it("yields nothing rather than throwing when the store cannot answer", () => {
+    const closed = ownedStore();
+    closed.close();
+
+    const migrating = new Database(":memory:");
+    migrate(
+      migrating,
+      MIGRATIONS.slice(
+        0,
+        MIGRATIONS.findIndex((migration) => migration.id === "012_app_owner"),
+      ),
+    );
+
+    expect(accountEvent(closed)).toEqual({});
+    expect(accountEvent(migrating)).toEqual({});
   });
 });

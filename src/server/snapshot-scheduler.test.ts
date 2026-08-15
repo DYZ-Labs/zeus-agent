@@ -8,10 +8,11 @@ vi.mock("server-only", () => ({}));
 
 import { openDb } from "@/core/db";
 import { deploymentSnapshotDirectory } from "@/core/snapshot-schedule";
-import { listRestorableSnapshots } from "@/core/snapshots";
+import { createVerifiedSnapshot, listRestorableSnapshots } from "@/core/snapshots";
 import {
   resetSnapshotScheduler,
   runDueSnapshots,
+  SNAPSHOT_STALE_GRACE_HOURS,
   snapshotSchedulerStatus,
   startSnapshotScheduler,
 } from "./snapshot-scheduler";
@@ -30,6 +31,8 @@ let account: string;
  * documented default or they prove nothing about it.
  */
 let snapshots: string;
+/** Somewhere else entirely, to move `ZEUS_SNAPSHOT_DIR` to after a scheduler has started. */
+let elsewhere: string;
 
 beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -41,6 +44,8 @@ beforeEach(() => {
   account = join(base, "accounts", `${ACCOUNT}.db`);
   openDb(account).close();
   snapshots = join(base, "snapshots");
+  elsewhere = join(base, "elsewhere");
+  mkdirSync(elsewhere);
   vi.stubEnv("ZEUS_DB", primary);
   // Pinned *unset*, not pinned to a path. Setting it is what hid the bug these tests
   // exist for, because both sides then agree by configuration rather than by code; not
@@ -73,7 +78,11 @@ describe("in-process snapshot scheduler", () => {
 
     expect(listRestorableSnapshots(primary, snapshots)).toHaveLength(1);
     expect(listRestorableSnapshots(account, snapshots)).toHaveLength(1);
-    expect(snapshotSchedulerStatus()).toMatchObject({ state: "running", lastResult: "ok" });
+    expect(snapshotSchedulerStatus()).toMatchObject({
+      state: "running",
+      lastResult: "ok",
+      freshness: { state: "fresh", oldestAgeHours: 0 },
+    });
   });
 
   it("does not snapshot again while the existing copy is still fresh", async () => {
@@ -147,6 +156,85 @@ describe("in-process snapshot scheduler", () => {
     await expect(runDueSnapshots()).resolves.toBeUndefined();
   });
 
+  it("says it is misconfigured when it cannot resolve a directory to write into", async () => {
+    vi.stubEnv("ZEUS_SNAPSHOT_SCHEDULER", "on");
+    // The likeliest mistake when the documented workstation path moves to a container.
+    vi.stubEnv("ZEUS_SNAPSHOT_DIR", "relative/not/absolute");
+
+    startSnapshotScheduler();
+    await runDueSnapshots();
+
+    // Emphatically not "running". A scheduler with nowhere to write will never produce a
+    // copy however long it runs, and reporting it as running is how a deployment goes a
+    // month with no backup and a green health check.
+    expect(snapshotSchedulerStatus()).toMatchObject({
+      state: "misconfigured",
+      freshness: { state: "unknown" },
+    });
+    expect(listRestorableSnapshots(primary, snapshots)).toHaveLength(0);
+  });
+
+  it("reads freshness off the volume, so a restart cannot report silence as health", async () => {
+    vi.stubEnv("ZEUS_SNAPSHOT_SCHEDULER", "on");
+    startSnapshotScheduler();
+    await runDueSnapshots();
+
+    const aged = new Date(Date.now() - (25 + SNAPSHOT_STALE_GRACE_HOURS) * 3_600_000);
+    for (const store of [primary, account]) {
+      const copy = onlySnapshot(store);
+      utimesSync(copy, aged, aged);
+    }
+    // The redeploy that used to reset every field this status reported.
+    resetSnapshotScheduler();
+
+    const status = snapshotSchedulerStatus();
+
+    // What the process remembers is nothing at all — which is exactly what it remembers
+    // when backups are perfectly healthy, and why the run it remembers cannot be the
+    // thing an operator is asked to trust.
+    expect(status).toMatchObject({ state: "not_started", lastResult: null, lastRunAt: null });
+    expect(status.freshness.state).toBe("stale");
+    expect(status.freshness.oldestAgeHours).toBeGreaterThanOrEqual(
+      25 + SNAPSHOT_STALE_GRACE_HOURS,
+    );
+  });
+
+  it("measures freshness against the directory the schedule resolved, not the environment", () => {
+    for (const store of [primary, account]) {
+      const db = openDb(store);
+      createVerifiedSnapshot(db, { directory: snapshots });
+      db.close();
+    }
+    // Switched off, which is where the reader used to be left to fend for itself: a start
+    // that returned before resolving anything gave the freshness read nothing to inherit.
+    vi.stubEnv("ZEUS_SNAPSHOT_SCHEDULER", "off");
+    startSnapshotScheduler();
+
+    // The variable moves after the schedule resolved — a redeploy carrying a new value, an
+    // edited service, a second process with a different environment. A reader that
+    // resolves its own directory follows it and reports every store as never copied, while
+    // the copies sit where the writer put them. A reader and a writer naming different
+    // directories is the drift that made a hosted deployment's backups unfindable.
+    vi.stubEnv("ZEUS_SNAPSHOT_DIR", elsewhere);
+
+    expect(snapshotSchedulerStatus().freshness).toMatchObject({ state: "fresh" });
+  });
+
+  it("reuses a freshness reading for its window rather than re-reading per request", async () => {
+    vi.stubEnv("ZEUS_SNAPSHOT_SCHEDULER", "on");
+    startSnapshotScheduler();
+    await runDueSnapshots();
+    expect(snapshotSchedulerStatus().freshness.state).toBe("fresh");
+
+    // Every copy removed by hand, which is the only way this state arrives inside a
+    // minute: the reading costs a directory listing per store, synchronously, on an
+    // unauthenticated route anyone may poll, and it measures an age that moves in hours.
+    // Nothing a monitor asks about can change between one request and the next.
+    for (const store of [primary, account]) rmSync(onlySnapshot(store));
+
+    expect(snapshotSchedulerStatus().freshness.state).toBe("fresh");
+  });
+
   it("stays off outside a hosted deployment and says so", () => {
     vi.stubEnv("NODE_ENV", "development");
     const settings = startSnapshotScheduler();
@@ -163,6 +251,10 @@ describe("in-process snapshot scheduler", () => {
       intervalHours: null,
       lastResult: null,
       lastRunAt: null,
+      // Two stores exist and neither has ever been copied. The remembered fields above
+      // say the same "null" they say when everything is fine; only the volume can tell
+      // those two apart.
+      freshness: { state: "never", oldestAgeHours: null },
     });
   });
 

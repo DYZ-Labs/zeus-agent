@@ -22,12 +22,34 @@ import {
   listWorkArtifacts,
   listWorkRuns,
   resumeWorkRun,
+  revokeWorkAuthorization,
   runWorkPlan,
 } from "./work-plans";
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
+
+/**
+ * Read back exactly what the operational log would write. Asserting on the serialized
+ * line, not on the call, is what proves a plan's objective or an executor's message never
+ * reaches it.
+ */
+function captureEvents() {
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+  const lines = () =>
+    stderr.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.startsWith("{"));
+  return {
+    named: (name: string) =>
+      lines()
+        .map((line) => JSON.parse(line) as Record<string, string | number>)
+        .filter((event) => event.event === name),
+    text: () => lines().join("\n"),
+  };
+}
 
 function userSource(db: ReturnType<typeof openTestDb>, content = "Please research this and draft it.") {
   const conversation = createConversation(db);
@@ -970,6 +992,417 @@ describe("bounded work execution", () => {
     expect(getWorkPlan(db, detail.plan.id)?.steps.every((step) => step.status === "cancelled")).toBe(true);
     expect(activeWorkAuthorization(db, detail.plan.id)).toBeNull();
     expect(listWorkRuns(db, detail.plan.id)).toHaveLength(1);
+  });
+});
+
+describe("operational visibility of bounded work", () => {
+  it("reports a run from start to terminal state without quoting the plan", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        objective: "Draft a note to Jane Okafor about the Elm Street lease",
+        steps: [{
+          title: "Draft the note to Jane",
+          instruction: "Write to Jane Okafor at 12 Elm Street.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    const run = await runWorkPlan(db, detail.plan.id, {
+      executor: async () => ({
+        artifacts: [{
+          kind: "draft",
+          title: "Note to Jane",
+          content: "Dear Jane Okafor of 12 Elm Street, about the lease.",
+        }],
+      }),
+    });
+
+    expect(run.status).toBe("completed");
+    expect(log.named("work_run_started")).toEqual([{
+      event: "work_run_started",
+      outcome: "ok",
+      plan_id: detail.plan.id,
+      run_id: run.id,
+    }]);
+    // The same run id on both lines is what lets an operator pair them and see what is
+    // still in flight; the count and the age are what the ceilings are measured against.
+    expect(log.named("work_run_stopped")).toEqual([{
+      event: "work_run_stopped",
+      outcome: "ok",
+      reason: "completed",
+      plan_id: detail.plan.id,
+      run_id: run.id,
+      count: 1,
+      duration_ms: 0,
+    }]);
+    expect(log.text()).not.toMatch(/Jane|Elm|lease/u);
+  });
+
+  it("reports each failed attempt with the effect it failed on, never the executor's text", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Research",
+          instruction: "Read current sources.",
+          effect_kind: "web_read",
+          depends_on: [],
+        }],
+        allowed_effects: ["web_read"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    const run = await runWorkPlan(db, detail.plan.id, {
+      executor: async () => {
+        throw new WorkStepExecutionError(
+          "Search failed for Jane Okafor of 12 Elm Street",
+          { code: "search_unavailable", transient: true },
+        );
+      },
+    });
+
+    expect(run).toMatchObject({ status: "failed" });
+    const attempt = (count: number, outcome: string) => ({
+      event: "work_step_failed",
+      outcome,
+      effect: "web_read",
+      plan_id: detail.plan.id,
+      run_id: run.id,
+      count,
+    });
+    // Two retries inside the budget, then the attempt that stopped the run.
+    expect(log.named("work_step_failed")).toEqual([
+      attempt(1, "degraded"),
+      attempt(2, "degraded"),
+      attempt(3, "error"),
+    ]);
+    expect(log.named("work_run_stopped")).toEqual([{
+      event: "work_run_stopped",
+      outcome: "error",
+      reason: "failed",
+      plan_id: detail.plan.id,
+      run_id: run.id,
+      count: 3,
+      duration_ms: 0,
+    }]);
+    // The stored error message and code are an executor's own strings, so neither the
+    // sentence nor the code it chose may appear.
+    expect(log.text()).not.toMatch(/Jane|Elm|search_unavailable/u);
+  });
+
+  it("reports a run another process already holds instead of yielding silently", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Research",
+          instruction: "Read current evidence.",
+          effect_kind: "web_read",
+          depends_on: [],
+        }],
+        allowed_effects: ["web_read"],
+      }),
+    );
+    authorize(db, detail, source.id);
+
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started!: () => void;
+    const executorStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const first = runWorkPlan(db, detail.plan.id, {
+      executor: async () => {
+        started();
+        await blocked;
+        return {
+          artifacts: [{ kind: "research_notes", title: "Research", content: "One result." }],
+        };
+      },
+    });
+    await executorStarted;
+
+    const log = captureEvents();
+    const inFlight = listWorkRuns(db, detail.plan.id)[0]!;
+    await resumeWorkRun(db, inFlight.id, {
+      executor: async () => ({
+        artifacts: [{ kind: "research_notes", title: "Duplicate", content: "Duplicate." }],
+      }),
+    });
+
+    expect(log.named("work_run_lease_lost")).toEqual([{
+      event: "work_run_lease_lost",
+      outcome: "degraded",
+      reason: "already_leased",
+      plan_id: detail.plan.id,
+      run_id: inFlight.id,
+    }]);
+    // The second caller did no work, so it must not look like a second run either.
+    expect(log.named("work_run_started")).toEqual([]);
+
+    release();
+    await first;
+  });
+
+  it("reports a lease taken back from a runner that went away", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const paused = await runWorkPlan(db, detail.plan.id);
+    // What a killed process leaves behind, exactly: a run the store still believes is
+    // running, still naming the holder that died, whose lease then simply ran out.
+    db.prepare(
+      `UPDATE work_run
+       SET status = 'running', runner_token = 'runner-that-died',
+           runner_lease_until = '2029-12-31T23:59:00.000Z'
+       WHERE id = ?`,
+    ).run(paused.id);
+    const log = captureEvents();
+
+    const completed = await resumeWorkRun(db, paused.id, {
+      executor: async () => ({
+        artifacts: [{ kind: "draft", title: "Recovered", content: "Recovered result." }],
+      }),
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(log.named("work_run_lease_lost")).toEqual([{
+      event: "work_run_lease_lost",
+      outcome: "degraded",
+      reason: "expired",
+      plan_id: detail.plan.id,
+      run_id: paused.id,
+    }]);
+    // The recovered run never left the live set, so the start line belongs to the process
+    // that died; writing a second one here would leave the pair permanently open.
+    expect(log.named("work_run_started")).toEqual([]);
+  });
+
+  it("does not call an unheld lease expired", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const paused = await runWorkPlan(db, detail.plan.id);
+    // A row saying `running` with no holder at all — a legacy or hand-edited state, not
+    // something a runner leaves. There is no lease here to have been lost.
+    db.prepare("UPDATE work_run SET status = 'running' WHERE id = ?").run(paused.id);
+    const log = captureEvents();
+
+    const completed = await resumeWorkRun(db, paused.id, {
+      executor: async () => ({
+        artifacts: [{ kind: "draft", title: "Recovered", content: "Recovered result." }],
+      }),
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(log.named("work_run_lease_lost")).toEqual([]);
+  });
+
+  it("charges a cancellation to the person who chose it, not to the lease", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    const cancelled = await runWorkPlan(db, detail.plan.id, {
+      executor: async ({ run }) => {
+        cancelWorkRun(db, run.id);
+        return { artifacts: [{ kind: "draft", title: "Stale", content: "Must not persist." }] };
+      },
+    });
+
+    expect(cancelled.status).toBe("cancelled");
+    // Pressing Cancel invalidates the in-flight claim by design. Reporting that as a lost
+    // lease would charge a person's own decision to the degradation rate, and an event
+    // that fires on an ordinary outcome is the one an operator learns to ignore.
+    expect(log.named("work_run_lease_lost")).toEqual([]);
+    expect(log.named("work_run_started")).toHaveLength(1);
+    expect(log.named("work_run_stopped")).toEqual([{
+      event: "work_run_stopped",
+      outcome: "ok",
+      reason: "cancelled",
+      plan_id: detail.plan.id,
+      run_id: cancelled.id,
+      // Nothing the discarded attempt spent is charged to the run, because the
+      // transaction that would have counted it is the one the cancel invalidated.
+      count: 0,
+      duration_ms: 0,
+    }]);
+  });
+
+  it("still reports the lease when another runner really did take the run", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    const contested = await runWorkPlan(db, detail.plan.id, {
+      executor: async ({ run }) => {
+        // A second runner claims the row while this step is in flight, which is the one
+        // reason a stale claim is genuinely a lost lease.
+        db.prepare("UPDATE work_run SET runner_token = 'another-runner' WHERE id = ?")
+          .run(run.id);
+        return { artifacts: [{ kind: "draft", title: "Stale", content: "Must not persist." }] };
+      },
+    });
+
+    expect(listWorkArtifacts(db, { runId: contested.id })).toEqual([]);
+    expect(log.named("work_run_lease_lost")).toEqual([{
+      event: "work_run_lease_lost",
+      outcome: "degraded",
+      reason: "ownership_lost",
+      plan_id: detail.plan.id,
+      run_id: contested.id,
+    }]);
+  });
+
+  it("opens and closes a run exactly once, however many times it is stopped", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    // Parked at a checkpoint, then retried while no executor is available, then retried
+    // against an authorization the user has since revoked, then cancelled outright. Every
+    // one of those retries takes a lease and reaches a pause statement.
+    const parked = await runWorkPlan(db, detail.plan.id);
+    expect(parked.status).toBe("paused");
+    await resumeWorkRun(db, parked.id);
+    await resumeWorkRun(db, parked.id);
+    revokeWorkAuthorization(db, detail.plan.id);
+    await resumeWorkRun(db, parked.id);
+    expect(cancelWorkRun(db, parked.id)?.status).toBe("cancelled");
+
+    // A run that had already stopped cannot stop again. Anything else makes the obvious
+    // "started minus stopped" gauge drift negative and the whole stream untrustworthy.
+    expect(log.named("work_run_started")).toHaveLength(1);
+    expect(log.named("work_run_stopped")).toEqual([{
+      event: "work_run_stopped",
+      outcome: "degraded",
+      reason: "paused",
+      plan_id: detail.plan.id,
+      run_id: parked.id,
+      count: 0,
+      duration_ms: 0,
+    }]);
+  });
+
+  it("pairs a start with a stop across a resume", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({
+        steps: [{
+          title: "Draft",
+          instruction: "Prepare a local draft.",
+          effect_kind: "prepare_local",
+          depends_on: [],
+        }],
+        allowed_effects: ["prepare_local"],
+      }),
+    );
+    authorize(db, detail, source.id);
+    const log = captureEvents();
+
+    const parked = await runWorkPlan(db, detail.plan.id);
+    const completed = await resumeWorkRun(db, parked.id, {
+      executor: async () => ({
+        artifacts: [{ kind: "draft", title: "Recovered", content: "Recovered result." }],
+      }),
+    });
+
+    expect(completed.status).toBe("completed");
+    // Leaving the checkpoint is a second start, and completing is its stop: one run, two
+    // stretches of work, and a gauge that returns to zero.
+    expect(log.named("work_run_started")).toHaveLength(2);
+    expect(log.named("work_run_stopped").map((event) => event.reason))
+      .toEqual(["paused", "completed"]);
   });
 });
 

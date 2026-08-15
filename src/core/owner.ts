@@ -31,6 +31,51 @@ export function getAppOwner(db: Db): AppOwnerRow | null {
 }
 
 /**
+ * Which account an operational event is about, shaped to spread into `logEvent`.
+ *
+ * `src/core` takes a `Db`, never an identity, and threading an account through every
+ * signature to reach a log line would be both invasive and wrong. It is also
+ * unnecessary: a hosted deployment gives each account its own store, so the handle
+ * already *is* the identity. `logEvent({ event: "…", ...accountEvent(db) })` therefore
+ * attributes an event with no signature changes anywhere.
+ *
+ * Without it an operator reading an incident cannot tell one broken account from every
+ * account broken, which is the first question worth asking.
+ */
+export type AccountEvent = { account: string } | Record<string, never>;
+
+/**
+ * Remembered per handle, and only once an owner is actually found.
+ *
+ * The binding is written once and never rewritten — a single row that `CHECK (id = 1)`
+ * keeps singular, and `bindAppOwner`'s INSERT is the only statement in Zeus that touches
+ * the table — so a resolved answer can never go stale. A store with no owner is
+ * deliberately not cached: one claimed mid-process starts attributing its events on the
+ * very next one, rather than staying anonymous for the life of the handle because of a
+ * negative nobody remembered to invalidate.
+ */
+const accountByDb = new WeakMap<Db, string>();
+
+export function accountEvent(db: Db): AccountEvent {
+  const cached = accountByDb.get(db);
+  if (cached !== undefined) return { account: cached };
+
+  try {
+    const owner = getAppOwner(db);
+    // Local single-user mode never binds an owner; there is one person and nothing to
+    // disambiguate, so those events are simply unattributed.
+    if (!owner) return {};
+    accountByDb.set(db, owner.supabase_user_id);
+    return { account: owner.supabase_user_id };
+  } catch {
+    // A logging helper that can throw turns a diagnostic into an outage. A closed
+    // handle, or a store that has not yet reached the migration that creates this table,
+    // has no attribution to offer — never a reason to lose the event being reported.
+    return {};
+  }
+}
+
+/**
  * Bind an unclaimed store to its first authenticated identity.
  *
  * The immediate transaction serializes the read-before-insert across the web and MCP

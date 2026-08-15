@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { availableCapabilityForEffect, isConnectorEffect } from "./connectors";
 import type { Db } from "./db";
 import { now } from "./db";
+import { logEvent } from "./observability";
+import { accountEvent } from "./owner";
 import type {
   EffectKind,
   EvaluationContext,
@@ -17,6 +19,7 @@ import type {
   WorkPlan,
   WorkPlanProposal,
   WorkRun,
+  WorkRunStatus,
   WorkStep,
 } from "./schema";
 import {
@@ -791,6 +794,7 @@ export async function runWorkPlan(
     if (!created) throw new Error("Work run vanished after insertion");
     return { run: created, created: true };
   }).immediate();
+  if (selected.created) logRunStarted(db, planId, selected.run.id);
   return selected.created
     ? executeRun(db, selected.run, options.executor, false)
     : resumeWorkRun(db, selected.run.id, options);
@@ -866,6 +870,7 @@ export function cancelWorkRun(db: Db, runId: number): WorkRun | null {
     ).run(timestamp, run.work_plan_id);
     revokeWorkAuthorization(db, run.work_plan_id);
   })();
+  logRunStopped(db, runId, run.status);
   return requireWorkRun(db, runId);
 }
 
@@ -980,7 +985,20 @@ async function executeRun(
     return requireWorkRun(db, run.id);
   }
   const lease = claimWorkRun(db, run.id);
-  if (!lease) return requireWorkRun(db, run.id);
+  if (!lease) {
+    const contested = requireWorkRun(db, run.id);
+    // Yielding to a live lease is correct, and silent: without this line a run being
+    // worked by another process looks exactly like a run nobody picked up.
+    if (contested.runner_token !== null) {
+      logLeaseLost(db, contested, "already_leased");
+    }
+    return contested;
+  }
+  // An expired lease means there was a holder and its time ran out — the visible half of
+  // a runner that died without saying so. `recovered` is deliberately wider than that: it
+  // also covers a row left saying `running` with no token at all, which no live runner
+  // produces and which would charge a lease loss to a lease nobody held.
+  if (lease.recovered && run.runner_token !== null) logLeaseLost(db, run, "expired");
   if (recoverInterrupted && lease.recovered) {
     recoverInterruptedAttempt(db, requireWorkRun(db, run.id), authorization);
     run = requireWorkRun(db, run.id);
@@ -991,9 +1009,15 @@ async function executeRun(
     return requireWorkRun(db, run.id);
   }
 
+  const parked = run.status === "paused";
   if (!markRunRunning(db, run.id, detail.plan.id, lease.token)) {
     return requireWorkRun(db, run.id);
   }
+  // A run leaving its checkpoint is the second and last way a run starts. A recovered
+  // runner re-marking a row that already said `running` is not one: that run never left
+  // the live set, and the start line the process that died wrote is still the open half
+  // of the pair.
+  if (parked) logRunStarted(db, detail.plan.id, run.id);
   while (true) {
     run = requireWorkRun(db, run.id);
     if (run.status === "cancelled" || run.status === "completed" || run.status === "failed") {
@@ -1268,6 +1292,22 @@ async function executeRun(
         );
         return "failed" as const;
       })();
+      if (outcome === "retry" || outcome === "failed") {
+        // The effect kind is Zeus's own fixed vocabulary, and it is the difference
+        // between "the model is struggling" and "every run dies at the calendar". The
+        // step's stored error code is not logged: an executor supplies that string.
+        logEvent({
+          event: "work_step_failed",
+          // A step still inside its retry budget is a degradation; the attempt that
+          // exhausts it is the failure that stopped the run.
+          outcome: outcome === "retry" ? "degraded" : "error",
+          effect: step.effect_kind,
+          plan_id: detail.plan.id,
+          run_id: run.id,
+          count: attempt,
+          ...accountEvent(db),
+        });
+      }
       if (outcome === "retry") continue;
       return requireWorkRun(db, run.id);
     }
@@ -1642,6 +1682,7 @@ function closeSupersededRun(db: Db, run: WorkRun): void {
        WHERE work_plan_id = ? AND status = 'running'`,
     ).run(run.work_plan_id);
   })();
+  logRunStopped(db, run.id, run.status);
 }
 
 function requireValidAuthorization(db: Db, plan: WorkPlan): WorkAuthorization {
@@ -1859,6 +1900,17 @@ function postExecutionBoundaryIssue(
 ): { code: string; message: string } | null {
   const run = requireWorkRun(db, runId);
   if (!executionClaimIsCurrent(db, runId, stepId, receiptId, runnerToken)) {
+    // The claim goes stale for several reasons and only one of them is a lease loss: a
+    // different runner now holds the token. Pressing Cancel and replacing an
+    // authorization also invalidate the claim, and both already announce themselves as
+    // `work_run_stopped` — reporting them a second time as a degradation would charge a
+    // person's own decision to the failure rate, and an event that fires on an ordinary
+    // outcome is the one an operator learns to ignore.
+    if (run.runner_token !== null && run.runner_token !== runnerToken) {
+      // Work that finished and is about to be discarded, because another runner took the
+      // run while this step was in flight. The most expensive way for a run to stop.
+      logLeaseLost(db, run, "ownership_lost");
+    }
     return { code: "execution_ownership_lost", message: "The work-run lease is no longer active" };
   }
   if (Date.parse(run.deadline_at) <= Date.now()) {
@@ -2073,6 +2125,7 @@ function pauseStepAndRun(
   code: string,
   message: string | null,
 ): void {
+  const before = statusBeforeTransition(db, runId);
   const normalizedCode = normalizeCode(code);
   const normalizedMessage = message === null ? null : safeErrorMessage(message);
   const timestamp = now();
@@ -2089,6 +2142,7 @@ function pauseStepAndRun(
   db.prepare<[string, number]>(
     "UPDATE work_plan SET status = 'paused', updated_at = ? WHERE id = ?",
   ).run(timestamp, planId);
+  logRunStopped(db, runId, before);
 }
 
 /**
@@ -2131,6 +2185,7 @@ function pauseRun(db: Db, runId: number, code: string, message: string): void {
        WHERE id = ? AND status NOT IN ('completed','cancelled')`,
     ).run(timestamp, run.work_plan_id);
   })();
+  logRunStopped(db, runId, run.status);
 }
 
 function failStepAndRun(
@@ -2141,6 +2196,7 @@ function failStepAndRun(
   code: string,
   message: string,
 ): void {
+  const before = statusBeforeTransition(db, runId);
   db.transaction(() => {
     const timestamp = now();
     const normalizedCode = normalizeCode(code);
@@ -2160,6 +2216,7 @@ function failStepAndRun(
       "UPDATE work_plan SET status = 'failed', updated_at = ? WHERE id = ?",
     ).run(timestamp, planId);
   })();
+  logRunStopped(db, runId, before);
 }
 
 function failRun(
@@ -2169,6 +2226,7 @@ function failRun(
   code: string,
   message: string,
 ): void {
+  const before = statusBeforeTransition(db, runId);
   const timestamp = now();
   db.transaction(() => {
     db.prepare<[string, string, string, string, number]>(
@@ -2181,9 +2239,11 @@ function failRun(
       "UPDATE work_plan SET status = 'failed', updated_at = ? WHERE id = ?",
     ).run(timestamp, planId);
   })();
+  logRunStopped(db, runId, before);
 }
 
 function completeRun(db: Db, runId: number, planId: number): void {
+  const before = statusBeforeTransition(db, runId);
   const timestamp = now();
   db.transaction(() => {
     db.prepare<[string, string, number]>(
@@ -2197,6 +2257,117 @@ function completeRun(db: Db, runId: number, planId: number): void {
        SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?`,
     ).run(timestamp, timestamp, planId);
   })();
+  logRunStopped(db, runId, before);
+}
+
+/**
+ * The two halves of a run's life, reported from the transitions that make it.
+ *
+ * A run owes the person an answer from the moment it is queued until it stops, and both
+ * lines describe that one set: `work_run_started` when a run joins it — created, or
+ * resumed out of a checkpoint — and `work_run_stopped` when a run leaves it. Kept exactly
+ * paired on purpose, because the first thing an operator does with them is subtract, and a
+ * gauge that drifts negative does not merely mislead about work runs, it teaches its
+ * reader to distrust every number in the stream.
+ *
+ * Without them, "did that run die or is it still going?" has no answer outside the store,
+ * and a store that has stopped running work at all looks exactly like one nobody asked to
+ * do any.
+ */
+function logRunStarted(db: Db, planId: number, runId: number): void {
+  logEvent({
+    event: "work_run_started",
+    outcome: "ok",
+    plan_id: planId,
+    run_id: runId,
+    ...accountEvent(db),
+  });
+}
+
+/**
+ * `before` is the status the run held when the caller began its transition, and a run that
+ * had already stopped reports nothing, because nothing stopped. Cancelling a run parked at
+ * a checkpoint, a guarded UPDATE that did not apply because the person cancelled a moment
+ * earlier, and every retried resume of a run whose authorization is gone each restate a
+ * stop already reported — and each would be a stop with no start left to close.
+ *
+ * A bounded run can hold a request for fifteen minutes, spend twenty model calls, and end
+ * in any of four states, so the state it ended in is the payload. It is Zeus's own closed
+ * vocabulary and safe to name; the `error_code` stored beside it deliberately is not: a
+ * safe executor supplies its own codes, and `normalizeCode` would render a sentence about
+ * the user as one long snake_case token that the log's shapes cannot tell apart from a
+ * code Zeus wrote.
+ */
+function logRunStopped(db: Db, runId: number, before: WorkRunStatus | null): void {
+  if (before !== "queued" && before !== "running") return;
+  try {
+    const run = getWorkRun(db, runId);
+    if (!run || run.status === "queued" || run.status === "running") return;
+    logEvent({
+      event: "work_run_stopped",
+      // Cancellation is the user's decision and completion is the point of the run;
+      // neither is a fault. A pause is work left undone, which an operator should see.
+      outcome: run.status === "failed" ? "error" : run.status === "paused" ? "degraded" : "ok",
+      reason: run.status,
+      plan_id: run.work_plan_id,
+      run_id: run.id,
+      count: run.model_call_count + run.tool_call_count,
+      duration_ms: runAgeMs(run),
+      ...accountEvent(db),
+    });
+  } catch {
+    // Most callers are mid-transaction — several inside an outer one that still owes the
+    // store a receipt failure, a pause, and a revoked authorization. A throw from this
+    // read would roll all of that back and surface as a failed turn, so a diagnostic
+    // would have caused the incident it exists to describe. Losing the line is cheaper.
+  }
+}
+
+/**
+ * The run's status as it stands before a caller changes it, for transitions that do not
+ * already hold the row. Best effort for the same reason `logRunStopped` is: reading a
+ * value for a log line must never be able to fail the write it accompanies, and an
+ * unknown prior state is reported as no stop rather than as a possibly duplicate one.
+ */
+function statusBeforeTransition(db: Db, runId: number): WorkRunStatus | null {
+  try {
+    return getWorkRun(db, runId)?.status ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * How long the run had been alive when it stopped, pauses included — the same clock
+ * `deadline_at` is set against, so a run that died at its ceiling and a run that died in
+ * two seconds stay distinguishable.
+ */
+function runAgeMs(run: WorkRun): number | undefined {
+  const startedAt = Date.parse(run.started_at);
+  const stoppedAt = Date.parse(run.completed_at ?? run.updated_at);
+  return Number.isFinite(startedAt) && Number.isFinite(stoppedAt)
+    ? stoppedAt - startedAt
+    : undefined;
+}
+
+/**
+ * The runner lease changing hands, which is otherwise entirely invisible: a run whose
+ * work is being redone by two processes, and a run whose runner died mid-step, both look
+ * from the outside like a run that is simply slow.
+ */
+function logLeaseLost(
+  db: Db,
+  run: WorkRun,
+  reason: "already_leased" | "expired" | "ownership_lost",
+): void {
+  logEvent({
+    event: "work_run_lease_lost",
+    outcome: "degraded",
+    reason,
+    plan_id: run.work_plan_id,
+    run_id: run.id,
+    ...accountEvent(db),
+  });
 }
 
 function normalizeExecutionResult(result: SafeStepExecutionResult): Required<

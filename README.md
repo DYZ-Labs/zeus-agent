@@ -349,7 +349,31 @@ sentence the user wrote. A value that does not fit its field is replaced with `i
 rather than truncated, so a bad call site is visible instead of leaking half a sentence.
 
 Account ids in events are Supabase UUIDs, which are pseudonymous by design; emails and
-display names are never logged.
+display names are never logged. A route is reported as its **template** — `/entity/[slug]`,
+never `/entity/jane-okafor` — because a slug is `slugify(entity.name)`, which is to say a
+person's name out of the store. The template comes from a closed list of this app's routes,
+and a path that matches none of them is reported as `/unmatched` rather than passed through,
+so the guarantee holds by construction rather than by pattern-matching.
+
+#### What an incident looks like
+
+The events worth knowing by name, because they answer the questions an incident actually
+raises:
+
+| Question | Events |
+| --- | --- |
+| Is one account broken, or everyone? | Every event carries `account` where the store is bound. `store_opened` / `store_open_failed` name the account whose memory would not load. |
+| Did the schema change land? | `migration_started` / `migration_applied` / `migration_failed`. The primary store migrates during the deploy's health check; each account store migrates on its owner's next request, so these arrive over hours. |
+| Why did a migration stop? | `migration_failed`'s `reason`: `reservation_failed` (another writer held the lock — the likeliest one), `ledger_mismatch` (**the deploy went backwards**; roll the code forward, never touch the store), `backup_space`, `dangling_references`, and four more. |
+| Is auth working? | `auth_unavailable` when Supabase cannot be reached — every user is locked out and this is the only thing that says so. `owner_access_denied` with `reason: wrong_account` means a store was reached by an identity it is not bound to. |
+| Are backups running? | `snapshot_created` / `snapshot_failed`, and `snapshot_replicated` / `snapshot_replication_failed` for the copy that leaves the volume. |
+| Is work running? | `work_run_started` / `work_run_stopped` pair exactly, so runs-in-flight is their difference. `work_run_lease_lost` means a lease was taken or expired — never an ordinary cancellation. |
+| What kind of failure was that? | `error_code` carries the machine code behind the class, so `SQLITE_FULL` (free the volume), `SQLITE_CORRUPT` (restore), `SQLITE_BUSY` (contention) and `SQLITE_READONLY` (remount) stop arriving as one indistinguishable line. |
+
+Two deliberate silences. A signed-out visitor is the ordinary state of the web and is not
+logged; an alert that fires on it gets muted, which costs more than it gives. And repeated
+refusals of the same kind are windowed rather than emitted per request, because
+`getOwnerAccess` runs more than once per page render.
 
 #### Something has to read it
 
