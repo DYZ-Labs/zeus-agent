@@ -199,8 +199,9 @@ export function calendarActionWorkPlanProposal(
       {
         title: action,
         instruction:
-          `${action} exactly as resolved, but only if the requested time was found to be ` +
-          "free. A collision, or a calendar that could not be read, stops here.",
+          `${action} exactly as resolved. A free destination may follow the user's standing ` +
+          "setting. An occupied destination must prepare the exact change and pause for one " +
+          "explicit confirmation. An ambiguous target or unverifiable read stops here.",
         effect_kind: writeEffect,
         depends_on: [2],
       },
@@ -208,7 +209,8 @@ export function calendarActionWorkPlanProposal(
     allowed_effects: ["external_read", "prepare_local", writeEffect],
     completion_criteria: [
       "The calendar was read, the requested time was checked against it, and the change was " +
-        "made only if that check came back clear.",
+        "either made under the applicable authorization or left pending as one exact, " +
+        "conflict-disclosing request for the user to confirm.",
     ],
     limits: {
       max_model_tool_calls: 10,

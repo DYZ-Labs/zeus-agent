@@ -20,11 +20,17 @@ import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
   confirmEffect,
+  declineEffect,
   effectsForRun,
   executeConfirmedEffect,
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
-import { cacheCalendarEvents, cachedEvents, parseCalendarEvents } from "./calendar-sync";
+import {
+  cacheCalendarEvents,
+  cachedEvents,
+  parseCalendarEvents,
+  readCalendarCoverage,
+} from "./calendar-sync";
 import { createSafeWorkExecutor, payloadSchemaMismatch } from "./work-execution";
 import {
   authorizeWorkPlan,
@@ -73,6 +79,15 @@ server.registerTool(
     annotations: { readOnlyHint: true } },
   async (args) => {
     if (log) appendFileSync(log, JSON.stringify({ tool: "list_events", args }) + "\\n");
+    if (process.env.FAKE_CALENDAR_RESULT_MODE === "error") {
+      return { isError: true, content: [{ type: "text", text: "calendar_read_failed" }] };
+    }
+    if (process.env.FAKE_CALENDAR_RESULT_MODE === "malformed") {
+      return { content: [{ type: "text", text: JSON.stringify({ not_events: [] }) }] };
+    }
+    if (process.env.FAKE_CALENDAR_RESULT_MODE === "malformed_event") {
+      return { content: [{ type: "text", text: JSON.stringify({ events: [{ summary: "No id" }] }) }] };
+    }
     const events = process.env.FAKE_CALENDAR_EVENTS
       ? JSON.parse(process.env.FAKE_CALENDAR_EVENTS)
       : DEFAULT_EVENTS;
@@ -137,12 +152,14 @@ beforeEach(() => {
   callLog = join(directory, "calls.log");
   process.env.FAKE_CALENDAR_CALL_LOG = callLog;
   process.env.FAKE_CALENDAR_EVENTS = "";
+  process.env.FAKE_CALENDAR_RESULT_MODE = "";
 });
 
 afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
   delete process.env.FAKE_CALENDAR_CALL_LOG;
   delete process.env.FAKE_CALENDAR_EVENTS;
+  delete process.env.FAKE_CALENDAR_RESULT_MODE;
 });
 
 function recordedCalls(): Array<Record<string, unknown>> {
@@ -162,7 +179,11 @@ async function connectCalendar(): Promise<void> {
     command: process.execPath,
     args: [join(directory, "calendar-server.mjs")],
     cwd: process.cwd(),
-    envVarNames: ["FAKE_CALENDAR_CALL_LOG", "FAKE_CALENDAR_EVENTS"],
+    envVarNames: [
+      "FAKE_CALENDAR_CALL_LOG",
+      "FAKE_CALENDAR_EVENTS",
+      "FAKE_CALENDAR_RESULT_MODE",
+    ],
     sourceMessageId: userMessageId,
   });
   const { tools } = await verifyConnector(db, connector.id);
@@ -288,34 +309,93 @@ describe("a calendar change reads first, checks, then acts", () => {
     expect(receipts.filter((receipt) => receipt.tool_name === "connector_call")).toHaveLength(2);
   }, 30_000);
 
-  it("refuses to double-book, and says what it collided with", async () => {
-    // The requested slot is occupied. This is the case that used to reach the user as a
-    // confirmation prompt and now must never reach the connector at all.
+  it("prepares one exact override when a move's destination is occupied", async () => {
     process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      {
+        id: "evt-dinner",
+        summary: "Dinner",
+        start: "2026-08-20T17:00:00Z",
+        end: "2026-08-20T18:00:00Z",
+      },
       {
         id: "evt-taken",
         summary: "Design review",
-        start: "2026-08-20T18:00:00Z",
-        end: "2026-08-20T19:00:00Z",
+        start: "2026-08-20T19:30:00Z",
+        end: "2026-08-20T20:30:00Z",
       },
     ]);
     await connectCalendar();
 
-    const { planId, run } = await realRun();
+    const { planId, run } = await realRun({
+      request: {
+        kind: "reschedule",
+        reference: { titleText: "dinner", startsAt: null, dateLocal: null },
+        startsAt: "2026-08-20T19:30:00.000Z",
+        endsAt: "2026-08-20T20:30:00.000Z",
+        timezone: "UTC",
+      },
+    });
 
     expect(run.status).toBe("paused");
-    expect(run.error_code).toBe("calendar_conflict");
-    // No request was ever prepared, so `proposed_effect` keeps meaning "Zeus meant to send
-    // this". Nothing but the read left the machine.
-    expect(effectsForRun(db, run.id)).toHaveLength(0);
+    expect(run.error_code).toBe("effect_confirmation_required");
+    const effect = effectsForRun(db, run.id)[0];
+    expect(effect).toMatchObject({
+      status: "pending_confirmation",
+      confirmation_kind: "user_message",
+      payload: {
+        event_id: "evt-dinner",
+        start: "2026-08-20T19:30:00.000Z",
+        end: "2026-08-20T20:30:00.000Z",
+      },
+    });
+    const check = JSON.parse(effect!.conflict_check_json!) as {
+      status: string;
+      considered_events: number;
+      conflicts: Array<{ external_id: string }>;
+      coverage: unknown;
+    };
+    expect(check).toMatchObject({ status: "conflict", considered_events: 2 });
+    expect(check.coverage).toBeTruthy();
+    expect(check.conflicts.map((conflict) => conflict.external_id)).toEqual(["evt-taken"]);
+    // The read is the only connector call before confirmation.
     expect(recordedCalls().map((call) => call.tool)).toEqual(["list_events"]);
 
     const artifacts = listWorkArtifacts(db, { planId });
-    const refusal = artifacts.find((artifact) => artifact.content.includes("calendar_conflict"));
-    expect(refusal).toBeDefined();
-    expect(refusal?.content).toContain("Design review");
-    // And it offers somewhere else to put it rather than only saying no.
-    expect(refusal?.content).toContain("alternatives");
+    const pending = artifacts.find((artifact) => artifact.content.includes("calendar_conflict"));
+    expect(pending?.content).toContain("Design review");
+    expect(pending?.content).toContain("alternatives");
+
+    const confirmation = appendMessage(
+      db,
+      conversationId,
+      "user",
+      `I confirm external request ${effect!.payload_hash}.`,
+      { origin: "user_action", recallState: "blocked" },
+    ).id;
+    confirmEffect(db, effect!.id, effect!.payload_hash, confirmation);
+    expect((await executeConfirmedEffect(db, effect!.id)).status).toBe("executed");
+    const resumed = await resumeWorkRun(db, run.id, { executor: createSafeWorkExecutor(db) });
+    expect(resumed.status).toBe("completed");
+    expect(recordedCalls().map((call) => call.tool)).toEqual(["list_events", "update_event"]);
+  }, 30_000);
+
+  it("declining an occupied destination sends nothing", async () => {
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-taken", summary: "Design review", start: "2026-08-20T18:00:00Z", end: "2026-08-20T19:00:00Z" },
+    ]);
+    await connectCalendar();
+
+    const { run } = await realRun();
+    const effect = effectsForRun(db, run.id)[0];
+    if (!effect) throw new Error("no pending conflict effect");
+    const decline = appendMessage(db, conversationId, "user", "Don't add it.", {
+      origin: "user_action",
+      recallState: "blocked",
+    }).id;
+    declineEffect(db, effect.id, decline, "user_declined");
+
+    expect(effectsForRun(db, run.id)[0]?.status).toBe("declined");
+    expect(recordedCalls().map((call) => call.tool)).toEqual(["list_events"]);
   }, 30_000);
 
   it("will not clear a slot against a calendar it could not read", async () => {
@@ -327,6 +407,23 @@ describe("a calendar change reads first, checks, then acts", () => {
     expect(effectsForRun(db, run.id)).toHaveLength(0);
     expect(recordedCalls().filter((call) => call.tool === "create_event")).toEqual([]);
   }, 30_000);
+
+  it.each(["error", "malformed", "malformed_event"])(
+    "does not create read coverage for a %s Calendar response",
+    async (mode) => {
+      await connectCalendar();
+      process.env.FAKE_CALENDAR_RESULT_MODE = mode;
+
+      const { run } = await realRun();
+
+      expect(run.status).toBe("paused");
+      expect(run.error_code).toBe("calendar_unverifiable");
+      expect(readCalendarCoverage(db)).toBeNull();
+      expect(effectsForRun(db, run.id)).toHaveLength(0);
+      expect(recordedCalls().filter((call) => call.tool !== "list_events")).toEqual([]);
+    },
+    30_000,
+  );
 
   it("falls back to asking when the standing setting is switched off", async () => {
     // A calendar with something on it, but not at the requested time.
@@ -374,13 +471,19 @@ describe("a calendar change reads first, checks, then acts", () => {
     expect(listWorkArtifacts(db, { planId }).length).toBeGreaterThan(0);
   }, 30_000);
 
-  it("moves an event and records how to put it back", async () => {
+  it("moves an event away from an existing conflict when the destination is free", async () => {
     process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
       {
         id: "evt-review",
         summary: "Design review",
         start: "2026-08-20T15:00:00Z",
         end: "2026-08-20T16:00:00Z",
+      },
+      {
+        id: "evt-overlap",
+        summary: "Client call",
+        start: "2026-08-20T15:30:00Z",
+        end: "2026-08-20T16:30:00Z",
       },
     ]);
     await connectCalendar();
@@ -673,7 +776,6 @@ describe("external data stays outside memory", () => {
       events: [
         { id: "evt-a", summary: "Flight", start: { dateTime: "2026-08-20T18:40:00Z" } },
         { event_id: "evt-b", title: "Dinner", starts_at: "2026-08-20T18:30:00Z", where: "Lisbon" },
-        { summary: "no id, dropped" },
       ],
     });
 
@@ -693,6 +795,9 @@ describe("external data stays outside memory", () => {
         location: "Lisbon",
       },
     ]);
+    expect(() => parseCalendarEvents({ events: [{ summary: "no id" }] })).toThrow(
+      /without an id/u,
+    );
   });
 
   it("never lets a cached external signal become evidence", async () => {

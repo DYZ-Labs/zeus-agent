@@ -569,6 +569,13 @@ const VERB: Record<CalendarOutcome["kind"], string> = {
   read: "Read your calendar",
 };
 
+const NOT_DONE: Record<CalendarOutcome["kind"], string> = {
+  create: "Not added",
+  reschedule: "Not moved",
+  cancel: "Not cancelled",
+  read: "Not read",
+};
+
 /**
  * What Zeus did to the calendar, or why it did not.
  *
@@ -632,7 +639,7 @@ function CalendarActionCard({
       >
         <p className="text-[0.85rem] leading-6">
           {decided === "executed"
-            ? "Done. It is on your calendar."
+            ? `Done. ${pending?.previewText ?? VERB[outcome.kind]}.`
             : decided === "reverted"
               ? "Undone."
               : "Nothing was sent."}
@@ -689,7 +696,7 @@ function CalendarActionCard({
       ) : outcome.status === "blocked_by_conflict" ? (
         <>
           <p className="text-[0.85rem] font-medium leading-6">
-            Not added — that time is taken.
+            {NOT_DONE[outcome.kind]} — that destination was occupied.
           </p>
           <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
             {outcome.conflicts.map((conflict) => (
@@ -708,7 +715,7 @@ function CalendarActionCard({
                   <button
                     key={slot.startsAt}
                     type="button"
-                    onClick={() => onReply(`Move it to ${localLabel(slot.startsAt)}.`)}
+                    onClick={() => onReply(alternativeReply(outcome.kind, slot.startsAt))}
                     className="rounded-md border px-2.5 py-1 text-[0.74rem]"
                     style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
                   >
@@ -744,8 +751,8 @@ function CalendarActionCard({
         <>
           <p className="text-[0.85rem] leading-6">
             {outcome.coverage?.eventCount === 0
-              ? "Nothing changed — the calendar Zeus read has nothing on it at all."
-              : "Nothing changed — Zeus could not find that on the calendar it read."}
+              ? "Nothing changed — Zeus found no events in the time window it checked."
+              : "Nothing changed — Zeus could not match that in the time window it checked."}
           </p>
           {outcome.nearMisses.length > 0 && (
             <>
@@ -789,7 +796,11 @@ function CalendarActionCard({
         </p>
       ) : outcome.status === "unverifiable" ? (
         <p className="text-[0.85rem] leading-6">
-          {outcome.reason === "no_read_capability"
+          {outcome.reason === "reconnect_required"
+            ? "Nothing changed. Google Calendar needs to be reconnected before Zeus can check or act."
+            : outcome.reason === "connector_unavailable"
+              ? "Nothing changed. The connected calendar is unavailable, so Zeus could not check or act. Review it in Settings under Connections."
+              : outcome.reason === "no_read_capability"
             ? "Nothing changed. Zeus cannot read your calendar with the permissions it has, so it could not check and did not act."
             : outcome.reason === "stale_coverage"
               ? "Nothing changed. Zeus last looked at your calendar too long ago to act on it. Ask again and it will read it fresh."
@@ -805,10 +816,58 @@ function CalendarActionCard({
         </p>
       ) : outcome.status === "awaiting_confirmation" && pending ? (
         <>
-          <p className="text-[0.85rem] font-medium leading-6">{pending.previewText}</p>
-          <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-            Nothing has been sent yet.
-          </p>
+          {outcome.reason === "calendar_conflict" ? (
+            <>
+              <p className="text-[0.85rem] font-medium leading-6">
+                {NOT_DONE[outcome.kind]} yet — the destination overlaps:
+              </p>
+              <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
+                {outcome.conflicts.map((conflict) => (
+                  <li key={`${conflict.startsAt}-${conflict.title ?? ""}`}>
+                    {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt)}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-3 text-[0.8rem] leading-5">{pending.previewText}</p>
+              <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+                Confirm to make this exact change despite the overlap. Nothing changed yet.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-[0.85rem] font-medium leading-6">{pending.previewText}</p>
+              <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+                Nothing has been sent yet.
+              </p>
+            </>
+          )}
+          <pre
+            className="mt-3 overflow-x-auto rounded-md border px-2.5 py-2 font-mono text-[0.66rem] leading-5"
+            style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+            aria-label="Exact Google Calendar request"
+          >
+            {JSON.stringify(pending.payload, null, 2)}
+          </pre>
+          {outcome.reason === "calendar_conflict" && outcome.alternatives.length > 0 && (
+            <>
+              <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+                Free nearby:
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                {outcome.alternatives.map((slot) => (
+                  <button
+                    key={slot.startsAt}
+                    type="button"
+                    onClick={() => onReply(alternativeReply(outcome.kind, slot.startsAt))}
+                    className="rounded-md border px-2.5 py-1 text-[0.74rem]"
+                    style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
+                  >
+                    {timeRange(slot.startsAt, slot.endsAt)}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
             <button
               type="button"
@@ -852,6 +911,12 @@ function localLabel(value: string): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function alternativeReply(kind: CalendarOutcome["kind"], startsAt: string): string {
+  return kind === "create"
+    ? `Add it at ${localLabel(startsAt)}.`
+    : `Move it to ${localLabel(startsAt)}.`;
 }
 
 function timeRange(startsAt: string, endsAt: string | null): string {

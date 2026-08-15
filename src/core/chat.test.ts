@@ -380,6 +380,38 @@ describe("reporting what happened to the calendar", () => {
     expect(outcome).toMatchObject({ status: "done", reason: null });
   });
 
+  it("renders a new conflict as one pending exact confirmation", () => {
+    const outcome = calendarOutcomeFor(
+      request,
+      runWith("paused", "effect_confirmation_required"),
+      artifactWith({
+        reason: "calendar_conflict",
+        considered_events: 2,
+        coverage: { from: "a", to: "b", fetchedAt: "c", eventCount: 2 },
+        conflicts: [
+          {
+            external_id: "review",
+            title: "Design review",
+            starts_at: "2026-08-15T11:00:00.000Z",
+            ends_at: "2026-08-15T12:00:00.000Z",
+          },
+        ],
+        alternatives: [
+          { startsAt: "2026-08-15T12:30:00.000Z", endsAt: "2026-08-15T13:30:00.000Z" },
+        ],
+      }),
+      null,
+    );
+
+    expect(outcome).toMatchObject({
+      status: "awaiting_confirmation",
+      reason: "calendar_conflict",
+      consideredEvents: 2,
+      conflicts: [{ title: "Design review" }],
+      alternatives: [{ startsAt: "2026-08-15T12:30:00.000Z" }],
+    });
+  });
+
   it("carries what Zeus saw instead, so the reply can ask rather than deny", () => {
     const outcome = calendarOutcomeFor(
       request,

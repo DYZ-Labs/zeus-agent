@@ -7,6 +7,7 @@ import {
 import type { CalendarRequest } from "./calendar-actions";
 import {
   classifyCalendarIntent,
+  isCalendarCapabilityQuestion,
   mayBeCalendarRequest,
   refusalIsSpoken,
   resolveCalendarRequest,
@@ -81,7 +82,7 @@ The final user input always begins with a <capabilities> block, and may then car
 
 Never state what is or is not on the user's calendar unless a <calendar_result> or <work_result> block in this turn supplies it. Zeus has no standing knowledge of their calendar and cannot recall it from memory. If nothing in this turn read the calendar, say plainly that you did not look, and offer to.
 
-What actually happened is never something to infer: only the supplied result or receipt says so. Never claim anything was sent, scheduled, moved, cancelled, purchased, reminded, coordinated, or changed outside this conversation unless the supplied data says it completed. If a request is still waiting for the user's confirmation, say plainly that nothing has happened yet and what confirming it would do. A <calendar_result> reports one status. For blocked_by_conflict, name what it collided with and any alternative times offered, and never describe the change as made. For ambiguous_target or target_not_found, name the events Zeus actually saw, ask one question that would settle it, and never assert that the event does not exist — a calendar Zeus could not match is not a calendar without that event on it. For unverifiable, say Zeus did not check and did not act. For needs_clarification, say what Zeus could not work out and ask for exactly that. For no_connector or read_only, say what is missing and where the user changes it.
+What actually happened is never something to infer: only the supplied result or receipt says so. Never claim anything was sent, scheduled, moved, cancelled, purchased, reminded, coordinated, or changed outside this conversation unless the supplied data says it completed. If a request is still waiting for the user's confirmation, say plainly that nothing has happened yet and what confirming it would do. A <calendar_result> reports one status. For awaiting_confirmation with reason calendar_conflict, use action-specific language such as “not moved yet,” name the collision, explain that confirming will make the exact change despite it, and offer any free alternatives. For blocked_by_conflict, preserve the same cautious wording for older stored results and never describe the change as made. For ambiguous_target or target_not_found, name the events Zeus actually saw, ask one question that would settle it, and never assert that the event does not exist — a calendar Zeus could not match is not a calendar without that event on it. For unverifiable, say Zeus did not check and did not act. For needs_clarification, say what Zeus could not work out and ask for exactly that. For no_connector or read_only, say what is missing and where the user changes it.
 
 A <work_result> block comes from an explicitly authorized bounded work plan and contains local artifacts, any external requests awaiting confirmation, and run status. Use it to answer the request, preserve its source citations, and state clearly if the run paused or failed. If it reports external_text_withheld, some third-party text was held back for safety; say so rather than guessing what it said.
 
@@ -359,7 +360,15 @@ function missingCalendarCapability(
 ): { status: CalendarOutcome["status"]; reason: string } | null {
   const state = calendarCapabilityState(db);
   if (!state.connected) return { status: "no_connector", reason: "not_connected" };
-  if (!state.canRead) return { status: "unverifiable", reason: "no_read_capability" };
+  if (!state.canRead) {
+    if (state.unusableReason === "reconnect_required") {
+      return { status: "unverifiable", reason: "reconnect_required" };
+    }
+    if (state.unusableReason !== null || state.unusableStatus !== null) {
+      return { status: "unverifiable", reason: "connector_unavailable" };
+    }
+    return { status: "unverifiable", reason: "no_read_capability" };
+  }
   if (request.kind === "read") return null;
   const canWrite = request.kind === "create" ? state.canCreate : state.canUpdate;
   return canWrite ? null : { status: "read_only", reason: "no_write_capability" };
@@ -418,6 +427,10 @@ async function resolveCalendarWork(
   priorTurns: readonly Message[],
   context: EvaluationContext,
 ): Promise<CalendarResolution | null> {
+  // Connection and permission questions are answered from the live capability block. Opening
+  // the calendar would spend a connector call and could turn "are you connected?" into an
+  // accidental claim about what is on it.
+  if (isCalendarCapabilityQuestion(sourceMessage.content)) return null;
   if (!mayBeCalendarRequest(sourceMessage.content)) return null;
   const intent = await classifyCalendarIntent(db, {
     message: sourceMessage.content,
@@ -511,6 +524,8 @@ export function calendarOutcomeFor(
       return outcome;
     case "effect_confirmation_required":
       outcome.status = "awaiting_confirmation";
+      outcome.conflicts = readConflicts(detail);
+      outcome.alternatives = readAlternatives(detail);
       return outcome;
     case "effect_not_available":
     case "capability_unavailable":

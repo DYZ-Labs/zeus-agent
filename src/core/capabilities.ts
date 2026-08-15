@@ -29,6 +29,8 @@ export type CalendarCapabilityState = {
   connectorLabel: string | null;
   /** Set only when a connector exists but cannot serve a call, so Zeus can say which. */
   unusableStatus: ConnectorStatus | null;
+  /** A code-owned reason such as reconnect_required; never remote or user-authored text. */
+  unusableReason: string | null;
   directExecution: boolean;
   remainingToday: number;
   lastReadAt: string | null;
@@ -45,10 +47,21 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
   const bound = usable
     ? null
     : listConnectors(db).find((connector) =>
+        connector.provider === "google_calendar" ||
         connector.capabilities.some((capability) =>
           (CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
         ),
       ) ?? null;
+  const connector = usable?.connector ?? bound;
+  const unusableReason = usable || !bound
+    ? null
+    : bound.last_error_code ?? (
+        bound.status === "ready"
+          ? bound.enabled === 0
+            ? "disabled"
+            : "no_enabled_capability"
+          : bound.status
+      );
 
   const allowance = directExecutionAllowance(db);
   return {
@@ -56,8 +69,9 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
     canRead: read !== null,
     canCreate: create !== null,
     canUpdate: update !== null,
-    connectorLabel: usable?.connector.label ?? bound?.label ?? null,
+    connectorLabel: connector?.label ?? null,
     unusableStatus: usable ? null : (bound?.status ?? null),
+    unusableReason,
     directExecution: allowance.reason !== "disabled",
     remainingToday: Math.max(0, allowance.limit - allowance.usedToday),
     lastReadAt: readCalendarCoverage(db)?.fetchedAt ?? null,
@@ -92,10 +106,25 @@ function calendarLines(state: CalendarCapabilityState): string[] {
     ];
   }
   if (!state.canRead && !state.canCreate && !state.canUpdate) {
-    const status = state.unusableStatus ? connectorStatusLabel(state.unusableStatus) : "unavailable";
+    const reconnect = state.unusableReason === "reconnect_required";
+    const disabled = state.unusableReason === "disabled";
+    const status = reconnect
+      ? "Reconnect required"
+      : disabled
+        ? "Disabled"
+        : state.unusableStatus
+          ? connectorStatusLabel(state.unusableStatus)
+          : "unavailable";
+    const action = reconnect
+      ? "reconnected"
+      : disabled
+        ? "enabled"
+        : state.unusableReason === "no_enabled_capability"
+          ? "given Calendar access"
+          : "reconnected or verified";
     return [
       `Calendar: ${name} is connected but cannot be used right now (${status}). Zeus cannot ` +
-        "read or change it until it is reconnected in Settings, under Connections.",
+        `read or change it until it is ${action} in Settings, under Connections.`,
     ];
   }
   const lines: string[] = [];

@@ -140,6 +140,19 @@ async function turn(input: string, db: Db = openTestDb()) {
 }
 
 describe("a recognized calendar request is never silent", () => {
+  it("answers a connection question from live capability state without reading events", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+
+    const { result, sentToModel } = await turn("Is Google Calendar connected?", db);
+
+    expect(result.calendar).toBeNull();
+    expect(sentToModel).toContain("<capabilities>");
+    expect(sentToModel).toContain("connected for reading only");
+    expect(mocks.classifyCalendarIntent).not.toHaveBeenCalled();
+    expect(mocks.generateWorkPlanProposal).not.toHaveBeenCalled();
+  });
+
   it("says nothing is connected instead of letting the model guess", async () => {
     mocks.classifyCalendarIntent.mockResolvedValue(intent());
 
