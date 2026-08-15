@@ -1806,6 +1806,170 @@ ON connector(provider)
 WHERE provider = 'google_calendar';
 `;
 
+/**
+ * Direct calendar execution: a second, *named* authorization path — never the absence of one.
+ *
+ * `proposed_effect` and `effect_event` are rebuilt rather than altered, for two reasons.
+ * `payload_hash` carried a global UNIQUE, so two identical requests collided across runs —
+ * harmless while every write needed a hand-typed confirmation, and a live bug the moment one
+ * sentence is enough. Uniqueness belongs to the step, not to the digest. And `effect_event`
+ * needs a new event type, which its CHECK constraints cannot accept in place.
+ *
+ * The rule this preserves: Zeus never writes a message the user did not send. A
+ * policy-authorized effect cites the user's real request — a stored `role='user'` row that
+ * really does say "add dinner Friday at 7" — and is recorded as `authorized_by_policy`, never
+ * as `confirmed`, because it does not name the payload hash.
+ */
+const CALENDAR_DIRECT_EXECUTION = `
+ALTER TABLE proposed_effect RENAME TO proposed_effect_gate_legacy;
+CREATE TABLE proposed_effect (
+  id                       INTEGER PRIMARY KEY,
+  work_run_id              INTEGER NOT NULL REFERENCES work_run(id) ON DELETE CASCADE,
+  work_step_id             INTEGER NOT NULL REFERENCES work_step(id) ON DELETE CASCADE,
+  connector_capability_id  INTEGER NOT NULL
+                           REFERENCES connector_capability(id) ON DELETE RESTRICT,
+  effect_kind              TEXT NOT NULL
+                           CHECK (effect_kind IN ('send','schedule','modify_external')),
+  payload_json             TEXT NOT NULL CHECK (json_valid(payload_json)),
+  payload_hash             TEXT NOT NULL
+                           CHECK (length(payload_hash) = 64
+                                  AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+  preview_text             TEXT NOT NULL,
+  reversal_json            TEXT CHECK (reversal_json IS NULL OR json_valid(reversal_json)),
+  -- What the read cache said about the target immediately before the call. Enough to
+  -- reverse the fields Zeus itself set; never enough to claim a full rollback.
+  prior_state_json         TEXT CHECK (prior_state_json IS NULL OR json_valid(prior_state_json)),
+  -- The deterministic check Zeus performed instead of asking a human.
+  conflict_check_json      TEXT CHECK (conflict_check_json IS NULL
+                                       OR json_valid(conflict_check_json)),
+  confirmation_kind        TEXT NOT NULL DEFAULT 'user_message'
+                           CHECK (confirmation_kind IN ('user_message','standing_policy')),
+  -- The user message this request was built from. Real and stored, and deliberately NOT a
+  -- confirmation, because it does not name the payload hash.
+  request_message_id       INTEGER REFERENCES message(id) ON DELETE RESTRICT,
+  status                   TEXT NOT NULL DEFAULT 'pending_confirmation'
+                           CHECK (status IN ('pending_confirmation','confirmed','declined',
+                                             'expired','executed','failed','reverted')),
+  idempotency_key          TEXT NOT NULL UNIQUE,
+  provider_request_key     TEXT NOT NULL,
+  expires_at               TEXT NOT NULL,
+  created_at               TEXT NOT NULL,
+  updated_at               TEXT NOT NULL,
+  UNIQUE (work_step_id, payload_hash),
+  -- A policy execution with nothing to cite is exactly the ledger lie this design refuses.
+  CHECK (confirmation_kind = 'user_message' OR request_message_id IS NOT NULL)
+);
+INSERT INTO proposed_effect
+  (id, work_run_id, work_step_id, connector_capability_id, effect_kind, payload_json,
+   payload_hash, preview_text, reversal_json, status, idempotency_key,
+   provider_request_key, expires_at, created_at, updated_at)
+SELECT id, work_run_id, work_step_id, connector_capability_id, effect_kind, payload_json,
+       payload_hash, preview_text, reversal_json, status, idempotency_key,
+       provider_request_key, expires_at, created_at, updated_at
+FROM proposed_effect_gate_legacy;
+DROP TABLE proposed_effect_gate_legacy;
+CREATE INDEX proposed_effect_run_idx ON proposed_effect(work_run_id, id);
+CREATE INDEX proposed_effect_pending_idx ON proposed_effect(expires_at)
+WHERE status = 'pending_confirmation';
+CREATE INDEX proposed_effect_hash_idx ON proposed_effect(payload_hash);
+
+DROP TRIGGER effect_event_immutable;
+DROP TRIGGER effect_event_decision_is_user_authored;
+ALTER TABLE effect_event RENAME TO effect_event_gate_legacy;
+CREATE TABLE effect_event (
+  id                  INTEGER PRIMARY KEY,
+  proposed_effect_id  INTEGER NOT NULL REFERENCES proposed_effect(id) ON DELETE CASCADE,
+  event_type          TEXT NOT NULL
+                      CHECK (event_type IN ('proposed','confirmed','authorized_by_policy',
+                                            'declined','expired','executed','failed',
+                                            'reverted')),
+  source_message_id   INTEGER REFERENCES message(id) ON DELETE RESTRICT,
+  detail_json         TEXT CHECK (detail_json IS NULL OR json_valid(detail_json)),
+  created_at          TEXT NOT NULL,
+  UNIQUE (proposed_effect_id, event_type),
+  CHECK (
+    (event_type IN ('confirmed','authorized_by_policy','declined','reverted')
+      AND source_message_id IS NOT NULL)
+    OR
+    (event_type IN ('proposed','expired','executed','failed') AND source_message_id IS NULL)
+  )
+);
+INSERT INTO effect_event (id, proposed_effect_id, event_type, source_message_id,
+                          detail_json, created_at)
+SELECT id, proposed_effect_id, event_type, source_message_id, detail_json, created_at
+FROM effect_event_gate_legacy;
+DROP TABLE effect_event_gate_legacy;
+CREATE INDEX effect_event_effect_idx ON effect_event(proposed_effect_id, id);
+CREATE INDEX effect_event_source_idx ON effect_event(source_message_id)
+WHERE source_message_id IS NOT NULL;
+
+CREATE TRIGGER effect_event_immutable
+BEFORE UPDATE ON effect_event
+BEGIN
+  SELECT RAISE(ABORT, 'effect history is append-only');
+END;
+
+-- Unchanged in force, and now covering the policy path too: whatever authorized this, the
+-- message it cites is the user's own.
+CREATE TRIGGER effect_event_decision_is_user_authored
+BEFORE INSERT ON effect_event
+WHEN NEW.source_message_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM message WHERE id = NEW.source_message_id AND role = 'user'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'an effect decision must cite a user message');
+END;
+
+-- An external request is authorized once, one way. Hand-confirmed and policy-authorized are
+-- mutually exclusive, enforced independently of whatever calls the write path.
+CREATE TRIGGER effect_event_single_authorization
+BEFORE INSERT ON effect_event
+WHEN NEW.event_type IN ('confirmed','authorized_by_policy')
+  AND EXISTS (
+    SELECT 1 FROM effect_event
+    WHERE proposed_effect_id = NEW.proposed_effect_id
+      AND event_type IN ('confirmed','authorized_by_policy')
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'an external request is authorized once, one way');
+END;
+
+-- Proof that a window was actually read, independent of whether it held any events. An
+-- empty calendar and a failed read must never look the same to a write gate, because
+-- "nothing conflicts" is otherwise exactly what an unread calendar reports.
+CREATE TABLE external_read_window (
+  id            INTEGER PRIMARY KEY,
+  connector_id  INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('calendar_event')),
+  window_from   TEXT NOT NULL,
+  window_to     TEXT NOT NULL,
+  event_count   INTEGER NOT NULL CHECK (event_count >= 0),
+  fetched_at    TEXT NOT NULL,
+  UNIQUE (connector_id, kind)
+);
+
+-- Deliberation is not Zeus's work. A run parked for a decision must not spend the budget
+-- that bounds how long Zeus may run; the authorization expiry is what bounds the user's
+-- window, and that one is untouched.
+ALTER TABLE work_run ADD COLUMN paused_at TEXT;
+ALTER TABLE work_run ADD COLUMN paused_ms_total INTEGER NOT NULL DEFAULT 0
+CHECK (paused_ms_total >= 0);
+
+CREATE TABLE calendar_action_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  direct_execution   INTEGER NOT NULL DEFAULT 1 CHECK (direct_execution IN (0,1)),
+  daily_limit        INTEGER NOT NULL DEFAULT 10 CHECK (daily_limit BETWEEN 1 AND 50),
+  day_start          TEXT NOT NULL DEFAULT '08:00',
+  day_end            TEXT NOT NULL DEFAULT '20:00',
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  updated_at         TEXT NOT NULL
+);
+INSERT INTO calendar_action_setting
+  (id, direct_execution, daily_limit, day_start, day_end, source_message_id, updated_at)
+VALUES (1, 1, 10, '08:00', '20:00', NULL, ${NOW});
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1832,4 +1996,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "023_external_actions", sql: EXTERNAL_ACTIONS },
   { id: "024_connector_presets", sql: CONNECTOR_PRESETS },
   { id: "025_google_calendar_provider", sql: GOOGLE_CALENDAR_PROVIDER },
+  { id: "026_calendar_direct_execution", sql: CALENDAR_DIRECT_EXECUTION },
 ];

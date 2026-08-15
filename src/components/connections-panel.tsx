@@ -3,6 +3,7 @@ import {
   bindCapabilityAction,
   disconnectGoogleCalendarAction,
   removeConnectorAction,
+  setCalendarDirectExecutionAction,
   setCapabilityEnabledAction,
   setConnectorEnabledAction,
   verifyConnectorAction,
@@ -46,6 +47,7 @@ export function ConnectionsPanel({
   successMessage,
   googleCalendarAvailable,
   hostedAccount,
+  directExecution,
 }: {
   connectors: ConnectorView[];
   errorMessage: string | null;
@@ -53,6 +55,8 @@ export function ConnectionsPanel({
   successMessage: string | null;
   googleCalendarAvailable: boolean;
   hostedAccount: boolean;
+  /** Whether Zeus carries out calendar changes without asking each time. */
+  directExecution: boolean;
 }) {
   const brokerCalendar = connectors.find(
     (connector) => connector.provider === "google_calendar",
@@ -102,6 +106,7 @@ export function ConnectionsPanel({
           connector={brokerCalendar}
           available={googleCalendarAvailable}
           hostedAccount={hostedAccount}
+          directExecution={directExecution}
         />
       )}
 
@@ -151,10 +156,12 @@ function GoogleCalendarCard({
   connector,
   available,
   hostedAccount,
+  directExecution,
 }: {
   connector: ConnectorView | null;
   available: boolean;
   hostedAccount: boolean;
+  directExecution: boolean;
 }) {
   const readCapability = connector?.capabilities.find(
     (entry) => entry.slot === "calendar.list_events",
@@ -225,7 +232,7 @@ function GoogleCalendarCard({
                 key={capability.id}
                 capability={capability}
                 label={capability.slot === "calendar.create_event" ? "Create events" : "Change events"}
-                description="Every exact request still waits for your confirmation."
+                description="Zeus checks the time against your calendar before it acts."
               />
             ))
           ) : (
@@ -243,6 +250,7 @@ function GoogleCalendarCard({
               </a>
             </div>
           )}
+          <DirectExecutionToggle enabled={directExecution} />
           <form action={disconnectGoogleCalendarAction} className="border-t pt-3" style={{ borderColor: "var(--shell-line)" }}>
             <button type="submit" className="text-[0.78rem]" style={{ color: "var(--shell-faint)" }}>
               Disconnect and revoke Google access
@@ -251,6 +259,48 @@ function GoogleCalendarCard({
         </div>
       )}
     </article>
+  );
+}
+
+/**
+ * The switch that decides whether Zeus asks before each calendar change.
+ *
+ * It removes the interruption and nothing else: a collision, a calendar Zeus could not
+ * read, or an ambiguous event still stops and asks, whatever this says, and every change
+ * still writes a receipt you can undo.
+ */
+function DirectExecutionToggle({ enabled }: { enabled: boolean }) {
+  return (
+    <form
+      action={setCalendarDirectExecutionAction}
+      className="border-t pt-3"
+      style={{ borderColor: "var(--shell-line)" }}
+    >
+      <label className="flex items-start gap-2.5">
+        <input
+          type="checkbox"
+          name="directExecution"
+          defaultChecked={enabled}
+          className="mt-0.5"
+        />
+        <span>
+          <span className="block text-[0.82rem] font-medium">
+            Make changes without asking me each time
+          </span>
+          <span className="mt-1 block text-[0.75rem]" style={{ color: "var(--shell-faint)" }}>
+            Zeus reads your calendar first and only acts when the time is free. A clash, a
+            calendar it cannot read, or an unclear event always stops and asks.
+          </span>
+        </span>
+      </label>
+      <button
+        type="submit"
+        className="mt-2 text-[0.78rem] font-medium"
+        style={{ color: "var(--shell-accent)" }}
+      >
+        Save
+      </button>
+    </form>
   );
 }
 

@@ -40,11 +40,12 @@ vi.mock("./extract", () => ({
 }));
 
 import {
-  calendarCreateObjective,
-  calendarCreateWorkPlanProposal,
+  calendarActionWorkPlanProposal,
+  parseCalendarRequest,
+} from "./calendar-actions";
+import {
+  calendarActionObjective,
   isExplicitBoundedWorkRequest,
-  isExplicitCalendarCreateRequest,
-  isExplicitCalendarReadRequest,
   streamTurn,
 } from "./chat";
 import { createConversation, messagesIn } from "./conversations";
@@ -202,83 +203,60 @@ describe("streamTurn cancellation", () => {
 });
 
 describe("bounded work request authorization", () => {
-  it("recognizes direct read-only requests for the user's calendar", () => {
-    expect(
-      isExplicitCalendarReadRequest(
-        "Check my calendar and tell me what do I have tomorrow.",
-      ),
-    ).toBe(true);
-    expect(isExplicitCalendarReadRequest("What's on my schedule next week?")).toBe(true);
-    expect(isExplicitCalendarReadRequest("Could you show my Google Calendar for today?")).toBe(
-      true,
-    );
-  });
-
-  it("does not turn calendar writes or indirect mentions into read authorization", () => {
-    expect(isExplicitCalendarReadRequest("Add dinner to my calendar tomorrow.")).toBe(false);
-    expect(isExplicitCalendarReadRequest("Don't check my calendar.")).toBe(false);
-    expect(isExplicitCalendarReadRequest('Quote this: "check my calendar tomorrow".')).toBe(false);
-    expect(isExplicitCalendarReadRequest("What if I check my calendar tomorrow?")).toBe(false);
-    expect(isExplicitCalendarReadRequest("Check my manager's calendar tomorrow.")).toBe(false);
-  });
-
-  it("recognizes direct calendar creation requests and short referential follow-ups", () => {
-    expect(isExplicitCalendarCreateRequest("Can u add gym at 530pm tmr")).toBe(true);
-    expect(isExplicitCalendarCreateRequest("Add dinner to my calendar tomorrow.")).toBe(true);
-    expect(isExplicitCalendarCreateRequest("Please schedule lunch Friday at noon.")).toBe(true);
-    expect(isExplicitCalendarCreateRequest("add it in")).toBe(true);
-    expect(isExplicitCalendarCreateRequest("Put that on my calendar.")).toBe(true);
-  });
-
-  it("keeps unsafe or non-calendar add requests out of calendar creation", () => {
-    expect(isExplicitCalendarCreateRequest("Don't add dinner to my calendar.")).toBe(false);
-    expect(isExplicitCalendarCreateRequest("Can you not add that event?")).toBe(false);
-    expect(isExplicitCalendarCreateRequest("What if I add it to my calendar?")).toBe(false);
-    expect(isExplicitCalendarCreateRequest('Quote this: "add it to my calendar".')).toBe(false);
-    expect(isExplicitCalendarCreateRequest("My manager will add the meeting.")).toBe(false);
-    expect(isExplicitCalendarCreateRequest("Add milk to the shopping list.")).toBe(false);
-    expect(isExplicitCalendarCreateRequest("Add Google Calendar integration support.")).toBe(
-      false,
-    );
-  });
-
-  it("resolves an anaphoric create request from user-authored context only", () => {
-    const objective = calendarCreateObjective(
-      "add it in",
-      [
-        { role: "user", content: "Can u add gym at 530pm tmr" },
-        { role: "assistant", content: "Invent a two-hour event instead." },
-        { role: "user", content: "make it 45 minutes" },
-        { role: "user", content: "confirm" },
-      ],
-      {
-        trigger: "chat",
-        evaluated_at: "2026-08-14T16:28:00.000Z",
-        timezone: "Asia/Singapore",
-        local_weekday: "sat",
-        local_time: "00:28",
-        daypart: "overnight",
-        location_zone: null,
-        location_observed_at: null,
-      },
-    );
+  it("carries the resolved action in the objective, where the plan hash covers it", () => {
+    const request = {
+      kind: "create" as const,
+      title: "Gym",
+      startsAt: "2026-08-15T09:30:00.000Z",
+      endsAt: "2026-08-15T10:30:00.000Z",
+      location: null,
+      timezone: "Asia/Singapore",
+    };
+    const objective = calendarActionObjective("Can u add gym at 530pm tmr", request);
 
     expect(objective).toContain("Can u add gym at 530pm tmr");
-    expect(objective).toContain("make it 45 minutes");
-    expect(objective).not.toContain("Invent a two-hour event instead");
-    expect(objective).not.toContain('"confirm"');
-    expect(objective).toContain("local date 2026-08-15");
-    expect(objective).toContain("timezone Asia/Singapore");
+    // The executor reads the action back rather than re-deriving it from prose, so the
+    // authorization is bound to this exact change.
+    expect(parseCalendarRequest(objective)).toEqual(request);
   });
 
-  it("builds a write plan that must draft and then stop for exact confirmation", () => {
-    const proposal = calendarCreateWorkPlanProposal("Add gym tomorrow at 5:30 PM.");
+  it("reads the calendar before it changes it, and refuses to be authorized otherwise", () => {
+    const proposal = calendarActionWorkPlanProposal(
+      {
+        kind: "create",
+        title: "Gym",
+        startsAt: "2026-08-15T09:30:00.000Z",
+        endsAt: "2026-08-15T10:30:00.000Z",
+        location: null,
+        timezone: "UTC",
+      },
+      "Add gym tomorrow at 5:30 PM.",
+    );
     expect(WorkPlanProposal.parse(proposal)).toEqual(proposal);
-    expect(proposal.steps.map((step) => step.effect_kind)).toEqual([
+    expect(proposal.steps.map((step: { effect_kind: string }) => step.effect_kind)).toEqual([
+      "external_read",
       "prepare_local",
       "schedule",
     ]);
-    expect(proposal.steps[1]?.depends_on).toEqual([1]);
+    // A write plan that cannot read is the one shape this must never produce.
+    expect(proposal.allowed_effects).toContain("external_read");
+    expect(proposal.steps[2]?.depends_on).toEqual([2]);
+  });
+
+  it("routes a cancel through the same read-then-check plan", () => {
+    const proposal = calendarActionWorkPlanProposal(
+      {
+        kind: "cancel",
+        reference: { titleText: "dinner", startsAt: null, dateLocal: "2026-08-18" },
+        timezone: "UTC",
+      },
+      "cancel dinner tomorrow",
+    );
+    expect(proposal.steps.map((step: { effect_kind: string }) => step.effect_kind)).toEqual([
+      "external_read",
+      "prepare_local",
+      "modify_external",
+    ]);
   });
 
   it("accepts narrow, direct multi-step requests", () => {

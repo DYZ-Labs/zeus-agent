@@ -105,7 +105,15 @@ npm run mcp            # stdio MCP server
   broker, plus the account-bound Calendar MCP service. Its database is never a Zeus store.
 - `src/server/google-calendar/` — signed OAuth handoff and system-managed provider setup for
   the hosted web front door; no Google token crosses this boundary.
-- `src/core/effects.ts` — proposed external requests and the payload confirmation gate.
+- `src/core/effects.ts` — proposed external requests, the payload confirmation gate, and
+  policy authorization.
+- `src/core/calendar-time.ts` — the interval arithmetic noticing and acting must share.
+- `src/core/calendar-conflicts.ts` — candidate-versus-calendar overlap, free-slot search,
+  and deterministic target resolution. Pure; fails closed without proof of a fresh read.
+- `src/core/calendar-intent.ts` — model intent recognition behind a deterministic veto that
+  can only ever downgrade what the model proposed.
+- `src/core/calendar-actions.ts` — the resolved action, its payload, and its work plan.
+- `src/core/calendar-policy.ts` — the standing direct-execution setting and its ceiling.
 - `src/core/calendar-sync.ts` — the disposable external read cache.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
@@ -233,7 +241,7 @@ reaches the user only through the existing opportunity pipeline, so intervention
 quiet hours, the one-per-day budget, cooldown, snooze, dismissal, and facet blocks all
 apply unchanged. Do not add a second interruption path.
 
-### External action passes two gates, never one
+### External action passes a scope gate and an authorization gate
 
 Authorizing a work plan approves a *scope*. It cannot approve a *payload*, because the
 concrete request only exists once earlier steps have run. Treating scope approval as
@@ -242,15 +250,52 @@ payload approval is the failure the whole design prevents.
 - **Scope, up front.** `authorizeWorkPlan` binds an exact plan hash, effects, limits, and
   expiry to a real user message. An effectful kind is authorizable only when a bound,
   enabled `connector_capability` provides it. `purchase` is refused unconditionally.
-- **Payload, at execution.** A write step must not call the connector. It materializes the
-  exact request into `proposed_effect` and returns a pause, so the run parks at its durable
-  checkpoint. `confirmEffect` requires a stored **user** message containing the exact
-  payload hash — the same proof `assertExactApprovalMessage` requires for a plan. The hash
-  is recomputed from storage immediately before dispatch, so an edited payload fails closed.
+- **Payload, at execution.** A write step materializes the exact request into
+  `proposed_effect`. It is then authorized in exactly one of two named ways, and
+  `confirmation_kind` records which:
+  - `user_message` — the default, and the only path for `send`, for generated plans, and
+    for any calendar action the conflict gate could not clear. `confirmEffect` requires a
+    stored **user** message containing the exact payload hash — the same proof
+    `assertExactApprovalMessage` requires for a plan. The step returns a pause, so the run
+    parks at its durable checkpoint.
+  - `standing_policy` — a calendar create, reschedule, or cancel, when
+    `calendar_action_setting.direct_execution` is on and the deterministic conflict gate
+    returned `clear` against a freshly read window. `authorizeEffectByPolicy` cites
+    `request_message_id`: the user's own request. It is **not** a confirmation and must
+    never be recorded as one; `effect_event` gets `authorized_by_policy`, never `confirmed`.
+
+Either way, the hash is recomputed from storage immediately before dispatch, so an edited
+payload fails closed.
+
+**Zeus never writes a message the user did not send.** Synthesizing an "I confirm `<hash>`"
+message to satisfy the confirmation check is prohibited: it would put fabricated text in the
+same `message` table that backs evidence, and it would reduce
+`assertExactConfirmationMessage` and the `effect_event_decision_is_user_authored` trigger to
+checks the system passes against its own output.
+
+**The standing policy covers verified, unconflicted actions only.** A collision, a calendar
+that could not be read or was read too long ago, a target matching more than one event, or
+an exhausted daily ceiling all fall back to per-payload confirmation, whatever the setting
+says. Removing the interruption never removes the record, and never removes the check.
 
 Silence is never consent: an unanswered request expires rather than escalating. An
-assistant message can never confirm anything; a database trigger enforces that
-independently of the write path.
+assistant message can never authorize anything; a database trigger enforces that
+independently of the write path, and a second trigger enforces that an effect is authorized
+once, one way.
+
+### A calendar write reads the calendar first
+
+`external_read` is not optional for a calendar write plan, and the conflict gate lives in
+the executor rather than in a plan step — a gate a generated plan can omit is not a gate.
+
+The gate must fail closed. An empty event list is not evidence that nothing conflicts,
+because an unread calendar produces exactly the same empty list; `external_read_window`
+records that a covering window was genuinely read, and `checkCalendarConflicts` refuses to
+return `clear` without it. A confirmation gate fails safe when it is wrong, because a human
+reads the payload first. This one does not have that luxury.
+
+Resolving which existing event the user meant is deterministic and refuses on ambiguity.
+Two plausible targets produce a question, never a choice.
 
 `external_read` is a distinct effect kind rather than a widening of `web_read`, because the
 effect kind is the unit of authorization: a plan approved for public web research must not
@@ -352,6 +397,10 @@ depends on them.
 ## Implementation guidance
 
 - Keep policy decisions in deterministic core code, not solely in model prompts.
+- A gate a generated plan can omit is not a gate. Unconditional checks belong in the
+  executor, not in a plan step.
+- Where a model must be involved, let it *recognize* and let code *decide*. The veto layer
+  may narrow what the model proposed; it may never widen it.
 - Split model calls from database application so write behavior remains testable offline.
 - Wrap multi-row state changes in a transaction.
 - Keep FTS and embedding records consistent with fact/message mutations. If searchable

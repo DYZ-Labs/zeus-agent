@@ -846,6 +846,9 @@ export const WorkRun = z
     deadline_at: z.string(),
     runner_token: z.string().nullable(),
     runner_lease_until: z.string().nullable(),
+    /** When this run parked for a person, so the wait can be credited back on resume. */
+    paused_at: z.string().nullable(),
+    paused_ms_total: z.number().int().nonnegative(),
     completed_at: z.string().nullable(),
     error_code: z.string().nullable(),
     error_message: z.string().nullable(),
@@ -1024,6 +1027,18 @@ export const ProposedEffectStatus = z.enum([
 export type ProposedEffectStatus = z.infer<typeof ProposedEffectStatus>;
 
 /**
+ * Which of the two authorization paths approved one exact payload.
+ *
+ * `user_message` is the default and the only path for `send`, for generated plans, and for
+ * anything the conflict gate could not clear. `standing_policy` covers a calendar action the
+ * user enabled direct execution for, and which Zeus verified against a freshly read window.
+ * The distinction is stored rather than inferred, so "did a human confirm this?" stays a
+ * query rather than an interpretation.
+ */
+export const EffectConfirmationKind = z.enum(["user_message", "standing_policy"]);
+export type EffectConfirmationKind = z.infer<typeof EffectConfirmationKind>;
+
+/**
  * The payload gate. Authorizing a plan approves a scope; this row is the exact request
  * that scope produced. Only the bytes hashed here can ever be sent.
  */
@@ -1038,6 +1053,13 @@ export const ProposedEffect = z
     payload_hash: Sha256Hex,
     preview_text: z.string(),
     reversal_json: z.string().nullable(),
+    /** The cached target immediately before the call, when there was one to capture. */
+    prior_state_json: z.string().nullable(),
+    /** The deterministic conflict check Zeus ran instead of asking. */
+    conflict_check_json: z.string().nullable(),
+    confirmation_kind: EffectConfirmationKind,
+    /** The user's own request. Never a confirmation — it does not name the hash. */
+    request_message_id: z.number().int().nullable(),
     status: ProposedEffectStatus,
     idempotency_key: z.string(),
     provider_request_key: z.string(),
@@ -1051,6 +1073,12 @@ export type ProposedEffect = z.infer<typeof ProposedEffect>;
 export const EffectEventType = z.enum([
   "proposed",
   "confirmed",
+  /**
+   * Authorized by the user's standing direct-execution setting rather than by a message
+   * naming the payload hash. Deliberately not `confirmed`: it cites the request, not a
+   * confirmation, and the ledger must never claim otherwise.
+   */
+  "authorized_by_policy",
   "declined",
   "expired",
   "executed",
@@ -1073,6 +1101,45 @@ export type EffectEvent = z.infer<typeof EffectEvent>;
 
 export const ExternalSignalKind = z.enum(["calendar_event"]);
 export type ExternalSignalKind = z.infer<typeof ExternalSignalKind>;
+
+/**
+ * Proof that a window was read, kept separately from what the read returned.
+ *
+ * An empty calendar and a failed read produce the same empty event set, and a write gate
+ * that cannot tell them apart will happily report "nothing conflicts" about a calendar it
+ * never saw. This row is what makes that distinction available.
+ */
+export const ExternalReadWindow = z
+  .object({
+    id: z.number().int(),
+    connector_id: z.number().int(),
+    kind: ExternalSignalKind,
+    window_from: z.string(),
+    window_to: z.string(),
+    event_count: z.number().int().nonnegative(),
+    fetched_at: z.string(),
+  })
+  .strict();
+export type ExternalReadWindow = z.infer<typeof ExternalReadWindow>;
+
+/**
+ * The standing permission to carry out a calendar change without asking each time.
+ *
+ * It removes the interruption, never the record and never the check: every action still
+ * writes a receipt, and the conflict gate still has to clear before this setting applies.
+ */
+export const CalendarActionSetting = z
+  .object({
+    id: z.literal(1),
+    direct_execution: z.union([z.literal(0), z.literal(1)]),
+    daily_limit: z.number().int().min(1).max(50),
+    day_start: z.string(),
+    day_end: z.string(),
+    source_message_id: z.number().int().nullable(),
+    updated_at: z.string(),
+  })
+  .strict();
+export type CalendarActionSetting = z.infer<typeof CalendarActionSetting>;
 
 /**
  * A disposable copy of what a connector reported. Never evidence: an invite someone else

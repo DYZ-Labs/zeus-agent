@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { confirmEffectAction, declineEffectAction } from "@/app/actions";
+import { confirmEffectAction, declineEffectAction, revertEffectAction } from "@/app/actions";
 import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CHAT_UPDATED_EVENT,
@@ -41,6 +41,14 @@ type Turn = ChatHistoryTurn & {
       capabilitySlot: string;
       connectorLabel: string;
     }>;
+    completedEffects?: Array<{
+      id: number;
+      previewText: string;
+      connectorLabel: string;
+      authorizedByPolicy: boolean;
+      reversible: boolean;
+    }>;
+    calendar?: CalendarOutcome | null;
   };
   /** Set on the assistant turn once the stream closes. */
   receipt?: ChatReceipt & {
@@ -327,6 +335,10 @@ export function Chat({
                           )
                         }
                         workPlan={turn.workPlan}
+                        onReply={(text) => {
+                          setInput(text);
+                          textareaRef.current?.focus();
+                        }}
                         pending={status === "streaming" && !turn.receipt}
                       />
                     )}
@@ -480,6 +492,7 @@ function AssistantTurn({
   recommendationDecision,
   onRecommendationDecision,
   workPlan,
+  onReply,
   pending,
 }: {
   text: string;
@@ -492,6 +505,8 @@ function AssistantTurn({
     userReason?: string,
   ) => void;
   workPlan?: Turn["workPlan"];
+  /** Fills the composer. Choosing an alternative is a message the user sends, not an act. */
+  onReply: (text: string) => void;
   pending: boolean;
 }) {
   return (
@@ -512,11 +527,221 @@ function AssistantTurn({
             onDecision={onRecommendationDecision}
           />
         )}
-        {workPlan && <WorkPlanCard workPlan={workPlan} />}
+        {workPlan?.calendar ? (
+          <CalendarActionCard workPlan={workPlan} outcome={workPlan.calendar} onReply={onReply} />
+        ) : (
+          workPlan && <WorkPlanCard workPlan={workPlan} />
+        )}
         {receipt && <Receipt {...receipt} />}
       </div>
     </div>
   );
+}
+
+type CalendarOutcome = {
+  kind: "create" | "reschedule" | "cancel" | "read";
+  status:
+    | "done"
+    | "awaiting_confirmation"
+    | "blocked_by_conflict"
+    | "ambiguous_target"
+    | "target_not_found"
+    | "unverifiable"
+    | "no_connector"
+    | "failed";
+  conflicts: Array<{ title: string | null; startsAt: string; endsAt: string | null }>;
+  alternatives: Array<{ startsAt: string; endsAt: string }>;
+  candidates: Array<{ externalId: string; title: string | null; startsAt: string }>;
+  consideredEvents: number | null;
+  coverage: { from: string; to: string; fetchedAt: string } | null;
+};
+
+const VERB: Record<CalendarOutcome["kind"], string> = {
+  create: "Added to your calendar",
+  reschedule: "Moved",
+  cancel: "Cancelled",
+  read: "Read your calendar",
+};
+
+/**
+ * What Zeus did to the calendar, or why it did not.
+ *
+ * Everything here is rendered from the deterministic outcome rather than from the
+ * assistant's prose, so the card cannot claim something the run did not do. Choosing an
+ * alternative time fills the composer instead of acting: the user sends a real message, the
+ * whole gated path runs again, and no button on this card writes to a calendar.
+ */
+function CalendarActionCard({
+  workPlan,
+  outcome,
+  onReply,
+}: {
+  workPlan: NonNullable<Turn["workPlan"]>;
+  outcome: CalendarOutcome;
+  onReply: (text: string) => void;
+}) {
+  const done = workPlan.completedEffects ?? [];
+  const pending = workPlan.pendingEffects[0];
+  return (
+    <aside
+      className="mt-4 rounded-xl border px-4 py-3.5"
+      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+      aria-label="Calendar change"
+    >
+      {outcome.status === "done" ? (
+        <>
+          <p className="text-[0.85rem] font-medium leading-6">
+            {VERB[outcome.kind]}
+            {done[0] ? ` — ${done[0].previewText}` : "."}
+          </p>
+          {outcome.consideredEvents !== null && outcome.kind !== "read" && (
+            <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+              Checked {outcome.consideredEvents}{" "}
+              {outcome.consideredEvents === 1 ? "event" : "events"} on your calendar first.
+            </p>
+          )}
+          {done[0] && (
+            <div className="mt-3 flex flex-wrap items-center gap-4 text-[0.75rem]">
+              <a
+                href={`/effects/${done[0].id}`}
+                className="underline underline-offset-2"
+                style={{ color: "var(--shell-muted)" }}
+              >
+                Receipt
+              </a>
+              {done[0].reversible && (
+                <form action={revertEffectAction}>
+                  <input type="hidden" name="id" value={done[0].id} />
+                  <button type="submit" className="underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
+                    {outcome.kind === "cancel" ? "Restore this event" : "Undo"}
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
+        </>
+      ) : outcome.status === "blocked_by_conflict" ? (
+        <>
+          <p className="text-[0.85rem] font-medium leading-6">
+            Not added — that time is taken.
+          </p>
+          <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
+            {outcome.conflicts.map((conflict) => (
+              <li key={`${conflict.startsAt}-${conflict.title ?? ""}`}>
+                {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt)}
+              </li>
+            ))}
+          </ul>
+          {outcome.alternatives.length > 0 && (
+            <>
+              <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+                Free nearby:
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                {outcome.alternatives.map((slot) => (
+                  <button
+                    key={slot.startsAt}
+                    type="button"
+                    onClick={() => onReply(`Move it to ${localLabel(slot.startsAt)}.`)}
+                    className="rounded-md border px-2.5 py-1 text-[0.74rem]"
+                    style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
+                  >
+                    {timeRange(slot.startsAt, slot.endsAt)}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      ) : outcome.status === "ambiguous_target" ? (
+        <>
+          <p className="text-[0.85rem] font-medium leading-6">
+            Nothing changed — more than one event matches.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {outcome.candidates.map((candidate) => (
+              <button
+                key={candidate.externalId}
+                type="button"
+                onClick={() =>
+                  onReply(`I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt)}.`)
+                }
+                className="rounded-md border px-2.5 py-1 text-[0.74rem]"
+                style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
+              >
+                {candidate.title ?? "An event"} · {localLabel(candidate.startsAt)}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : outcome.status === "target_not_found" ? (
+        <p className="text-[0.85rem] leading-6">
+          Nothing changed — nothing on the calendar Zeus read matches that.
+        </p>
+      ) : outcome.status === "unverifiable" ? (
+        <p className="text-[0.85rem] leading-6">
+          Nothing changed. Zeus could not read your calendar, so it cannot promise that time
+          is free and did not act on it.
+        </p>
+      ) : outcome.status === "no_connector" ? (
+        <p className="text-[0.85rem] leading-6">
+          No calendar is connected, so nothing was changed.{" "}
+          <a href="/settings#connections" className="underline underline-offset-2">
+            Connect one
+          </a>
+          .
+        </p>
+      ) : outcome.status === "awaiting_confirmation" && pending ? (
+        <>
+          <p className="text-[0.85rem] font-medium leading-6">{pending.previewText}</p>
+          <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+            Nothing has been sent yet.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
+            <form action={confirmEffectAction}>
+              <input type="hidden" name="id" value={pending.id} />
+              <input type="hidden" name="payloadHash" value={pending.payloadHash} />
+              <button
+                type="submit"
+                className="rounded-md px-3 py-1.5 font-medium"
+                style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
+              >
+                Confirm
+              </button>
+            </form>
+            <form action={declineEffectAction}>
+              <input type="hidden" name="id" value={pending.id} />
+              <button type="submit" className="underline underline-offset-2" style={{ color: "var(--shell-muted)" }}>
+                Don&apos;t
+              </button>
+            </form>
+          </div>
+        </>
+      ) : (
+        <p className="text-[0.85rem] leading-6">
+          Nothing changed. Zeus stopped before making the change.
+        </p>
+      )}
+    </aside>
+  );
+}
+
+function localLabel(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString(undefined, {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function timeRange(startsAt: string, endsAt: string | null): string {
+  const end = endsAt ? new Date(endsAt) : null;
+  const endLabel = end && !Number.isNaN(end.getTime())
+    ? end.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : null;
+  return endLabel ? `${localLabel(startsAt)}–${endLabel}` : localLabel(startsAt);
 }
 
 function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> }) {

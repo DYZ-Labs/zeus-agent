@@ -15,6 +15,12 @@ import {
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
+  directExecutionAllowance,
+  getCalendarActionSetting,
+  updateCalendarActionSetting,
+} from "./calendar-policy";
+import {
+  authorizeEffectByPolicy,
   confirmEffect,
   declineEffect,
   effectsForRun,
@@ -65,7 +71,17 @@ server.registerTool(
 
 server.registerTool(
   "update_event",
-  { title: "Update event", inputSchema: { event_id: z.string(), status: z.string() } },
+  {
+    title: "Update event",
+    inputSchema: {
+      event_id: z.string(),
+      status: z.string().optional(),
+      start: z.string().optional(),
+      end: z.string().optional(),
+      title: z.string().optional(),
+      location: z.string().optional(),
+    },
+  },
   async (args) => {
     if (log) appendFileSync(log, JSON.stringify(args) + "\\n");
     return { content: [{ type: "text", text: JSON.stringify({ updated: args.event_id }) }] };
@@ -180,6 +196,11 @@ function confirmationMessage(hash: string, text = `Confirm ${hash}`): number {
     origin: "user_action",
     recallState: "blocked",
   }).id;
+}
+
+/** Guards the rule that Zeus never writes a message the user did not send. */
+function messageCount(): number {
+  return db.prepare<[], { count: number }>("SELECT COUNT(*) AS count FROM message").get()?.count ?? 0;
 }
 
 describe("proposing an effect never performs it", () => {
@@ -435,6 +456,211 @@ describe("silence is not consent", () => {
     expect(() =>
       confirmEffect(db, effect.id, effect.payload_hash, confirmationMessage(effect.payload_hash)),
     ).toThrow(/expired/u);
+  }, 30_000);
+});
+
+describe("acting on a standing setting, without pretending it was confirmed", () => {
+  it("cites the user's real request and never fabricates a confirmation", async () => {
+    await grantCalendar();
+    const effect = propose();
+    const before = messageCount();
+
+    const authorized = authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+      detail: { conflict_check: "clear" },
+    });
+
+    expect(authorized.status).toBe("confirmed");
+    expect(authorized.confirmation_kind).toBe("standing_policy");
+    expect(authorized.request_message_id).toBe(userMessageId);
+    const types = authorized.events.map((event) => event.event_type);
+    expect(types).toEqual(["proposed", "authorized_by_policy"]);
+    // The ledger must never record a confirmation the user did not type.
+    expect(types).not.toContain("confirmed");
+    // And Zeus must not have written a message on their behalf to get there.
+    expect(messageCount()).toBe(before);
+  }, 30_000);
+
+  it("executes exactly the authorized bytes and records the call", async () => {
+    await grantCalendar();
+    const effect = propose();
+    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+    });
+
+    const result = await executeConfirmedEffect(db, effect.id);
+
+    expect(result.status).toBe("executed");
+    expect(recordedCalls()).toEqual([
+      { title: "Dinner with Sam", starts_at: "2026-08-20T18:30:00Z" },
+    ]);
+  }, 30_000);
+
+  it("refuses to cite an assistant message", async () => {
+    await grantCalendar();
+    const effect = propose();
+    const assistantId = appendMessage(db, conversationId, "assistant", "I'll add that.").id;
+
+    expect(() =>
+      authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+        requestMessageId: assistantId,
+        policy: "calendar_direct_execution",
+      }),
+    ).toThrow(/must cite the user's own request/u);
+  }, 30_000);
+
+  it("refuses a hash that does not match the stored payload", async () => {
+    await grantCalendar();
+    const effect = propose();
+
+    expect(() =>
+      authorizeEffectByPolicy(db, effect.id, "0".repeat(64), {
+        requestMessageId: userMessageId,
+        policy: "calendar_direct_execution",
+      }),
+    ).toThrow(/does not match this exact external request/u);
+  }, 30_000);
+
+  it("authorizes an external request once, one way", async () => {
+    await grantCalendar();
+    const effect = propose();
+    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+    });
+
+    expect(() =>
+      confirmEffect(db, effect.id, effect.payload_hash, confirmationMessage(effect.payload_hash)),
+    ).toThrow(/already been decided|already authorized by your standing setting/u);
+
+    // And the database refuses the pair independently of the write path.
+    expect(() =>
+      db.exec(
+        `INSERT INTO effect_event (proposed_effect_id, event_type, source_message_id, created_at)
+         VALUES (${effect.id}, 'confirmed', ${userMessageId}, '2026-08-20T00:00:00.000Z')`,
+      ),
+    ).toThrow(/authorized once, one way/u);
+  }, 30_000);
+
+  it("lets the user undo a reschedule, because the calendar was read first", async () => {
+    await grantCalendar();
+    const { runId, stepId } = workRun();
+    const effect = proposeEffect(db, {
+      workRunId: runId,
+      workStepId: stepId,
+      slot: "calendar.update_event",
+      payload: {
+        event_id: "evt-1",
+        start: "2026-08-20T16:00:00Z",
+        end: "2026-08-20T17:00:00Z",
+      },
+      previewText: "Move “Design review” to 16:00.",
+      providerRequestKey: "req-move",
+      priorState: {
+        external_id: "evt-1",
+        title: "Design review",
+        start: "2026-08-20T15:00:00Z",
+        end: "2026-08-20T16:00:00Z",
+      },
+    });
+    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+    });
+
+    await executeConfirmedEffect(db, effect.id);
+
+    // Undo restores the times Zeus itself changed, and only those.
+    expect(effectsForRun(db, runId)[0]?.reversal).toEqual({
+      slot: "calendar.update_event",
+      payload: {
+        event_id: "evt-1",
+        start: "2026-08-20T15:00:00Z",
+        end: "2026-08-20T16:00:00Z",
+      },
+    });
+  }, 30_000);
+
+  it("offers no undo for an update it has no snapshot for", async () => {
+    await grantCalendar();
+    const { runId, stepId } = workRun();
+    const effect = proposeEffect(db, {
+      workRunId: runId,
+      workStepId: stepId,
+      slot: "calendar.update_event",
+      payload: { event_id: "evt-2", start: "2026-08-20T16:00:00Z" },
+      previewText: "Move an event.",
+      providerRequestKey: "req-blind",
+    });
+    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+    });
+
+    await executeConfirmedEffect(db, effect.id);
+
+    expect(effectsForRun(db, runId)[0]?.reversal).toBeNull();
+  }, 30_000);
+});
+
+describe("the standing setting is a user decision", () => {
+  it("starts on, so a connected calendar acts rather than asks", () => {
+    expect(getCalendarActionSetting(db).direct_execution).toBe(1);
+    expect(directExecutionAllowance(db)).toMatchObject({ allowed: true, reason: null });
+  });
+
+  it("stops acting once the day's ceiling is reached", async () => {
+    await grantCalendar();
+    updateCalendarActionSetting(db, { dailyLimit: 1 }, userMessageId);
+    const effect = propose();
+    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+      requestMessageId: userMessageId,
+      policy: "calendar_direct_execution",
+    });
+
+    expect(directExecutionAllowance(db)).toMatchObject({
+      allowed: false,
+      reason: "daily_limit",
+      usedToday: 1,
+    });
+  }, 30_000);
+
+  it("can be switched off, and refuses to be switched by anything but a user action", () => {
+    updateCalendarActionSetting(db, { directExecution: false }, userMessageId);
+    expect(directExecutionAllowance(db)).toMatchObject({ allowed: false, reason: "disabled" });
+
+    const assistantId = appendMessage(db, conversationId, "assistant", "Turning that on.").id;
+    expect(() =>
+      updateCalendarActionSetting(db, { directExecution: true }, assistantId),
+    ).toThrow(/explicit user action/u);
+  });
+});
+
+describe("two identical requests are two requests", () => {
+  it("proposes again on a new step rather than returning a spent one", async () => {
+    await grantCalendar();
+    const first = propose();
+
+    // The same event, asked for again after the first was dealt with. A digest that was
+    // unique globally rather than per step silently returned the old row and created
+    // nothing.
+    db.exec(`
+      INSERT INTO work_step (id, work_plan_id, position, title, instruction, effect_kind, status)
+      VALUES (2, 1, 2, 'hold again', 'hold the slot again', 'schedule', 'running');
+    `);
+    const second = proposeEffect(db, {
+      workRunId: 1,
+      workStepId: 2,
+      slot: "calendar.create_event",
+      payload: { title: "Dinner with Sam", starts_at: "2026-08-20T18:30:00Z" },
+      previewText: "Create “Dinner with Sam” on 20 August at 18:30.",
+      providerRequestKey: "req-2",
+    });
+
+    expect(second.id).not.toBe(first.id);
+    expect(second.payload_hash).toBe(first.payload_hash);
   }, 30_000);
 });
 

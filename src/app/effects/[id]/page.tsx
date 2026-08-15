@@ -52,12 +52,70 @@ export default async function EffectPage({
           </p>
         </Section>
 
+        <Section title="Who authorized it">
+          <p className="max-w-[68ch] text-[0.84rem] leading-6">
+            {effect.confirmation_kind === "standing_policy" ? (
+              <>
+                Your standing setting for calendar changes, applied to{" "}
+                {effect.request_message_id !== null ? (
+                  <Link
+                    href={`/source/${effect.request_message_id}`}
+                    className="underline underline-offset-2"
+                  >
+                    the message you sent
+                  </Link>
+                ) : (
+                  "your request"
+                )}
+                . You did not confirm this exact request, and Zeus did not ask you to — it
+                checked your calendar first and found the time free.{" "}
+                <Link href="/settings#connections" className="underline underline-offset-2">
+                  Change that setting
+                </Link>
+                .
+              </>
+            ) : (
+              <>You confirmed this exact request by its hash before anything was sent.</>
+            )}
+          </p>
+          {effect.conflict_check_json && (
+            <details className="mt-3">
+              <summary className="cursor-pointer text-[0.74rem]" style={{ color: "var(--shell-muted)" }}>
+                The check Zeus ran instead of asking
+              </summary>
+              <pre
+                className="mt-2 overflow-x-auto rounded-lg border px-3 py-2 font-mono text-[0.68rem] leading-5"
+                style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+              >
+                {effect.conflict_check_json}
+              </pre>
+            </details>
+          )}
+        </Section>
+
+        {effect.prior_state_json && (
+          <Section title="What it looked like before">
+            <pre
+              className="overflow-x-auto rounded-lg border px-3 py-2 font-mono text-[0.7rem] leading-5"
+              style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+            >
+              {effect.prior_state_json}
+            </pre>
+            <p className="mt-2 max-w-[68ch] text-[0.78rem] leading-6" style={{ color: "var(--shell-faint)" }}>
+              Captured from the calendar read that preceded this change, so undo can restore
+              the fields Zeus itself set. Attendees, description, recurrence, reminders, and
+              conferencing were never read and are not restored — and un-cancelling an event
+              does not recall the cancellation notices it already sent.
+            </p>
+          </Section>
+        )}
+
         <Section title="What happened">
           <ol className="space-y-3 text-[0.82rem]">
             {effect.events.map((event) => (
               <li key={event.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <span className="font-mono text-[0.66rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
-                  {event.event_type}
+                  {event.event_type.replace(/_/gu, " ")}
                 </span>
                 <span style={{ color: "var(--shell-muted)" }}>{event.created_at}</span>
                 {event.source_message_id !== null ? (
@@ -65,7 +123,8 @@ export default async function EffectPage({
                     href={`/source/${event.source_message_id}`}
                     className="font-mono text-[0.66rem] underline underline-offset-2"
                   >
-                    your message {event.source_message_id}
+                    {event.event_type === "authorized_by_policy" ? "your request" : "your message"}{" "}
+                    {event.source_message_id}
                   </Link>
                 ) : null}
                 {event.detail_json ? (
@@ -113,7 +172,7 @@ export default async function EffectPage({
 
 const STATUS_LABEL: Record<string, string> = {
   pending_confirmation: "waiting for you",
-  confirmed: "confirmed, not yet sent",
+  confirmed: "authorized, not yet sent",
   declined: "you declined it",
   expired: "expired unanswered",
   executed: "sent",

@@ -1,0 +1,329 @@
+import { zodTextFormat } from "openai/helpers/zod";
+import { z } from "zod";
+
+import { recordModelCall, responseUsage } from "./budget";
+import type { CalendarRequest } from "./calendar-actions";
+import type { EventReference } from "./calendar-conflicts";
+import type { Db } from "./db";
+import { errorSignature, logEvent } from "./observability";
+import { MODEL, assertResponseComplete, openai } from "./openai";
+import type { EvaluationContext } from "./schema";
+
+/**
+ * Recognizing that the user asked for something to happen to their calendar.
+ *
+ * This replaces three hand-written regexes that required a message to *begin* with a create
+ * verb. They were the right conservatism when the only consequence was drafting, but they
+ * are also why "I need to get dinner with Sam on the calendar" produced a sentence instead
+ * of an event — the failure this module exists to remove.
+ *
+ * The division of labour is the same one `extract` → `applyExtraction` uses. A model is
+ * good at recognizing what someone meant and bad at being a policy; so it proposes an
+ * intent, and deterministic code decides whether anything may be done with it. Layer 3 can
+ * only ever *downgrade* what the model returned — it can turn a create into nothing, and
+ * can never turn nothing into a create.
+ *
+ * Note what is deliberately absent: calendar text never reaches this call. Only the user's
+ * own messages do, so an invitation someone else wrote cannot steer what Zeus decides to do.
+ */
+
+const INTENT_TIMEOUT_MS = 15_000;
+const MAX_INPUT_CHARS = 2_000;
+const MAX_PRIOR_MESSAGES = 6;
+const MAX_PRIOR_CHARS = 500;
+
+/** Longest a single event may run before Zeus treats the parse as wrong rather than bold. */
+const MAX_DURATION_MS = 24 * 3_600_000;
+const DEFAULT_DURATION_MS = 60 * 60_000;
+const MAX_FUTURE_MS = 400 * 86_400_000;
+const MAX_PAST_MS = 24 * 3_600_000;
+
+const SYSTEM_PROMPT = `You classify whether the user's latest message asks for something to happen to their own calendar, and extract the details needed to carry it out.
+
+Return intent "create" to add a new event, "reschedule" to move an existing one, "cancel" to remove one, "read" to look at the calendar, and "none" for everything else. "none" is the right answer far more often than not: ordinary conversation that merely mentions a time, a date, or a meeting is not a request to change anything.
+
+Resolve times to local wall-clock in the supplied timezone, formatted YYYY-MM-DDTHH:mm. Never include an offset or a Z suffix. Use the supplied local date and time to resolve relative expressions such as "tomorrow", "next Tuesday", or "tonight". If the user gave no end time, leave ends_at_local null rather than inventing one.
+
+For "reschedule" and "cancel", describe how the user referred to the existing event in the target field — its title words, its start time, or its date. Never invent an identifier; the system resolves which event they meant.
+
+Set confidence "high" only when the request is unambiguous and every field you filled in is directly supported by the user's words. Use "low" whenever you are inferring, guessing a time, or unsure which event is meant.
+
+Set is_negated when the user is declining, forbidding, or cancelling a request rather than making one. Set is_hypothetical_or_quoted when they are supposing, quoting, or giving an example. Set is_about_another_person when the calendar or the action belongs to somebody other than the user. These flags are safety checks: when in doubt, set them.`;
+
+const TargetReference = z
+  .object({
+    title_text: z.string().max(200).nullable(),
+    starts_at_local: z.string().max(20).nullable(),
+    date_local: z.string().max(10).nullable(),
+  })
+  .strict();
+
+/**
+ * Every field is required and nullable rather than optional: structured outputs put every
+ * declared property in `required`, and an optional field is silently dropped.
+ */
+export const CalendarIntent = z
+  .object({
+    intent: z.enum(["create", "reschedule", "cancel", "read", "none"]),
+    confidence: z.enum(["low", "medium", "high"]),
+    title: z.string().max(200).nullable(),
+    starts_at_local: z.string().max(20).nullable(),
+    ends_at_local: z.string().max(20).nullable(),
+    location: z.string().max(200).nullable(),
+    target: TargetReference.nullable(),
+    is_negated: z.boolean(),
+    is_hypothetical_or_quoted: z.boolean(),
+    is_about_another_person: z.boolean(),
+  })
+  .strict();
+export type CalendarIntent = z.infer<typeof CalendarIntent>;
+
+/**
+ * A cheap skip, deliberately over-inclusive.
+ *
+ * This is not a gate and must never become one — that is exactly the mistake the old
+ * regexes made. A false positive costs one low-effort model call; a false negative is the
+ * bug. So it only asks "could this conceivably be about a calendar?" and errs toward yes.
+ */
+export function mayBeCalendarRequest(input: string): boolean {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
+  const subject =
+    /\b(?:calendar|schedule|scheduling|meeting|appointment|event|invite|booking|book|reschedule|rebook|standup|stand-up|call|lunch|dinner|breakfast|coffee|class|workout|gym|session|catch[- ]?up|sync|one[- ]?on[- ]?one|1:1|deadline|reminder|agenda)\b/iu;
+  const action =
+    /\b(?:add|create|put|set\s+up|pencil|slot|block|hold|move|shift|push|bump|change|cancel|kill|drop|clear|delete|remove|free|busy|availab|make\s+time|find\s+time)\b/iu;
+  const temporal =
+    /\b(?:today|tonight|tomorrow|tmr|yesterday|next\s+\w+|this\s+\w+|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}\s*(?:am|pm)|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|morning|afternoon|evening|noon|midday)\b/iu;
+  // "block 2-3", "hold 10–11": a bare hour range is a time to a person and nothing to the
+  // patterns above.
+  const hourRange = /\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b/iu;
+  return (
+    subject.test(normalized) ||
+    (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized)))
+  );
+}
+
+/**
+ * Signals that a message is not a request, whatever it otherwise looks like.
+ *
+ * Carried over from the regexes this module replaces, with one change: the negation set is
+ * no longer anchored to the start of the message, so "actually, don't put that on my
+ * calendar" is caught rather than only "don't put that on my calendar".
+ */
+export function containsCalendarRefusalSignal(input: string): boolean {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  return (
+    /\b(?:do not|don['’]t|dont|never|no need to|instead of|rather than|without)\s+(?:add|create|put|schedule|book|move|cancel|delete|remove|change)\b/iu.test(
+      normalized,
+    ) ||
+    /^(?:what if|suppose|imagine|hypothetically|for example|e\.g\.|quote|quoted|someone said)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:calendar|google calendar)\s+(?:support|integration|connection|feature|button|permission|api|oauth|scope)\b/iu.test(
+      normalized,
+    )
+  );
+}
+
+export async function classifyCalendarIntent(
+  db: Db,
+  input: {
+    message: string;
+    /** The user's own prior messages, oldest first. Assistant text is never supplied. */
+    priorUserMessages: readonly string[];
+    context: EvaluationContext;
+  },
+  options: { signal?: AbortSignal } = {},
+): Promise<CalendarIntent | null> {
+  const deadline = AbortSignal.timeout(INTENT_TIMEOUT_MS);
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  const prior = input.priorUserMessages
+    .slice(-MAX_PRIOR_MESSAGES)
+    .map((message) => message.replace(/\s+/gu, " ").trim().slice(0, MAX_PRIOR_CHARS));
+  try {
+    const response = await openai().responses.parse(
+      {
+        model: MODEL,
+        max_output_tokens: 2_000,
+        reasoning: { effort: "low" },
+        instructions: SYSTEM_PROMPT,
+        text: { format: zodTextFormat(CalendarIntent, "calendar_intent") },
+        input: [
+          {
+            role: "user",
+            content: [
+              `Local date ${localDate(input.context)}, local time ${input.context.local_time}, ` +
+                `weekday ${input.context.local_weekday}, timezone ${input.context.timezone}.`,
+              prior.length > 0
+                ? `Earlier messages from the user, oldest first: ${JSON.stringify(prior)}`
+                : "No earlier user messages.",
+              `Latest message from the user: ${JSON.stringify(
+                input.message.replace(/\s+/gu, " ").trim().slice(0, MAX_INPUT_CHARS),
+              )}`,
+            ].join("\n\n"),
+          },
+        ],
+        store: false,
+      },
+      { signal },
+    );
+    recordModelCall(db, responseUsage(response));
+    assertResponseComplete(response);
+    return response.output_parsed ?? null;
+  } catch (error) {
+    // Degrading here lands exactly where the old regexes landed for an unrecognized
+    // phrasing: an ordinary chat turn. It can never be worse than the behavior it replaced.
+    logEvent({
+      event: "calendar_intent_classified",
+      outcome: "degraded",
+      ...errorSignature(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * Turn a proposed intent into an action Zeus may actually take — or into nothing.
+ *
+ * Downgrade-only, by construction: every branch either returns a request built from fields
+ * the model supplied, or returns null. With no confirmation gate downstream, this is where
+ * a misread has to be stopped, so the refusals are deliberately eager.
+ */
+export function resolveCalendarRequest(
+  message: string,
+  intent: CalendarIntent,
+  context: EvaluationContext,
+): CalendarRequest | null {
+  if (intent.intent === "none") return null;
+  if (intent.is_negated || intent.is_hypothetical_or_quoted || intent.is_about_another_person) {
+    return null;
+  }
+  if (containsCalendarRefusalSignal(message)) return null;
+
+  const timezone = context.timezone;
+  if (intent.intent === "read") {
+    const at = Date.parse(context.evaluated_at);
+    return {
+      kind: "read",
+      from: new Date(at).toISOString(),
+      to: new Date(at + 30 * 86_400_000).toISOString(),
+      timezone,
+    };
+  }
+
+  // A low-confidence read costs nothing; a low-confidence write changes someone's week.
+  if (intent.confidence === "low") return null;
+
+  if (intent.intent === "cancel") {
+    const reference = resolveReference(intent.target, timezone);
+    return reference ? { kind: "cancel", reference, timezone } : null;
+  }
+
+  if (!intent.starts_at_local) return null;
+  const startsAt = localToUtc(intent.starts_at_local, timezone);
+  if (!startsAt) return null;
+  const endsAt = intent.ends_at_local
+    ? localToUtc(intent.ends_at_local, timezone)
+    : new Date(Date.parse(startsAt) + DEFAULT_DURATION_MS).toISOString();
+  if (!endsAt) return null;
+
+  const start = Date.parse(startsAt);
+  const end = Date.parse(endsAt);
+  const at = Date.parse(context.evaluated_at);
+  if (end <= start || end - start > MAX_DURATION_MS) return null;
+  if (start > at + MAX_FUTURE_MS || start < at - MAX_PAST_MS) return null;
+
+  if (intent.intent === "reschedule") {
+    const reference = resolveReference(intent.target, timezone);
+    return reference ? { kind: "reschedule", reference, startsAt, endsAt, timezone } : null;
+  }
+
+  const title = (intent.title ?? "").trim();
+  // An event with no name cannot be reviewed at a glance afterwards, which is the only
+  // check left once it has already been created.
+  if (title.length === 0) return null;
+  return {
+    kind: "create",
+    title,
+    startsAt,
+    endsAt,
+    location: intent.location?.trim() || null,
+    timezone,
+  };
+}
+
+function resolveReference(
+  target: CalendarIntent["target"],
+  timezone: string,
+): EventReference | null {
+  if (!target) return null;
+  const titleText = target.title_text?.trim() || null;
+  const startsAt = target.starts_at_local ? localToUtc(target.starts_at_local, timezone) : null;
+  const dateLocal = /^\d{4}-\d{2}-\d{2}$/u.test(target.date_local ?? "")
+    ? target.date_local
+    : null;
+  // Nothing to match on is not a target. Resolving against an empty reference would pick
+  // whatever happened to be next.
+  if (!titleText && !startsAt && !dateLocal) return null;
+  return { titleText, startsAt, dateLocal };
+}
+
+function localDate(context: EvaluationContext): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: context.timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(context.evaluated_at));
+}
+
+/**
+ * Local wall-clock to an instant.
+ *
+ * The model is asked for wall-clock precisely so this conversion happens here: asking a
+ * model for a UTC offset gets DST wrong, and gets half-hour zones wrong more often. Two
+ * passes settle the offset, which is enough for every zone including the hour that repeats
+ * at a DST fall-back.
+ */
+export function localToUtc(local: string, timezone: string): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})/u.exec(local.trim());
+  if (!match) return null;
+  const [, year, month, day, hour, minute] = match;
+  const naive = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+  );
+  if (!Number.isFinite(naive)) return null;
+  let instant = naive;
+  for (let pass = 0; pass < 2; pass += 1) {
+    instant = naive - timezoneOffsetMs(instant, timezone);
+  }
+  return Number.isFinite(instant) ? new Date(instant).toISOString() : null;
+}
+
+function timezoneOffsetMs(timestamp: number, timezone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((entry) => entry.type === type)?.value ?? 0);
+  const asIfUtc = Date.UTC(
+    part("year"),
+    part("month") - 1,
+    part("day"),
+    part("hour"),
+    part("minute"),
+    part("second"),
+  );
+  return asIfUtc - timestamp;
+}

@@ -208,8 +208,8 @@ const SELECT_AUTHORIZATION = `
 const SELECT_RUN = `
   SELECT id, work_plan_id, authorization_id, plan_hash, status,
          model_call_count, tool_call_count, checkpoint_step_id, started_at,
-         updated_at, deadline_at, runner_token, runner_lease_until, completed_at,
-         error_code, error_message
+         updated_at, deadline_at, runner_token, runner_lease_until, paused_at,
+         paused_ms_total, completed_at, error_code, error_message
   FROM work_run
 `;
 
@@ -823,13 +823,16 @@ export async function resumeWorkRun(
     pauseRun(db, run.id, "authorization_invalid", "Exact authorization expired or was revoked");
     return requireWorkRun(db, run.id);
   }
-  if (Date.parse(run.deadline_at) <= Date.now()) {
+  // Credit the time this run spent parked before judging it against its deadline. The
+  // authorization above is what actually bounds how long the user has to decide.
+  const deadline = resumeDeadline(db, run, authorization.expires_at);
+  if (Date.parse(deadline) <= Date.now()) {
     pauseRun(db, run.id, "run_deadline_exceeded", "The bounded run deadline elapsed");
     revokeWorkAuthorization(db, detail.plan.id);
     return requireWorkRun(db, run.id);
   }
 
-  return executeRun(db, run, options.executor, true);
+  return executeRun(db, requireWorkRun(db, run.id), options.executor, true);
 }
 
 export function cancelWorkRun(db: Db, runId: number): WorkRun | null {
@@ -1186,6 +1189,17 @@ async function executeRun(
         }
         finishReceiptCompleted(db, receipt.id, result.output, result.citations);
         addRunCounts(db, run.id, result.modelCalls, result.toolCalls);
+        // Artifacts are written before the pause branch, not after it. A step that stops is
+        // exactly the step whose reasons the user needs: the conflict it found, the payload
+        // it is holding. Returning first threw all of that away.
+        for (const artifact of result.artifacts) {
+          createWorkArtifact(db, {
+            planId: detail.plan.id,
+            runId: run.id,
+            stepId: step.id,
+            artifact,
+          });
+        }
         if (result.pause) {
           pauseStepAndRun(
             db,
@@ -1199,14 +1213,6 @@ async function executeRun(
             revokeAuthorization(db, run.authorization_id);
           }
           return true;
-        }
-        for (const artifact of result.artifacts) {
-          createWorkArtifact(db, {
-            planId: detail.plan.id,
-            runId: run.id,
-            stepId: step.id,
-            artifact,
-          });
         }
         completeStep(db, run.id, step.id);
         return true;
@@ -2074,15 +2080,40 @@ function pauseStepAndRun(
     `UPDATE work_step
      SET status = 'pending', error_code = ?, error_message = ? WHERE id = ?`,
   ).run(normalizedCode, normalizedMessage, stepId);
-  db.prepare<[string, string | null, string, number]>(
+  db.prepare<[string, string | null, string, string, number]>(
     `UPDATE work_run
      SET status = 'paused', error_code = ?, error_message = ?, updated_at = ?
-         , runner_token = NULL, runner_lease_until = NULL
+         , runner_token = NULL, runner_lease_until = NULL, paused_at = ?
      WHERE id = ? AND status != 'cancelled'`,
-  ).run(normalizedCode, normalizedMessage, timestamp, runId);
+  ).run(normalizedCode, normalizedMessage, timestamp, timestamp, runId);
   db.prepare<[string, number]>(
     "UPDATE work_plan SET status = 'paused', updated_at = ? WHERE id = ?",
   ).run(timestamp, planId);
+}
+
+/**
+ * Give back the time a run spent waiting on a person.
+ *
+ * `max_duration_seconds` bounds how long Zeus may work, not how long the user may think.
+ * Charging deliberation against it meant a run that stopped for a decision died while the
+ * user was reading — and the created event, already sent, was left attached to a plan that
+ * could never finish. The authorization expiry is what bounds the user's window, and it is
+ * deliberately untouched here: the deadline is only ever extended up to that ceiling.
+ */
+function resumeDeadline(db: Db, run: WorkRun, authorizationExpiresAt: string): string {
+  if (!run.paused_at) return run.deadline_at;
+  const parkedMs = Math.max(0, Date.now() - Date.parse(run.paused_at));
+  const extended = Date.parse(run.deadline_at) + parkedMs;
+  const ceiling = Date.parse(authorizationExpiresAt);
+  const deadline = new Date(
+    Number.isFinite(ceiling) ? Math.min(extended, ceiling) : extended,
+  ).toISOString();
+  db.prepare<[string, number, number]>(
+    `UPDATE work_run
+     SET deadline_at = ?, paused_at = NULL, paused_ms_total = paused_ms_total + ?
+     WHERE id = ?`,
+  ).run(deadline, parkedMs, run.id);
+  return deadline;
 }
 
 function pauseRun(db: Db, runId: number, code: string, message: string): void {

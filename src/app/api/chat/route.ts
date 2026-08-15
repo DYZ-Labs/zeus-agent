@@ -178,6 +178,14 @@ function privateChatResponse(
                   capabilitySlot: effect.capability.slot,
                   connectorLabel: effect.connector.label,
                 })),
+                completedEffects: result.work.completedEffects.map((effect) => ({
+                  id: effect.id,
+                  previewText: effect.preview_text,
+                  connectorLabel: effect.connector.label,
+                  authorizedByPolicy: effect.confirmation_kind === "standing_policy",
+                  reversible: effect.reversal !== null,
+                })),
+                calendar: result.work.calendarOutcome,
               }
             : null,
           extractionFailed: result.learned === null,
