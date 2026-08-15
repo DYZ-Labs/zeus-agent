@@ -13,7 +13,10 @@ import {
   receiptSummaryParts,
   type ChatReceipt,
 } from "@/components/chat-receipt";
-import type { FollowThroughRecommendation } from "@/core/schema";
+// Imported rather than restated. A hand-copied duplicate is how a new status ends up
+// rendering the catch-all sentence "Zeus stopped before making the change", which for
+// read_only would be actively false.
+import type { CalendarOutcome, FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
 
@@ -21,6 +24,12 @@ export type ChatHistoryTurn = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  /**
+   * How a calendar request ended. Stored with the turn, so the deterministic account of what
+   * happened survives a reload — otherwise the only durable record is the model's prose,
+   * which is the part this whole card exists to not depend on.
+   */
+  calendar?: CalendarOutcome | null;
 };
 
 type Turn = ChatHistoryTurn & {
@@ -48,7 +57,6 @@ type Turn = ChatHistoryTurn & {
       authorizedByPolicy: boolean;
       reversible: boolean;
     }>;
-    calendar?: CalendarOutcome | null;
   };
   /** Set on the assistant turn once the stream closes. */
   receipt?: ChatReceipt & {
@@ -212,6 +220,7 @@ export function Chat({
                           : undefined,
                       workPlan:
                         (event.workPlan as Turn["workPlan"] | null) ?? undefined,
+                      calendar: (event.calendar as CalendarOutcome | null) ?? null,
                     }
                   : turn,
               ),
@@ -335,6 +344,7 @@ export function Chat({
                           )
                         }
                         workPlan={turn.workPlan}
+                        calendar={turn.calendar}
                         onReply={(text) => {
                           setInput(text);
                           textareaRef.current?.focus();
@@ -492,6 +502,7 @@ function AssistantTurn({
   recommendationDecision,
   onRecommendationDecision,
   workPlan,
+  calendar,
   onReply,
   pending,
 }: {
@@ -505,6 +516,7 @@ function AssistantTurn({
     userReason?: string,
   ) => void;
   workPlan?: Turn["workPlan"];
+  calendar?: CalendarOutcome | null;
   /** Fills the composer. Choosing an alternative is a message the user sends, not an act. */
   onReply: (text: string) => void;
   pending: boolean;
@@ -527,8 +539,8 @@ function AssistantTurn({
             onDecision={onRecommendationDecision}
           />
         )}
-        {workPlan?.calendar ? (
-          <CalendarActionCard workPlan={workPlan} outcome={workPlan.calendar} onReply={onReply} />
+        {calendar ? (
+          <CalendarActionCard workPlan={workPlan} outcome={calendar} onReply={onReply} />
         ) : (
           workPlan && <WorkPlanCard workPlan={workPlan} />
         )}
@@ -538,22 +550,16 @@ function AssistantTurn({
   );
 }
 
-type CalendarOutcome = {
-  kind: "create" | "reschedule" | "cancel" | "read";
-  status:
-    | "done"
-    | "awaiting_confirmation"
-    | "blocked_by_conflict"
-    | "ambiguous_target"
-    | "target_not_found"
-    | "unverifiable"
-    | "no_connector"
-    | "failed";
-  conflicts: Array<{ title: string | null; startsAt: string; endsAt: string | null }>;
-  alternatives: Array<{ startsAt: string; endsAt: string }>;
-  candidates: Array<{ externalId: string; title: string | null; startsAt: string }>;
-  consideredEvents: number | null;
-  coverage: { from: string; to: string; fetchedAt: string } | null;
+/** What Zeus could not work out, said in the user's terms rather than the veto's. */
+const CLARIFICATION: Record<string, string> = {
+  low_confidence_write: "Zeus was not sure enough about that to act on it.",
+  no_target_reference: "Zeus could not tell which event you meant.",
+  no_start_time: "Zeus could not tell what time you meant.",
+  unparsable_start: "Zeus could not read that as a time.",
+  unparsable_end: "Zeus could not read that as an end time.",
+  implausible_duration: "That worked out to a length Zeus did not trust.",
+  implausible_date: "That worked out to a date Zeus did not trust.",
+  no_title: "Zeus could not tell what to call it.",
 };
 
 const VERB: Record<CalendarOutcome["kind"], string> = {
@@ -576,15 +582,17 @@ function CalendarActionCard({
   outcome,
   onReply,
 }: {
-  workPlan: NonNullable<Turn["workPlan"]>;
+  // Optional: the outcomes worth surfacing most — nothing connected, or a request Zeus
+  // recognized and could not resolve — never produced a run to attach to.
+  workPlan?: Turn["workPlan"];
   outcome: CalendarOutcome;
   onReply: (text: string) => void;
 }) {
   const [decided, setDecided] = useState<"executed" | "declined" | "reverted" | null>(null);
   const [busy, setBusy] = useState<"confirm" | "decline" | "revert" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const done = workPlan.completedEffects ?? [];
-  const pending = workPlan.pendingEffects[0];
+  const done = workPlan?.completedEffects ?? [];
+  const pending = workPlan?.pendingEffects[0];
 
   async function decide(action: "confirm" | "decline" | "revert", effectId: number, hash?: string) {
     if (busy) return;
@@ -733,13 +741,59 @@ function CalendarActionCard({
           </div>
         </>
       ) : outcome.status === "target_not_found" ? (
+        <>
+          <p className="text-[0.85rem] leading-6">
+            {outcome.coverage?.eventCount === 0
+              ? "Nothing changed — the calendar Zeus read has nothing on it at all."
+              : "Nothing changed — Zeus could not find that on the calendar it read."}
+          </p>
+          {outcome.nearMisses.length > 0 && (
+            <>
+              <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
+                It did see these. Did you mean one of them?
+              </p>
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                {outcome.nearMisses.map((candidate) => (
+                  <button
+                    key={candidate.externalId}
+                    type="button"
+                    onClick={() =>
+                      onReply(
+                        `I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt)}.`,
+                      )
+                    }
+                    className="rounded-md border px-2.5 py-1 text-[0.74rem]"
+                    style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
+                  >
+                    {candidate.title ?? "An event"} · {localLabel(candidate.startsAt)}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </>
+      ) : outcome.status === "needs_clarification" ? (
         <p className="text-[0.85rem] leading-6">
-          Nothing changed — nothing on the calendar Zeus read matches that.
+          Nothing changed.{" "}
+          {(outcome.reason && CLARIFICATION[outcome.reason]) ??
+            "Zeus could not work out what you wanted changed."}{" "}
+          Say it again with the detail it was missing and it will try.
+        </p>
+      ) : outcome.status === "read_only" ? (
+        <p className="text-[0.85rem] leading-6">
+          Your calendar is connected for reading only, so nothing was changed.{" "}
+          <a href="/settings#connections" className="underline underline-offset-2">
+            Allow calendar changes
+          </a>
+          .
         </p>
       ) : outcome.status === "unverifiable" ? (
         <p className="text-[0.85rem] leading-6">
-          Nothing changed. Zeus could not read your calendar, so it cannot promise that time
-          is free and did not act on it.
+          {outcome.reason === "no_read_capability"
+            ? "Nothing changed. Zeus cannot read your calendar with the permissions it has, so it could not check and did not act."
+            : outcome.reason === "stale_coverage"
+              ? "Nothing changed. Zeus last looked at your calendar too long ago to act on it. Ask again and it will read it fresh."
+              : "Nothing changed. Zeus could not read your calendar, so it cannot promise that time is free and did not act on it."}
         </p>
       ) : outcome.status === "no_connector" ? (
         <p className="text-[0.85rem] leading-6">

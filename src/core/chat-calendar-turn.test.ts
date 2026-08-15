@@ -1,0 +1,232 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { CalendarIntent } from "./calendar-intent";
+
+/**
+ * What a chat turn does with a calendar request it recognizes but does not carry out.
+ *
+ * Every one of these used to end the same way: `work` was null, no block reached the model,
+ * no card reached the screen, and the reply was composed from memory alone. That is how
+ * "there is no existing dinner event to reschedule" came to be said about a calendar nothing
+ * in the turn had opened.
+ */
+
+const mocks = vi.hoisted(() => ({
+  assertResponseComplete: vi.fn(),
+  buildContext: vi.fn(),
+  classifyCalendarIntent: vi.fn(),
+  finalResponse: vi.fn(),
+  generateWorkPlanProposal: vi.fn(),
+  on: vi.fn(),
+  openaiStream: vi.fn(),
+  recordResponseContext: vi.fn(),
+  renderMemoryBlock: vi.fn(() => "<memory />"),
+}));
+
+vi.mock("./openai", () => ({
+  MODEL: "test-model",
+  OPENAI_TIMEOUT_MS: 75_000,
+  assertResponseComplete: mocks.assertResponseComplete,
+  openai: () => ({ responses: { stream: mocks.openaiStream } }),
+}));
+
+vi.mock("./context", () => ({
+  buildContext: mocks.buildContext,
+  intentFieldProvenance: vi.fn(),
+  recordResponseContext: mocks.recordResponseContext,
+  renderMemoryBlock: mocks.renderMemoryBlock,
+}));
+
+vi.mock("./extract", () => ({
+  applyExtraction: vi.fn(),
+  extract: vi.fn(async () => ({})),
+  extractionContext: vi.fn(() => ({})),
+  extractionSourceMessageIds: vi.fn(() => []),
+  finishExtractionRun: vi.fn(() => ({ status: "completed" })),
+  startExtractionRun: vi.fn(() => ({ id: 1 })),
+}));
+
+// Only the model call is replaced. The veto, the capability check, and the outcome mapping
+// all run for real — they are the parts under test.
+vi.mock("./calendar-intent", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./calendar-intent")>()),
+  classifyCalendarIntent: mocks.classifyCalendarIntent,
+}));
+
+vi.mock("./work-execution", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./work-execution")>()),
+  generateWorkPlanProposal: mocks.generateWorkPlanProposal,
+}));
+
+import { streamTurn } from "./chat";
+import {
+  bindCapability,
+  createConnector,
+  recordConnectorVerification,
+  setCapabilityEnabled,
+  setConnectorEnabled,
+} from "./connectors";
+import { appendMessage, createConversation } from "./conversations";
+import { type Db, openTestDb } from "./db";
+import type { CapabilitySlot } from "./schema";
+
+function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
+  return {
+    intent: "reschedule",
+    confidence: "high",
+    title: null,
+    starts_at_local: "2026-08-17T19:30",
+    ends_at_local: null,
+    location: null,
+    target: { title_text: "dinner", starts_at_local: null, date_local: null },
+    is_negated: false,
+    is_hypothetical_or_quoted: false,
+    is_about_another_person: false,
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.buildContext.mockResolvedValue({
+    hits: [],
+    plan: {},
+    queryVector: null,
+    recommendation: null,
+  });
+  mocks.openaiStream.mockReturnValue({ on: mocks.on, finalResponse: mocks.finalResponse });
+  mocks.finalResponse.mockResolvedValue({ output_text: "Reply." });
+  mocks.generateWorkPlanProposal.mockResolvedValue(null);
+});
+
+function connectCalendar(db: Db, slots: readonly CapabilitySlot[]): void {
+  const conversation = createConversation(db, { title: "Connections", source: "web" });
+  const sourceMessageId = appendMessage(db, conversation.id, "user", "connect my calendar", {
+    origin: "user_action",
+    recallState: "blocked",
+  }).id;
+  const connector = createConnector(db, {
+    label: "Calendar",
+    transport: "stdio",
+    command: "node",
+    args: ["./calendar-server.js"],
+    sourceMessageId,
+  });
+  recordConnectorVerification(db, connector.id, { status: "ready" });
+  setConnectorEnabled(db, connector.id, true, sourceMessageId);
+  for (const slot of slots) {
+    const capability = bindCapability(db, {
+      connectorId: connector.id,
+      slot,
+      remoteToolName: slot.split(".")[1] ?? slot,
+      inputSchema: { type: "object", properties: { title: { type: "string" } } },
+      sourceMessageId,
+    });
+    setCapabilityEnabled(db, capability.id, true, sourceMessageId);
+  }
+}
+
+async function turn(input: string, db: Db = openTestDb()) {
+  const conversation = createConversation(db);
+  const result = await streamTurn(db, {
+    conversationId: conversation.id,
+    input,
+    timezone: "UTC",
+  });
+  const body = mocks.openaiStream.mock.calls[0]?.[0] as {
+    input: { role: string; content: string }[];
+  };
+  return { result, sentToModel: body.input.at(-1)?.content ?? "" };
+}
+
+describe("a recognized calendar request is never silent", () => {
+  it("says nothing is connected instead of letting the model guess", async () => {
+    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+
+    const { result, sentToModel } = await turn("move dinner to 7:30pm");
+
+    expect(result.calendar).toMatchObject({
+      kind: "reschedule",
+      status: "no_connector",
+      reason: "not_connected",
+    });
+    expect(sentToModel).toContain('<calendar_result status="no_connector"');
+    // No connector means no plan to generate; the turn must not spend a model call finding
+    // that out.
+    expect(mocks.generateWorkPlanProposal).not.toHaveBeenCalled();
+  });
+
+  it("reports a read-only connection instead of discarding the turn", async () => {
+    // A read-only grant used to make `assertAuthorizableEffects` throw, which the planning
+    // catch swallowed — so the user was told nothing and the model was told nothing.
+    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+
+    const { result, sentToModel } = await turn("move dinner to 7:30pm", db);
+
+    expect(result.calendar).toMatchObject({
+      status: "read_only",
+      reason: "no_write_capability",
+    });
+    expect(sentToModel).toContain('<calendar_result status="read_only"');
+  });
+
+  it("asks rather than inventing a reason when the classifier was unsure", async () => {
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ confidence: "low" }));
+
+    const { result, sentToModel } = await turn("move dinner to 7:30pm");
+
+    expect(result.calendar).toMatchObject({
+      status: "needs_clarification",
+      reason: "low_confidence_write",
+      kind: "reschedule",
+    });
+    expect(sentToModel).toContain("needs_clarification");
+  });
+
+  it.each([
+    ["negated", { is_negated: true }],
+    ["hypothetical", { is_hypothetical_or_quoted: true }],
+    ["someone else's", { is_about_another_person: true }],
+    ["not a calendar request", { intent: "none" as const }],
+  ])("stays quiet when the user did not ask (%s)", async (_label, overrides) => {
+    mocks.classifyCalendarIntent.mockResolvedValue(intent(overrides));
+
+    const { result, sentToModel } = await turn("dinner with Priya was great tonight");
+
+    // The prefilter is over-inclusive on purpose. If these spoke, an ordinary sentence about
+    // dinner would raise a calendar card.
+    expect(result.calendar).toBeNull();
+    expect(sentToModel).not.toContain("<calendar_result");
+  });
+
+  it("still runs a research plan when the message was never a calendar request", async () => {
+    // "by Friday" is enough for the prefilter, so an ordinary bounded-work request reaches
+    // the classifier and comes back as `none`. Returning there would quietly drop the work.
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+
+    await turn("Research the backup options by Friday and draft a recommendation.");
+
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+  });
+
+  it("stores the outcome so a reload still shows what happened", async () => {
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ confidence: "low" }));
+    const db = openTestDb();
+    const conversation = createConversation(db);
+
+    const result = await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "move dinner to 7:30pm",
+      timezone: "UTC",
+    });
+
+    const stored = db
+      .prepare<[number], { status: string }>(
+        "SELECT status FROM calendar_outcome WHERE assistant_message_id = ?",
+      )
+      .get(result.message.id);
+    expect(stored?.status).toBe("needs_clarification");
+  });
+});

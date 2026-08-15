@@ -114,6 +114,10 @@ npm run mcp            # stdio MCP server
   can only ever downgrade what the model proposed.
 - `src/core/calendar-actions.ts` — the resolved action, its payload, and its work plan.
 - `src/core/calendar-policy.ts` — the standing direct-execution setting and its ceiling.
+- `src/core/calendar-outcome.ts` — the deterministic account of what a calendar request did,
+  stored with its assistant turn so a reload does not leave prose as the only record.
+- `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
+  `<capabilities>` block. Never memory.
 - `src/core/calendar-sync.ts` — the disposable external read cache.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
