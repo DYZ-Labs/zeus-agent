@@ -5,6 +5,7 @@ import {
   findConflicts,
   findFreeSlots,
   MAX_COVERAGE_AGE_MS,
+  MAX_NEAR_MISSES,
   resolveTargetEvent,
 } from "./calendar-conflicts";
 import type { CalendarCoverage, CandidateEvent } from "./calendar-conflicts";
@@ -375,7 +376,56 @@ describe("resolving which event the user meant", () => {
       startsAt: null,
       dateLocal: null,
     }, options);
-    expect(result).toEqual({ status: "not_found" });
+    expect(result.status).toBe("not_found");
+  });
+
+  it("says what it did see, so the refusal can become a question", () => {
+    // The failure this replaces: Zeus answered "there is no existing dinner event" about a
+    // calendar it had read correctly, because the match missed. A miss is not evidence of
+    // absence, and near misses are what let the reply ask instead of assert.
+    const result = resolveTargetEvent([standup, dinner, review], {
+      titleText: "supper",
+      startsAt: "2026-08-18T19:30:00.000Z",
+      dateLocal: null,
+    }, options);
+    expect(result.status).toBe("not_found");
+    if (result.status !== "not_found") return;
+    expect(result.nearMisses.map((entry) => entry.external_id)).toContain("dinner");
+    expect(result.nearMisses.length).toBeLessThanOrEqual(MAX_NEAR_MISSES);
+  });
+
+  it("does not offer near misses from beyond the day the user named", () => {
+    const distant = event({
+      external_id: "distant",
+      starts_at: "2026-09-30T19:00:00.000Z",
+      ends_at: "2026-09-30T20:00:00.000Z",
+      title: "Quarterly planning",
+    });
+    const result = resolveTargetEvent([distant], {
+      titleText: "supper",
+      startsAt: "2026-08-18T19:30:00.000Z",
+      dateLocal: null,
+    }, options);
+    expect(result).toMatchObject({ status: "not_found", nearMisses: [] });
+  });
+
+  it("matches a title the user described more fully than the calendar did", () => {
+    // "dinner with Sam" against an event called "Dinner" used to score zero: the filler word
+    // pushed the shared-word threshold to two. Describing the event better made it harder
+    // to find.
+    const bare = event({
+      external_id: "bare-dinner",
+      starts_at: "2026-08-18T19:00:00.000Z",
+      ends_at: "2026-08-18T20:00:00.000Z",
+      title: "Dinner",
+    });
+    const result = resolveTargetEvent([standup, bare], {
+      titleText: "dinner with Sam",
+      startsAt: null,
+      dateLocal: null,
+    }, options);
+    expect(result).toMatchObject({ status: "resolved" });
+    if (result.status === "resolved") expect(result.event.external_id).toBe("bare-dinner");
   });
 
   it("ignores events that have already finished but keeps one still running", () => {

@@ -194,6 +194,15 @@ export type BuildContextOptions = {
   querySourceMessageId?: number | null;
   memoryBudgetTokens?: number;
   interactionBudgetTokens?: number;
+  /**
+   * The turn's own evaluation context.
+   *
+   * Supplied by the caller so a single turn resolves "now" once. The fallback reads the
+   * ambient setting, whose timezone defaults to UTC — fine for a background trigger that has
+   * no other source, wrong for a chat turn whose browser reported a real zone, and silently
+   * wrong in a way that lands on facet conditions and relative dates alike.
+   */
+  evaluationContext?: EvaluationContext;
 };
 
 export function inferContextIntent(query: string): ContextIntent {
@@ -227,7 +236,8 @@ export async function buildContext(
   );
   const queryVector = options.queryVector === undefined ? await embed(query) : options.queryVector;
   const personalization = computePersonalizationProfile(db);
-  const evaluationContext = buildEvaluationContextForTrigger(db, "chat");
+  const evaluationContext =
+    options.evaluationContext ?? buildEvaluationContextForTrigger(db, "chat");
   const cycle = evaluateOpportunity(
     db,
     evaluationContext,

@@ -267,10 +267,25 @@ export type EventReference = {
 export type TargetResolution =
   | { status: "resolved"; event: CachedEvent }
   | { status: "ambiguous"; candidates: CachedEvent[] }
-  | { status: "not_found" };
+  | {
+      status: "not_found";
+      /**
+       * What Zeus did see, so a refusal can become a question.
+       *
+       * Nothing acts on these and nothing may treat them as the calendar's contents: they
+       * are, by construction, the entries that failed the match. They exist so the reply can
+       * say "I do not see a dinner; I do see this — did you mean it?" instead of asserting
+       * that the event does not exist, which is a claim about someone's calendar that a
+       * failed lookup does not support.
+       */
+      nearMisses: CachedEvent[];
+    };
 
 export const TARGET_START_TOLERANCE_MS = 15 * 60_000;
 export const MAX_TARGET_CANDIDATES = 5;
+export const MAX_NEAR_MISSES = 3;
+/** How far from the time the user named a non-matching event may be and still be worth naming. */
+export const NEAR_MISS_WINDOW_MS = 7 * 86_400_000;
 
 /**
  * Which existing event "my 3pm" or "dinner with Sam" refers to.
@@ -283,14 +298,25 @@ export const MAX_TARGET_CANDIDATES = 5;
 export function resolveTargetEvent(
   events: readonly CachedEvent[],
   reference: EventReference,
-  options: { timezone: string; now: string },
+  options: {
+    timezone: string;
+    now: string;
+    /**
+     * Where in time to look when nothing matched — the requested new time, for a
+     * reschedule. Never used to resolve a target, only to decide which non-matching events
+     * are worth naming back: someone moving something to Thursday is not helped by a list of
+     * what is on today.
+     */
+    anchorAt?: string | null;
+  },
 ): TargetResolution {
   const nowMs = Date.parse(options.now);
   // A meeting that started ten minutes ago is still reschedulable; yesterday's is not.
-  let pool = events.filter((event) => {
+  const live = events.filter((event) => {
     const eventEnd = endOf(event);
     return Number.isFinite(eventEnd) && eventEnd > nowMs - 3_600_000;
   });
+  let pool = live;
 
   if (reference.dateLocal) {
     pool = pool.filter(
@@ -324,10 +350,14 @@ export function resolveTargetEvent(
     pool = scored.filter((entry) => entry.score === best).map((entry) => entry.event);
   }
 
-  if (pool.length === 0) return { status: "not_found" };
+  if (pool.length === 0) {
+    return { status: "not_found", nearMisses: nearMissesFor(live, reference, nowMs, options.anchorAt ?? null) };
+  }
   if (pool.length === 1) {
     const event = pool[0];
-    return event ? { status: "resolved", event } : { status: "not_found" };
+    return event
+      ? { status: "resolved", event }
+      : { status: "not_found", nearMisses: nearMissesFor(live, reference, nowMs, options.anchorAt ?? null) };
   }
   return {
     status: "ambiguous",
@@ -335,6 +365,54 @@ export function resolveTargetEvent(
       .sort((left, right) => startOf(left) - startOf(right))
       .slice(0, MAX_TARGET_CANDIDATES),
   };
+}
+
+/**
+ * A short, bounded list of what was there instead.
+ *
+ * Deliberately looser than the strict chain and deliberately incapable of resolving
+ * anything: one shared word, or a containment either way, or simply being near the time the
+ * user named. The cap and the time window keep this from becoming a dump of somebody's week
+ * in exchange for a failed lookup.
+ */
+function nearMissesFor(
+  live: readonly CachedEvent[],
+  reference: EventReference,
+  nowMs: number,
+  anchorAt: string | null,
+): CachedEvent[] {
+  const needle = reference.titleText?.trim().toLocaleLowerCase() ?? "";
+  const words = reference.titleText ? contentWords(reference.titleText) : new Set<string>();
+  // How the user pointed at the event first, then where they are putting it, then now.
+  const anchor = [reference.startsAt, anchorAt]
+    .map((value) => (value ? Date.parse(value) : Number.NaN))
+    .find((value) => Number.isFinite(value)) ?? nowMs;
+
+  const scored = live
+    .map((event) => {
+      const title = (event.title ?? "").toLocaleLowerCase();
+      let score = 0;
+      if (needle.length > 0 && title.length > 0) {
+        if (title.includes(needle) || needle.includes(title)) score = 3;
+        else {
+          const eventWords = contentWords(event.title ?? "");
+          for (const word of words) if (eventWords.has(word)) score = Math.max(score, 2);
+        }
+      }
+      const distance = Math.abs(startOf(event) - anchor);
+      // Nothing shared a word, so offer what sits around the time they named. Without this
+      // a title-only miss has nothing to say, which is the case that started all of this.
+      if (score === 0 && Number.isFinite(distance) && distance <= NEAR_MISS_WINDOW_MS) score = 1;
+      return { event, score, distance };
+    })
+    .filter((entry) => entry.score > 0);
+
+  return scored
+    .sort((left, right) =>
+      left.score === right.score ? left.distance - right.distance : right.score - left.score,
+    )
+    .slice(0, MAX_NEAR_MISSES)
+    .map((entry) => entry.event);
 }
 
 // ---------------------------------------------------------------------------

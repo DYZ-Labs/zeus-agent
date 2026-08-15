@@ -9,6 +9,7 @@ import {
   bindCapability,
   createConnector,
   getConnector,
+  listConnectors,
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "./connectors";
@@ -452,6 +453,69 @@ describe("a calendar change reads first, checks, then acts", () => {
     expect(run.error_code).toBe("calendar_target_ambiguous");
     expect(effectsForRun(db, run.id)).toHaveLength(0);
     expect(recordedCalls().filter((call) => call.tool === "update_event")).toEqual([]);
+  }, 30_000);
+
+  it("says what it did see instead of asserting the event is not there", async () => {
+    // The reported failure: "there is no existing dinner event to reschedule", said about a
+    // calendar that had been read correctly and did have a dinner on it. A lookup that
+    // missed is not evidence of absence, so the refusal has to carry what was actually
+    // there and let the reply ask.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-sushi", summary: "Sushi with Mark", start: "2026-08-20T18:00:00Z", end: "2026-08-20T20:00:00Z" },
+    ]);
+    await connectCalendar();
+
+    const { run } = await realRun({
+      request: {
+        kind: "reschedule",
+        reference: { titleText: "quarterly board meeting", startsAt: null, dateLocal: null },
+        startsAt: "2026-08-20T19:30:00.000Z",
+        endsAt: "2026-08-20T20:30:00.000Z",
+        timezone: "UTC",
+      },
+    });
+
+    expect(run.error_code).toBe("calendar_target_not_found");
+    expect(effectsForRun(db, run.id)).toHaveLength(0);
+    const artifact = listWorkArtifacts(db, { runId: run.id }).at(-1);
+    const detail = JSON.parse(artifact!.content.slice(artifact!.content.indexOf("{"))) as {
+      near_misses: { external_id: string }[];
+      coverage: { eventCount: number } | null;
+    };
+    expect(detail.near_misses.map((entry) => entry.external_id)).toContain("evt-sushi");
+    // And enough to tell "your calendar is empty" apart from "I could not match it".
+    expect(detail.coverage?.eventCount).toBe(1);
+  }, 30_000);
+
+  it("will not resolve a target against a read that is too old, even to cancel", async () => {
+    // A cancel never reaches the conflict check, which is the only thing that enforced the
+    // staleness bound — so this was the one path that could resolve a target from a cache of
+    // any age and then execute under the standing setting.
+    await connectCalendar();
+    const connector = listConnectors(db)[0];
+    const staleAt = new Date(Date.now() - 40 * 60_000);
+    cacheCalendarEvents(
+      db,
+      connector!.id,
+      [{ id: "evt-dinner", summary: "Dinner with Priya", start: "2026-08-20T19:00:00Z", end: "2026-08-20T21:00:00Z" }],
+      staleAt,
+    );
+
+    const { run } = await realRun({
+      skipRead: true,
+      request: {
+        kind: "cancel",
+        reference: { titleText: "dinner with Priya", startsAt: null, dateLocal: null },
+        timezone: "UTC",
+      },
+    });
+
+    // The cached rows have not expired, so the target *would* have resolved. What stops it
+    // is the age of the read, which is the honest reason and the one the user can act on.
+    expect(cachedEvents(db, new Date())).toHaveLength(1);
+    expect(run.error_code).toBe("calendar_unverifiable");
+    expect(recordedCalls().filter((call) => call.tool === "update_event")).toEqual([]);
+    expect(effectsForRun(db, run.id)).toHaveLength(0);
   }, 30_000);
 
   it("refuses a plan whose own limits cannot cover its own steps", async () => {

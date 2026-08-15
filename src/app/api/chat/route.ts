@@ -186,9 +186,11 @@ function privateChatResponse(
                   authorizedByPolicy: effect.confirmation_kind === "standing_policy",
                   reversible: effect.reversal !== null,
                 })),
-                calendar: result.work.calendarOutcome,
               }
             : null,
+          // A sibling of workPlan, not a field inside it: the outcomes that matter most —
+          // nothing connected, or a request Zeus could not resolve — never had a run.
+          calendar: result.calendar,
           extractionFailed: result.learned === null,
         });
 

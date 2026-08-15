@@ -1142,6 +1142,68 @@ export const CalendarActionSetting = z
 export type CalendarActionSetting = z.infer<typeof CalendarActionSetting>;
 
 /**
+ * How one calendar request ended, decided deterministically rather than read out of prose.
+ *
+ * The card, the model's sentences, and the stored record all descend from this, so they
+ * cannot disagree. Assistant-authored outcome data: never a fact, never evidence, and never
+ * supplied as memory — the event titles it carries are somebody else's writing.
+ *
+ * Note `nearMisses`, which is not a list of what is on the calendar. It is the entries that
+ * *failed* the match, kept so a refusal can ask which was meant instead of asserting that
+ * the event does not exist. A lookup that missed is not evidence of absence.
+ */
+export const CalendarOutcomeEvent = z
+  .object({
+    externalId: z.string(),
+    title: z.string().nullable(),
+    startsAt: z.string(),
+  })
+  .strict();
+
+export const CalendarOutcome = z
+  .object({
+    kind: z.enum(["create", "reschedule", "cancel", "read"]),
+    status: z.enum([
+      "done",
+      "awaiting_confirmation",
+      "blocked_by_conflict",
+      "ambiguous_target",
+      "target_not_found",
+      "unverifiable",
+      "no_connector",
+      "read_only",
+      "needs_clarification",
+      "failed",
+    ]),
+    reason: z.string().nullable(),
+    note: z.string().nullable(),
+    conflicts: z.array(
+      z
+        .object({
+          title: z.string().nullable(),
+          startsAt: z.string(),
+          endsAt: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    alternatives: z.array(z.object({ startsAt: z.string(), endsAt: z.string() }).strict()),
+    candidates: z.array(CalendarOutcomeEvent),
+    nearMisses: z.array(CalendarOutcomeEvent),
+    consideredEvents: z.number().nullable(),
+    coverage: z
+      .object({
+        from: z.string(),
+        to: z.string(),
+        fetchedAt: z.string(),
+        eventCount: z.number().nullable(),
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+export type CalendarOutcome = z.infer<typeof CalendarOutcome>;
+
+/**
  * A disposable copy of what a connector reported. Never evidence: an invite someone else
  * wrote is not the user speaking, so it may shape a plan but can never become memory.
  */

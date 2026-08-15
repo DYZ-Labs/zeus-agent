@@ -1,4 +1,5 @@
 import { Chat, type ChatHistoryTurn } from "@/components/chat";
+import { calendarOutcomesIn } from "@/core/calendar-outcome";
 import { getConversation, messagesIn } from "@/core/conversations";
 import { hasCredentials } from "@/core/openai";
 import { getOwnerAccess } from "@/server/auth/access";
@@ -33,11 +34,15 @@ export default async function ChatPage({
   const conversation = db && Number.isInteger(requestedConversationId) && requestedConversationId > 0
     ? getConversation(db, requestedConversationId)
     : null;
+  // Rehydrated so a reload still shows what Zeus actually did, rather than leaving the
+  // assistant's own sentences as the only surviving account of it.
+  const storedOutcomes = conversation && db ? calendarOutcomesIn(db, conversation.id) : null;
   const initialTurns: ChatHistoryTurn[] = conversation && db
     ? messagesIn(db, conversation.id, 400).map((message) => ({
         id: `stored-${message.id}`,
         role: message.role,
         text: message.content,
+        calendar: storedOutcomes?.get(message.id) ?? null,
       }))
     : [];
 

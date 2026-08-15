@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { recordModelCall, responseUsage } from "./budget";
 import type { CalendarRequest } from "./calendar-actions";
+import { TARGET_START_TOLERANCE_MS } from "./calendar-conflicts";
 import type { EventReference } from "./calendar-conflicts";
 import type { Db } from "./db";
 import { errorSignature, logEvent } from "./observability";
@@ -46,7 +47,9 @@ Resolve times to local wall-clock in the supplied timezone, formatted YYYY-MM-DD
 
 For "reschedule" and "cancel", describe how the user referred to the existing event in the target field — its title words, its start time, or its date. Never invent an identifier; the system resolves which event they meant.
 
-Set confidence "high" only when the request is unambiguous and every field you filled in is directly supported by the user's words. Use "low" whenever you are inferring, guessing a time, or unsure which event is meant.
+Keep the two times apart. The top-level starts_at_local is where the user wants the event to end up. target.starts_at_local is the time they used to point at the event that already exists, and it must be null when the only time in the message is the destination: "move dinner to 7:30pm" gives starts_at_local "…T19:30" and target {title_text: "dinner", starts_at_local: null, date_local: null}. Likewise the top-level title names a new event; for a reschedule or a cancel, the words the user used for the existing event belong in target.title_text.
+
+Set confidence "high" only when the request is unambiguous and every field you filled in is directly supported by the user's words. Use "low" whenever you are inferring or guessing a time. Confidence is about the fields you filled in, not about which existing event the user meant: you cannot see their calendar, and the system matches the target against it deterministically and asks the user when more than one event fits. Do not lower confidence merely because you do not know which event is meant.
 
 Set is_negated only when the user is telling you NOT to do something, or is withdrawing an instruction they gave earlier — "don't put that on my calendar", "actually, leave it". Asking you to cancel or delete an event is a request, not a negation: intent "cancel" with is_negated false is the correct answer for "cancel my 3pm". Set is_hypothetical_or_quoted when they are supposing, quoting, or giving an example. Set is_about_another_person when the calendar or the action belongs to somebody other than the user. These flags are safety checks: when genuinely in doubt, set them.
 
@@ -148,6 +151,8 @@ export async function classifyCalendarIntent(
     /** The user's own prior messages, oldest first. Assistant text is never supplied. */
     priorUserMessages: readonly string[];
     context: EvaluationContext;
+    /** The turn this classification belongs to, so a later refusal can be tied to it. */
+    sourceMessageId?: number | null;
   },
   options: { signal?: AbortSignal } = {},
 ): Promise<CalendarIntent | null> {
@@ -185,38 +190,120 @@ export async function classifyCalendarIntent(
     );
     recordModelCall(db, responseUsage(response));
     assertResponseComplete(response);
-    return response.output_parsed ?? null;
+    const parsed = response.output_parsed ?? null;
+    // What the classifier proposed, tied to the turn. Without this a later refusal can only
+    // be correlated by wall clock, which is why "why did nothing happen?" stayed a
+    // two-hypothesis question for as long as it did.
+    logEvent({
+      event: "calendar_intent_classified",
+      outcome: "ok",
+      message_id: input.sourceMessageId ?? null,
+      ...(parsed ? { mode: parsed.intent, confidence: parsed.confidence } : {}),
+    });
+    return parsed;
   } catch (error) {
     // Degrading here lands exactly where the old regexes landed for an unrecognized
     // phrasing: an ordinary chat turn. It can never be worse than the behavior it replaced.
     logEvent({
       event: "calendar_intent_classified",
       outcome: "degraded",
+      message_id: input.sourceMessageId ?? null,
       ...errorSignature(error),
     });
     return null;
   }
 }
 
+export type CalendarRefusalReason =
+  | "no_calendar_intent"
+  | "negated"
+  | "hypothetical_or_quoted"
+  | "another_person"
+  | "refusal_signal_in_message"
+  | "low_confidence_write"
+  | "no_target_reference"
+  | "no_start_time"
+  | "unparsable_start"
+  | "unparsable_end"
+  | "implausible_duration"
+  | "implausible_date"
+  | "no_title";
+
+/**
+ * Refusals the user should hear about, and the ones that must stay silent.
+ *
+ * The distinction is whether the user asked for anything. A message the model read as
+ * negated, hypothetical, about somebody else, or not a calendar request at all is one where
+ * saying "I could not do that" would be answering a question nobody put — and
+ * `mayBeCalendarRequest` is deliberately over-inclusive, so `no_calendar_intent` is the
+ * common case. Every remaining reason follows a request Zeus recognized and did not carry
+ * out, and silence there is what let a fabricated explanation fill the gap.
+ */
+export const SPOKEN_REFUSAL_REASONS = [
+  "low_confidence_write",
+  "no_target_reference",
+  "no_start_time",
+  "unparsable_start",
+  "unparsable_end",
+  "implausible_duration",
+  "implausible_date",
+  "no_title",
+] as const satisfies readonly CalendarRefusalReason[];
+
+export function refusalIsSpoken(reason: CalendarRefusalReason): boolean {
+  return (SPOKEN_REFUSAL_REASONS as readonly CalendarRefusalReason[]).includes(reason);
+}
+
+export type CalendarResolution =
+  | {
+      status: "request";
+      request: CalendarRequest;
+      /** A field that was dropped as unusable, worth reporting rather than hiding. */
+      note: "target_time_was_destination" | null;
+    }
+  | {
+      status: "refused";
+      reason: CalendarRefusalReason;
+      /** What the model thought was being asked, so a spoken refusal can name the action. */
+      intent: CalendarIntent["intent"];
+    };
+
 /**
  * Turn a proposed intent into an action Zeus may actually take — or into nothing.
  *
  * Downgrade-only, by construction: every branch either returns a request built from fields
- * the model supplied, or returns null. With no confirmation gate downstream, this is where
- * a misread has to be stopped, so the refusals are deliberately eager.
+ * the model supplied, or refuses. With no confirmation gate downstream, this is where a
+ * misread has to be stopped, so the refusals are deliberately eager.
+ *
+ * A refusal now carries its reason out rather than collapsing to a bare null. That is not
+ * cosmetic: when the caller could not tell a recognized-but-refused request from an ordinary
+ * sentence, the chat model received no signal at all and answered anyway — which is how
+ * "there is no existing dinner event to reschedule" was said about a calendar nothing had
+ * read.
  */
 export function resolveCalendarRequest(
   message: string,
   intent: CalendarIntent,
   context: EvaluationContext,
-): CalendarRequest | null {
-  // A refusal here means the user sees nothing happen and is told nothing about why, so
-  // the reason has to be recoverable from the log. Classification is a model call and will
-  // vary between identical requests; without this, "it worked yesterday" is unfalsifiable.
-  const refuse = (reason: string): null => {
-    logEvent({ event: "calendar_intent_refused", outcome: "degraded", reason });
-    return null;
+  options: { sourceMessageId?: number | null } = {},
+): CalendarResolution {
+  // Still logged, because classification is a model call and will vary between identical
+  // requests; without this, "it worked yesterday" is unfalsifiable.
+  const refuse = (reason: CalendarRefusalReason): CalendarResolution => {
+    logEvent({
+      event: "calendar_intent_refused",
+      outcome: "degraded",
+      reason,
+      message_id: options.sourceMessageId ?? null,
+      mode: intent.intent,
+      confidence: intent.confidence,
+    });
+    return { status: "refused", reason, intent: intent.intent };
   };
+  const act = (
+    request: CalendarRequest,
+    note: "target_time_was_destination" | null = null,
+  ): CalendarResolution => ({ status: "request", request, note });
 
   if (intent.intent === "none") return refuse("no_calendar_intent");
   if (intent.is_negated) return refuse("negated");
@@ -227,20 +314,20 @@ export function resolveCalendarRequest(
   const timezone = context.timezone;
   if (intent.intent === "read") {
     const at = Date.parse(context.evaluated_at);
-    return {
+    return act({
       kind: "read",
       from: new Date(at).toISOString(),
       to: new Date(at + 30 * 86_400_000).toISOString(),
       timezone,
-    };
+    });
   }
 
   // A low-confidence read costs nothing; a low-confidence write changes someone's week.
   if (intent.confidence === "low") return refuse("low_confidence_write");
 
   if (intent.intent === "cancel") {
-    const reference = resolveReference(intent.target, timezone);
-    return reference ? { kind: "cancel", reference, timezone } : refuse("no_target_reference");
+    const reference = resolveReference(intent, timezone);
+    return reference ? act({ kind: "cancel", reference, timezone }) : refuse("no_target_reference");
   }
 
   if (!intent.starts_at_local) return refuse("no_start_time");
@@ -258,40 +345,84 @@ export function resolveCalendarRequest(
   if (start > at + MAX_FUTURE_MS || start < at - MAX_PAST_MS) return refuse("implausible_date");
 
   if (intent.intent === "reschedule") {
-    const reference = resolveReference(intent.target, timezone);
-    return reference
-      ? { kind: "reschedule", reference, startsAt, endsAt, timezone }
-      : refuse("no_target_reference");
+    const reference = resolveReference(intent, timezone);
+    if (!reference) return refuse("no_target_reference");
+    const usable = withoutDestinationTime(reference, startsAt);
+    // The time the user is moving the event *to* cannot also be how they pointed at it. Left
+    // in, it filters the real event out of the pool and the run reports that nothing matches
+    // — a denial about a calendar that was read correctly.
+    if (!usable) return refuse("no_target_reference");
+    return act(
+      { kind: "reschedule", reference: usable.reference, startsAt, endsAt, timezone },
+      usable.dropped ? "target_time_was_destination" : null,
+    );
   }
 
   const title = (intent.title ?? "").trim();
   // An event with no name cannot be reviewed at a glance afterwards, which is the only
   // check left once it has already been created.
   if (title.length === 0) return refuse("no_title");
-  return {
+  return act({
     kind: "create",
     title,
     startsAt,
     endsAt,
     location: intent.location?.trim() || null,
     timezone,
-  };
+  });
 }
 
+/**
+ * How the user pointed at an event that already exists.
+ *
+ * The top-level `title` is a fallback rather than a second source of truth: the schema offers
+ * both it and `target.title_text`, and a model that puts "dinner" in the wrong one has still
+ * told us plainly which words the user used. Reading it here is cheaper than refusing a
+ * request whose target is sitting in the next field.
+ */
 function resolveReference(
-  target: CalendarIntent["target"],
+  intent: CalendarIntent,
   timezone: string,
 ): EventReference | null {
-  if (!target) return null;
-  const titleText = target.title_text?.trim() || null;
-  const startsAt = target.starts_at_local ? localToUtc(target.starts_at_local, timezone) : null;
-  const dateLocal = /^\d{4}-\d{2}-\d{2}$/u.test(target.date_local ?? "")
-    ? target.date_local
+  const target = intent.target;
+  const titleText = target?.title_text?.trim() || intent.title?.trim() || null;
+  const startsAt = target?.starts_at_local
+    ? localToUtc(target.starts_at_local, timezone)
+    : null;
+  const dateLocal = /^\d{4}-\d{2}-\d{2}$/u.test(target?.date_local ?? "")
+    ? (target?.date_local ?? null)
     : null;
   // Nothing to match on is not a target. Resolving against an empty reference would pick
   // whatever happened to be next.
   if (!titleText && !startsAt && !dateLocal) return null;
   return { titleText, startsAt, dateLocal };
+}
+
+/**
+ * Drop a target start time that is really the destination, and only when something else
+ * still identifies the event.
+ *
+ * Deliberately not a repair that widens: if the coinciding time was the *only* thing
+ * narrowing the pool, this returns null and the caller refuses, because falling back to
+ * "any event Zeus can see" is exactly what `resolveReference` already refuses to do. The
+ * prompt fixes this at source; this is the check that does not depend on the model obeying it.
+ */
+function withoutDestinationTime(
+  reference: EventReference,
+  destinationStartsAt: string,
+): { reference: EventReference; dropped: boolean } | null {
+  if (!reference.startsAt) return { reference, dropped: false };
+  const target = Date.parse(reference.startsAt);
+  const destination = Date.parse(destinationStartsAt);
+  if (
+    !Number.isFinite(target) ||
+    !Number.isFinite(destination) ||
+    Math.abs(target - destination) > TARGET_START_TOLERANCE_MS
+  ) {
+    return { reference, dropped: false };
+  }
+  if (!reference.titleText && !reference.dateLocal) return null;
+  return { reference: { ...reference, startsAt: null }, dropped: true };
 }
 
 function localDate(context: EvaluationContext): string {

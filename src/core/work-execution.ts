@@ -10,7 +10,11 @@ import {
   priorStateOf,
 } from "./calendar-actions";
 import type { CalendarWriteRequest } from "./calendar-actions";
-import { checkCalendarConflicts, resolveTargetEvent } from "./calendar-conflicts";
+import {
+  MAX_COVERAGE_AGE_MS,
+  checkCalendarConflicts,
+  resolveTargetEvent,
+} from "./calendar-conflicts";
 import type { CalendarCoverage } from "./calendar-conflicts";
 import { directExecutionAllowance, getCalendarActionSetting } from "./calendar-policy";
 import { cacheCalendarEvents, cachedEvents, calendarWindow, readCalendarCoverage } from "./calendar-sync";
@@ -686,19 +690,45 @@ function calendarGate(
         result: calendarRefusal(input, "calendar_unverifiable", {
           request,
           reason: "no_coverage",
+          coverage,
           detail: "Zeus could not read the calendar, so it did not change anything.",
+        }),
+      };
+    }
+    // The same staleness bound the conflict check enforces, applied before the target is
+    // resolved rather than after. Two reasons it belongs here. A cancel never reaches the
+    // conflict check at all, so this was the one path that could resolve a target from a
+    // cache of any age and then execute under the standing policy. And when the cached rows
+    // have expired but the coverage row has not, resolution finds nothing and reports that
+    // nothing matches — a statement about the user's calendar, drawn from a cache that had
+    // simply gone empty.
+    const coverageAge = at.getTime() - Date.parse(coverage.fetchedAt);
+    if (!Number.isFinite(coverageAge) || coverageAge > MAX_COVERAGE_AGE_MS) {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_unverifiable", {
+          request,
+          reason: "stale_coverage",
+          coverage,
+          detail: "Zeus last read the calendar too long ago to act on it.",
         }),
       };
     }
     const resolution = resolveTargetEvent(events, request.reference, {
       timezone: request.timezone,
       now: at.toISOString(),
+      anchorAt: request.kind === "reschedule" ? request.startsAt : null,
     });
     if (resolution.status === "not_found") {
       return {
         status: "refused",
         result: calendarRefusal(input, "calendar_target_not_found", {
           request,
+          coverage,
+          considered_events: events.length,
+          // Not the calendar's contents — the entries that failed the match. Carried so the
+          // reply can ask which was meant instead of asserting the event does not exist.
+          near_misses: resolution.nearMisses,
           detail: "Nothing on the calendar that was read matches that description.",
         }),
       };
@@ -710,6 +740,7 @@ function calendarGate(
         status: "refused",
         result: calendarRefusal(input, "calendar_target_ambiguous", {
           request,
+          coverage,
           candidates: resolution.candidates,
           detail: "More than one event matches that description.",
         }),
@@ -738,6 +769,7 @@ function calendarGate(
         result: calendarRefusal(input, "calendar_unverifiable", {
           request,
           reason: check.reason,
+          coverage,
           detail: "Zeus could not verify the requested time against the calendar.",
         }),
       };
@@ -749,6 +781,8 @@ function calendarGate(
           request,
           conflicts: check.conflicts,
           alternatives: check.alternatives,
+          coverage: check.coverage,
+          considered_events: events.length,
           detail: "The requested time is already taken.",
         }),
       };

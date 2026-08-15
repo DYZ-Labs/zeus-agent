@@ -64,6 +64,8 @@ export type ZeusEvent = {
   error_site?: string;
   model?: string;
   mode?: string;
+  /** A model's self-reported certainty, from a fixed set. Never a sentence. */
+  confidence?: string;
   store?: string;
   /** A capability slot such as `calendar.create_event`. Named by Zeus, never by a remote. */
   slot?: string;
@@ -90,6 +92,7 @@ const FIELD_PATTERNS = {
   // no user data; without them a real value would be reported as "invalid".
   model: /^[A-Za-z0-9._/-]{1,64}$/u,
   mode: /^[a-z][a-z0-9_]{0,31}$/u,
+  confidence: /^(?:low|medium|high)$/u,
   store: /^[a-z][a-z0-9_]{0,31}$/u,
   slot: /^[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}$/u,
   effect: /^[a-z][a-z0-9_]{0,31}$/u,

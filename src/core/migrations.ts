@@ -1970,6 +1970,26 @@ INSERT INTO calendar_action_setting
 VALUES (1, 1, 10, '08:00', '20:00', NULL, ${NOW});
 `;
 
+/**
+ * What a calendar request did, kept with the assistant turn that reported it.
+ *
+ * Assistant-authored outcome data: not memory, not evidence, and deliberately in its own
+ * table so it cannot reach extraction, the `<memory>` block, or retrieval. It is stored
+ * rather than reconstructed because the outcomes that most needed saying — nothing
+ * connected, a request Zeus could not resolve — never produced a `work_run` to rebuild from.
+ *
+ * Cascades from the message, so deleting a source conversation takes its outcomes with it.
+ */
+const CALENDAR_TURN_OUTCOME = `
+CREATE TABLE calendar_outcome (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  kind                 TEXT NOT NULL CHECK (kind IN ('create','reschedule','cancel','read')),
+  status               TEXT NOT NULL,
+  outcome_json         TEXT NOT NULL,
+  created_at           TEXT NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -1997,4 +2017,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "024_connector_presets", sql: CONNECTOR_PRESETS },
   { id: "025_google_calendar_provider", sql: GOOGLE_CALENDAR_PROVIDER },
   { id: "026_calendar_direct_execution", sql: CALENDAR_DIRECT_EXECUTION },
+  { id: "027_calendar_turn_outcome", sql: CALENDAR_TURN_OUTCOME },
 ];

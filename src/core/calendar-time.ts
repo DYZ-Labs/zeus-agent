@@ -56,10 +56,29 @@ export function mentions(event: CachedEvent, title: string): boolean {
   return shared >= Math.min(2, words.size);
 }
 
+/**
+ * Words long enough to survive the length filter and still carry no meaning in a title.
+ *
+ * Without these, a filler word raises the bar instead of lowering it: "dinner with Sam"
+ * against an event called "Dinner" yields {dinner, with} — "Sam" is dropped for being short
+ * — so the `min(2, size)` threshold demands two shared words, finds one, and scores zero.
+ * The more precisely someone describes the event, the less likely it is to match.
+ */
+const FILLER_WORDS = new Set([
+  "with",
+  "from",
+  "about",
+  "that",
+  "this",
+  "your",
+  "their",
+  "some",
+]);
+
 export function contentWords(value: string): Set<string> {
   return new Set(
     (value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
-      (word) => word.length > 3,
+      (word) => word.length > 3 && !FILLER_WORDS.has(word),
     ),
   );
 }
