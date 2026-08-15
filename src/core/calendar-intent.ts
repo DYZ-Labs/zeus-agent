@@ -136,7 +136,69 @@ export function isCalendarCapabilityQuestion(input: string): boolean {
     /\b(?:is|can\s+you\s+use)\s+(?:my\s+|google\s+)?calendar(?:\s+integration)?\s+(?:available|working)\b/iu.test(
       normalized,
     );
-  return namesCalendar && asksAboutAccess;
+  // A first-turn request often starts by checking access and then asks for actual contents.
+  // That second clause makes it a read request, not a capability-only question.
+  const alsoAsksForContents =
+    /\b(?:and|then)\s+(?:check|read|show(?:\s+me)?|view|open|list|look\s+(?:at|up)|tell\s+me\s+(?:what|which|when|where|how\s+many))\b/iu.test(
+      normalized,
+    );
+  return namesCalendar && asksAboutAccess && !alsoAsksForContents;
+}
+
+/**
+ * Resolve a narrow, explicit request to inspect the user's own calendar without a model.
+ *
+ * A direct read has no fields for a classifier to invent: the connected service is asked
+ * for the same bounded window `resolveCalendarRequest` uses for a model-recognized read.
+ * Keeping this small deterministic path matters most on the first turn of a conversation,
+ * where there is no preceding chat to disambiguate the request and a classifier timeout
+ * previously meant the calendar was never opened at all.
+ *
+ * Ambiguous language still goes through the classifier. Negated, quoted, hypothetical,
+ * third-person, connection-only, and write requests stay out of this path entirely.
+ */
+export function directCalendarReadRequest(
+  input: string,
+  context: EvaluationContext,
+): Extract<CalendarRequest, { kind: "read" }> | null {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return null;
+  if (
+    /^(?:what if|suppose|imagine|hypothetically|for example|e\.g\.|quote|quoted|someone said)\b/iu.test(
+      normalized,
+    ) ||
+    /^(?:he|she|they|the user|my (?:manager|colleague|client|friend))\b/iu.test(normalized) ||
+    /\b(?:do not|don['’]t|dont|never|no need to|instead of|rather than|without)\s+(?:check|read|show|view|open|list|look)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:add|create|put|set\s+up|pencil|slot|block|hold|book|move|shift|push|bump|change|reschedule|rebook|cancel|kill|drop|clear|delete|remove|update|edit|invite|free\s+up)\b/iu.test(
+      normalized,
+    ) ||
+    /\bschedule\s+(?:a|an|the|my|our|lunch|dinner|breakfast|meeting|call|appointment|event|sync|session|workout|gym)\b/iu.test(
+      normalized,
+    ) ||
+    /\b(?:calendar|google calendar)\s+(?:support|integration|connection|feature|button|permission|api|oauth|scope)\b/iu.test(
+      normalized,
+    )
+  ) {
+    return null;
+  }
+
+  const ownCalendar =
+    /\bmy\s+(?:(?:google|work|personal)\s+)?(?:calendar|schedule|meetings?|appointments?|events?)\b/iu;
+  if (!ownCalendar.test(normalized)) return null;
+
+  const imperative =
+    /^(?:please\s+)?(?:check|read|show(?:\s+me)?|view|open|list|look\s+(?:at|up)|tell\s+me\s+(?:what|which|when|where|how\s+many))\b/iu;
+  const addressed =
+    /^(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+)?(?:(?:check|read|show(?:\s+me)?|view|open|list|look\s+(?:at|up)|tell\s+me\s+(?:what|which|when|where|how\s+many))\b|(?:access|use)\b.{0,200}\b(?:and|then)\s+(?:check|read|show(?:\s+me)?|view|open|list|look\s+(?:at|up)|tell\s+me\s+(?:what|which|when|where|how\s+many))\b)/iu;
+  const contentsQuestion =
+    /^(?:what(?:['’]s|\s+is)\s+(?:on|in)|what\s+do\s+i\s+have|which\s+(?:meetings?|appointments?|events?)|when\s+(?:is|are)\s+my|where\s+(?:is|are)\s+my|how\s+many\s+(?:meetings?|appointments?|events?)|am\s+i\s+(?:free|busy))\b/iu;
+  if (!imperative.test(normalized) && !addressed.test(normalized) && !contentsQuestion.test(normalized)) {
+    return null;
+  }
+
+  return calendarReadWindow(context);
 }
 
 /**
@@ -330,13 +392,7 @@ export function resolveCalendarRequest(
 
   const timezone = context.timezone;
   if (intent.intent === "read") {
-    const at = Date.parse(context.evaluated_at);
-    return act({
-      kind: "read",
-      from: new Date(at).toISOString(),
-      to: new Date(at + 30 * 86_400_000).toISOString(),
-      timezone,
-    });
+    return act(calendarReadWindow(context));
   }
 
   // A low-confidence read costs nothing; a low-confidence write changes someone's week.
@@ -387,6 +443,18 @@ export function resolveCalendarRequest(
     location: intent.location?.trim() || null,
     timezone,
   });
+}
+
+function calendarReadWindow(
+  context: EvaluationContext,
+): Extract<CalendarRequest, { kind: "read" }> {
+  const at = Date.parse(context.evaluated_at);
+  return {
+    kind: "read",
+    from: new Date(at).toISOString(),
+    to: new Date(at + 30 * 86_400_000).toISOString(),
+    timezone: context.timezone,
+  };
 }
 
 /**

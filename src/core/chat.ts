@@ -7,6 +7,7 @@ import {
 import type { CalendarRequest } from "./calendar-actions";
 import {
   classifyCalendarIntent,
+  directCalendarReadRequest,
   isCalendarCapabilityQuestion,
   mayBeCalendarRequest,
   refusalIsSpoken,
@@ -451,8 +452,13 @@ async function resolveCalendarWork(
 ): Promise<CalendarResolution | null> {
   // Connection and permission questions are answered from the live capability block. Opening
   // the calendar would spend a connector call and could turn "are you connected?" into an
-  // accidental claim about what is on it.
+  // accidental claim about what is on it. The predicate excludes mixed first-turn requests
+  // such as “access my calendar and tell me what I have tomorrow”.
   if (isCalendarCapabilityQuestion(sourceMessage.content)) return null;
+  // A direct contents request has no fields for a model to invent. Ambiguous wording still
+  // takes the classifier path below.
+  const directRead = directCalendarReadRequest(sourceMessage.content, context);
+  if (directRead) return { status: "request", request: directRead, note: null };
   if (!mayBeCalendarRequest(sourceMessage.content)) return null;
   const intent = await classifyCalendarIntent(db, {
     message: sourceMessage.content,

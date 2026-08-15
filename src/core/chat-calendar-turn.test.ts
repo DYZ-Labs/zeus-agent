@@ -112,7 +112,11 @@ beforeEach(() => {
   mocks.finalResponse.mockResolvedValue({ output_text: "Reply." });
   mocks.generateWorkPlanProposal.mockResolvedValue(null);
   mocks.restoreConnectorReachability.mockResolvedValue(false);
-  mocks.callCapability.mockResolvedValue({ isError: false, text: "", value: { events: [] } });
+  mocks.callCapability.mockResolvedValue({
+    value: { events: [] },
+    text: JSON.stringify({ events: [] }),
+    isError: false,
+  });
 });
 
 function connectCalendar(db: Db, slots: readonly CapabilitySlot[]): void {
@@ -156,6 +160,22 @@ async function turn(input: string, db: Db = openTestDb()) {
 }
 
 describe("a recognized calendar request is never silent", () => {
+  it("reads a connected calendar on the first turn of every new conversation", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    // A classifier timeout or malformed response returns null. A direct read must not need
+    // conversational history—or a second attempt—to reach an already granted capability.
+    mocks.classifyCalendarIntent.mockResolvedValue(null);
+
+    const first = await turn("What is on my calendar tomorrow?", db);
+    const second = await turn("Show me my calendar for tomorrow.", db);
+
+    expect(first.result.calendar).toMatchObject({ kind: "read", status: "done" });
+    expect(second.result.calendar).toMatchObject({ kind: "read", status: "done" });
+    expect(mocks.callCapability).toHaveBeenCalledTimes(2);
+    expect(mocks.classifyCalendarIntent).not.toHaveBeenCalled();
+  });
+
   it("answers a connection question from live capability state without reading events", async () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);

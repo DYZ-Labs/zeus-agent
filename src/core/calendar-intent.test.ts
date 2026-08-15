@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   containsCalendarRefusalSignal,
+  directCalendarReadRequest,
   isCalendarCapabilityQuestion,
   localToUtc,
   mayBeCalendarRequest,
@@ -41,6 +42,34 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
 
 describe("noticing that a message might be about a calendar", () => {
   it.each([
+    "What is on my calendar tomorrow?",
+    "Show me my calendar for tomorrow.",
+    "Please check my work schedule this week.",
+    "Can you check my appointments?",
+    "Can you access my calendar and tell me what I have tomorrow?",
+  ])("resolves a direct contents request without conversational history: %j", (message) => {
+    expect(directCalendarReadRequest(message, CONTEXT)).toEqual({
+      kind: "read",
+      from: "2026-08-17T09:00:00.000Z",
+      to: "2026-09-16T09:00:00.000Z",
+      timezone: "UTC",
+    });
+  });
+
+  it.each([
+    "is Google Calendar connected?",
+    "do you have access to my calendar",
+    "Can you tell me if my calendar is connected?",
+    "don't read my calendar",
+    "what if you read my calendar",
+    "Alice can read my calendar",
+    "add Google Calendar integration support",
+    "cancel my meeting",
+  ])("keeps a non-read or unsafe request out of the direct path: %j", (message) => {
+    expect(directCalendarReadRequest(message, CONTEXT)).toBeNull();
+  });
+
+  it.each([
     "is Google Calendar connected?",
     "do you have access to my calendar",
     "is the calendar integration enabled",
@@ -51,6 +80,11 @@ describe("noticing that a message might be about a calendar", () => {
   it("does not confuse a contents question with a connection question", () => {
     expect(isCalendarCapabilityQuestion("what is on my calendar tomorrow?")).toBe(false);
     expect(isCalendarCapabilityQuestion("what times are available on my calendar?")).toBe(false);
+    expect(
+      isCalendarCapabilityQuestion(
+        "Can you access my calendar and tell me what I have tomorrow?",
+      ),
+    ).toBe(false);
   });
 
   // Each of these is a phrasing the regexes this module replaces would have dropped on the
