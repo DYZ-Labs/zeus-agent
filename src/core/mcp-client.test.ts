@@ -19,6 +19,7 @@ import {
   ConnectorError,
   callCapability,
   googleCalendarAdcHeaders,
+  restoreConnectorReachability,
   revalidateCapabilitySchemas,
   verifyConnector,
 } from "./mcp-client";
@@ -197,6 +198,37 @@ describe("reaching a connected service", () => {
     await expect(
       callCapability(db, "calendar.create_event", { title: "Dinner" }),
     ).rejects.toThrow(/No connected service currently provides/u);
+  }, 30_000);
+
+  it("brings a connection back after the server starts answering again", async () => {
+    const connectorId = calendarConnector();
+    await grant(connectorId, "calendar.list_events", "list_events");
+    // The server stops answering while it is out of service. Before this, that was the end
+    // of the connection: nothing on any path re-verified it, so every later turn reported a
+    // calendar the user had plainly connected as one that could not be used.
+    writeFileSync(join(directory, "calendar-server.mjs"), "process.exit(1);", { mode: 0o600 });
+    await expect(verifyConnector(db, connectorId)).rejects.toBeInstanceOf(ConnectorError);
+    expect(availableCapability(db, "calendar.list_events")).toBeNull();
+    // The grant itself is untouched, which is what makes an unattended recovery legitimate.
+    expect(getConnector(db, connectorId)?.capabilities[0]?.enabled).toBe(1);
+
+    // The user's grant survived the outage, so there is something to restore.
+    expect(await restoreConnectorReachability(db, "calendar.list_events")).toBe(false);
+    writeFileSync(join(directory, "calendar-server.mjs"), CALENDAR_SERVER, { mode: 0o600 });
+    expect(await restoreConnectorReachability(db, "calendar.list_events")).toBe(true);
+
+    const result = await callCapability(db, "calendar.list_events", { from: "a", to: "b" });
+    expect(result.isError).toBe(false);
+    expect(getConnector(db, connectorId)?.enabled).toBe(1);
+  }, 30_000);
+
+  it("will not revive a connection the user switched off", async () => {
+    const connectorId = calendarConnector();
+    await grant(connectorId, "calendar.list_events", "list_events");
+    setConnectorEnabled(db, connectorId, false, userMessageId);
+
+    expect(await restoreConnectorReachability(db, "calendar.list_events")).toBe(false);
+    expect(getConnector(db, connectorId)?.enabled).toBe(0);
   }, 30_000);
 
   it("marks an unreachable server rather than leaving it enabled", async () => {

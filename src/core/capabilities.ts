@@ -1,6 +1,12 @@
 import { directExecutionAllowance } from "./calendar-policy";
 import { readCalendarCoverage } from "./calendar-sync";
-import { CAPABILITY_SLOTS, availableCapability, connectorStatusLabel, listConnectors } from "./connectors";
+import {
+  CAPABILITY_SLOTS,
+  availableCapability,
+  connectorStatusLabel,
+  listConnectors,
+  reachabilityFailureWithdrawsGrant,
+} from "./connectors";
 import type { Db } from "./db";
 import type { ConnectorStatus, EvaluationContext } from "./schema";
 
@@ -31,6 +37,14 @@ export type CalendarCapabilityState = {
   unusableStatus: ConnectorStatus | null;
   /** A code-owned reason such as reconnect_required; never remote or user-authored text. */
   unusableReason: string | null;
+  /**
+   * The connection is intact and the service simply did not answer.
+   *
+   * Worth its own field because it is the one unusable state that asks nothing of the user.
+   * Collapsing it into the others is what produced a reply telling someone to reconnect a
+   * calendar whose authorization was never in question.
+   */
+  temporarilyUnreachable: boolean;
   directExecution: boolean;
   remainingToday: number;
   lastReadAt: string | null;
@@ -72,6 +86,16 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
     connectorLabel: connector?.label ?? null,
     unusableStatus: usable ? null : (bound?.status ?? null),
     unusableReason,
+    temporarilyUnreachable:
+      !usable &&
+      bound !== null &&
+      bound.status === "unreachable" &&
+      unusableReason !== null &&
+      !reachabilityFailureWithdrawsGrant(unusableReason) &&
+      // The grants are the evidence that this is a service outage rather than a connection
+      // the user took apart. Without them there is nothing to put back into service, and
+      // "nothing to fix" would be the wrong thing to tell them.
+      bound.capabilities.some((entry) => entry.enabled === 1),
     directExecution: allowance.reason !== "disabled",
     remainingToday: Math.max(0, allowance.limit - allowance.usedToday),
     lastReadAt: readCalendarCoverage(db)?.fetchedAt ?? null,
@@ -106,6 +130,17 @@ function calendarLines(state: CalendarCapabilityState): string[] {
     ];
   }
   if (!state.canRead && !state.canCreate && !state.canUpdate) {
+    // A service that did not answer is not a connection the user has to repair, and saying
+    // so sends them to Settings to fix something that was never broken. The grant is still
+    // theirs; Zeus already tried again this turn and will try again on the next request.
+    if (state.temporarilyUnreachable) {
+      return [
+        `Calendar: ${name} is connected, and did not answer just now. The connection is ` +
+          "intact and needs nothing from the user; Zeus tried again this turn and will try " +
+          "again on the next request. It cannot say what is on the calendar until one of " +
+          "those succeeds.",
+      ];
+    }
     const reconnect = state.unusableReason === "reconnect_required";
     const disabled = state.unusableReason === "disabled";
     const status = reconnect

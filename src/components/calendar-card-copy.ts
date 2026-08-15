@@ -53,6 +53,10 @@ export const UNVERIFIABLE: Record<string, string> = {
     "Nothing changed. Google Calendar needs reconnecting before I can check or act.",
   connector_unavailable:
     "Nothing changed. The connected calendar is unavailable, so I couldn't check or act. Review it in Settings under Connections.",
+  provider_unavailable:
+    "Nothing changed. Your calendar is still connected — it just didn't answer me. Nothing to fix; ask again in a moment.",
+  connector_call_failed:
+    "Nothing changed. I couldn't reach your calendar just now, so I didn't act. Your connection is fine; ask again in a moment.",
   no_read_capability:
     "Nothing changed. I can't read your calendar with the permissions I have, so I couldn't check and didn't act.",
   stale_coverage:

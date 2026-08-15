@@ -257,10 +257,36 @@ export class GoogleCalendarApi {
     });
     const body = await boundedJson(response);
     if (!response.ok) {
-      throw new GoogleCalendarError("refresh_failed", "Google Calendar must be reconnected");
+      // Google says a refresh token is dead in exactly one way, and a revoked grant is the
+      // only failure here the user can do anything about. A 500, a rate limit, or a
+      // misconfigured OAuth client all used to arrive as the same `refresh_failed`, which
+      // marked the stored grant unusable — so one bad minute at Google cost the user a
+      // whole re-authorization, and every request after it was refused by a broker that
+      // had already made up its mind.
+      throw refreshTokenIsRevoked(response.status, body)
+        ? new GoogleCalendarError("refresh_revoked", "Google Calendar must be reconnected")
+        : new GoogleCalendarError(
+            "refresh_unavailable",
+            "Google could not issue a Calendar token just now",
+          );
     }
     return TokenResponse.parse(body).access_token;
   }
+}
+
+/**
+ * Whether Google is saying the grant is gone, rather than that it could not answer.
+ *
+ * Deliberately narrow, and deliberately not a catch-all on 4xx: `invalid_client` and
+ * `unauthorized_client` mean the *operator's* OAuth client is wrong, which no amount of
+ * user re-consent fixes, and revoking their grant over it would only hide the real fault.
+ */
+function refreshTokenIsRevoked(status: number, body: unknown): boolean {
+  if (status !== 400 && status !== 401) return false;
+  const error = body !== null && typeof body === "object"
+    ? (body as { error?: unknown }).error
+    : null;
+  return error === "invalid_grant";
 }
 
 function eventBody(input: CalendarEventInput): Record<string, unknown> {
