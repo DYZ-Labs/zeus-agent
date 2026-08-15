@@ -52,6 +52,16 @@ describe("noticing that a message might be about a calendar", () => {
     "move the design review to next week",
     "I should probably book a dentist appointment tomorrow",
     "set up a sync with Priya wednesday",
+    // Answering a slot Zeus just offered. Requiring an action verb here meant Zeus
+    // ignored people accepting its own suggestions.
+    "yes, 1pm works",
+    "make it thursday instead",
+    "the 3pm one",
+    "how about 10:30",
+    // No time and no calendar noun, but unmistakably about an appointment.
+    "cancel the design review",
+    "reschedule the offsite",
+    "postpone my one-on-one with Dana",
   ])("considers %j", (message) => {
     expect(mayBeCalendarRequest(message)).toBe(true);
   });

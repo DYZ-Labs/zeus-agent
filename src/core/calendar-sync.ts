@@ -109,6 +109,25 @@ export function cacheCalendarEvents(
   );
   db.transaction(() => {
     db.prepare<[string]>("DELETE FROM external_signal WHERE expires_at <= ?").run(fetchedAt);
+    // Reconcile the window, don't just merge into it. A read that comes back without an
+    // event Zeus had cached is the only evidence it will ever get that the event is gone —
+    // and a cache that only ever grows will happily resolve "cancel my standup" against a
+    // meeting that was deleted an hour ago, or refuse a slot that is actually free. Scoped
+    // to the window that was read, so events outside it are left alone rather than assumed
+    // absent. This mirrors `resolveAbsentSignals`, for the same reason.
+    const seen = new Set(events.map((event) => event.id));
+    const stale = db
+      .prepare<[number, string, string], { external_id: string }>(
+        `SELECT external_id FROM external_signal
+         WHERE connector_id = ? AND kind = 'calendar_event'
+           AND starts_at IS NOT NULL AND starts_at >= ? AND starts_at < ?`,
+      )
+      .all(connectorId, window.from, window.to)
+      .filter((row) => !seen.has(row.external_id));
+    const drop = db.prepare<[number, string]>(
+      "DELETE FROM external_signal WHERE connector_id = ? AND kind = 'calendar_event' AND external_id = ?",
+    );
+    for (const row of stale) drop.run(connectorId, row.external_id);
     for (const event of events) {
       upsert.run(
         connectorId,

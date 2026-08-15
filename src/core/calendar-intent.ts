@@ -48,7 +48,9 @@ For "reschedule" and "cancel", describe how the user referred to the existing ev
 
 Set confidence "high" only when the request is unambiguous and every field you filled in is directly supported by the user's words. Use "low" whenever you are inferring, guessing a time, or unsure which event is meant.
 
-Set is_negated when the user is declining, forbidding, or cancelling a request rather than making one. Set is_hypothetical_or_quoted when they are supposing, quoting, or giving an example. Set is_about_another_person when the calendar or the action belongs to somebody other than the user. These flags are safety checks: when in doubt, set them.`;
+Set is_negated only when the user is telling you NOT to do something, or is withdrawing an instruction they gave earlier — "don't put that on my calendar", "actually, leave it". Asking you to cancel or delete an event is a request, not a negation: intent "cancel" with is_negated false is the correct answer for "cancel my 3pm". Set is_hypothetical_or_quoted when they are supposing, quoting, or giving an example. Set is_about_another_person when the calendar or the action belongs to somebody other than the user. These flags are safety checks: when genuinely in doubt, set them.
+
+A short reply may be answering a question you asked a moment ago. Use the earlier user messages to resolve it: after being offered alternative times, "yes, 1pm works" is a create request carrying the details from the earlier message, not a new conversation.`;
 
 const TargetReference = z
   .object({
@@ -97,9 +99,23 @@ export function mayBeCalendarRequest(input: string): boolean {
   // "block 2-3", "hold 10–11": a bare hour range is a time to a person and nothing to the
   // patterns above.
   const hourRange = /\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b/iu;
+  // A short reply that is mostly a time is almost always answering a question about one —
+  // "yes, 1pm works", "make it Thursday", "the 3pm one". Requiring an action verb here is
+  // what made Zeus ignore someone accepting a slot it had just offered them, which is the
+  // exact false negative this filter exists to avoid. The classifier sees the preceding
+  // user messages and can tell the difference; a needless call costs one low-effort model
+  // request, and the veto and conflict gate still stand behind it.
+  const shortReply = normalized.length <= 80;
+  // Verbs that are about appointments and very little else. "cancel the design review"
+  // carries no time and no calendar noun, so pairing a verb with a time would skip it —
+  // and the thing named is exactly the thing the user wants gone.
+  const schedulingVerb =
+    /\b(?:reschedule|rebook|postpone|unbook|cancel|call\s+off|double[- ]?book|free\s+up|push\s+back)\b/iu;
   return (
     subject.test(normalized) ||
-    (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized)))
+    schedulingVerb.test(normalized) ||
+    (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized))) ||
+    (shortReply && (temporal.test(normalized) || hourRange.test(normalized)))
   );
 }
 
@@ -194,11 +210,19 @@ export function resolveCalendarRequest(
   intent: CalendarIntent,
   context: EvaluationContext,
 ): CalendarRequest | null {
-  if (intent.intent === "none") return null;
-  if (intent.is_negated || intent.is_hypothetical_or_quoted || intent.is_about_another_person) {
+  // A refusal here means the user sees nothing happen and is told nothing about why, so
+  // the reason has to be recoverable from the log. Classification is a model call and will
+  // vary between identical requests; without this, "it worked yesterday" is unfalsifiable.
+  const refuse = (reason: string): null => {
+    logEvent({ event: "calendar_intent_refused", outcome: "degraded", reason });
     return null;
-  }
-  if (containsCalendarRefusalSignal(message)) return null;
+  };
+
+  if (intent.intent === "none") return refuse("no_calendar_intent");
+  if (intent.is_negated) return refuse("negated");
+  if (intent.is_hypothetical_or_quoted) return refuse("hypothetical_or_quoted");
+  if (intent.is_about_another_person) return refuse("another_person");
+  if (containsCalendarRefusalSignal(message)) return refuse("refusal_signal_in_message");
 
   const timezone = context.timezone;
   if (intent.intent === "read") {
@@ -212,36 +236,38 @@ export function resolveCalendarRequest(
   }
 
   // A low-confidence read costs nothing; a low-confidence write changes someone's week.
-  if (intent.confidence === "low") return null;
+  if (intent.confidence === "low") return refuse("low_confidence_write");
 
   if (intent.intent === "cancel") {
     const reference = resolveReference(intent.target, timezone);
-    return reference ? { kind: "cancel", reference, timezone } : null;
+    return reference ? { kind: "cancel", reference, timezone } : refuse("no_target_reference");
   }
 
-  if (!intent.starts_at_local) return null;
+  if (!intent.starts_at_local) return refuse("no_start_time");
   const startsAt = localToUtc(intent.starts_at_local, timezone);
-  if (!startsAt) return null;
+  if (!startsAt) return refuse("unparsable_start");
   const endsAt = intent.ends_at_local
     ? localToUtc(intent.ends_at_local, timezone)
     : new Date(Date.parse(startsAt) + DEFAULT_DURATION_MS).toISOString();
-  if (!endsAt) return null;
+  if (!endsAt) return refuse("unparsable_end");
 
   const start = Date.parse(startsAt);
   const end = Date.parse(endsAt);
   const at = Date.parse(context.evaluated_at);
-  if (end <= start || end - start > MAX_DURATION_MS) return null;
-  if (start > at + MAX_FUTURE_MS || start < at - MAX_PAST_MS) return null;
+  if (end <= start || end - start > MAX_DURATION_MS) return refuse("implausible_duration");
+  if (start > at + MAX_FUTURE_MS || start < at - MAX_PAST_MS) return refuse("implausible_date");
 
   if (intent.intent === "reschedule") {
     const reference = resolveReference(intent.target, timezone);
-    return reference ? { kind: "reschedule", reference, startsAt, endsAt, timezone } : null;
+    return reference
+      ? { kind: "reschedule", reference, startsAt, endsAt, timezone }
+      : refuse("no_target_reference");
   }
 
   const title = (intent.title ?? "").trim();
   // An event with no name cannot be reviewed at a glance afterwards, which is the only
   // check left once it has already been created.
-  if (title.length === 0) return null;
+  if (title.length === 0) return refuse("no_title");
   return {
     kind: "create",
     title,

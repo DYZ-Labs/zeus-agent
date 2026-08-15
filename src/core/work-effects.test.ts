@@ -23,7 +23,7 @@ import {
   executeConfirmedEffect,
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
-import { parseCalendarEvents } from "./calendar-sync";
+import { cacheCalendarEvents, cachedEvents, parseCalendarEvents } from "./calendar-sync";
 import { createSafeWorkExecutor, payloadSchemaMismatch } from "./work-execution";
 import {
   authorizeWorkPlan,
@@ -556,6 +556,50 @@ describe("a request the user is asked to confirm must be able to succeed", () =>
     ).toBeNull();
     expect(payloadSchemaMismatch("not json", { anything: true })).toBeNull();
     expect(payloadSchemaMismatch("{}", { anything: true })).toBeNull();
+  });
+});
+
+describe("the read cache reflects the calendar, not the union of every read", () => {
+  it("drops an event that the calendar stopped returning", () => {
+    const at = new Date("2026-08-15T09:00:00.000Z");
+    const window = { from: "2026-08-15T09:00:00.000Z", to: "2026-09-14T09:00:00.000Z" };
+    db.exec(`INSERT INTO connector (id,label,transport,command,args_json,cwd,env_var_names_json,status,enabled,source_message_id,created_at,updated_at)
+      VALUES (9,'C','stdio','node','[]','/tmp','[]','ready',1,${userMessageId},'2026-08-15T00:00:00.000Z','2026-08-15T00:00:00.000Z')`);
+
+    cacheCalendarEvents(db, 9, {
+      events: [
+        { id: "a", summary: "Standup", start: "2026-08-16T09:00:00Z", end: "2026-08-16T09:15:00Z" },
+        { id: "b", summary: "Review", start: "2026-08-16T15:00:00Z", end: "2026-08-16T16:00:00Z" },
+      ],
+    }, at, window);
+    expect(cachedEvents(db, at).map((event) => event.external_id).sort()).toEqual(["a", "b"]);
+
+    // The standup was cancelled in the calendar itself. The next read is the only evidence
+    // Zeus will ever get; a cache that only merges would keep resolving "cancel my
+    // standup" against a meeting that no longer exists.
+    cacheCalendarEvents(db, 9, {
+      events: [
+        { id: "b", summary: "Review", start: "2026-08-16T15:00:00Z", end: "2026-08-16T16:00:00Z" },
+      ],
+    }, at, window);
+    expect(cachedEvents(db, at).map((event) => event.external_id)).toEqual(["b"]);
+  });
+
+  it("leaves events outside the window that was read alone", () => {
+    const at = new Date("2026-08-15T09:00:00.000Z");
+    db.exec(`INSERT INTO connector (id,label,transport,command,args_json,cwd,env_var_names_json,status,enabled,source_message_id,created_at,updated_at)
+      VALUES (9,'C','stdio','node','[]','/tmp','[]','ready',1,${userMessageId},'2026-08-15T00:00:00.000Z','2026-08-15T00:00:00.000Z')`);
+    cacheCalendarEvents(db, 9, {
+      events: [{ id: "far", summary: "Later", start: "2026-09-30T10:00:00Z", end: "2026-09-30T11:00:00Z" }],
+    }, at, { from: "2026-09-01T00:00:00.000Z", to: "2026-10-01T00:00:00.000Z" });
+
+    // A read of next week says nothing about a meeting six weeks out.
+    cacheCalendarEvents(db, 9, { events: [] }, at, {
+      from: "2026-08-15T09:00:00.000Z",
+      to: "2026-08-22T09:00:00.000Z",
+    });
+
+    expect(cachedEvents(db, at, { includeEnded: true }).map((e) => e.external_id)).toEqual(["far"]);
   });
 });
 
