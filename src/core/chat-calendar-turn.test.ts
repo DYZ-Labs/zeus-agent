@@ -139,7 +139,17 @@ function connectCalendar(db: Db, slots: readonly CapabilitySlot[]): void {
       connectorId: connector.id,
       slot,
       remoteToolName: slot.split(".")[1] ?? slot,
-      inputSchema: { type: "object", properties: { title: { type: "string" } } },
+      inputSchema:
+        slot === "calendar.list_events"
+          ? {
+              type: "object",
+              properties: {
+                from: { type: "string" },
+                to: { type: "string" },
+              },
+              required: ["from", "to"],
+            }
+          : { type: "object", properties: { title: { type: "string" } } },
       sourceMessageId,
     });
     setCapabilityEnabled(db, capability.id, true, sourceMessageId);

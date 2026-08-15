@@ -31,6 +31,13 @@ export type CalendarEvent = {
 
 export type CalendarWindow = { from: string; to: string };
 
+const CALENDAR_WINDOW_FIELDS = [
+  ["from", "to"],
+  ["startTime", "endTime"],
+  ["timeMin", "timeMax"],
+  ["start_time", "end_time"],
+] as const;
+
 export function calendarWindow(at: Date = new Date(), days = WINDOW_DAYS): CalendarWindow {
   return {
     from: at.toISOString(),
@@ -53,7 +60,8 @@ export async function syncCalendar(
   const at = options.at ?? new Date();
   const window = calendarWindow(at);
   try {
-    const result = await callCapability(db, "calendar.list_events", { ...window }, {
+    const args = calendarListEventArguments(available.capability.input_schema_json, window);
+    const result = await callCapability(db, "calendar.list_events", args, {
       signal: options.signal,
       capabilityId: available.capability.id,
     });
@@ -75,6 +83,57 @@ export async function syncCalendar(
     });
     return null;
   }
+}
+
+/**
+ * Translate Zeus's canonical bounded window into the exact live tool contract the user
+ * reviewed. The hosted broker uses `from`/`to`; Google's official MCP server uses
+ * `startTime`/`endTime`, and earlier previews used `timeMin`/`timeMax`. Unknown or newly
+ * required fields fail closed instead of sending a malformed or broader request.
+ */
+export function calendarListEventArguments(
+  inputSchemaJson: string,
+  window: CalendarWindow,
+): Record<string, unknown> {
+  let schema: unknown;
+  try {
+    schema = JSON.parse(inputSchemaJson) as unknown;
+  } catch {
+    throw new Error("Calendar list tool has an invalid input schema");
+  }
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error("Calendar list tool has an invalid input schema");
+  }
+  const record = schema as Record<string, unknown>;
+  const properties = record.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    throw new Error("Calendar list tool has no reviewable input fields");
+  }
+  const fields = properties as Record<string, unknown>;
+  const pair = CALENDAR_WINDOW_FIELDS.find(
+    ([lower, upper]) => Object.hasOwn(fields, lower) && Object.hasOwn(fields, upper),
+  );
+  if (!pair) {
+    throw new Error("Calendar list tool has no supported bounded time window");
+  }
+
+  const [lower, upper] = pair;
+  const args: Record<string, unknown> = {
+    [lower]: window.from,
+    [upper]: window.to,
+  };
+  const required = Array.isArray(record.required)
+    ? record.required.filter((field): field is string => typeof field === "string")
+    : [];
+  for (const field of required) {
+    if (Object.hasOwn(args, field)) continue;
+    if (field === "calendarId" && Object.hasOwn(fields, field)) {
+      args.calendarId = "primary";
+      continue;
+    }
+    throw new Error(`Calendar list tool requires unsupported field ${field}`);
+  }
+  return args;
 }
 
 /**

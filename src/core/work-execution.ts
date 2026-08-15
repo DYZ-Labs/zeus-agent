@@ -17,7 +17,13 @@ import {
 } from "./calendar-conflicts";
 import type { CalendarCoverage, FreeSlot } from "./calendar-conflicts";
 import { directExecutionAllowance, getCalendarActionSetting } from "./calendar-policy";
-import { cacheCalendarEvents, cachedEvents, calendarWindow, readCalendarCoverage } from "./calendar-sync";
+import {
+  cacheCalendarEvents,
+  cachedEvents,
+  calendarListEventArguments,
+  calendarWindow,
+  readCalendarCoverage,
+} from "./calendar-sync";
 import type { CachedEvent } from "./calendar-time";
 import { availableCapabilityForEffect, availableEffectKinds, getConnector } from "./connectors";
 import type { BoundCapability } from "./connectors";
@@ -486,6 +492,12 @@ async function executeExternalRead(
     };
   }
   const window = calendarWindow();
+  let args: Record<string, unknown>;
+  try {
+    args = calendarListEventArguments(available.capability.input_schema_json, window);
+  } catch {
+    return calendarReadFailure(input, "unsupported_calendar_schema", 0);
+  }
   // A read that stops is a turn that tells the user their calendar could not be checked, so
   // it is worth one more attempt before saying so. The plan's own retry budget cannot help
   // here: a pause is a deliberate stop rather than a failure, and the runner only retries
@@ -499,7 +511,7 @@ async function executeExternalRead(
   for (;;) {
     attempts += 1;
     try {
-      result = await callCapability(db, "calendar.list_events", { ...window }, {
+      result = await callCapability(db, "calendar.list_events", args, {
         signal: input.signal,
         capabilityId: available.capability.id,
       });
