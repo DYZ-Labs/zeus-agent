@@ -23,14 +23,22 @@ import type {
  * which people — only exists once the earlier steps have run. Treating the scope approval
  * as payload approval is the failure this module exists to prevent.
  *
- * So a run that reaches a write effect stops. It records exactly what it intends to send
- * and pauses at its durable checkpoint. The user reads that payload and confirms it by
- * hash, in a real message of their own. Execution then sends those bytes and no others:
- * the hash is recomputed from storage immediately before dispatch, so an edited payload
- * fails closed rather than going out under an old confirmation.
+ * So a run that reaches a write effect records exactly what it intends to send. It is then
+ * authorized in exactly one of two named ways, and the row records which:
+ *
+ * - `user_message` — the user reads the payload and confirms it by hash, in a real message
+ *   of their own. The default, and the only path for `send`, for generated plans, and for
+ *   any calendar action the conflict gate could not clear.
+ * - `standing_policy` — a calendar action the user enabled direct execution for, which a
+ *   deterministic conflict check cleared against a freshly read window. The row cites the
+ *   user's actual request. It is not a confirmation and is never recorded as one.
+ *
+ * Either way, execution sends those bytes and no others: the hash is recomputed from
+ * storage immediately before dispatch, so an edited payload fails closed.
  *
  * Nothing here infers intent. Silence is not confirmation, an assistant sentence is not
- * confirmation, and an expired proposal is simply dead.
+ * confirmation, and an expired proposal is simply dead. And nothing here ever writes a
+ * message on the user's behalf — see `authorizeEffectByPolicy`.
  */
 
 /** Long enough to step away and come back; short enough that stale intent cannot fire. */
@@ -48,6 +56,18 @@ export type ProposeEffectInput = {
   /** Stable across retries so one logical step cannot send twice. */
   providerRequestKey: string;
   expiresAt?: string;
+  /**
+   * The user message this request was built from.
+   *
+   * Required before the effect can be authorized by policy, and never sufficient to confirm
+   * one: it does not name the payload hash, which is exactly why it is recorded as a
+   * request rather than as a confirmation.
+   */
+  requestMessageId?: number | null;
+  /** What the read cache held about the target, captured before anything changed it. */
+  priorState?: Record<string, unknown> | null;
+  /** The deterministic check that ran in place of asking. */
+  conflictCheck?: Record<string, unknown> | null;
 };
 
 export type ProposedEffectView = ProposedEffect & {
@@ -66,7 +86,8 @@ export type EffectExecutionResult = {
 
 const SELECT_EFFECT = `
   SELECT id, work_run_id, work_step_id, connector_capability_id, effect_kind,
-         payload_json, payload_hash, preview_text, reversal_json, status,
+         payload_json, payload_hash, preview_text, reversal_json, prior_state_json,
+         conflict_check_json, confirmation_kind, request_message_id, status,
          idempotency_key, provider_request_key, expires_at, created_at, updated_at
   FROM proposed_effect
 `;
@@ -106,22 +127,28 @@ export function proposeEffect(db: Db, input: ProposeEffectInput): ProposedEffect
   const expiresAt = input.expiresAt ?? new Date(Date.now() + DEFAULT_CONFIRMATION_TTL_MS).toISOString();
 
   return db.transaction((): ProposedEffectView => {
+    // Scoped to the step, not to the digest. A globally unique hash meant that asking for
+    // the identical event twice — after cancelling the first, say — silently returned the
+    // old executed row and created nothing.
     const existing = db
-      .prepare<[string], ProposedEffect>(`${SELECT_EFFECT} WHERE payload_hash = ?`)
-      .get(hash);
+      .prepare<[number, string], ProposedEffect>(
+        `${SELECT_EFFECT} WHERE work_step_id = ? AND payload_hash = ?`,
+      )
+      .get(input.workStepId, hash);
     if (existing) return requireView(db, existing.id);
 
     const timestamp = now();
     const inserted = db
       .prepare<
-        [number, number, number, WriteEffectKind, string, string, string, string, string,
-         string, string, string]
+        [number, number, number, WriteEffectKind, string, string, string, string | null,
+         string | null, number | null, string, string, string, string, string]
       >(
         `INSERT INTO proposed_effect
            (work_run_id, work_step_id, connector_capability_id, effect_kind, payload_json,
-            payload_hash, preview_text, idempotency_key, provider_request_key, expires_at,
+            payload_hash, preview_text, prior_state_json, conflict_check_json,
+            request_message_id, idempotency_key, provider_request_key, expires_at,
             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.workRunId,
@@ -131,6 +158,9 @@ export function proposeEffect(db: Db, input: ProposeEffectInput): ProposedEffect
         payloadJson,
         hash,
         previewText,
+        input.priorState ? JSON.stringify(input.priorState) : null,
+        input.conflictCheck ? JSON.stringify(input.conflictCheck) : null,
+        input.requestMessageId ?? null,
         `effect:${randomUUID()}`,
         input.providerRequestKey,
         expiresAt,
@@ -203,6 +233,9 @@ export function confirmEffect(
   return db.transaction((): ProposedEffectView => {
     const effect = requireEffect(db, id);
     assertPending(effect);
+    if (effect.confirmation_kind === "standing_policy") {
+      throw new Error("This request was already authorized by your standing setting");
+    }
     if (effect.payload_hash !== payloadHashToConfirm) {
       throw new Error("That confirmation does not match this exact external request");
     }
@@ -220,6 +253,75 @@ export function confirmEffect(
       effect: effect.effect_kind,
       effect_id: id,
       message_id: sourceMessageId,
+    });
+    return requireView(db, id);
+  })();
+}
+
+/**
+ * Authorize one exact payload from the user's standing setting.
+ *
+ * This is deliberately not `confirmEffect` with the check relaxed, and the difference is
+ * worth stating because someone will eventually propose collapsing them.
+ *
+ * The tempting shortcut is to synthesize a message reading "I confirm <hash>" and feed it
+ * to the existing path. That is prohibited. It would write a `role='user'` row the user
+ * never sent into the same `message` table that backs evidence, episodic retrieval, and
+ * exports — and it would reduce `assertExactConfirmationMessage` and the
+ * `effect_event_decision_is_user_authored` trigger to checks the system passes against text
+ * it wrote itself. A control that validates your own output is not a control.
+ *
+ * So this path writes nothing on the user's behalf. It cites `requestMessageId`: a real,
+ * stored message that really does say "add dinner Friday at 7". That message does not name
+ * the payload hash, which is precisely why the ledger records `authorized_by_policy` and
+ * never `confirmed`. Whoever reads the effect page later can still tell exactly what
+ * happened.
+ *
+ * Callers are responsible for the two conditions this cannot see: that the conflict gate
+ * returned `clear`, and that direct execution is permitted right now.
+ */
+export function authorizeEffectByPolicy(
+  db: Db,
+  id: number,
+  payloadHashToAuthorize: string,
+  input: {
+    requestMessageId: number;
+    policy: string;
+    detail?: Record<string, unknown>;
+  },
+): ProposedEffectView {
+  return db.transaction((): ProposedEffectView => {
+    const effect = requireEffect(db, id);
+    assertPending(effect);
+    if (effect.payload_hash !== payloadHashToAuthorize) {
+      throw new Error("That authorization does not match this exact external request");
+    }
+    const message = db
+      .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
+      .get(input.requestMessageId);
+    if (!message || message.role !== "user") {
+      throw new Error("A policy authorization must cite the user's own request");
+    }
+    const capability = getCapability(db, effect.connector_capability_id);
+    if (!capability || capability.enabled !== 1) {
+      throw new Error("The capability behind this request is no longer available");
+    }
+    db.prepare<[number, string, number]>(
+      `UPDATE proposed_effect
+       SET status = 'confirmed', confirmation_kind = 'standing_policy',
+           request_message_id = ?, updated_at = ?
+       WHERE id = ?`,
+    ).run(input.requestMessageId, now(), id);
+    appendEffectEvent(db, id, "authorized_by_policy", input.requestMessageId, {
+      policy: input.policy,
+      ...(input.detail ?? {}),
+    });
+    logEvent({
+      event: "effect_authorized_by_policy",
+      outcome: "ok",
+      effect: effect.effect_kind,
+      effect_id: id,
+      message_id: input.requestMessageId,
     });
     return requireView(db, id);
   })();
@@ -310,7 +412,7 @@ export async function executeConfirmedEffect(
     }
     finishConnectorCallReceipt(db, receiptId, "completed", null);
 
-    const reversal = reversalFor(capability.slot, result.value);
+    const reversal = reversalFor(capability.slot, result.value, effect);
     db.transaction(() => {
       if (reversal) {
         db.prepare<[string, string, number]>(
@@ -452,20 +554,66 @@ function fail(db: Db, id: number, errorCode: string): EffectExecutionResult {
 }
 
 /**
- * What it would take to undo this, recorded from the service's own answer.
+ * What it would take to undo this — from the service's own answer, plus whatever Zeus read
+ * beforehand.
  *
- * Only a created event is reversible today, and only when the service returned an id. An
- * update is not: Zeus never captured the prior state, and inventing one would be worse
- * than admitting the change stands.
+ * A created event is reversible because the service returns an id. An update is reversible
+ * only because the calendar is now read before it is written: `prior_state_json` holds what
+ * the cache said about the target moments earlier.
+ *
+ * That reversal is deliberately narrow. It restores only keys this payload actually set,
+ * and only when the snapshot has a value for each of them, because the cache holds five
+ * fields and nothing else. Attendees, description, recurrence, reminders, and conferencing
+ * were never read and are not restored — and an un-cancelled event does not un-send the
+ * cancellation notices. A partial undo offered as a complete one would be worse than none.
  */
+const REVERSIBLE_UPDATE_KEYS = ["start", "end", "status", "title", "location"] as const;
+
 function reversalFor(
   slot: CapabilitySlot,
   value: unknown,
+  effect: ProposedEffect,
 ): { slot: CapabilitySlot; payload: Record<string, unknown> } | null {
-  if (slot !== "calendar.create_event") return null;
-  const id = externalIdOf(value);
-  if (id === null) return null;
-  return { slot: "calendar.update_event", payload: { event_id: id, status: "cancelled" } };
+  if (slot === "calendar.create_event") {
+    const id = externalIdOf(value);
+    if (id === null) return null;
+    return { slot: "calendar.update_event", payload: { event_id: id, status: "cancelled" } };
+  }
+  if (slot !== "calendar.update_event") return null;
+
+  const prior = parseRecord(effect.prior_state_json);
+  const payload = parseRecord(effect.payload_json);
+  if (!prior || !payload) return null;
+  const eventId = payload.event_id;
+  if (typeof eventId !== "string" || eventId.length === 0) return null;
+
+  const changed = Object.keys(payload).filter((key) => key !== "event_id" && key !== "time_zone");
+  if (changed.length === 0) return null;
+  if (!changed.every((key) => (REVERSIBLE_UPDATE_KEYS as readonly string[]).includes(key))) {
+    return null;
+  }
+
+  const restore: Record<string, unknown> = { event_id: eventId };
+  for (const key of changed) {
+    // Un-cancelling is the one restoration the snapshot cannot supply, because a cached
+    // event is only ever cached while it is live.
+    const priorValue = key === "status" ? (prior.status ?? "confirmed") : prior[key];
+    if (priorValue === undefined || priorValue === null) return null;
+    restore[key] = priorValue;
+  }
+  return { slot: "calendar.update_event", payload: restore };
+}
+
+function parseRecord(value: string | null): Record<string, unknown> | null {
+  if (value === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function externalIdOf(value: unknown): string | null {

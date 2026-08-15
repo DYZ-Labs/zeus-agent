@@ -2,11 +2,29 @@ import { zodTextFormat } from "openai/helpers/zod";
 
 import { buildEvaluationContextForTrigger } from "./ambient";
 import { recordModelCall, responseUsage } from "./budget";
-import { cacheCalendarEvents, calendarWindow } from "./calendar-sync";
+import {
+  buildCalendarPayload,
+  isCalendarWriteRequest,
+  parseCalendarRequest,
+  previewFor,
+  priorStateOf,
+} from "./calendar-actions";
+import type { CalendarWriteRequest } from "./calendar-actions";
+import { checkCalendarConflicts, resolveTargetEvent } from "./calendar-conflicts";
+import type { CalendarCoverage } from "./calendar-conflicts";
+import { directExecutionAllowance, getCalendarActionSetting } from "./calendar-policy";
+import { cacheCalendarEvents, cachedEvents, calendarWindow, readCalendarCoverage } from "./calendar-sync";
+import type { CachedEvent } from "./calendar-time";
 import { availableCapabilityForEffect, availableEffectKinds } from "./connectors";
+import type { BoundCapability } from "./connectors";
 import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
-import { effectsForRun, proposeEffect } from "./effects";
+import {
+  authorizeEffectByPolicy,
+  effectsForRun,
+  executeConfirmedEffect,
+  proposeEffect,
+} from "./effects";
 import { ConnectorError, callCapability } from "./mcp-client";
 import { logEvent } from "./observability";
 import { MODEL, assertResponseComplete, openai } from "./openai";
@@ -31,6 +49,7 @@ import type {
   SafeStepExecutionInput,
   SafeStepExecutionResult,
   SafeWorkExecutor,
+  WorkArtifactInput,
   WorkPlanGenerationProvenanceInput,
   WorkPlanMemorySourceInput,
 } from "./work-plans";
@@ -292,6 +311,15 @@ async function executeSafeStep(
 
   if (effect === "external_read") return executeExternalRead(db, input);
 
+  // A resolved calendar action needs no model at any step: the times came from the intent
+  // router and the target is resolved deterministically. Checking here as well as at the
+  // write step means the run stops at the step whose title says it is checking, which is
+  // what the user sees.
+  const calendarStep = parseCalendarRequest(input.plan.objective);
+  if (effect === "prepare_local" && calendarStep && isCalendarWriteRequest(calendarStep)) {
+    return checkCalendarStep(db, input, calendarStep);
+  }
+
   if (input.step.effect_kind === "memory_read") {
     const context = await buildContext(db, `${input.plan.objective}\n${input.step.instruction}`, {
       queryVector: null,
@@ -471,7 +499,9 @@ async function executeExternalRead(
     );
   }
 
-  const events = cacheCalendarEvents(db, available.connector.id, result.value);
+  // The window is passed through rather than recomputed, so the coverage row records the
+  // window that was actually asked for.
+  const events = cacheCalendarEvents(db, available.connector.id, result.value, new Date(), window);
   const content = JSON.stringify({ window, event_count: events.length, events }, null, 2);
   const unsafe = inspectUntrustedWorkData(content);
   if (unsafe) return sensitivePause(db, input, unsafe, 0, 1);
@@ -523,6 +553,14 @@ async function prepareExternalRequest(
       },
       toolCalls: 0,
     };
+  }
+
+  // A resolved calendar action needs no model to build its payload, and must not get one:
+  // the conflict gate below is unconditional, and a gate a generated plan could route
+  // around is not a gate.
+  const calendarRequest = parseCalendarRequest(input.plan.objective);
+  if (calendarRequest && isCalendarWriteRequest(calendarRequest)) {
+    return executeCalendarWrite(db, input, available, calendarRequest);
   }
 
   const response = await openai().responses.create({
@@ -604,6 +642,266 @@ async function prepareExternalRequest(
       message: "This step prepared an external request and is waiting for confirmation",
       requiresReauthorization: false,
     },
+  };
+}
+
+/**
+ * The deterministic calendar write: read, check, then act — or stop and say why.
+ *
+ * This is the function that replaces the confirmation prompt, so it carries the weight the
+ * prompt used to. Three refusals happen before a payload is even proposed, and each of them
+ * ends the run rather than degrading into a send:
+ *
+ * - the target cannot be resolved to exactly one event, or resolves to none;
+ * - the requested time collides with something already there;
+ * - the calendar could not be verified — no read, a stale read, or a read that never covered
+ *   the requested time.
+ *
+ * `proposed_effect` therefore keeps meaning "a request Zeus intended to make". A refusal
+ * leaves an artifact and no row, so the receipt log never has to be interpreted.
+ */
+type CalendarGate =
+  | { status: "clear"; target: CachedEvent | null; events: number; coverage: CalendarCoverage | null }
+  | { status: "refused"; result: SafeStepExecutionResult };
+
+/**
+ * Resolve the target and check the time. Shared by the checking step and the write step,
+ * so the two can never disagree about whether it was safe to proceed.
+ */
+function calendarGate(
+  db: Db,
+  input: SafeStepExecutionInput,
+  request: CalendarWriteRequest,
+): CalendarGate {
+  const at = new Date();
+  const events = cachedEvents(db, at);
+  const coverage = readCalendarCoverage(db);
+  const setting = getCalendarActionSetting(db);
+
+  let target: CachedEvent | null = null;
+  if (request.kind !== "create") {
+    if (!coverage) {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_unverifiable", {
+          request,
+          reason: "no_coverage",
+          detail: "Zeus could not read the calendar, so it did not change anything.",
+        }),
+      };
+    }
+    const resolution = resolveTargetEvent(events, request.reference, {
+      timezone: request.timezone,
+      now: at.toISOString(),
+    });
+    if (resolution.status === "not_found") {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_target_not_found", {
+          request,
+          detail: "Nothing on the calendar that was read matches that description.",
+        }),
+      };
+    }
+    if (resolution.status === "ambiguous") {
+      // Never "the nearest one". With nothing downstream to catch a wrong pick, cancelling
+      // the wrong meeting would be discovered by its absence.
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_target_ambiguous", {
+          request,
+          candidates: resolution.candidates,
+          detail: "More than one event matches that description.",
+        }),
+      };
+    }
+    target = resolution.event;
+  }
+
+  if (request.kind !== "cancel") {
+    const check = checkCalendarConflicts({
+      events,
+      candidate: {
+        startsAt: request.startsAt,
+        endsAt: request.endsAt,
+        excludeExternalId: target?.external_id ?? null,
+      },
+      coverage,
+      timezone: request.timezone,
+      now: at.toISOString(),
+      dayStart: setting.day_start,
+      dayEnd: setting.day_end,
+    });
+    if (check.status === "unverifiable") {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_unverifiable", {
+          request,
+          reason: check.reason,
+          detail: "Zeus could not verify the requested time against the calendar.",
+        }),
+      };
+    }
+    if (check.status === "conflict") {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_conflict", {
+          request,
+          conflicts: check.conflicts,
+          alternatives: check.alternatives,
+          detail: "The requested time is already taken.",
+        }),
+      };
+    }
+  }
+
+  return { status: "clear", target, events: events.length, coverage };
+}
+
+/** The checking step: same gate, no capability needed, and it never sends anything. */
+function checkCalendarStep(
+  db: Db,
+  input: SafeStepExecutionInput,
+  request: CalendarWriteRequest,
+): SafeStepExecutionResult {
+  const gate = calendarGate(db, input, request);
+  if (gate.status === "refused") return gate.result;
+  return {
+    output: { checked: true, considered_events: gate.events },
+    artifacts: [calendarArtifact(input, "The requested time is free", {
+      request,
+      target: gate.target,
+      coverage: gate.coverage,
+      considered_events: gate.events,
+    })],
+    toolCalls: 0,
+  };
+}
+
+async function executeCalendarWrite(
+  db: Db,
+  input: SafeStepExecutionInput,
+  available: BoundCapability,
+  request: CalendarWriteRequest,
+): Promise<SafeStepExecutionResult> {
+  // Checked again here, deliberately. The check that matters is the one immediately before
+  // the send, not the one a previous step reported.
+  const gate = calendarGate(db, input, request);
+  if (gate.status === "refused") return gate.result;
+  const { target, coverage } = gate;
+
+  const payload = buildCalendarPayload(request, target);
+  const mismatch = payloadSchemaMismatch(available.capability.input_schema_json, payload);
+  if (mismatch) {
+    return { pause: { code: "payload_invalid", message: mismatch }, toolCalls: 0 };
+  }
+
+  const effect = proposeEffect(db, {
+    workRunId: input.run.id,
+    workStepId: input.step.id,
+    slot: available.capability.slot,
+    payload,
+    previewText: previewFor(request, target),
+    providerRequestKey: input.providerRequestKey,
+    requestMessageId: input.plan.source_message_id,
+    priorState: priorStateOf(target),
+    conflictCheck: {
+      checked_at: new Date().toISOString(),
+      coverage,
+      considered_events: gate.events,
+    },
+  });
+
+  const allowance = directExecutionAllowance(db);
+  if (!allowance.allowed || input.plan.source_message_id === null) {
+    // Falling back to asking is the safe direction, but it has to say why, or an exhausted
+    // ceiling reads as a random regression.
+    return {
+      output: { proposed_effect_id: effect.id, payload_hash: effect.payload_hash },
+      artifacts: [calendarArtifact(input, "Waiting for your confirmation", {
+        request,
+        effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
+        reason: allowance.reason,
+      })],
+      toolCalls: 0,
+      pause: {
+        code: "effect_confirmation_required",
+        message: allowance.reason === "daily_limit"
+          ? "Today's limit for unattended calendar changes is used up"
+          : "This step prepared an external request and is waiting for confirmation",
+        requiresReauthorization: false,
+      },
+    };
+  }
+
+  authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
+    requestMessageId: input.plan.source_message_id,
+    policy: "calendar_direct_execution",
+    detail: {
+      conflict_check: "clear",
+      coverage_fetched_at: coverage?.fetchedAt ?? null,
+      considered_events: gate.events,
+    },
+  });
+  const result = await executeConfirmedEffect(db, effect.id, { signal: input.signal });
+  if (result.status !== "executed") {
+    return {
+      pause: {
+        code: result.errorCode ?? "effect_failed",
+        message: "The calendar change did not go through",
+        requiresReauthorization: false,
+      },
+      toolCalls: 1,
+    };
+  }
+
+  return {
+    output: {
+      proposed_effect_id: effect.id,
+      payload_hash: effect.payload_hash,
+      executed: true,
+    },
+    artifacts: [calendarArtifact(input, "Done", {
+      request,
+      effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
+      coverage,
+      considered_events: gate.events,
+    })],
+    toolCalls: 1,
+  };
+}
+
+function calendarRefusal(
+  input: SafeStepExecutionInput,
+  code: string,
+  detail: Record<string, unknown>,
+): SafeStepExecutionResult {
+  return {
+    output: { refused: code, ...detail },
+    artifacts: [calendarArtifact(input, "Nothing was changed", { code, ...detail })],
+    toolCalls: 0,
+    pause: {
+      code,
+      message: typeof detail.detail === "string" ? detail.detail : code,
+      // The plan's scope is untouched; what stopped this was the calendar, not the grant.
+      requiresReauthorization: false,
+    },
+  };
+}
+
+function calendarArtifact(
+  input: SafeStepExecutionInput,
+  heading: string,
+  detail: Record<string, unknown>,
+): WorkArtifactInput {
+  return {
+    kind: "draft",
+    title: input.step.title,
+    content: `${heading}\n\n${JSON.stringify(detail, null, 2)}`,
+    citations: [],
+    // Nothing here came from the user, so nothing here is evidence.
+    sourceMessageIds: [],
+    sourceMemoryItems: [],
   };
 }
 

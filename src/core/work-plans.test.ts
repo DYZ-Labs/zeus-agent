@@ -898,6 +898,86 @@ describe("bounded work execution", () => {
     expect(listToolReceipts(db, paused.id)[0]?.error_code).toBe("interrupted");
   });
 
+  it("does not charge the user's deliberation against the run's own budget", async () => {
+    // A run parked for a decision used to burn its whole duration waiting, then die on
+    // resume — after the external change had already been made, leaving a plan that could
+    // never finish. `max_duration_seconds` bounds Zeus's work; the authorization expiry is
+    // what bounds the user's window.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(
+      db,
+      proposal({ limits: { max_model_tool_calls: 8, max_retries_per_step: 2, max_duration_seconds: 120 } }),
+    );
+    authorize(db, detail, source.id, {
+      expiresAt: new Date("2030-01-01T01:00:00.000Z").toISOString(),
+    });
+    const paused = await runWorkPlan(db, detail.plan.id, {
+      executor: async () => ({
+        pause: { code: "effect_confirmation_required", requiresReauthorization: false },
+      }),
+    });
+    expect(paused.status).toBe("paused");
+
+    // Ten minutes of reading, well past the two-minute run budget.
+    vi.setSystemTime(new Date("2030-01-01T00:10:00.000Z"));
+    const resumed = await resumeWorkRun(db, paused.id, {
+      executor: async () => ({
+        output: { done: true },
+        artifacts: [{ kind: "research_notes", title: "Done", content: "Finished." }],
+      }),
+    });
+
+    expect(resumed.status).toBe("completed");
+    expect(resumed.paused_ms_total).toBeGreaterThanOrEqual(600_000);
+    expect(activeWorkAuthorization(db, detail.plan.id)).not.toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("still stops when the authorization itself expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const db = openTestDb();
+    const { source, detail } = createPlan(db);
+    authorize(db, detail, source.id, {
+      expiresAt: new Date("2030-01-01T00:05:00.000Z").toISOString(),
+    });
+    const paused = await runWorkPlan(db, detail.plan.id, {
+      executor: async () => ({
+        pause: { code: "effect_confirmation_required", requiresReauthorization: false },
+      }),
+    });
+
+    vi.setSystemTime(new Date("2030-01-01T02:00:00.000Z"));
+    const resumed = await resumeWorkRun(db, paused.id, {
+      executor: async () => ({ output: { done: true } }),
+    });
+
+    expect(resumed.status).toBe("paused");
+    expect(resumed.error_code).toBe("authorization_invalid");
+    vi.useRealTimers();
+  });
+
+  it("keeps the artifact from a step that stopped", async () => {
+    // The pause branch used to return before artifacts were written, discarding the one
+    // record of why the run stopped.
+    const db = openTestDb();
+    const { source, detail } = createPlan(db);
+    authorize(db, detail, source.id);
+    const paused = await runWorkPlan(db, detail.plan.id, {
+      executor: async () => ({
+        artifacts: [{ kind: "research_notes", title: "Why it stopped", content: "A collision." }],
+        pause: { code: "effect_confirmation_required", requiresReauthorization: false },
+      }),
+    });
+
+    expect(paused.status).toBe("paused");
+    expect(listWorkArtifacts(db, { runId: paused.id }).map((a) => a.title)).toEqual([
+      "Why it stopped",
+    ]);
+  });
+
   it("cancels a paused run, its remaining steps, and its authorization", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));

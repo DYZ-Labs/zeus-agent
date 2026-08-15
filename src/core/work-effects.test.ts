@@ -12,17 +12,18 @@ import {
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "./connectors";
-import { calendarCreateWorkPlanProposal, calendarReadWorkPlanProposal } from "./chat";
+import { calendarActionWorkPlanProposal, encodeCalendarRequest } from "./calendar-actions";
+import type { CalendarRequest } from "./calendar-actions";
+import { updateCalendarActionSetting } from "./calendar-policy";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
   confirmEffect,
   effectsForRun,
   executeConfirmedEffect,
-  proposeEffect,
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
-import { parseCalendarEvents } from "./calendar-sync";
+import { cacheCalendarEvents, cachedEvents, parseCalendarEvents } from "./calendar-sync";
 import { createSafeWorkExecutor, payloadSchemaMismatch } from "./work-execution";
 import {
   authorizeWorkPlan,
@@ -31,7 +32,6 @@ import {
   listWorkArtifacts,
   resumeWorkRun,
   runWorkPlan,
-  type SafeWorkExecutor,
 } from "./work-plans";
 
 /**
@@ -62,24 +62,59 @@ import { appendFileSync } from "node:fs";
 const log = process.env.FAKE_CALENDAR_CALL_LOG;
 const server = new McpServer({ name: "fake-calendar", version: "0.0.1" });
 
+const DEFAULT_EVENTS = [
+  { id: "evt-a", summary: "Flight lands", start: "2026-08-20T18:40:00Z", end: "2026-08-20T19:10:00Z" },
+];
+
 server.registerTool(
   "list_events",
   { title: "List events", inputSchema: { from: z.string(), to: z.string() },
     annotations: { readOnlyHint: true } },
   async (args) => {
     if (log) appendFileSync(log, JSON.stringify({ tool: "list_events", args }) + "\\n");
-    return { content: [{ type: "text", text: JSON.stringify({ events: [
-      { id: "evt-a", summary: "Flight lands", start: "2026-08-20T18:40:00Z", end: "2026-08-20T19:10:00Z" },
-    ] }) }] };
+    const events = process.env.FAKE_CALENDAR_EVENTS
+      ? JSON.parse(process.env.FAKE_CALENDAR_EVENTS)
+      : DEFAULT_EVENTS;
+    return { content: [{ type: "text", text: JSON.stringify({ events }) }] };
+  },
+);
+
+// Mirrors the real broker's contract, so a payload built here is a payload that would work.
+server.registerTool(
+  "create_event",
+  {
+    title: "Create event",
+    inputSchema: {
+      title: z.string(),
+      start: z.string(),
+      end: z.string(),
+      time_zone: z.string().optional(),
+      location: z.string().optional(),
+    },
+  },
+  async (args) => {
+    if (log) appendFileSync(log, JSON.stringify({ tool: "create_event", args }) + "\\n");
+    return { content: [{ type: "text", text: JSON.stringify({ id: "evt-new", ...args }) }] };
   },
 );
 
 server.registerTool(
-  "create_event",
-  { title: "Create event", inputSchema: { title: z.string(), starts_at: z.string() } },
+  "update_event",
+  {
+    title: "Update event",
+    inputSchema: {
+      event_id: z.string(),
+      start: z.string().optional(),
+      end: z.string().optional(),
+      status: z.string().optional(),
+      title: z.string().optional(),
+      location: z.string().optional(),
+      time_zone: z.string().optional(),
+    },
+  },
   async (args) => {
-    if (log) appendFileSync(log, JSON.stringify({ tool: "create_event", args }) + "\\n");
-    return { content: [{ type: "text", text: JSON.stringify({ id: "evt-new", ...args }) }] };
+    if (log) appendFileSync(log, JSON.stringify({ tool: "update_event", args }) + "\\n");
+    return { content: [{ type: "text", text: JSON.stringify({ updated: args.event_id }) }] };
   },
 );
 
@@ -100,11 +135,13 @@ beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "zeus-work-effects-"));
   callLog = join(directory, "calls.log");
   process.env.FAKE_CALENDAR_CALL_LOG = callLog;
+  process.env.FAKE_CALENDAR_EVENTS = "";
 });
 
 afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
   delete process.env.FAKE_CALENDAR_CALL_LOG;
+  delete process.env.FAKE_CALENDAR_EVENTS;
 });
 
 function recordedCalls(): Array<Record<string, unknown>> {
@@ -124,13 +161,14 @@ async function connectCalendar(): Promise<void> {
     command: process.execPath,
     args: [join(directory, "calendar-server.mjs")],
     cwd: process.cwd(),
-    envVarNames: ["FAKE_CALENDAR_CALL_LOG"],
+    envVarNames: ["FAKE_CALENDAR_CALL_LOG", "FAKE_CALENDAR_EVENTS"],
     sourceMessageId: userMessageId,
   });
   const { tools } = await verifyConnector(db, connector.id);
   for (const [slot, tool] of [
     ["calendar.list_events", "list_events"],
     ["calendar.create_event", "create_event"],
+    ["calendar.update_event", "update_event"],
   ] as const) {
     const discovered = tools.find((entry) => entry.name === tool);
     if (!discovered) throw new Error(`missing ${tool}`);
@@ -148,138 +186,165 @@ async function connectCalendar(): Promise<void> {
   }
 }
 
-const PROPOSAL = calendarCreateWorkPlanProposal(
+const PROPOSAL = calendarActionWorkPlanProposal(
+  {
+    kind: "create",
+    title: "Dinner",
+    startsAt: "2026-08-20T18:30:00.000Z",
+    endsAt: "2026-08-20T19:30:00.000Z",
+    location: null,
+    timezone: "UTC",
+  },
   "Hold the dinner slot after the flight lands",
 );
 
-/**
- * Stands in for the model half of the executor. The write step still goes through the
- * real `prepareExternalRequest` path in production; here it produces the same proposal
- * deterministically so the test exercises the gate rather than the model.
- */
-function scriptedExecutor(): SafeWorkExecutor {
-  return async (input) => {
-    if (input.step.effect_kind === "prepare_local") {
-      return {
-        artifacts: [
-          {
-            kind: "draft",
-            title: input.step.title,
-            content: "Dinner with Sam at 19:30 on 20 August.",
-            citations: [],
-          },
-        ],
-        modelCalls: 1,
-        toolCalls: 1,
-      };
-    }
-    const effect = proposeEffect(db, {
-      workRunId: input.run.id,
-      workStepId: input.step.id,
-      slot: "calendar.create_event",
-      payload: { title: "Dinner with Sam", starts_at: "2026-08-20T19:30:00Z" },
-      previewText: "Create “Dinner with Sam” on 20 August at 19:30.",
-      providerRequestKey: input.providerRequestKey,
-    });
-    return {
-      artifacts: [
-        {
-          kind: "draft",
-          title: input.step.title,
-          content: `Waiting for confirmation. Hash: ${effect.payload_hash}`,
-          citations: [],
-        },
-      ],
-      modelCalls: 1,
-      toolCalls: 0,
-      pause: {
-        code: "effect_confirmation_required",
-        message: "Waiting for confirmation",
-        requiresReauthorization: false,
-      },
-    };
-  };
-}
 
-async function authorizedRun() {
+/**
+ * Drives the real executor.
+ *
+ * The calendar payload is built deterministically now, so the whole write path — read,
+ * resolve, check, act — runs offline without a model. That is the point: the gate is
+ * testable rather than merely described.
+ */
+async function realRun(
+  options: { request?: CalendarRequest; skipRead?: boolean } = {},
+) {
+  const request: CalendarRequest = options.request ?? {
+    kind: "create",
+    title: "Dinner",
+    startsAt: "2026-08-20T18:30:00.000Z",
+    endsAt: "2026-08-20T19:30:00.000Z",
+    location: null,
+    timezone: "UTC",
+  };
+  const proposal = options.skipRead
+    ? {
+        ...calendarActionWorkPlanProposal(request, calendarObjective(request)),
+        // Deliberately malformed: a plan that writes without reading must fail closed
+        // rather than clear a slot it never looked at.
+        steps: calendarActionWorkPlanProposal(request, calendarObjective(request))
+          .steps.slice(1)
+          .map((step, index) => ({ ...step, depends_on: index === 0 ? [] : [index] })),
+      }
+    : calendarActionWorkPlanProposal(request, calendarObjective(request));
   const detail = createWorkPlan(db, {
-    proposal: PROPOSAL,
+    proposal,
     sourceMessageId: userMessageId,
     origin: "explicit_request",
   });
   authorizeWorkPlan(db, detail.plan.id, {
     planHash: detail.plan.plan_hash,
     authorizationKind: "explicit_request",
-    allowedEffects: PROPOSAL.allowed_effects,
+    allowedEffects: proposal.allowed_effects,
     maxModelToolCalls: detail.plan.max_model_tool_calls,
     maxRetriesPerStep: detail.plan.max_retries_per_step,
     maxDurationSeconds: detail.plan.max_duration_seconds,
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     sourceMessageId: userMessageId,
   });
-  const run = await runWorkPlan(db, detail.plan.id, { executor: scriptedExecutor() });
+  const run = await runWorkPlan(db, detail.plan.id, {
+    executor: createSafeWorkExecutor(db),
+  });
   return { planId: detail.plan.id, run };
 }
 
-describe("a run that would act stops and waits", () => {
-  it("pauses at the write step with the exact request recorded and nothing sent", async () => {
+function calendarObjective(request: CalendarRequest): string {
+  return `Calendar request from the user.\n\n${encodeCalendarRequest(request)}`;
+}
+
+
+describe("a calendar change reads first, checks, then acts", () => {
+  it("creates the event when the requested time is genuinely free", async () => {
+    // A calendar with something on it, but not at the requested time.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-a", summary: "Flight lands", start: "2026-08-20T14:00:00Z", end: "2026-08-20T15:00:00Z" },
+    ]);
     await connectCalendar();
 
-    const { run } = await authorizedRun();
+    const { run } = await realRun();
+
+    expect(run.status).toBe("completed");
+    const effects = effectsForRun(db, run.id);
+    expect(effects).toHaveLength(1);
+    expect(effects[0]?.status).toBe("executed");
+    // The ledger says which of the two authorization paths was used, and never guesses.
+    expect(effects[0]?.confirmation_kind).toBe("standing_policy");
+    expect(effects[0]?.request_message_id).toBe(userMessageId);
+    expect(effects[0]?.events.map((event) => event.event_type)).toEqual([
+      "proposed",
+      "authorized_by_policy",
+      "executed",
+    ]);
+
+    const calls = recordedCalls();
+    expect(calls.map((call) => call.tool)).toEqual(["list_events", "create_event"]);
+    expect(calls[1]?.args).toMatchObject({
+      title: "Dinner",
+      start: "2026-08-20T18:30:00.000Z",
+      end: "2026-08-20T19:30:00.000Z",
+    });
+    const receipts = listToolReceipts(db, run.id);
+    expect(receipts.filter((receipt) => receipt.tool_name === "connector_call")).toHaveLength(2);
+  }, 30_000);
+
+  it("refuses to double-book, and says what it collided with", async () => {
+    // The requested slot is occupied. This is the case that used to reach the user as a
+    // confirmation prompt and now must never reach the connector at all.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      {
+        id: "evt-taken",
+        summary: "Design review",
+        start: "2026-08-20T18:00:00Z",
+        end: "2026-08-20T19:00:00Z",
+      },
+    ]);
+    await connectCalendar();
+
+    const { planId, run } = await realRun();
+
+    expect(run.status).toBe("paused");
+    expect(run.error_code).toBe("calendar_conflict");
+    // No request was ever prepared, so `proposed_effect` keeps meaning "Zeus meant to send
+    // this". Nothing but the read left the machine.
+    expect(effectsForRun(db, run.id)).toHaveLength(0);
+    expect(recordedCalls().map((call) => call.tool)).toEqual(["list_events"]);
+
+    const artifacts = listWorkArtifacts(db, { planId });
+    const refusal = artifacts.find((artifact) => artifact.content.includes("calendar_conflict"));
+    expect(refusal).toBeDefined();
+    expect(refusal?.content).toContain("Design review");
+    // And it offers somewhere else to put it rather than only saying no.
+    expect(refusal?.content).toContain("alternatives");
+  }, 30_000);
+
+  it("will not clear a slot against a calendar it could not read", async () => {
+    await connectCalendar();
+    const { run } = await realRun({ skipRead: true });
+
+    expect(run.status).toBe("paused");
+    expect(run.error_code).toBe("calendar_unverifiable");
+    expect(effectsForRun(db, run.id)).toHaveLength(0);
+    expect(recordedCalls().filter((call) => call.tool === "create_event")).toEqual([]);
+  }, 30_000);
+
+  it("falls back to asking when the standing setting is switched off", async () => {
+    // A calendar with something on it, but not at the requested time.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-a", summary: "Flight lands", start: "2026-08-20T14:00:00Z", end: "2026-08-20T15:00:00Z" },
+    ]);
+    await connectCalendar();
+    updateCalendarActionSetting(db, { directExecution: false }, userMessageId);
+
+    const { run } = await realRun();
 
     expect(run.status).toBe("paused");
     expect(run.error_code).toBe("effect_confirmation_required");
-    const pending = effectsForRun(db, run.id);
-    expect(pending).toHaveLength(1);
-    expect(pending[0]?.status).toBe("pending_confirmation");
-    expect(pending[0]?.payload).toEqual({
-      title: "Dinner with Sam",
-      starts_at: "2026-08-20T19:30:00Z",
-    });
-    // Verification listed tools; no tool was ever called.
-    expect(recordedCalls()).toEqual([]);
-    // The receipt log distinguishes preparing from sending.
-    const receipts = listToolReceipts(db, run.id);
-    expect(receipts.map((receipt) => receipt.tool_name)).toEqual([
-      "local_artifact",
-      "effect_proposal",
-    ]);
-    expect(receipts.some((receipt) => receipt.tool_name === "connector_call")).toBe(false);
-  }, 30_000);
-
-  it("sends only after the user confirms the exact hash, then records a connector call", async () => {
-    await connectCalendar();
-    const { run } = await authorizedRun();
     const effect = effectsForRun(db, run.id)[0];
-    if (!effect) throw new Error("no proposed effect");
+    expect(effect?.status).toBe("pending_confirmation");
+    expect(effect?.confirmation_kind).toBe("user_message");
+    expect(recordedCalls().filter((call) => call.tool === "create_event")).toEqual([]);
 
-    const confirmation = appendMessage(
-      db,
-      conversationId,
-      "user",
-      `Confirm ${effect.payload_hash}`,
-      { origin: "user_action", recallState: "blocked" },
-    ).id;
-    confirmEffect(db, effect.id, effect.payload_hash, confirmation);
-    const result = await executeConfirmedEffect(db, effect.id);
-
-    expect(result.status).toBe("executed");
-    expect(recordedCalls()).toEqual([
-      {
-        tool: "create_event",
-        args: { title: "Dinner with Sam", starts_at: "2026-08-20T19:30:00Z" },
-      },
-    ]);
-    const receipts = listToolReceipts(db, run.id);
-    const call = receipts.find((receipt) => receipt.tool_name === "connector_call");
-    expect(call?.status).toBe("completed");
-    expect(call?.proposed_effect_id).toBe(effect.id);
-  }, 30_000);
-
-  it("finishes the step on resume instead of proposing the same request again", async () => {
-    await connectCalendar();
-    const { run } = await authorizedRun();
-    const effect = effectsForRun(db, run.id)[0];
+    // And the hand-confirmation path still works end to end.
     if (!effect) throw new Error("no proposed effect");
     const confirmation = appendMessage(
       db,
@@ -289,24 +354,109 @@ describe("a run that would act stops and waits", () => {
       { origin: "user_action", recallState: "blocked" },
     ).id;
     confirmEffect(db, effect.id, effect.payload_hash, confirmation);
-    await executeConfirmedEffect(db, effect.id);
+    const result = await executeConfirmedEffect(db, effect.id);
+    expect(result.status).toBe("executed");
+  }, 30_000);
 
-    // The real executor, deliberately: an already-settled step short-circuits before any
-    // model call, so this exercises the production path without one.
-    const resumed = await resumeWorkRun(db, run.id, {
-      executor: createSafeWorkExecutor(db),
+  it("keeps the artifact that explains why it stopped", async () => {
+    // A calendar with something on it, but not at the requested time.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-a", summary: "Flight lands", start: "2026-08-20T14:00:00Z", end: "2026-08-20T15:00:00Z" },
+    ]);
+    await connectCalendar();
+    updateCalendarActionSetting(db, { directExecution: false }, userMessageId);
+
+    const { planId } = await realRun();
+
+    // A paused step used to return before its artifacts were written, throwing away the
+    // one record of what it was holding.
+    expect(listWorkArtifacts(db, { planId }).length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("moves an event and records how to put it back", async () => {
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      {
+        id: "evt-review",
+        summary: "Design review",
+        start: "2026-08-20T15:00:00Z",
+        end: "2026-08-20T16:00:00Z",
+      },
+    ]);
+    await connectCalendar();
+
+    const { run } = await realRun({
+      request: {
+        kind: "reschedule",
+        reference: { titleText: "design review", startsAt: null, dateLocal: null },
+        startsAt: "2026-08-20T17:00:00.000Z",
+        endsAt: "2026-08-20T18:00:00.000Z",
+        timezone: "UTC",
+      },
     });
 
-    expect(resumed.status).toBe("completed");
-    expect(recordedCalls().filter((call) => call.tool === "create_event")).toHaveLength(1);
-    expect(effectsForRun(db, run.id)).toHaveLength(1);
+    expect(run.status).toBe("completed");
+    const effect = effectsForRun(db, run.id)[0];
+    expect(effect?.payload).toMatchObject({ event_id: "evt-review" });
+    // Undo exists only because the calendar was read before it was written.
+    expect(effect?.reversal).toEqual({
+      slot: "calendar.update_event",
+      payload: {
+        event_id: "evt-review",
+        start: "2026-08-20T15:00:00Z",
+        end: "2026-08-20T16:00:00Z",
+      },
+    });
+  }, 30_000);
+
+  it("cancels by setting the event's status, not by inventing a delete", async () => {
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      {
+        id: "evt-dinner",
+        summary: "Dinner with Priya",
+        start: "2026-08-20T19:00:00Z",
+        end: "2026-08-20T21:00:00Z",
+      },
+    ]);
+    await connectCalendar();
+
+    const { run } = await realRun({
+      request: {
+        kind: "cancel",
+        reference: { titleText: "dinner with Priya", startsAt: null, dateLocal: null },
+        timezone: "UTC",
+      },
+    });
+
+    expect(run.status).toBe("completed");
+    expect(recordedCalls().at(-1)).toMatchObject({
+      tool: "update_event",
+      args: { event_id: "evt-dinner", status: "cancelled" },
+    });
+  }, 30_000);
+
+  it("asks which one rather than guessing between two matches", async () => {
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "a", summary: "Design review", start: "2026-08-20T15:00:00Z", end: "2026-08-20T16:00:00Z" },
+      { id: "b", summary: "Design review", start: "2026-08-21T15:00:00Z", end: "2026-08-21T16:00:00Z" },
+    ]);
+    await connectCalendar();
+
+    const { run } = await realRun({
+      request: {
+        kind: "cancel",
+        reference: { titleText: "design review", startsAt: null, dateLocal: null },
+        timezone: "UTC",
+      },
+    });
+
+    expect(run.error_code).toBe("calendar_target_ambiguous");
+    expect(effectsForRun(db, run.id)).toHaveLength(0);
+    expect(recordedCalls().filter((call) => call.tool === "update_event")).toEqual([]);
   }, 30_000);
 
   it("refuses a plan whose own limits cannot cover its own steps", async () => {
     await connectCalendar();
 
-    // Three non-trivial steps need six calls; the plan allows three. Left unchecked this
-    // fails on the last step — the one that would have asked the user to confirm.
     expect(() =>
       createWorkPlan(db, {
         proposal: {
@@ -316,19 +466,23 @@ describe("a run that would act stops and waits", () => {
         sourceMessageId: userMessageId,
         origin: "explicit_request",
       }),
-    ).toThrow(/allows 3 model\/tool calls but its steps need at least 4/u);
+    ).toThrow(/allows 3 model\/tool calls but its steps need at least/u);
   }, 30_000);
 
-  it("pauses again rather than acting when the grant is withdrawn before resume", async () => {
+  it("pauses rather than acting when the grant is withdrawn before resume", async () => {
+    // A calendar with something on it, but not at the requested time.
+    process.env.FAKE_CALENDAR_EVENTS = JSON.stringify([
+      { id: "evt-a", summary: "Flight lands", start: "2026-08-20T14:00:00Z", end: "2026-08-20T15:00:00Z" },
+    ]);
     await connectCalendar();
-    const { planId, run } = await authorizedRun();
+    updateCalendarActionSetting(db, { directExecution: false }, userMessageId);
+    const { planId, run } = await realRun();
     db.exec("UPDATE connector_capability SET enabled = 0");
 
-    const resumed = await resumeWorkRun(db, run.id, { executor: scriptedExecutor() });
+    const resumed = await resumeWorkRun(db, run.id, { executor: createSafeWorkExecutor(db) });
 
     expect(resumed.status).toBe("paused");
-    expect(resumed.error_code).toBe("capability_unavailable");
-    expect(recordedCalls()).toEqual([]);
+    expect(recordedCalls().filter((call) => call.tool === "create_event")).toEqual([]);
     expect(listWorkArtifacts(db, { planId }).length).toBeGreaterThan(0);
   }, 30_000);
 });
@@ -343,7 +497,10 @@ describe("an explicit calendar read", () => {
       "Check my calendar and tell me what I have tomorrow.",
       { origin: "user_action", recallState: "blocked" },
     );
-    const proposal = calendarReadWorkPlanProposal(request.content);
+    const proposal = calendarActionWorkPlanProposal(
+      { kind: "read", from: "2026-08-14T00:00:00.000Z", to: "2026-09-13T00:00:00.000Z", timezone: "UTC" },
+      request.content,
+    );
     const detail = createWorkPlan(db, {
       proposal,
       sourceMessageId: request.id,
@@ -399,6 +556,50 @@ describe("a request the user is asked to confirm must be able to succeed", () =>
     ).toBeNull();
     expect(payloadSchemaMismatch("not json", { anything: true })).toBeNull();
     expect(payloadSchemaMismatch("{}", { anything: true })).toBeNull();
+  });
+});
+
+describe("the read cache reflects the calendar, not the union of every read", () => {
+  it("drops an event that the calendar stopped returning", () => {
+    const at = new Date("2026-08-15T09:00:00.000Z");
+    const window = { from: "2026-08-15T09:00:00.000Z", to: "2026-09-14T09:00:00.000Z" };
+    db.exec(`INSERT INTO connector (id,label,transport,command,args_json,cwd,env_var_names_json,status,enabled,source_message_id,created_at,updated_at)
+      VALUES (9,'C','stdio','node','[]','/tmp','[]','ready',1,${userMessageId},'2026-08-15T00:00:00.000Z','2026-08-15T00:00:00.000Z')`);
+
+    cacheCalendarEvents(db, 9, {
+      events: [
+        { id: "a", summary: "Standup", start: "2026-08-16T09:00:00Z", end: "2026-08-16T09:15:00Z" },
+        { id: "b", summary: "Review", start: "2026-08-16T15:00:00Z", end: "2026-08-16T16:00:00Z" },
+      ],
+    }, at, window);
+    expect(cachedEvents(db, at).map((event) => event.external_id).sort()).toEqual(["a", "b"]);
+
+    // The standup was cancelled in the calendar itself. The next read is the only evidence
+    // Zeus will ever get; a cache that only merges would keep resolving "cancel my
+    // standup" against a meeting that no longer exists.
+    cacheCalendarEvents(db, 9, {
+      events: [
+        { id: "b", summary: "Review", start: "2026-08-16T15:00:00Z", end: "2026-08-16T16:00:00Z" },
+      ],
+    }, at, window);
+    expect(cachedEvents(db, at).map((event) => event.external_id)).toEqual(["b"]);
+  });
+
+  it("leaves events outside the window that was read alone", () => {
+    const at = new Date("2026-08-15T09:00:00.000Z");
+    db.exec(`INSERT INTO connector (id,label,transport,command,args_json,cwd,env_var_names_json,status,enabled,source_message_id,created_at,updated_at)
+      VALUES (9,'C','stdio','node','[]','/tmp','[]','ready',1,${userMessageId},'2026-08-15T00:00:00.000Z','2026-08-15T00:00:00.000Z')`);
+    cacheCalendarEvents(db, 9, {
+      events: [{ id: "far", summary: "Later", start: "2026-09-30T10:00:00Z", end: "2026-09-30T11:00:00Z" }],
+    }, at, { from: "2026-09-01T00:00:00.000Z", to: "2026-10-01T00:00:00.000Z" });
+
+    // A read of next week says nothing about a meeting six weeks out.
+    cacheCalendarEvents(db, 9, { events: [] }, at, {
+      from: "2026-08-15T09:00:00.000Z",
+      to: "2026-08-22T09:00:00.000Z",
+    });
+
+    expect(cachedEvents(db, at, { includeEnded: true }).map((e) => e.external_id)).toEqual(["far"]);
   });
 });
 

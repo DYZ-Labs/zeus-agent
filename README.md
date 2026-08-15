@@ -42,9 +42,12 @@ contextual follow-through.
   intervention mode are hard gates. Stewardship can be turned off without disabling
   explicit Today, MCP, or “what should I do?” requests.
 - **Permission before action.** Zeus can draft, research, compare, and plan in chat, and —
-  once you connect a service — read your calendar and prepare changes to it. Preparing is
-  not doing. Every external request stops with the exact payload shown, and only a message
-  of yours naming that payload's hash lets it be sent. Silence is not consent: an
+  once you connect a calendar — read it and carry out changes you asked for. Every change
+  is checked against your calendar first: if the time collides with something already
+  there, Zeus refuses, names the collision, and offers openings instead. Anything it could
+  not verify, and every other kind of external request, stops with the exact payload shown,
+  and only a message of yours naming that payload's hash lets it be sent. Silence is not
+  consent: an
   unanswered request expires.
 - **No credentials in the store.** Zeus reaches other services through reviewed MCP
   capabilities. Manual connections record only commands, URLs, and environment-variable
@@ -82,8 +85,8 @@ contextual follow-through.
 - Deterministic detection of calendar overlaps, tight turnarounds, deadline collisions, and
   unscheduled commitments, delivered through the same gates as every other interruption.
 - A **Today** view with one best current action, external requests awaiting your
-  confirmation with their exact payloads, intervention controls, and a transparent
-  progress-and-regret readout.
+  confirmation with their exact payloads, a record of every change Zeus made and what
+  authorized it, intervention controls, and a transparent progress-and-regret readout.
 - Source transcripts and per-response recall traces for investigating why Zeus answered
   a particular way.
 - A stdio MCP server so other local agents can use the same memory.
@@ -102,8 +105,8 @@ flowchart LR
     G --> J{"Changes something outside Zeus?"}
     J -->|"no"| I["Learn\nsource-backed corrections and outcomes"]
     J -->|"yes"| K["Stop\nshow the exact payload"]
-    K --> L{"Confirmed by hash?"}
-    L -->|"no / silence"| M["Nothing happens\ndecline or expire"]
+    K --> L{"Verified free, or confirmed by hash?"}
+    L -->|"clashes / unreadable / silence"| M["Nothing happens\nrefuse, decline, or expire"]
     L -->|"yes"| N["Send exactly those bytes\nreceipt + undo where possible"]
     M --> I
     N --> I
@@ -681,8 +684,9 @@ Google's official Developer Preview MCP endpoint and verifies the live `list_eve
 `create_event`, and `update_event` schemas before saving a grant. Google Cloud project,
 API, IAM, Desktop OAuth client, and Application Default Credentials setup remains an
 explicit user-run prerequisite; Zeus provides copyable commands but never changes those
-resources. A selected write permission still stops at Zeus's exact-payload confirmation
-gate before any calendar mutation.
+resources. A selected write permission lets Zeus carry out changes you ask for once it has
+read your calendar and found the time free; anything it cannot verify still stops at the
+exact-payload confirmation gate.
 
 ## MCP integration
 
@@ -775,10 +779,12 @@ GOOGLE_CALENDAR_BROKER_SERVICE_KEY=<the same broker service key>
 ```
 
 The Connections screen then offers **Connect Google Calendar**. Initial consent grants
-event reads only. Enabling calendar changes starts a second incremental OAuth consent;
-Zeus still prepares every create or update payload and waits for exact confirmation
-before calling the broker. Disconnect first revokes the Google grant and only then
-removes the local connector row.
+event reads only. Enabling calendar changes starts a second incremental OAuth consent.
+Zeus then reads your calendar before every create, move, or cancel and acts only when the
+requested time is free; a collision, an unreadable calendar, or an ambiguous event stops
+for your exact confirmation. Turn confirmations back on for everything with **Make changes
+without asking me each time** on the same screen. Disconnect first revokes the Google grant
+and only then removes the local connector row.
 
 ## Commands
 
@@ -861,13 +867,16 @@ What is sent to OpenAI:
   the user messages actually present in that window.
 - Historical user excerpts only after the user explicitly starts the disclosed
   backfill preview.
-- When a calendar is connected: the objective, the step, and the calendar data a bounded
-  run read, so the model can draft the exact request you will be asked to confirm.
+- When a calendar is connected: your own request, so the intent classifier can resolve what
+  you asked for. Calendar text is never sent to that classifier, and the payload itself is
+  built deterministically rather than by a model.
 
 What is sent to a connected service:
 
 - Only the calls a capability you granted permits: a bounded read of your calendar window,
-  and — after you confirm one by its hash — exactly the payload you confirmed.
+  and exactly the payload recorded in `proposed_effect` — after you confirmed it by its
+  hash, or after the conflict gate cleared it under the standing setting you enabled. The
+  effect page always says which of the two authorized it.
 - Nothing else. A connector never receives your memory, your transcripts, or any
   environment variable you did not name for it.
 
@@ -882,9 +891,15 @@ commit them.
   reminder, or shopping capability yet, and `purchase` is refused unconditionally — the
   storage layer will not even record it. Zeus can research and draft around those, but it
   stops before the action and never claims otherwise.
-- Undoing an external request works only where the service's own answer makes it possible.
-  A created calendar event can be cancelled; a change to an existing one cannot be rolled
-  back, because Zeus never captured the prior state.
+- Undoing an external request works where the service's answer or Zeus's own prior read
+  makes it possible. A created event can be cancelled. A moved or cancelled event can be
+  restored from the snapshot taken during the read that preceded the change — but only the
+  fields Zeus read. Attendees, description, recurrence, reminders, and conferencing are not
+  restored, and un-cancelling does not recall the notices already sent.
+- The conflict check is only as good as the calendar Zeus can see. It reads your primary
+  calendar; a secondary or shared calendar it was never granted is invisible to it. The
+  chat card says how many events it checked, so the scope of the check is visible rather
+  than implied.
 - Detectors read only your calendar and your accepted commitments. They notice overlapping
   events, tight turnarounds between different places, deadlines on already-full days, and
   commitments with no time set aside. They are deliberately literal and will not infer that

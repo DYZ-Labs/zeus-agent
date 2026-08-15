@@ -1,0 +1,404 @@
+import {
+  contentWords,
+  endOf,
+  OVERLAP_GRACE_MS,
+  startOf,
+} from "./calendar-time";
+import type { CachedEvent } from "./calendar-time";
+
+/**
+ * Whether an event Zeus is about to create collides with one the user already has.
+ *
+ * This is the check that replaces asking. That changes what it has to guarantee: a
+ * confirmation gate fails safe when it is wrong, because a human reads the payload before
+ * anything happens, but a conflict gate that answers "clear" when it does not know is a
+ * double-booking with a receipt. So the only route to `clear` runs through proof that a
+ * window covering the candidate was actually read, recently. An empty event list is never
+ * enough on its own — an unread calendar reports exactly the same thing.
+ *
+ * Pure. No database, no model call, no clock of its own: every input is passed in, so the
+ * whole gate is testable offline and its answers are reproducible.
+ */
+
+export const SLOT_GRANULARITY_MS = 15 * 60_000;
+export const MIN_DURATION_MS = 15 * 60_000;
+export const SEARCH_BEFORE_MS = 86_400_000;
+export const SEARCH_AFTER_MS = 7 * 86_400_000;
+export const MAX_ALTERNATIVES = 3;
+
+/**
+ * How stale a read may be and still support a write.
+ *
+ * Deliberately far tighter than the one-hour cache TTL that serves detectors. A detector
+ * raising a slightly stale conflict costs a glance; a write gate clearing a slot someone
+ * booked forty minutes ago costs a collision.
+ */
+export const MAX_COVERAGE_AGE_MS = 10 * 60_000;
+
+export type CandidateEvent = {
+  startsAt: string;
+  endsAt: string;
+  /** A reschedule must not be judged to conflict with itself. */
+  excludeExternalId?: string | null;
+};
+
+/** Proof of a successful read, and of which window it covered. */
+export type CalendarCoverage = {
+  from: string;
+  to: string;
+  fetchedAt: string;
+  eventCount: number;
+};
+
+export type FreeSlot = { startsAt: string; endsAt: string };
+
+export type ConflictCheck =
+  | { status: "clear"; coverage: CalendarCoverage; consideredEvents: number }
+  | {
+      status: "conflict";
+      conflicts: CachedEvent[];
+      alternatives: FreeSlot[];
+      coverage: CalendarCoverage;
+    }
+  | {
+      status: "unverifiable";
+      reason: "no_coverage" | "stale_coverage" | "outside_coverage" | "unparsable_candidate";
+    };
+
+export function intervalsOverlap(
+  aStart: number,
+  aEnd: number,
+  bStart: number,
+  bEnd: number,
+): boolean {
+  // The grace window is what keeps back-to-back meetings from reading as collisions: an
+  // event ending at 10:00 and one starting at 10:00 share an instant, not any minutes.
+  return aStart < bEnd - OVERLAP_GRACE_MS && bStart < aEnd - OVERLAP_GRACE_MS;
+}
+
+/** Cached events claiming any of the candidate's minutes, earliest first. */
+export function findConflicts(
+  events: readonly CachedEvent[],
+  candidate: CandidateEvent,
+): CachedEvent[] {
+  const start = Date.parse(candidate.startsAt);
+  const end = Date.parse(candidate.endsAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+  return events
+    .filter((event) => {
+      if (candidate.excludeExternalId && event.external_id === candidate.excludeExternalId) {
+        return false;
+      }
+      const eventStart = startOf(event);
+      if (!Number.isFinite(eventStart)) return false;
+      return intervalsOverlap(start, end, eventStart, endOf(event));
+    })
+    .sort((left, right) => startOf(left) - startOf(right));
+}
+
+/**
+ * The nearest openings of the candidate's own length.
+ *
+ * Every choice here is fixed rather than inferred, so the same request always produces the
+ * same three suggestions: a 15-minute grid aligned in the user's own timezone (aligning in
+ * UTC produces :15-offset slots for half-hour zones), inside the user's stated day, ordered
+ * by closeness to what they actually asked for, and spaced at least one event-length apart
+ * so three suggestions are three real options rather than one option three times.
+ *
+ * The requested time itself always counts as inside the day: someone who asks for 21:00 is
+ * better served by 21:30 than by being told the only opening is 08:00 tomorrow.
+ */
+export function findFreeSlots(input: {
+  events: readonly CachedEvent[];
+  candidate: CandidateEvent;
+  coverage: CalendarCoverage;
+  timezone: string;
+  now: string;
+  dayStart: string;
+  dayEnd: string;
+  limit?: number;
+}): FreeSlot[] {
+  const start = Date.parse(input.candidate.startsAt);
+  const end = Date.parse(input.candidate.endsAt);
+  const nowMs = Date.parse(input.now);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
+
+  const duration = Math.max(end - start, MIN_DURATION_MS);
+  const coverageFrom = Date.parse(input.coverage.from);
+  const coverageTo = Date.parse(input.coverage.to);
+  const searchFrom = Math.max(start - SEARCH_BEFORE_MS, nowMs, coverageFrom);
+  const searchTo = Math.min(start + SEARCH_AFTER_MS, coverageTo);
+  if (!Number.isFinite(searchFrom) || !Number.isFinite(searchTo)) return [];
+
+  const dayStartMinutes = minutesOfDay(input.dayStart) ?? 8 * 60;
+  const dayEndMinutes = minutesOfDay(input.dayEnd) ?? 20 * 60;
+  const requestedStartMinutes = localMinutesOfDay(start, input.timezone);
+  const requestedEndMinutes = localMinutesOfDay(end, input.timezone);
+
+  const found: FreeSlot[] = [];
+  const limit = input.limit ?? MAX_ALTERNATIVES;
+  const candidates: { slotStart: number; distance: number }[] = [];
+
+  for (
+    let slotStart = alignToGrid(searchFrom, input.timezone);
+    slotStart + duration <= searchTo;
+    slotStart += SLOT_GRANULARITY_MS
+  ) {
+    if (slotStart < searchFrom) continue;
+    if (slotStart === start) continue;
+    const slotStartMinutes = localMinutesOfDay(slotStart, input.timezone);
+    const slotEndMinutes = slotStartMinutes + duration / 60_000;
+    const insideStatedDay =
+      slotStartMinutes >= dayStartMinutes && slotEndMinutes <= dayEndMinutes;
+    const insideRequestedSpan =
+      slotStartMinutes >= requestedStartMinutes && slotEndMinutes <= requestedEndMinutes + 240;
+    if (!insideStatedDay && !insideRequestedSpan) continue;
+    const conflicts = findConflicts(input.events, {
+      startsAt: new Date(slotStart).toISOString(),
+      endsAt: new Date(slotStart + duration).toISOString(),
+      excludeExternalId: input.candidate.excludeExternalId ?? null,
+    });
+    if (conflicts.length > 0) continue;
+    candidates.push({ slotStart, distance: Math.abs(slotStart - start) });
+  }
+
+  candidates.sort((left, right) =>
+    left.distance === right.distance
+      ? left.slotStart - right.slotStart
+      : left.distance - right.distance,
+  );
+
+  for (const entry of candidates) {
+    if (found.length >= limit) break;
+    // Three suggestions fifteen minutes apart is one suggestion. Space them by the length
+    // of the thing being scheduled.
+    const tooClose = found.some(
+      (slot) => Math.abs(Date.parse(slot.startsAt) - entry.slotStart) < duration,
+    );
+    if (tooClose) continue;
+    found.push({
+      startsAt: new Date(entry.slotStart).toISOString(),
+      endsAt: new Date(entry.slotStart + duration).toISOString(),
+    });
+  }
+  return found;
+}
+
+/**
+ * The gate itself.
+ *
+ * Note the order: coverage is established before events are consulted at all. There is no
+ * path from an empty event list to `clear` that does not first prove a covering window was
+ * read within `MAX_COVERAGE_AGE_MS`.
+ */
+export function checkCalendarConflicts(input: {
+  events: readonly CachedEvent[];
+  candidate: CandidateEvent;
+  coverage: CalendarCoverage | null;
+  timezone: string;
+  now: string;
+  dayStart: string;
+  dayEnd: string;
+}): ConflictCheck {
+  const start = Date.parse(input.candidate.startsAt);
+  const end = Date.parse(input.candidate.endsAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return { status: "unverifiable", reason: "unparsable_candidate" };
+  }
+  if (!input.coverage) return { status: "unverifiable", reason: "no_coverage" };
+
+  const fetchedAt = Date.parse(input.coverage.fetchedAt);
+  const nowMs = Date.parse(input.now);
+  if (
+    !Number.isFinite(fetchedAt) ||
+    !Number.isFinite(nowMs) ||
+    nowMs - fetchedAt > MAX_COVERAGE_AGE_MS
+  ) {
+    return { status: "unverifiable", reason: "stale_coverage" };
+  }
+
+  const coverageFrom = Date.parse(input.coverage.from);
+  const coverageTo = Date.parse(input.coverage.to);
+  if (
+    !Number.isFinite(coverageFrom) ||
+    !Number.isFinite(coverageTo) ||
+    start < coverageFrom ||
+    end > coverageTo
+  ) {
+    return { status: "unverifiable", reason: "outside_coverage" };
+  }
+
+  const conflicts = findConflicts(input.events, input.candidate);
+  if (conflicts.length === 0) {
+    return {
+      status: "clear",
+      coverage: input.coverage,
+      consideredEvents: input.events.length,
+    };
+  }
+  return {
+    status: "conflict",
+    conflicts,
+    alternatives: findFreeSlots({
+      events: input.events,
+      candidate: input.candidate,
+      coverage: input.coverage,
+      timezone: input.timezone,
+      now: input.now,
+      dayStart: input.dayStart,
+      dayEnd: input.dayEnd,
+    }),
+    coverage: input.coverage,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Resolving which existing event the user meant
+// ---------------------------------------------------------------------------
+
+export type EventReference = {
+  titleText: string | null;
+  /** An absolute instant, when the user named a time. */
+  startsAt: string | null;
+  /** A local calendar day, when they named only a day. */
+  dateLocal: string | null;
+};
+
+export type TargetResolution =
+  | { status: "resolved"; event: CachedEvent }
+  | { status: "ambiguous"; candidates: CachedEvent[] }
+  | { status: "not_found" };
+
+export const TARGET_START_TOLERANCE_MS = 15 * 60_000;
+export const MAX_TARGET_CANDIDATES = 5;
+
+/**
+ * Which existing event "my 3pm" or "dinner with Sam" refers to.
+ *
+ * Deterministic, and it refuses rather than guesses. Two events at 3pm produce a question,
+ * never a coin flip — the same rule that makes a shared alias resolve as ambiguous instead
+ * of being forced onto one person. With no confirmation gate downstream, "nearest match"
+ * would mean cancelling the wrong meeting and finding out afterwards.
+ */
+export function resolveTargetEvent(
+  events: readonly CachedEvent[],
+  reference: EventReference,
+  options: { timezone: string; now: string },
+): TargetResolution {
+  const nowMs = Date.parse(options.now);
+  // A meeting that started ten minutes ago is still reschedulable; yesterday's is not.
+  let pool = events.filter((event) => {
+    const eventEnd = endOf(event);
+    return Number.isFinite(eventEnd) && eventEnd > nowMs - 3_600_000;
+  });
+
+  if (reference.dateLocal) {
+    pool = pool.filter(
+      (event) => localDate(startOf(event), options.timezone) === reference.dateLocal,
+    );
+  }
+
+  if (reference.startsAt) {
+    const target = Date.parse(reference.startsAt);
+    if (Number.isFinite(target)) {
+      pool = pool.filter(
+        (event) => Math.abs(startOf(event) - target) <= TARGET_START_TOLERANCE_MS,
+      );
+    }
+  }
+
+  if (reference.titleText && reference.titleText.trim().length > 0) {
+    const needle = reference.titleText.trim().toLocaleLowerCase();
+    const words = contentWords(reference.titleText);
+    const scored = pool
+      .map((event) => {
+        const title = (event.title ?? "").toLocaleLowerCase();
+        if (title.length > 0 && title.includes(needle)) return { event, score: 100 };
+        const eventWords = contentWords(event.title ?? "");
+        let shared = 0;
+        for (const word of words) if (eventWords.has(word)) shared += 1;
+        return { event, score: shared >= Math.min(2, words.size) ? shared : 0 };
+      })
+      .filter((entry) => entry.score > 0);
+    const best = scored.reduce((max, entry) => Math.max(max, entry.score), 0);
+    pool = scored.filter((entry) => entry.score === best).map((entry) => entry.event);
+  }
+
+  if (pool.length === 0) return { status: "not_found" };
+  if (pool.length === 1) {
+    const event = pool[0];
+    return event ? { status: "resolved", event } : { status: "not_found" };
+  }
+  return {
+    status: "ambiguous",
+    candidates: [...pool]
+      .sort((left, right) => startOf(left) - startOf(right))
+      .slice(0, MAX_TARGET_CANDIDATES),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Timezone-aware helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Local wall-clock parts for an instant.
+ *
+ * Everything here goes through `Intl` rather than arithmetic on the UTC value, because a
+ * fixed offset is wrong twice a year and permanently wrong for half-hour zones.
+ */
+function localParts(
+  timestamp: number,
+  timezone: string,
+): { year: string; month: string; day: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((entry) => entry.type === type)?.value ?? "00";
+  return {
+    year: part("year"),
+    month: part("month"),
+    day: part("day"),
+    hour: Number(part("hour")),
+    minute: Number(part("minute")),
+  };
+}
+
+export function localDate(timestamp: number, timezone: string): string {
+  if (!Number.isFinite(timestamp)) return "";
+  const parts = localParts(timestamp, timezone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+export function localMinutesOfDay(timestamp: number, timezone: string): number {
+  const parts = localParts(timestamp, timezone);
+  return parts.hour * 60 + parts.minute;
+}
+
+function minutesOfDay(value: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/u.exec(value.trim());
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+/** Round up to the next 15-minute boundary of the user's own clock, not of UTC. */
+function alignToGrid(timestamp: number, timezone: string): number {
+  const minutes = localMinutesOfDay(timestamp, timezone);
+  const remainder = minutes % 15;
+  const seconds = new Date(timestamp).getUTCSeconds();
+  const millis = new Date(timestamp).getUTCMilliseconds();
+  const toNext = remainder === 0 && seconds === 0 && millis === 0
+    ? 0
+    : (15 - remainder) * 60_000 - seconds * 1_000 - millis;
+  return timestamp + toNext;
+}

@@ -16,6 +16,7 @@ import {
   startUnderstandingBackfill,
 } from "@/core/backfill";
 import { updateAmbientSetting } from "@/core/ambient";
+import { updateCalendarActionSetting } from "@/core/calendar-policy";
 import {
   CAPABILITY_SLOTS,
   ConnectorPresetError,
@@ -549,6 +550,27 @@ export async function setStewardshipModeAction(formData: FormData): Promise<void
   setStewardshipMode(db, mode, source.id);
   revalidatePath("/today");
   revalidatePath("/settings");
+}
+
+/**
+ * Turn unattended calendar changes on or off.
+ *
+ * The setting removes the interruption, never the record: every change still writes a
+ * receipt, and the conflict gate still has to clear before it applies. Switching it is an
+ * explicit user action so `authorized_by_policy` always traces back to one.
+ */
+export async function setCalendarDirectExecutionAction(formData: FormData): Promise<void> {
+  const enabled = formData.get("directExecution") === "on";
+  const db = await requireOwnerDb();
+  const source = curationMessage(
+    db,
+    enabled
+      ? "Carry out calendar changes I ask for without confirming each one, when the time is free."
+      : "Ask me to confirm every calendar change before making it.",
+  );
+  updateCalendarActionSetting(db, { directExecution: enabled }, source.id);
+  revalidatePath("/settings");
+  revalidatePath("/");
 }
 
 export async function updateAmbientSettingAction(formData: FormData): Promise<void> {

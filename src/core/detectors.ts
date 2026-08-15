@@ -1,3 +1,13 @@
+import { cachedEvents } from "./calendar-sync";
+import {
+  clock,
+  endOf,
+  label,
+  mentions,
+  normalizedPlace,
+  OVERLAP_GRACE_MS,
+} from "./calendar-time";
+import type { CachedEvent } from "./calendar-time";
 import type { Db } from "./db";
 import { now } from "./db";
 import { listCommitments, listGoals } from "./intentions";
@@ -23,21 +33,13 @@ import type { DetectedSignal, DetectorKind, EffectKind } from "./schema";
  */
 
 const DAY_MS = 86_400_000;
-/** Below this, two events are adjacent rather than genuinely colliding. */
-const OVERLAP_GRACE_MS = 60_000;
 /** Time between events at different places, under which the second is hard to reach. */
 const TRAVEL_GAP_MS = 30 * 60_000;
 /** How far ahead a deadline has to be before an unscheduled commitment is worth raising. */
 const UNSCHEDULED_HORIZON_MS = 7 * DAY_MS;
 const MAX_SIGNALS_PER_RUN = 50;
 
-export type CachedEvent = {
-  external_id: string;
-  starts_at: string;
-  ends_at: string | null;
-  location: string | null;
-  title: string | null;
-};
+export type { CachedEvent };
 
 export type DetectionResult = {
   created: DetectedSignal[];
@@ -91,7 +93,7 @@ export function runDetectors(db: Db, options: { at?: Date } = {}): DetectionResu
     const seen = new Set(drafts.map((draft) => draft.dedupeKey));
     const resolved = resolveAbsentSignals(db, seen, at);
     const created: DetectedSignal[] = [];
-    for (const draft of drafts) created.push(upsertSignal(db, draft, at));
+    for (const draft of drafts) created.push(upsertSignal(db, draft));
     return { created, resolved };
   })();
 }
@@ -118,18 +120,6 @@ export function signalSubject(signal: DetectedSignal): Record<string, unknown> {
     : {};
 }
 
-/** Cached calendar rows that have not expired, ordered in time. Unstarted events only. */
-export function cachedEvents(db: Db, at: Date): CachedEvent[] {
-  return db
-    .prepare<[string], CachedEvent>(
-      `SELECT external_id, starts_at, ends_at, location, json_extract(payload_json, '$.title') AS title
-       FROM external_signal
-       WHERE kind = 'calendar_event' AND expires_at > ? AND starts_at IS NOT NULL
-       ORDER BY starts_at, external_id`,
-    )
-    .all(at.toISOString())
-    .filter((event) => Number.isFinite(Date.parse(event.starts_at)));
-}
 
 /** Two events claiming the same minutes. The most checkable observation there is. */
 function detectCalendarOverlaps(events: readonly CachedEvent[]): Draft[] {
@@ -292,7 +282,7 @@ function eligible(
  * fact it was already surfaced — so a periodic sweep cannot turn one conflict into a
  * fresh interruption every time it runs.
  */
-function upsertSignal(db: Db, draft: Draft, at: Date): DetectedSignal {
+function upsertSignal(db: Db, draft: Draft): DetectedSignal {
   const timestamp = now();
   db.prepare<
     [DetectorKind, string, string, number | null, number, string, string, EffectKind,
@@ -325,7 +315,6 @@ function upsertSignal(db: Db, draft: Draft, at: Date): DetectedSignal {
     .prepare<[string], DetectedSignal>(`${SELECT_SIGNAL} WHERE dedupe_key = ?`)
     .get(draft.dedupeKey);
   if (!signal) throw new Error("Detected signal vanished after insertion");
-  void at;
   return signal;
 }
 
@@ -348,40 +337,3 @@ function resolveAbsentSignals(db: Db, seen: ReadonlySet<string>, at: Date): numb
   return resolved;
 }
 
-function endOf(event: CachedEvent): number {
-  const start = Date.parse(event.starts_at);
-  const end = event.ends_at === null ? Number.NaN : Date.parse(event.ends_at);
-  // A calendar entry with no end is treated as an hour: long enough to collide with the
-  // next thing, short enough not to swallow the day.
-  return Number.isFinite(end) && end > start ? end : start + 3_600_000;
-}
-
-function label(event: CachedEvent): string {
-  return event.title && event.title.trim().length > 0 ? `“${event.title.trim()}”` : "an event";
-}
-
-function clock(timestamp: number): string {
-  return new Date(timestamp).toISOString().slice(11, 16);
-}
-
-function normalizedPlace(value: string): string {
-  return value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-}
-
-/** Whether a calendar entry plainly refers to a commitment, by shared content words. */
-function mentions(event: CachedEvent, title: string): boolean {
-  const words = contentWords(title);
-  if (words.size === 0) return false;
-  const eventWords = contentWords(event.title ?? "");
-  let shared = 0;
-  for (const word of words) if (eventWords.has(word)) shared += 1;
-  return shared >= Math.min(2, words.size);
-}
-
-function contentWords(value: string): Set<string> {
-  return new Set(
-    (value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
-      (word) => word.length > 3,
-    ),
-  );
-}

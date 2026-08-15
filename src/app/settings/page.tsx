@@ -8,6 +8,7 @@ import {
 } from "@/app/actions";
 import { logoutAction } from "@/app/auth/actions";
 import { ConnectionsPanel } from "@/components/connections-panel";
+import { getCalendarActionSetting } from "@/core/calendar-policy";
 import { DeleteAllConversations } from "@/components/delete-all-conversations";
 import { CoarseLocationControl } from "@/components/coarse-location-control";
 import { SettingsModal } from "@/components/settings-modal";
@@ -50,6 +51,7 @@ export default async function SettingsPage({
         location: getFreshCoarseLocation(access.db),
         behavioralSuggestions: listBehavioralPolicySuggestions(access.db, { limit: 20 }),
         connectors: listConnectors(access.db),
+        calendarAction: getCalendarActionSetting(access.db),
       }
     : null;
 
@@ -79,6 +81,7 @@ export default async function SettingsPage({
             successMessage={typeof connectorSuccess === "string" ? connectorSuccess : null}
             googleCalendarAvailable={googleCalendarConfiguration.state === "ready"}
             hostedAccount={access.state === "authorized"}
+            directExecution={privateSettings.calendarAction.direct_execution === 1}
           />
         ) : (
           <LockedSettings />

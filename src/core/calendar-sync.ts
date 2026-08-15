@@ -1,3 +1,6 @@
+import type { CalendarCoverage } from "./calendar-conflicts";
+import { endOf } from "./calendar-time";
+import type { CachedEvent } from "./calendar-time";
 import { availableCapability } from "./connectors";
 import type { Db } from "./db";
 import { callCapability } from "./mcp-client";
@@ -84,6 +87,7 @@ export function cacheCalendarEvents(
   connectorId: number,
   value: unknown,
   at: Date = new Date(),
+  window: CalendarWindow = calendarWindow(at),
 ): CalendarEvent[] {
   const events = parseCalendarEvents(value);
   const fetchedAt = at.toISOString();
@@ -105,6 +109,25 @@ export function cacheCalendarEvents(
   );
   db.transaction(() => {
     db.prepare<[string]>("DELETE FROM external_signal WHERE expires_at <= ?").run(fetchedAt);
+    // Reconcile the window, don't just merge into it. A read that comes back without an
+    // event Zeus had cached is the only evidence it will ever get that the event is gone —
+    // and a cache that only ever grows will happily resolve "cancel my standup" against a
+    // meeting that was deleted an hour ago, or refuse a slot that is actually free. Scoped
+    // to the window that was read, so events outside it are left alone rather than assumed
+    // absent. This mirrors `resolveAbsentSignals`, for the same reason.
+    const seen = new Set(events.map((event) => event.id));
+    const stale = db
+      .prepare<[number, string, string], { external_id: string }>(
+        `SELECT external_id FROM external_signal
+         WHERE connector_id = ? AND kind = 'calendar_event'
+           AND starts_at IS NOT NULL AND starts_at >= ? AND starts_at < ?`,
+      )
+      .all(connectorId, window.from, window.to)
+      .filter((row) => !seen.has(row.external_id));
+    const drop = db.prepare<[number, string]>(
+      "DELETE FROM external_signal WHERE connector_id = ? AND kind = 'calendar_event' AND external_id = ?",
+    );
+    for (const row of stale) drop.run(connectorId, row.external_id);
     for (const event of events) {
       upsert.run(
         connectorId,
@@ -117,8 +140,74 @@ export function cacheCalendarEvents(
         expiresAt,
       );
     }
+    // Recorded in the same transaction as the rows themselves, because the whole value of
+    // this row is that it cannot disagree with them. A calendar with nothing in it and a
+    // calendar that was never read are otherwise indistinguishable to a write gate.
+    db.prepare<[number, string, string, number, string]>(
+      `INSERT INTO external_read_window
+         (connector_id, kind, window_from, window_to, event_count, fetched_at)
+       VALUES (?, 'calendar_event', ?, ?, ?, ?)
+       ON CONFLICT (connector_id, kind) DO UPDATE SET
+         window_from = excluded.window_from,
+         window_to = excluded.window_to,
+         event_count = excluded.event_count,
+         fetched_at = excluded.fetched_at`,
+    ).run(connectorId, window.from, window.to, events.length, fetchedAt);
   })();
   return events;
+}
+
+/**
+ * The most recent proof that a calendar window was read.
+ *
+ * Returns null when no read has ever succeeded. Callers must treat that as "unknown", never
+ * as "empty" — that distinction is the entire reason this table exists.
+ */
+export function readCalendarCoverage(db: Db): CalendarCoverage | null {
+  const row = db
+    .prepare<[], { window_from: string; window_to: string; event_count: number; fetched_at: string }>(
+      `SELECT window_from, window_to, event_count, fetched_at
+       FROM external_read_window
+       WHERE kind = 'calendar_event'
+       ORDER BY fetched_at DESC
+       LIMIT 1`,
+    )
+    .get();
+  if (!row) return null;
+  return {
+    from: row.window_from,
+    to: row.window_to,
+    fetchedAt: row.fetched_at,
+    eventCount: row.event_count,
+  };
+}
+
+/**
+ * Cached calendar rows that have not expired and have not already ended, ordered in time.
+ *
+ * "Has not ended" rather than "has not started": an event that began twenty minutes ago and
+ * runs another forty still collides with something booked ten minutes from now. The SQL
+ * bound is deliberately generous and the exact test is applied in TypeScript, where the
+ * one-hour default for a missing end already lives.
+ */
+export function cachedEvents(
+  db: Db,
+  at: Date,
+  options: { includeEnded?: boolean } = {},
+): CachedEvent[] {
+  const rows = db
+    .prepare<[string, string], CachedEvent>(
+      `SELECT external_id, starts_at, ends_at, location,
+              json_extract(payload_json, '$.title') AS title
+       FROM external_signal
+       WHERE kind = 'calendar_event' AND expires_at > ? AND starts_at IS NOT NULL
+         AND starts_at > ?
+       ORDER BY starts_at, external_id`,
+    )
+    .all(at.toISOString(), new Date(at.getTime() - 2 * 86_400_000).toISOString())
+    .filter((event) => Number.isFinite(Date.parse(event.starts_at)));
+  if (options.includeEnded) return rows;
+  return rows.filter((event) => endOf(event) > at.getTime());
 }
 
 /**
