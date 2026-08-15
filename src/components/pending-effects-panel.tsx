@@ -26,7 +26,7 @@ export function PendingEffectsPanel({
     <section id="confirmations" className="mt-10 max-w-[54rem]">
       <h2 className="text-[0.95rem] font-medium leading-5">Waiting for your confirmation</h2>
       <p className="mt-1 max-w-[64ch] text-[0.84rem] leading-6" style={{ color: "var(--shell-muted)" }}>
-        Zeus prepared these. None of them has happened.
+        I prepared these. None of them has happened.
       </p>
 
       {errorMessage ? (

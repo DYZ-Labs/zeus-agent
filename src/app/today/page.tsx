@@ -134,7 +134,7 @@ function SignalCard({ alert, canChat }: { alert: SignalAlert; canChat: boolean }
         {alert.why}
       </p>
       <p className="mt-3 font-mono text-[0.64rem]" style={{ color: "var(--shell-faint)" }}>
-        Read from your connected calendar. Zeus has changed nothing.
+        Read from your connected calendar. I have changed nothing.
       </p>
 
       <form action={signalDecisionAction} className="mt-5">

@@ -1306,11 +1306,14 @@ function scoreRecommendation(input: ScoreInput): FollowThroughRecommendation | n
   });
   const suggestedAction = actionFor(actionKind, effectKind, commitment.title);
   const requiresConfirmation = requiresEffectConfirmation(effectKind);
+  // What the user appears to have typed once they click through, so it stays the length of
+  // something a person would type. It carries no standing disclaimer: external action is
+  // gated by authorizeWorkPlan and confirmEffect whatever this text says, and a compliance
+  // paragraph attributed to the user is a worse lie than a short request.
   const chatPrompt = [
     `Help me follow through on “${commitment.title}”.`,
     suggestedAction,
     goal ? `Keep my goal “${goal.title}” in view.` : null,
-    "Use only my accepted memory as personal context. Draft, research, or plan now, but do not send, schedule, purchase, or change anything externally without asking me first.",
   ]
     .filter((part): part is string => part !== null)
     .join(" ");

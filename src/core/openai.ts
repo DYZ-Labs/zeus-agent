@@ -7,7 +7,7 @@ import { logEvent } from "./observability";
  * The single OpenAI client. Constructed lazily so the store, tests, and curation
  * UI continue to work without credentials; only model-backed paths require a key.
  */
-export const MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5.5";
+export const MODEL = process.env.OPENAI_MODEL?.trim() || "gpt-5.6-luna";
 export const OPENAI_TIMEOUT_MS = 75_000;
 export const OPENAI_MAX_RETRIES = 1;
 

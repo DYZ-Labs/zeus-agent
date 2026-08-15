@@ -270,7 +270,7 @@ redeploys.
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `OPENAI_API_KEY` | For chat/extraction | — | OpenAI API credential |
-| `OPENAI_MODEL` | No | `gpt-5.5` | Model used for both chat and extraction |
+| `OPENAI_MODEL` | No | `gpt-5.6-luna` | Model used for both chat and extraction |
 | `NEXT_PUBLIC_SUPABASE_URL` | For web login | — | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | For web login | — | Browser-safe Supabase publishable key |
 | `NEXT_PUBLIC_SITE_URL` | For web login | `http://127.0.0.1:3000` in the example | Exact app origin used for auth callbacks |
