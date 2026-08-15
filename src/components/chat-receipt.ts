@@ -1,3 +1,11 @@
+/**
+ * What a turn did to memory.
+ *
+ * The chat no longer renders this. It is still carried on the turn because two things
+ * depend on it: the reply is only finished once it arrives, and a follow-through decision
+ * needs the assistant message it was shown against. The provenance itself lives in
+ * `response_context` and is reachable at /response/[id].
+ */
 export type ChatReceipt = {
   messageId: number;
   recalled: number;
@@ -13,17 +21,3 @@ export type ChatReceipt = {
   superseded: number;
   failed: boolean;
 };
-
-/** Keep a no-op memory pass out of the reply chrome while retaining meaningful receipts. */
-export function receiptSummaryParts(receipt: ChatReceipt): string[] {
-  return [
-    receipt.recalled > 0 ? `${receipt.recalled} recalled` : null,
-    receipt.failed
-      ? "extraction failed"
-      : receipt.accepted > 0
-        ? `${receipt.accepted} accepted`
-        : null,
-    receipt.pending > 0 ? `${receipt.pending} pending` : null,
-    receipt.superseded > 0 ? `${receipt.superseded} superseded` : null,
-  ].filter((part): part is string => part !== null);
-}
