@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { mayBeCalendarRequest } from "./calendar-intent";
 import { buildContext } from "./context";
 import { appendMessage, createConversation } from "./conversations";
 import { openTestDb } from "./db";
@@ -163,6 +164,21 @@ describe("follow-through selection", () => {
     expect(recommendNextAction(db, "what is the weather")).toBeNull();
   });
 
+  it("keeps a schedule prompt routable to the calendar path after trimming", () => {
+    // The composer text is sent as an ordinary user message, so it has to clear the
+    // deterministic prefilter in chat.ts before the calendar classifier ever sees it.
+    // Shortening the prompt is exactly the kind of edit that breaks that quietly.
+    const db = openTestDb();
+    const message = source(db);
+    createCommitment(db, {
+      title: "Schedule Maya's birthday dinner",
+      sourceMessageId: message.id,
+    });
+    const schedule = recommendNextAction(db, "", { context: explicitContext() });
+    expect(schedule?.action_kind).toBe("schedule");
+    expect(mayBeCalendarRequest(schedule!.chat_prompt)).toBe(true);
+  });
+
   it("classifies useful preparation while keeping external action behind confirmation", () => {
     const db = openTestDb();
     const message = source(db);
@@ -184,7 +200,12 @@ describe("follow-through selection", () => {
     expect(research?.action_kind).toBe("research");
     expect(research?.effect_kind).toBe("web_read");
     expect(research?.requires_confirmation).toBe(false);
-    expect(research?.chat_prompt).toMatch(/do not send, schedule, purchase/u);
+    // The composer text reads as something the user would type. The standing disclaimer it
+    // used to carry was never what held external action back — the plan and effect gates
+    // are — and attributing a compliance paragraph to the user misrepresents them.
+    expect(research?.chat_prompt).not.toMatch(/do not send, schedule, purchase/u);
+    expect(research?.chat_prompt).toContain("Help me follow through on");
+    expect(research?.chat_prompt).toContain(research!.suggested_action);
 
     updateCommitment(db, research!.commitment_id, {
       title: "Buy pottery gifts",

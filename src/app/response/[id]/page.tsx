@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
+import { AssistantProse } from "@/components/assistant-prose";
 import { PageHeader } from "@/components/page-header";
 import { getMessage } from "@/core/conversations";
 import type { IntentFieldProvenance } from "@/core/context";
@@ -42,7 +43,11 @@ export default async function ResponseSourcesPage({
           <h2 className="font-mono text-[0.64rem] uppercase tracking-[0.14em]" style={{ color: "var(--shell-faint)" }}>
             Zeus answered
           </h2>
-          <p className="mt-3 whitespace-pre-wrap text-[0.92rem]">{message.content}</p>
+          <AssistantProse
+            text={message.content}
+            className="mt-3"
+            paragraphClassName="text-[0.92rem]"
+          />
         </section>
 
         {recommendations.length > 0 && (

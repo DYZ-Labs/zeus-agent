@@ -3,7 +3,20 @@
 import { useEffect, useRef, useState } from "react";
 
 import { confirmEffectAction, declineEffectAction } from "@/app/actions";
+import { AssistantProse } from "@/components/assistant-prose";
 import { AuthTrigger } from "@/components/auth-trigger";
+import {
+  CARD_COPY,
+  CLARIFICATION,
+  CLARIFICATION_FALLBACK,
+  FOLLOW_THROUGH_DECISION,
+  NOT_DONE,
+  TARGET_NOT_FOUND,
+  UNVERIFIABLE,
+  UNVERIFIABLE_FALLBACK,
+  VERB,
+  WORK_CARD_COPY,
+} from "@/components/calendar-card-copy";
 import {
   CHAT_UPDATED_EVENT,
   NEW_CHAT_EVENT,
@@ -14,8 +27,8 @@ import {
   type ChatReceipt,
 } from "@/components/chat-receipt";
 // Imported rather than restated. A hand-copied duplicate is how a new status ends up
-// rendering the catch-all sentence "Zeus stopped before making the change", which for
-// read_only would be actively false.
+// rendering the catch-all sentence in CARD_COPY.stoppedShort, which for read_only would
+// be actively false.
 import type { CalendarOutcome, FollowThroughRecommendation } from "@/core/schema";
 
 type RecommendationDecision = "accepted" | "dismissed" | "snoozed" | "completed";
@@ -526,9 +539,11 @@ function AssistantTurn({
       <AssistantMark />
       <div className="min-w-0 flex-1 pt-0.5">
         {text ? (
-          <p className="whitespace-pre-wrap text-[0.95rem] leading-7" style={{ color: "var(--shell-fg)" }}>
-            {text}
-          </p>
+          <AssistantProse
+            text={text}
+            paragraphClassName="text-[0.95rem] leading-7"
+            style={{ color: "var(--shell-fg)" }}
+          />
         ) : (
           pending && <ThinkingIndicator />
         )}
@@ -549,32 +564,6 @@ function AssistantTurn({
     </div>
   );
 }
-
-/** What Zeus could not work out, said in the user's terms rather than the veto's. */
-const CLARIFICATION: Record<string, string> = {
-  low_confidence_write: "Zeus was not sure enough about that to act on it.",
-  no_target_reference: "Zeus could not tell which event you meant.",
-  no_start_time: "Zeus could not tell what time you meant.",
-  unparsable_start: "Zeus could not read that as a time.",
-  unparsable_end: "Zeus could not read that as an end time.",
-  implausible_duration: "That worked out to a length Zeus did not trust.",
-  implausible_date: "That worked out to a date Zeus did not trust.",
-  no_title: "Zeus could not tell what to call it.",
-};
-
-const VERB: Record<CalendarOutcome["kind"], string> = {
-  create: "Added to your calendar",
-  reschedule: "Moved",
-  cancel: "Cancelled",
-  read: "Read your calendar",
-};
-
-const NOT_DONE: Record<CalendarOutcome["kind"], string> = {
-  create: "Not added",
-  reschedule: "Not moved",
-  cancel: "Not cancelled",
-  read: "Not read",
-};
 
 /**
  * What Zeus did to the calendar, or why it did not.
@@ -641,8 +630,8 @@ function CalendarActionCard({
           {decided === "executed"
             ? `Done. ${pending?.previewText ?? VERB[outcome.kind]}.`
             : decided === "reverted"
-              ? "Undone."
-              : "Nothing was sent."}
+              ? CARD_COPY.undone
+              : CARD_COPY.nothingWasSent}
         </p>
       </aside>
     );
@@ -663,7 +652,7 @@ function CalendarActionCard({
           {outcome.consideredEvents !== null && outcome.kind !== "read" && (
             <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
               Checked {outcome.consideredEvents}{" "}
-              {outcome.consideredEvents === 1 ? "event" : "events"} on your calendar first.
+              {outcome.consideredEvents === 1 ? "event" : "events"} {CARD_COPY.checkedFirst}
             </p>
           )}
           {done[0] && (
@@ -696,7 +685,7 @@ function CalendarActionCard({
       ) : outcome.status === "blocked_by_conflict" ? (
         <>
           <p className="text-[0.85rem] font-medium leading-6">
-            {NOT_DONE[outcome.kind]} — that destination was occupied.
+            {NOT_DONE[outcome.kind]} — {CARD_COPY.blockedByConflict}
           </p>
           <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
             {outcome.conflicts.map((conflict) => (
@@ -708,7 +697,7 @@ function CalendarActionCard({
           {outcome.alternatives.length > 0 && (
             <>
               <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                Free nearby:
+                {CARD_COPY.freeNearby}
               </p>
               <div className="mt-1.5 flex flex-wrap gap-2">
                 {outcome.alternatives.map((slot) => (
@@ -729,7 +718,7 @@ function CalendarActionCard({
       ) : outcome.status === "ambiguous_target" ? (
         <>
           <p className="text-[0.85rem] font-medium leading-6">
-            Nothing changed — more than one event matches.
+            {CARD_COPY.ambiguousTarget}
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
             {outcome.candidates.map((candidate) => (
@@ -751,13 +740,13 @@ function CalendarActionCard({
         <>
           <p className="text-[0.85rem] leading-6">
             {outcome.coverage?.eventCount === 0
-              ? "Nothing changed — Zeus found no events in the time window it checked."
-              : "Nothing changed — Zeus could not match that in the time window it checked."}
+              ? TARGET_NOT_FOUND.emptyWindow
+              : TARGET_NOT_FOUND.noMatch}
           </p>
           {outcome.nearMisses.length > 0 && (
             <>
               <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                It did see these. Did you mean one of them?
+                {TARGET_NOT_FOUND.nearMisses}
               </p>
               <div className="mt-1.5 flex flex-wrap gap-2">
                 {outcome.nearMisses.map((candidate) => (
@@ -782,13 +771,12 @@ function CalendarActionCard({
       ) : outcome.status === "needs_clarification" ? (
         <p className="text-[0.85rem] leading-6">
           Nothing changed.{" "}
-          {(outcome.reason && CLARIFICATION[outcome.reason]) ??
-            "Zeus could not work out what you wanted changed."}{" "}
-          Say it again with the detail it was missing and it will try.
+          {(outcome.reason && CLARIFICATION[outcome.reason]) ?? CLARIFICATION_FALLBACK}{" "}
+          {CARD_COPY.needsClarificationSuffix}
         </p>
       ) : outcome.status === "read_only" ? (
         <p className="text-[0.85rem] leading-6">
-          Your calendar is connected for reading only, so nothing was changed.{" "}
+          {CARD_COPY.readOnly}{" "}
           <a href="/settings#connections" className="underline underline-offset-2">
             Allow calendar changes
           </a>
@@ -796,19 +784,11 @@ function CalendarActionCard({
         </p>
       ) : outcome.status === "unverifiable" ? (
         <p className="text-[0.85rem] leading-6">
-          {outcome.reason === "reconnect_required"
-            ? "Nothing changed. Google Calendar needs to be reconnected before Zeus can check or act."
-            : outcome.reason === "connector_unavailable"
-              ? "Nothing changed. The connected calendar is unavailable, so Zeus could not check or act. Review it in Settings under Connections."
-              : outcome.reason === "no_read_capability"
-            ? "Nothing changed. Zeus cannot read your calendar with the permissions it has, so it could not check and did not act."
-            : outcome.reason === "stale_coverage"
-              ? "Nothing changed. Zeus last looked at your calendar too long ago to act on it. Ask again and it will read it fresh."
-              : "Nothing changed. Zeus could not read your calendar, so it cannot promise that time is free and did not act on it."}
+          {(outcome.reason && UNVERIFIABLE[outcome.reason]) ?? UNVERIFIABLE_FALLBACK}
         </p>
       ) : outcome.status === "no_connector" ? (
         <p className="text-[0.85rem] leading-6">
-          No calendar is connected, so nothing was changed.{" "}
+          {CARD_COPY.noConnector}{" "}
           <a href="/settings#connections" className="underline underline-offset-2">
             Connect one
           </a>
@@ -819,7 +799,7 @@ function CalendarActionCard({
           {outcome.reason === "calendar_conflict" ? (
             <>
               <p className="text-[0.85rem] font-medium leading-6">
-                {NOT_DONE[outcome.kind]} yet — the destination overlaps:
+                {NOT_DONE[outcome.kind]} yet — {CARD_COPY.awaitingOverlap}
               </p>
               <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
                 {outcome.conflicts.map((conflict) => (
@@ -830,14 +810,14 @@ function CalendarActionCard({
               </ul>
               <p className="mt-3 text-[0.8rem] leading-5">{pending.previewText}</p>
               <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                Confirm to make this exact change despite the overlap. Nothing changed yet.
+                {CARD_COPY.confirmDespiteOverlap}
               </p>
             </>
           ) : (
             <>
               <p className="text-[0.85rem] font-medium leading-6">{pending.previewText}</p>
               <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                Nothing has been sent yet.
+                {CARD_COPY.nothingSentYet}
               </p>
             </>
           )}
@@ -851,7 +831,7 @@ function CalendarActionCard({
           {outcome.reason === "calendar_conflict" && outcome.alternatives.length > 0 && (
             <>
               <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                Free nearby:
+                {CARD_COPY.freeNearby}
               </p>
               <div className="mt-1.5 flex flex-wrap gap-2">
                 {outcome.alternatives.map((slot) => (
@@ -890,9 +870,7 @@ function CalendarActionCard({
           </div>
         </>
       ) : (
-        <p className="text-[0.85rem] leading-6">
-          Nothing changed. Zeus stopped before making the change.
-        </p>
+        <p className="text-[0.85rem] leading-6">{CARD_COPY.stoppedShort}</p>
       )}
       {actionError && (
         <p className="mt-2 text-[0.72rem]" role="alert" style={{ color: "#f3a6a6" }}>
@@ -978,9 +956,9 @@ function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> })
       </p>
       <p className="mt-2 text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
         {completed
-          ? "Zeus completed the authorized research and local preparation steps."
+          ? WORK_CARD_COPY.completed
           : awaitingConfirmation
-            ? "Zeus prepared an external request and stopped. Nothing has been sent."
+            ? WORK_CARD_COPY.awaitingConfirmation
             : `The run stopped at ${errorCode ?? "a durable checkpoint"}; no external action was taken.`}
       </p>
       {awaitingConfirmation && pendingEffect ? (
@@ -1104,16 +1082,7 @@ function FollowThroughCard({
   ) => void;
 }) {
   const [userReason, setUserReason] = useState("");
-  const decisionText =
-    decision === "accepted"
-      ? "Ready in the composer — help is available without acting externally."
-      : decision === "completed"
-        ? "Marked complete."
-        : decision === "snoozed"
-          ? "Snoozed for seven days."
-          : decision === "dismissed"
-            ? "Dismissed. It will stay quiet unless the commitment changes."
-            : null;
+  const decisionText = decision ? FOLLOW_THROUGH_DECISION[decision] : null;
 
   return (
     <aside

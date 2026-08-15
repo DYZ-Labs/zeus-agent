@@ -230,6 +230,46 @@ describe("the turn tells the model what Zeus can do", () => {
     expect(body.instructions).toContain("Never state what is or is not on the user's calendar");
   });
 
+  it("asks for a voice, not only for a list of things not to claim", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.finalResponse.mockResolvedValue({ output_text: "Fine." });
+
+    await streamTurn(db, { conversationId: conversation.id, input: "hello" });
+
+    const body = mocks.openaiStream.mock.calls[0]?.[0] as {
+      instructions: string;
+      text?: { verbosity?: string };
+      reasoning?: { effort?: string };
+    };
+    // The capability lines and the cards both talk about Zeus in the third person, and the
+    // model copies whatever register it is handed unless told otherwise.
+    expect(body.instructions).toContain("Refer to yourself as I");
+    // The chat has no Markdown parser, so a bulleted answer reaches the user as literal
+    // hyphens. Banning the markers alone left lists behind.
+    expect(body.instructions).toContain("do not write bulleted lists");
+    // Length is capped on the output, not on the reasoning the calendar gates depend on.
+    expect(body.text?.verbosity).toBe("low");
+    expect(body.reasoning?.effort).toBe("high");
+  });
+
+  it("keeps the system prompt a fixed prefix, so it can stay cached between turns", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.finalResponse.mockResolvedValue({ output_text: "Fine." });
+
+    await streamTurn(db, { conversationId: conversation.id, input: "first" });
+    await streamTurn(db, { conversationId: conversation.id, input: "second", timezone: "UTC" });
+
+    const [first, second] = mocks.openaiStream.mock.calls.map(
+      (call) => (call[0] as { instructions: string }).instructions,
+    );
+    expect(second).toBe(first);
+    // Nothing volatile may be interpolated: dates, capabilities, and memory ride in the
+    // final user turn precisely so this stays true.
+    expect(first).not.toMatch(/\d{4}-\d{2}-\d{2}/u);
+  });
+
   it("leaves the memory trace alone, so the new block cannot be mistaken for memory", async () => {
     const db = openTestDb();
     const conversation = createConversation(db);

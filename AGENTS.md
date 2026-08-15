@@ -45,7 +45,7 @@ cp .env.example .env.local
 ```
 
 The store, curation UI, tests, trust evaluation, and FTS search do not need an API key.
-`OPENAI_MODEL` defaults to `gpt-5.5`.
+`OPENAI_MODEL` defaults to `gpt-5.6-luna`.
 
 ```bash
 npm run dev            # http://127.0.0.1:3000; loopback only
@@ -418,6 +418,40 @@ depends on them.
 - Preserve loopback-only server binding unless the user explicitly changes the threat
   model.
 - Follow existing strict typing and import conventions. ESLint warnings are failures.
+
+### Response voice
+
+Zeus speaks as I. The failure this replaced was a reply that narrated its own internals in
+the third person — “Zeus did not look at your calendar” — which is what an audit log sounds
+like, not a person who knows you.
+
+- `SYSTEM_PROMPT` in `src/core/chat.ts` owns the voice. Prohibitions are necessary but they
+  are not free: a prompt that is nine parts *never* and one part *how to write* produces
+  careful institutional prose. Keep the voice and conversation paragraphs at the top, and
+  when you add a constraint, add it as a constraint rather than as another sentence of
+  scripted output.
+- `text: { verbosity: "low" }` is the length dial. `reasoning: { effort: "high" }` is not —
+  the calendar and effect gates depend on that reasoning, so lower the output, not the
+  thinking.
+- The chat renders plain text: blank lines become paragraphs via `AssistantProse`, and
+  there is no Markdown parser. If you relax the no-Markdown rule in the prompt, ship a
+  renderer in the same change or users will read literal asterisks.
+- A card and the prose must not narrate the same status twice. The card is deterministic
+  and survives a reload; the prose says the human version once and leaves the particulars
+  to the panel.
+- Fixed user-facing copy speaks in the first person and lives in
+  `src/components/calendar-card-copy.ts`, swept by `styleViolations`
+  (`src/core/response-style.ts`). Add new card copy there, not inline in a component.
+- The `<capabilities>` block is the deliberate exception and stays third person: it rides
+  inside a user-role message, where “I” would read as the user. The prompt asks for it to
+  be relayed as I.
+- Text placed in the composer on the user's behalf must read like something they would
+  type. It carries no standing safety disclaimer — `authorizeWorkPlan` and `confirmEffect`
+  gate external action regardless, and a compliance paragraph attributed to the user
+  misrepresents them. `I confirm external request <hash>` is the exception, because that
+  exact string is evidence.
+- Nothing in `npm run check` can judge model prose. The linter pins the deterministic
+  strings only; tone changes still need a real conversation before you believe them.
 
 ## Testing expectations
 
