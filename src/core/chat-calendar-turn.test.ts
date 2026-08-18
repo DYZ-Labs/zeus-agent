@@ -88,6 +88,7 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
   return {
     intent: "reschedule",
     confidence: "high",
+    details_from: "user_message",
     title: null,
     starts_at_local: "2026-08-17T19:30",
     ends_at_local: null,
@@ -168,6 +169,50 @@ async function turn(input: string, db: Db = openTestDb()) {
   };
   return { result, sentToModel: body.input.at(-1)?.content ?? "" };
 }
+
+describe("resolving what a short reply is agreeing to", () => {
+  it("shows the classifier its own earlier reply, labelled as its own", async () => {
+    // "ok do it" points at a proposal only Zeus made. A classifier shown one half of the
+    // transcript has to rebuild the change from whichever numbers are in the user's words —
+    // which is how an agreed 10:00-10:30 was written as 10:30-11:30.
+    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    appendMessage(db, conversation.id, "user", "what should i do");
+    appendMessage(
+      db,
+      conversation.id,
+      "assistant",
+      "Move “wake up and shower” to 10:00–10:30 AM.",
+    );
+
+    await streamTurn(db, { conversationId: conversation.id, input: "ok do it", timezone: "UTC" });
+
+    const passed = mocks.classifyCalendarIntent.mock.calls.at(-1)?.[1] as {
+      priorTurns: { role: string; text: string }[];
+    };
+    expect(passed.priorTurns).toContainEqual({
+      role: "assistant",
+      text: "Move “wake up and shower” to 10:00–10:30 AM.",
+    });
+    expect(passed.priorTurns).toContainEqual({ role: "user", text: "what should i do" });
+  });
+});
+
+describe("what this conversation has already done", () => {
+  it("tells the model there is no record of a change rather than leaving it to infer one", async () => {
+    // On a turn that runs no calendar work there is no result block at all, and the only
+    // other account of what happened is whatever Zeus last said. "Have you moved it?" was
+    // answered from that, which is not a record of anything.
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+
+    const { sentToModel } = await turn("thanks, that helps", db);
+
+    expect(sentToModel).toContain("Zeus has carried out no calendar changes in this conversation.");
+  });
+});
 
 describe("a recognized calendar request is never silent", () => {
   it("reads a connected calendar on the first turn of every new conversation", async () => {

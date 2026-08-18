@@ -82,3 +82,129 @@ export function contentWords(value: string): Set<string> {
     ),
   );
 }
+
+// ---------------------------------------------------------------------------
+
+/**
+ * Local wall-clock parts for an instant.
+ *
+ * Everything here goes through `Intl` rather than arithmetic on the UTC value, because a
+ * fixed offset is wrong twice a year and permanently wrong for half-hour zones.
+ *
+ * Lives here rather than in `calendar-conflicts.ts` because the module that owns one
+ * definition of "overlap" should own one definition of "what time is that where the user
+ * is". Both the gate and the sentences shown to the user now read from the same place.
+ */
+export function localParts(
+  timestamp: number,
+  timezone: string,
+): { year: string; month: string; day: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((entry) => entry.type === type)?.value ?? "00";
+  return {
+    year: part("year"),
+    month: part("month"),
+    day: part("day"),
+    hour: Number(part("hour")),
+    minute: Number(part("minute")),
+  };
+}
+
+export function localDate(timestamp: number, timezone: string): string {
+  if (!Number.isFinite(timestamp)) return "";
+  const parts = localParts(timestamp, timezone);
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+export function localMinutesOfDay(timestamp: number, timezone: string): number {
+  const parts = localParts(timestamp, timezone);
+  return parts.hour * 60 + parts.minute;
+}
+
+/** Exact calendar arithmetic on a YYYY-MM-DD, so "tomorrow" survives a DST boundary. */
+function shiftDate(date: string, days: number): string {
+  const parsed = Date.parse(`${date}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed)) return "";
+  return new Date(parsed + days * 86_400_000).toISOString().slice(0, 10);
+}
+
+function meridiem(minutes: number): string {
+  return minutes < 720 ? "AM" : "PM";
+}
+
+function clockText(minutes: number, withMeridiem: boolean): string {
+  const hour24 = Math.floor(minutes / 60);
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  const minute = String(minutes % 60).padStart(2, "0");
+  return `${hour12}:${minute}${withMeridiem ? ` ${meridiem(minutes)}` : ""}`;
+}
+
+function dayText(timestamp: number, timezone: string, nowMs: number | null): string {
+  const date = localDate(timestamp, timezone);
+  const today = nowMs === null ? null : localDate(nowMs, timezone);
+  if (today !== null) {
+    if (date === today) return "today";
+    if (date === shiftDate(today, 1)) return "tomorrow";
+    if (date === shiftDate(today, -1)) return "yesterday";
+  }
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  }).format(new Date(timestamp));
+}
+
+/**
+ * One way to write a window, for every surface that shows one.
+ *
+ * The failure this replaces: `previewFor` emitted raw UTC ISO instants, so the text a person
+ * read before approving a change was `2026-08-20T10:30:00.000Z–2026-08-20T11:30:00.000Z`,
+ * while the card wrote the same window a third way and the model wrote it a fourth. A window
+ * nobody can read at a glance is a window nobody checks.
+ *
+ * `now` only decides whether a day is named or called today/tomorrow; it never changes which
+ * instants are described. Pass null to always name the day — which is what a server render
+ * does, because a relative label resolved against two different clocks is a hydration
+ * mismatch, and "tomorrow" is not worth one.
+ */
+export function describeInterval(
+  startsAt: string,
+  endsAt: string | null,
+  timezone: string,
+  now: string | null,
+): string {
+  const start = Date.parse(startsAt);
+  const parsedNow = now === null ? null : Date.parse(now);
+  const nowMs = parsedNow !== null && Number.isFinite(parsedNow) ? parsedNow : null;
+  if (!Number.isFinite(start)) return "";
+  const startMinutes = localMinutesOfDay(start, timezone);
+  const day = dayText(start, timezone, nowMs);
+
+  const end = endsAt === null ? Number.NaN : Date.parse(endsAt);
+  if (!Number.isFinite(end) || end <= start) {
+    return `${day} from ${clockText(startMinutes, true)}`;
+  }
+
+  const endMinutes = localMinutesOfDay(end, timezone);
+  if (localDate(start, timezone) !== localDate(end, timezone)) {
+    const endDay = dayText(end, timezone, nowMs);
+    return `${day} ${clockText(startMinutes, true)} – ${endDay} ${clockText(endMinutes, true)}`;
+  }
+  // "10:00–10:30 AM" when the meridiem is shared, "11:30 AM–12:30 PM" when it is not. Saying
+  // it twice where it does not change reads as machine output; dropping it where it does
+  // changes the meaning.
+  const shared = meridiem(startMinutes) === meridiem(endMinutes);
+  return shared
+    ? `${day} ${clockText(startMinutes, false)}–${clockText(endMinutes, true)}`
+    : `${day} ${clockText(startMinutes, true)}–${clockText(endMinutes, true)}`;
+}

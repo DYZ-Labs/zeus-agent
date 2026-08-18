@@ -1160,6 +1160,27 @@ export const CalendarOutcomeEvent = z
   })
   .strict();
 
+/**
+ * The window a calendar request actually resolved to, kept with the outcome.
+ *
+ * Without this the deterministic record said only *that* something was moved, so the panel
+ * could not show which minutes and the model wrote them from its reading of the
+ * conversation. That is how a reply promising 10:00-10:30 accompanied a change to
+ * 10:30-11:30 with nothing to contradict it.
+ *
+ * `from` is null for a create and `to` is null for a cancel: each is the side that does not
+ * exist, rather than a value that could not be worked out.
+ */
+export const CalendarOutcomeChange = z
+  .object({
+    title: z.string().nullable(),
+    timezone: z.string(),
+    from: z.object({ startsAt: z.string(), endsAt: z.string().nullable() }).strict().nullable(),
+    to: z.object({ startsAt: z.string(), endsAt: z.string().nullable() }).strict().nullable(),
+  })
+  .strict();
+export type CalendarOutcomeChange = z.infer<typeof CalendarOutcomeChange>;
+
 export const CalendarOutcome = z
   .object({
     kind: z.enum(["create", "reschedule", "cancel", "read"]),
@@ -1189,6 +1210,8 @@ export const CalendarOutcome = z
     alternatives: z.array(z.object({ startsAt: z.string(), endsAt: z.string() }).strict()),
     candidates: z.array(CalendarOutcomeEvent),
     nearMisses: z.array(CalendarOutcomeEvent),
+    /** Nullable so a row stored before this field existed still parses rather than vanishing. */
+    change: CalendarOutcomeChange.nullable(),
     consideredEvents: z.number().nullable(),
     coverage: z
       .object({

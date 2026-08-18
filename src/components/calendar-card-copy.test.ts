@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CARD_COPY,
+  CHANGE,
   CLARIFICATION,
   CLARIFICATION_FALLBACK,
   FOLLOW_THROUGH_DECISION,
@@ -27,6 +28,10 @@ function everyString(): Array<[string, string]> {
       value,
     ]),
     ["CLARIFICATION_FALLBACK", CLARIFICATION_FALLBACK],
+    ...Object.entries(CHANGE).map(([key, value]): [string, string] => [
+      `CHANGE.${key}`,
+      value,
+    ]),
     ...Object.entries(VERB).map(([key, value]): [string, string] => [`VERB.${key}`, value]),
     ...Object.entries(NOT_DONE).map(([key, value]): [string, string] => [
       `NOT_DONE.${key}`,

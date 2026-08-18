@@ -66,3 +66,111 @@ function safeJson(value: string): unknown {
     return null;
   }
 }
+
+/**
+ * What this conversation actually changed, and what it is still waiting on.
+ *
+ * The gap this closes: on any turn where no calendar work runs, the model receives no
+ * `<calendar_result>` and no `<work_result>`, the stored transcript is raw text, and the
+ * `<memory>` block has no calendar content by design. So "have you moved it?" had nothing to
+ * answer from except Zeus's own earlier sentence — which is how a change it had described
+ * one way was reaffirmed as done, in a different way, with nothing able to contradict it.
+ *
+ * Read from `proposed_effect`, not from the prose and not from `calendar_outcome`: `executed`
+ * is set after the connector call returns, so it is the difference between a request that
+ * was prepared and one that left the machine. A pending row is reported as pending, never
+ * folded in with the rest.
+ */
+
+export type CalendarLedgerEntry = {
+  status: "executed" | "pending_confirmation";
+  preview: string;
+  at: string;
+};
+
+const LEDGER_LIMIT = 8;
+
+export function conversationCalendarLedger(
+  db: Db,
+  conversationId: number,
+): CalendarLedgerEntry[] {
+  const rows = db
+    .prepare<[number, number], { status: string; preview_text: string; updated_at: string }>(
+      `SELECT e.status, e.preview_text, e.updated_at
+       FROM proposed_effect e
+       JOIN work_run r ON r.id = e.work_run_id
+       JOIN work_plan p ON p.id = r.work_plan_id
+       JOIN message m ON m.id = p.source_message_id
+       WHERE m.conversation_id = ?
+         AND e.status IN ('executed', 'pending_confirmation')
+         AND e.effect_kind IN ('schedule', 'modify_external')
+       ORDER BY e.id DESC
+       LIMIT ?`,
+    )
+    .all(conversationId, LEDGER_LIMIT);
+  return rows
+    .map((row) => ({
+      status: row.status === "executed"
+        ? ("executed" as const)
+        : ("pending_confirmation" as const),
+      preview: row.preview_text,
+      at: row.updated_at,
+    }))
+    .reverse();
+}
+
+/**
+ * Calendar changes still waiting on the user, keyed by the turn that proposed them.
+ *
+ * The card's Confirm button used to live entirely in the streaming frame, so a reload left a
+ * genuinely pending change with no way to accept it — and, because the branch was guarded on
+ * the effect being present, described as one Zeus had stopped before making. The effect is
+ * durable; only the route to it was not.
+ *
+ * Tied back to the assistant turn through the plan's source message: the reply that reported
+ * the proposal is the next assistant message after the request that prompted it.
+ */
+export type PendingCalendarEffect = {
+  id: number;
+  payloadHash: string;
+  payload: unknown;
+};
+
+export function pendingCalendarEffectsIn(
+  db: Db,
+  conversationId: number,
+): Map<number, PendingCalendarEffect> {
+  const rows = db
+    .prepare<[number, string], {
+      id: number;
+      payload_hash: string;
+      payload_json: string;
+      assistant_message_id: number | null;
+    }>(
+      `SELECT e.id, e.payload_hash, e.payload_json,
+              (SELECT MIN(m2.id) FROM message m2
+                WHERE m2.conversation_id = m.conversation_id
+                  AND m2.role = 'assistant'
+                  AND m2.id > p.source_message_id) AS assistant_message_id
+       FROM proposed_effect e
+       JOIN work_run r ON r.id = e.work_run_id
+       JOIN work_plan p ON p.id = r.work_plan_id
+       JOIN message m ON m.id = p.source_message_id
+       WHERE m.conversation_id = ?
+         AND e.status = 'pending_confirmation'
+         AND e.expires_at > ?
+         AND e.effect_kind IN ('schedule', 'modify_external')
+       ORDER BY e.id ASC`,
+    )
+    .all(conversationId, now());
+  const pending = new Map<number, PendingCalendarEffect>();
+  for (const row of rows) {
+    if (row.assistant_message_id === null) continue;
+    pending.set(row.assistant_message_id, {
+      id: row.id,
+      payloadHash: row.payload_hash,
+      payload: safeJson(row.payload_json),
+    });
+  }
+  return pending;
+}

@@ -1,4 +1,5 @@
 import { directExecutionAllowance } from "./calendar-policy";
+import type { CalendarLedgerEntry } from "./calendar-outcome";
 import { readCalendarCoverage } from "./calendar-sync";
 import {
   CAPABILITY_SLOTS,
@@ -77,7 +78,9 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
           : bound.status
       );
 
-  const allowance = directExecutionAllowance(db);
+  // Asked about the general case — a change the user spelled out themselves — because this
+  // block describes the setting rather than judging any particular request.
+  const allowance = directExecutionAllowance(db, { detailsFrom: "user_message" });
   return {
     connected: usable !== null || bound !== null,
     canRead: read !== null,
@@ -112,13 +115,59 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
 export function renderCapabilityBlock(
   state: CalendarCapabilityState,
   context: EvaluationContext,
+  ledger: readonly CalendarLedgerEntry[] = [],
 ): string {
   const lines = [
     `Today is ${localDate(context)} (${context.local_weekday}), local time ` +
       `${context.local_time}, timezone ${context.timezone}.`,
     ...calendarLines(state),
+    ...ledgerLines(ledger, state.connected),
   ];
   return `<capabilities>\n${escapeCapabilityData(lines.join("\n"))}\n</capabilities>`;
+}
+
+/**
+ * What this conversation has and has not already done to the calendar.
+ *
+ * The one historical claim in the block that is about Zeus's own actions, and it belongs
+ * here for the same reason `lastReadAt` does: it is resolved fresh every turn from the
+ * ledger, so it cannot go stale in the way a sentence in the transcript does. Without it,
+ * "have you moved it?" on a turn that runs no calendar work has nothing to answer from but
+ * whatever Zeus last said, which is not a record of anything.
+ *
+ * Executed and pending are stated separately and never merged. A prepared request is the
+ * thing most easily mistaken for a completed one, and this block is where that mistake would
+ * become an answer.
+ */
+function ledgerLines(
+  ledger: readonly CalendarLedgerEntry[],
+  connected: boolean,
+): string[] {
+  // Said on every turn of a connected conversation, including — especially — when the answer
+  // is none. An absent line is not a denial, and "Zeus has changed nothing here" is the
+  // sentence that was missing when a reply claimed otherwise.
+  if (!connected) return [];
+  const done = ledger.filter((entry) => entry.status === "executed");
+  const waiting = ledger.filter((entry) => entry.status === "pending_confirmation");
+  const lines: string[] = [];
+  if (done.length > 0) {
+    lines.push(
+      "Calendar changes Zeus has carried out in this conversation, oldest first: " +
+        `${done.map((entry) => entry.preview).join(" ")} This is the record of what was ` +
+        "actually sent; it is the only thing that says a change went through.",
+    );
+  }
+  if (waiting.length > 0) {
+    lines.push(
+      "Calendar changes prepared in this conversation and still waiting for the user, " +
+        `oldest first: ${waiting.map((entry) => entry.preview).join(" ")} None of these has ` +
+        "happened.",
+    );
+  }
+  if (done.length === 0) {
+    lines.push("Zeus has carried out no calendar changes in this conversation.");
+  }
+  return lines;
 }
 
 function calendarLines(state: CalendarCapabilityState): string[] {
@@ -180,8 +229,9 @@ function calendarLines(state: CalendarCapabilityState): string[] {
       state.directExecution
         ? "Calendar changes without asking each time: on, and " +
             `${state.remainingToday} more allowed today. Zeus still reads the calendar first ` +
-            "and still stops to ask when the time is taken, the calendar cannot be read, or " +
-            "more than one event matches."
+            "and still stops to ask when the time is taken, the calendar cannot be read, " +
+            "more than one event matches, or the times came from something Zeus suggested " +
+            "rather than from the user."
         : "Calendar changes without asking each time: off. Every change stops for the user to " +
             "confirm the exact request.",
     );

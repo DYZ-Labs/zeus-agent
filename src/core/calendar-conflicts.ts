@@ -1,6 +1,8 @@
 import {
   contentWords,
   endOf,
+  localDate,
+  localMinutesOfDay,
   OVERLAP_GRACE_MS,
   startOf,
 } from "./calendar-time";
@@ -418,47 +420,6 @@ function nearMissesFor(
 // ---------------------------------------------------------------------------
 // Timezone-aware helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Local wall-clock parts for an instant.
- *
- * Everything here goes through `Intl` rather than arithmetic on the UTC value, because a
- * fixed offset is wrong twice a year and permanently wrong for half-hour zones.
- */
-function localParts(
-  timestamp: number,
-  timezone: string,
-): { year: string; month: string; day: string; hour: number; minute: number } {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(new Date(timestamp));
-  const part = (type: Intl.DateTimeFormatPartTypes) =>
-    parts.find((entry) => entry.type === type)?.value ?? "00";
-  return {
-    year: part("year"),
-    month: part("month"),
-    day: part("day"),
-    hour: Number(part("hour")),
-    minute: Number(part("minute")),
-  };
-}
-
-export function localDate(timestamp: number, timezone: string): string {
-  if (!Number.isFinite(timestamp)) return "";
-  const parts = localParts(timestamp, timezone);
-  return `${parts.year}-${parts.month}-${parts.day}`;
-}
-
-export function localMinutesOfDay(timestamp: number, timezone: string): number {
-  const parts = localParts(timestamp, timezone);
-  return parts.hour * 60 + parts.minute;
-}
 
 function minutesOfDay(value: string): number | null {
   const match = /^(\d{1,2}):(\d{2})$/u.exec(value.trim());

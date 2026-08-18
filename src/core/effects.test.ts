@@ -667,7 +667,30 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
 describe("the standing setting is a user decision", () => {
   it("starts on, so a connected calendar acts rather than asks", () => {
     expect(getCalendarActionSetting(db).direct_execution).toBe(1);
-    expect(directExecutionAllowance(db)).toMatchObject({ allowed: true, reason: null });
+    expect(directExecutionAllowance(db, { detailsFrom: "user_message" })).toMatchObject({
+      allowed: true,
+      reason: null,
+    });
+  });
+
+  it("still asks when the times came from Zeus's own suggestion", () => {
+    // The conflict gate can only vouch for the destination. A change assembled from
+    // something Zeus proposed — "ok do it" — has had no check that it is the change the user
+    // meant, and an hour nobody asked for is free precisely because nobody asked for it.
+    expect(getCalendarActionSetting(db).direct_execution).toBe(1);
+    expect(directExecutionAllowance(db, { detailsFrom: "earlier_proposal" })).toMatchObject({
+      allowed: false,
+      reason: "inferred_details",
+    });
+  });
+
+  it("treats a request that never said where its details came from as inferred", () => {
+    // Fails closed. The alternative is that anything reaching this call without the field —
+    // a plan encoded before it existed — quietly recovers the permission it never had.
+    expect(directExecutionAllowance(db)).toMatchObject({
+      allowed: false,
+      reason: "inferred_details",
+    });
   });
 
   it("stops acting once the day's ceiling is reached", async () => {
@@ -679,7 +702,7 @@ describe("the standing setting is a user decision", () => {
       policy: "calendar_direct_execution",
     });
 
-    expect(directExecutionAllowance(db)).toMatchObject({
+    expect(directExecutionAllowance(db, { detailsFrom: "user_message" })).toMatchObject({
       allowed: false,
       reason: "daily_limit",
       usedToday: 1,
@@ -688,7 +711,10 @@ describe("the standing setting is a user decision", () => {
 
   it("can be switched off, and refuses to be switched by anything but a user action", () => {
     updateCalendarActionSetting(db, { directExecution: false }, userMessageId);
-    expect(directExecutionAllowance(db)).toMatchObject({ allowed: false, reason: "disabled" });
+    expect(directExecutionAllowance(db, { detailsFrom: "user_message" })).toMatchObject({
+      allowed: false,
+      reason: "disabled",
+    });
 
     const assistantId = appendMessage(db, conversationId, "assistant", "Turning that on.").id;
     expect(() =>

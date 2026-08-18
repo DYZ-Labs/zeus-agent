@@ -226,6 +226,7 @@ const PROPOSAL = calendarActionWorkPlanProposal(
     endsAt: "2026-08-20T19:30:00.000Z",
     location: null,
     timezone: "UTC",
+    detailsFrom: "user_message" as const,
   },
   "Hold the dinner slot after the flight lands",
 );
@@ -248,6 +249,7 @@ async function realRun(
     endsAt: "2026-08-20T19:30:00.000Z",
     location: null,
     timezone: "UTC",
+    detailsFrom: "user_message" as const,
   };
   const proposal = options.skipRead
     ? {
@@ -343,6 +345,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         startsAt: "2026-08-20T19:30:00.000Z",
         endsAt: "2026-08-20T20:30:00.000Z",
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 
@@ -505,6 +508,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         startsAt: "2026-08-20T17:00:00.000Z",
         endsAt: "2026-08-20T18:00:00.000Z",
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 
@@ -538,6 +542,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         kind: "cancel",
         reference: { titleText: "dinner with Priya", startsAt: null, dateLocal: null },
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 
@@ -560,6 +565,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         kind: "cancel",
         reference: { titleText: "design review", startsAt: null, dateLocal: null },
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 
@@ -585,6 +591,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         startsAt: "2026-08-20T19:30:00.000Z",
         endsAt: "2026-08-20T20:30:00.000Z",
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 
@@ -620,6 +627,7 @@ describe("a calendar change reads first, checks, then acts", () => {
         kind: "cancel",
         reference: { titleText: "dinner with Priya", startsAt: null, dateLocal: null },
         timezone: "UTC",
+        detailsFrom: "user_message" as const,
       },
     });
 

@@ -5,9 +5,11 @@ import { recordModelCall, responseUsage } from "./budget";
 import {
   buildCalendarPayload,
   isCalendarWriteRequest,
+  changeOf,
   parseCalendarRequest,
   previewFor,
   priorStateOf,
+  resolvedEnd,
 } from "./calendar-actions";
 import type { CalendarWriteRequest } from "./calendar-actions";
 import {
@@ -878,11 +880,28 @@ function calendarGate(
   }
 
   if (request.kind !== "cancel") {
+    // The window the write will actually use, not the one the request happened to name. A
+    // move that keeps its own length has no end until the target is resolved, and a gate
+    // that cleared a different window from the one being sent would be checking nothing.
+    const candidateEnd = request.kind === "reschedule" && target !== null
+      ? resolvedEnd(request, target)
+      : request.endsAt;
+    if (candidateEnd === null) {
+      return {
+        status: "refused",
+        result: calendarRefusal(input, "calendar_unverifiable", {
+          request,
+          reason: "unresolved_duration",
+          coverage,
+          detail: "Zeus could not work out how long the event should run.",
+        }),
+      };
+    }
     const check = checkCalendarConflicts({
       events,
       candidate: {
         startsAt: request.startsAt,
-        endsAt: request.endsAt,
+        endsAt: candidateEnd,
         excludeExternalId: target?.external_id ?? null,
       },
       coverage,
@@ -942,6 +961,7 @@ function checkCalendarStep(
       artifacts: [calendarArtifact(input, pendingConflictHeading(request.kind), {
         request,
         target: gate.target,
+        change: changeOf(request, gate.target),
         reason: "calendar_conflict",
         conflicts: gate.conflicts,
         alternatives: gate.alternatives,
@@ -956,6 +976,7 @@ function checkCalendarStep(
     artifacts: [calendarArtifact(input, "The requested time is free", {
       request,
       target: gate.target,
+      change: changeOf(request, gate.target),
       coverage: gate.coverage,
       considered_events: gate.events,
     })],
@@ -986,7 +1007,7 @@ async function executeCalendarWrite(
     workStepId: input.step.id,
     slot: available.capability.slot,
     payload,
-    previewText: previewFor(request, target),
+    previewText: previewFor(request, target, gate.checkedAt),
     providerRequestKey: input.providerRequestKey,
     requestMessageId: input.plan.source_message_id,
     priorState: priorStateOf(target),
@@ -1007,6 +1028,7 @@ async function executeCalendarWrite(
       artifacts: [calendarArtifact(input, pendingConflictHeading(request.kind), {
         request,
         target,
+        change: changeOf(request, target),
         effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
         reason: "calendar_conflict",
         conflicts: gate.conflicts,
@@ -1023,7 +1045,7 @@ async function executeCalendarWrite(
     };
   }
 
-  const allowance = directExecutionAllowance(db);
+  const allowance = directExecutionAllowance(db, { detailsFrom: request.detailsFrom });
   if (!allowance.allowed || input.plan.source_message_id === null) {
     // Falling back to asking is the safe direction, but it has to say why, or an exhausted
     // ceiling reads as a random regression.
@@ -1031,6 +1053,7 @@ async function executeCalendarWrite(
       output: { proposed_effect_id: effect.id, payload_hash: effect.payload_hash },
       artifacts: [calendarArtifact(input, "Waiting for your confirmation", {
         request,
+        change: changeOf(request, target),
         effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
         reason: allowance.reason,
       })],
@@ -1039,7 +1062,10 @@ async function executeCalendarWrite(
         code: "effect_confirmation_required",
         message: allowance.reason === "daily_limit"
           ? "Today's limit for unattended calendar changes is used up"
-          : "This step prepared an external request and is waiting for confirmation",
+          : allowance.reason === "inferred_details"
+            ? "These times came from a suggestion rather than from the user, so the exact " +
+              "change needs confirming"
+            : "This step prepared an external request and is waiting for confirmation",
         requiresReauthorization: false,
       },
     };
@@ -1074,6 +1100,7 @@ async function executeCalendarWrite(
     },
     artifacts: [calendarArtifact(input, "Done", {
       request,
+      change: changeOf(request, target),
       effect: { id: effect.id, preview: effect.preview_text, hash: effect.payload_hash },
       coverage,
       considered_events: gate.events,

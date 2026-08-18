@@ -41,6 +41,23 @@ export const NOT_DONE: Record<CalendarOutcome["kind"], string> = {
   read: "Not read",
 };
 
+/**
+ * The before and after of one change, labelled.
+ *
+ * The card used to name a status and no times at all, so the only account of which minutes
+ * were written was whatever I had said in prose — and the two could differ without anything
+ * noticing. These labels are what make the panel checkable at a glance.
+ */
+export const CHANGE = {
+  from: "from",
+  to: "to",
+  cancelledWas: "was",
+  awaiting: "I've prepared this exact change and haven't sent it.",
+  inferredDetails:
+    "These times came from what I suggested rather than from you, so I'd rather you looked " +
+    "before I send it.",
+} as const;
+
 export const TARGET_NOT_FOUND = {
   emptyWindow: "Nothing changed — I found no events in the window I checked.",
   noMatch: "Nothing changed — I couldn't match that in the window I checked.",

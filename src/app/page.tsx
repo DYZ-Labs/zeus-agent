@@ -1,5 +1,5 @@
 import { Chat, type ChatHistoryTurn } from "@/components/chat";
-import { calendarOutcomesIn } from "@/core/calendar-outcome";
+import { calendarOutcomesIn, pendingCalendarEffectsIn } from "@/core/calendar-outcome";
 import { getConversation, messagesIn } from "@/core/conversations";
 import { hasCredentials } from "@/core/openai";
 import { getOwnerAccess } from "@/server/auth/access";
@@ -37,12 +37,18 @@ export default async function ChatPage({
   // Rehydrated so a reload still shows what Zeus actually did, rather than leaving the
   // assistant's own sentences as the only surviving account of it.
   const storedOutcomes = conversation && db ? calendarOutcomesIn(db, conversation.id) : null;
+  // The change is durable but the button used to live only in the streaming frame, so a
+  // reload stranded a pending change with nothing to accept it.
+  const storedPending = conversation && db
+    ? pendingCalendarEffectsIn(db, conversation.id)
+    : null;
   const initialTurns: ChatHistoryTurn[] = conversation && db
     ? messagesIn(db, conversation.id, 400).map((message) => ({
         id: `stored-${message.id}`,
         role: message.role,
         text: message.content,
         calendar: storedOutcomes?.get(message.id) ?? null,
+        pendingEffect: storedPending?.get(message.id) ?? null,
       }))
     : [];
 

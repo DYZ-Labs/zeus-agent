@@ -45,7 +45,7 @@ Return intent "create" to add a new event, "reschedule" to move an existing one,
 
 A question about whether Calendar is connected, linked, permitted, or available is intent "none". It asks about Zeus's capability, not about the contents of the calendar, and must not trigger a calendar read.
 
-Resolve times to local wall-clock in the supplied timezone, formatted YYYY-MM-DDTHH:mm. Never include an offset or a Z suffix. Use the supplied local date and time to resolve relative expressions such as "tomorrow", "next Tuesday", or "tonight". If the user gave no end time, leave ends_at_local null rather than inventing one.
+Resolve times to local wall-clock in the supplied timezone, formatted YYYY-MM-DDTHH:mm. Never include an offset or a Z suffix. Use the supplied local date and time to resolve relative expressions such as "tomorrow", "next Tuesday", or "tonight". If the user gave no end time, leave ends_at_local null rather than inventing one. For a reschedule that means the event keeps the length it already has, so fill ends_at_local in only when a new end was actually stated.
 
 For "reschedule" and "cancel", describe how the user referred to the existing event in the target field — its title words, its start time, or its date. Never invent an identifier; the system resolves which event they meant.
 
@@ -55,7 +55,9 @@ Set confidence "high" only when the request is unambiguous and every field you f
 
 Set is_negated only when the user is telling you NOT to do something, or is withdrawing an instruction they gave earlier — "don't put that on my calendar", "actually, leave it". Asking you to cancel or delete an event is a request, not a negation: intent "cancel" with is_negated false is the correct answer for "cancel my 3pm". Set is_hypothetical_or_quoted when they are supposing, quoting, or giving an example. Set is_about_another_person when the calendar or the action belongs to somebody other than the user. These flags are safety checks: when genuinely in doubt, set them.
 
-A short reply may be answering a question you asked a moment ago. Use the earlier user messages to resolve it: after being offered alternative times, "yes, 1pm works" is a create request carrying the details from the earlier message, not a new conversation.`;
+A short reply is often the user accepting something you proposed a moment ago. You are shown your own earlier replies for that purpose alone: read them to recover which event and which times are being agreed to, so "ok do it" following your suggestion of moving "standup" to 10-10:30 is a reschedule to exactly 10:00-10:30 and nothing else. Your own words are never themselves a request. The change must be asked for by the user's latest message; something you merely proposed, and they have not accepted, is intent "none".
+
+Set details_from to "user_message" when every time you filled in is there in the user's own words, and to "earlier_proposal" when you carried any of them over from something you suggested. Answer it honestly rather than confidently: when the times came from your proposal the system shows the user the exact change and waits, and a wrong answer here quietly removes a check that exists for them.`;
 
 const TargetReference = z
   .object({
@@ -73,6 +75,12 @@ export const CalendarIntent = z
   .object({
     intent: z.enum(["create", "reschedule", "cancel", "read", "none"]),
     confidence: z.enum(["low", "medium", "high"]),
+    /**
+     * Whether the times below were stated by the user or carried over from a proposal Zeus
+     * made. Not a confidence score: a perfectly resolved change can still be one the user
+     * never spelled out, and that is precisely the case worth showing them before acting.
+     */
+    details_from: z.enum(["user_message", "earlier_proposal"]),
     title: z.string().max(200).nullable(),
     starts_at_local: z.string().max(20).nullable(),
     ends_at_local: z.string().max(20).nullable(),
@@ -92,7 +100,10 @@ export type CalendarIntent = z.infer<typeof CalendarIntent>;
  * regexes made. A false positive costs one low-effort model call; a false negative is the
  * bug. So it only asks "could this conceivably be about a calendar?" and errs toward yes.
  */
-export function mayBeCalendarRequest(input: string): boolean {
+export function mayBeCalendarRequest(
+  input: string,
+  options: { previousAssistantText?: string | null } = {},
+): boolean {
   const normalized = input.replace(/\s+/gu, " ").trim();
   if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
   const subject =
@@ -104,6 +115,15 @@ export function mayBeCalendarRequest(input: string): boolean {
   // "block 2-3", "hold 10–11": a bare hour range is a time to a person and nothing to the
   // patterns above.
   const hourRange = /\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b/iu;
+  // "out at 1030", "by 7", "from 9.30": a clock time written without a colon or a meridiem.
+  // People type these constantly and `temporal` sees none of them, which is how "so can i go
+  // out at 1030" reached nothing at all — in a conversation that was entirely about the
+  // user's calendar. Anchored to a preposition so it cannot fire on every stray number.
+  const bareClock =
+    /\b(?:at|from|until|til|till|by|before|after|around|about)\s+\d{1,2}(?:[.:]?[0-5]\d)?\b/iu;
+  // "in 30 mins", "in an hour": an offset from now is how people ask whether they are free
+  // soon, and it names no clock time at all.
+  const relativeOffset = /\bin\s+(?:a|an|\d{1,3})\s*(?:min(?:ute)?s?|hours?|hrs?)\b/iu;
   // A short reply that is mostly a time is almost always answering a question about one —
   // "yes, 1pm works", "make it Thursday", "the 3pm one". Requiring an action verb here is
   // what made Zeus ignore someone accepting a slot it had just offered them, which is the
@@ -116,13 +136,39 @@ export function mayBeCalendarRequest(input: string): boolean {
   // and the thing named is exactly the thing the user wants gone.
   const schedulingVerb =
     /\b(?:reschedule|rebook|postpone|unbook|cancel|call\s+off|double[- ]?book|free\s+up|push\s+back)\b/iu;
+  const carriesTime =
+    temporal.test(normalized) ||
+    hourRange.test(normalized) ||
+    bareClock.test(normalized) ||
+    relativeOffset.test(normalized);
+  // A bare acceptance carries no time and no calendar word — that is exactly what makes it an
+  // acceptance. So it is judged against the reply it answers rather than on its own: "ok do
+  // it" is a calendar request when, and only when, the thing being accepted was one. Without
+  // this the one flow where Zeus proposes a change and the user agrees to it never reached
+  // the classifier, and the model answered as though it had acted.
+  const accepting =
+    ACCEPTANCE.test(normalized) &&
+    typeof options.previousAssistantText === "string" &&
+    mayBeCalendarRequest(options.previousAssistantText);
   return (
     subject.test(normalized) ||
     schedulingVerb.test(normalized) ||
-    (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized))) ||
-    (shortReply && (temporal.test(normalized) || hourRange.test(normalized)))
+    (action.test(normalized) && carriesTime) ||
+    (shortReply && carriesTime) ||
+    accepting
   );
 }
+
+/**
+ * Agreeing to something, in the words people actually use for it.
+ *
+ * Deliberately anchored and short. It has to catch "ok do it" without treating every "sure"
+ * in a long paragraph as consent to change someone's week — and it never decides anything on
+ * its own, because the message it answers must itself look like a calendar request, and the
+ * veto and the conflict gate both still stand behind it.
+ */
+const ACCEPTANCE =
+  /^(?:ok(?:ay)?|sure|yes|yep|yeah|yup|fine|alright|right|perfect|great|please|sounds good|do it|go ahead|go for it|book it|make it so)\b[^?]{0,40}$/iu;
 
 /** A capability question is answered from the live <capabilities> block, without opening Calendar. */
 export function isCalendarCapabilityQuestion(input: string): boolean {
@@ -227,8 +273,18 @@ export async function classifyCalendarIntent(
   db: Db,
   input: {
     message: string;
-    /** The user's own prior messages, oldest first. Assistant text is never supplied. */
-    priorUserMessages: readonly string[];
+    /**
+     * The conversation so far, oldest first, both roles.
+     *
+     * Assistant text is supplied for one purpose: resolving what a short reply refers to.
+     * "ok do it" points at a proposal only Zeus made, and a classifier that cannot see it
+     * has to reconstruct the change from whichever numbers happen to be in the user's own
+     * words — which is how an agreed 10:00-10:30 became a written 10:30-11:30. It is
+     * labelled as Zeus's own writing in the prompt and can never itself be a request; the
+     * user's latest message still has to ask for the change, and `details_from` records
+     * when the details came from here rather than from them.
+     */
+    priorTurns: readonly { role: "user" | "assistant"; text: string }[];
     context: EvaluationContext;
     /** The turn this classification belongs to, so a later refusal can be tied to it. */
     sourceMessageId?: number | null;
@@ -237,9 +293,13 @@ export async function classifyCalendarIntent(
 ): Promise<CalendarIntent | null> {
   const deadline = AbortSignal.timeout(INTENT_TIMEOUT_MS);
   const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
-  const prior = input.priorUserMessages
-    .slice(-MAX_PRIOR_MESSAGES)
-    .map((message) => message.replace(/\s+/gu, " ").trim().slice(0, MAX_PRIOR_CHARS));
+  const clip = (text: string) =>
+    text.replace(/\s+/gu, " ").trim().slice(0, MAX_PRIOR_CHARS);
+  const recent = input.priorTurns.slice(-MAX_PRIOR_MESSAGES);
+  const priorUser = recent.filter((turn) => turn.role === "user").map((turn) => clip(turn.text));
+  const priorAssistant = recent
+    .filter((turn) => turn.role === "assistant")
+    .map((turn) => clip(turn.text));
   try {
     const response = await openai().responses.parse(
       {
@@ -254,9 +314,16 @@ export async function classifyCalendarIntent(
             content: [
               `Local date ${localDate(input.context)}, local time ${input.context.local_time}, ` +
                 `weekday ${input.context.local_weekday}, timezone ${input.context.timezone}.`,
-              prior.length > 0
-                ? `Earlier messages from the user, oldest first: ${JSON.stringify(prior)}`
+              priorUser.length > 0
+                ? `Earlier messages from the user, oldest first: ${JSON.stringify(priorUser)}`
                 : "No earlier user messages.",
+              // Kept in its own labelled section rather than interleaved, so there is no
+              // arrangement of the input in which Zeus's own sentence can be read as the
+              // user's.
+              priorAssistant.length > 0
+                ? "Your own earlier replies, oldest first. These are reference only: they " +
+                  `say what was proposed, never what was asked for. ${JSON.stringify(priorAssistant)}`
+                : "No earlier replies of your own.",
               `Latest message from the user: ${JSON.stringify(
                 input.message.replace(/\s+/gu, " ").trim().slice(0, MAX_INPUT_CHARS),
               )}`,
@@ -398,23 +465,29 @@ export function resolveCalendarRequest(
   // A low-confidence read costs nothing; a low-confidence write changes someone's week.
   if (intent.confidence === "low") return refuse("low_confidence_write");
 
+  const detailsFrom = intent.details_from;
   if (intent.intent === "cancel") {
     const reference = resolveReference(intent, timezone);
-    return reference ? act({ kind: "cancel", reference, timezone }) : refuse("no_target_reference");
+    return reference
+      ? act({ kind: "cancel", reference, timezone, detailsFrom })
+      : refuse("no_target_reference");
   }
 
   if (!intent.starts_at_local) return refuse("no_start_time");
   const startsAt = localToUtc(intent.starts_at_local, timezone);
   if (!startsAt) return refuse("unparsable_start");
-  const endsAt = intent.ends_at_local
-    ? localToUtc(intent.ends_at_local, timezone)
-    : new Date(Date.parse(startsAt) + DEFAULT_DURATION_MS).toISOString();
-  if (!endsAt) return refuse("unparsable_end");
+  // A stated end is honoured; a missing one is left missing. What "no end" means depends on
+  // the action, and only the create branch is entitled to answer it: an event being moved
+  // already has a length, and inventing an hour for it silently reshapes the user's day.
+  const statedEnd = intent.ends_at_local ? localToUtc(intent.ends_at_local, timezone) : null;
+  if (intent.ends_at_local && !statedEnd) return refuse("unparsable_end");
 
   const start = Date.parse(startsAt);
-  const end = Date.parse(endsAt);
   const at = Date.parse(context.evaluated_at);
-  if (end <= start || end - start > MAX_DURATION_MS) return refuse("implausible_duration");
+  if (statedEnd !== null) {
+    const end = Date.parse(statedEnd);
+    if (end <= start || end - start > MAX_DURATION_MS) return refuse("implausible_duration");
+  }
   if (start > at + MAX_FUTURE_MS || start < at - MAX_PAST_MS) return refuse("implausible_date");
 
   if (intent.intent === "reschedule") {
@@ -426,7 +499,14 @@ export function resolveCalendarRequest(
     // — a denial about a calendar that was read correctly.
     if (!usable) return refuse("no_target_reference");
     return act(
-      { kind: "reschedule", reference: usable.reference, startsAt, endsAt, timezone },
+      {
+        kind: "reschedule",
+        reference: usable.reference,
+        startsAt,
+        endsAt: statedEnd,
+        timezone,
+        detailsFrom,
+      },
       usable.dropped ? "target_time_was_destination" : null,
     );
   }
@@ -439,9 +519,11 @@ export function resolveCalendarRequest(
     kind: "create",
     title,
     startsAt,
-    endsAt,
+    // A new event has no length of its own to keep, so the house rule applies here alone.
+    endsAt: statedEnd ?? new Date(start + DEFAULT_DURATION_MS).toISOString(),
     location: intent.location?.trim() || null,
     timezone,
+    detailsFrom,
   });
 }
 

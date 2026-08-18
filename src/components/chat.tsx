@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { confirmEffectAction, declineEffectAction } from "@/app/actions";
 import { AssistantProse } from "@/components/assistant-prose";
 import { AuthTrigger } from "@/components/auth-trigger";
 import {
   CARD_COPY,
+  CHANGE,
   CLARIFICATION,
   CLARIFICATION_FALLBACK,
   FOLLOW_THROUGH_DECISION,
@@ -23,6 +24,7 @@ import {
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
 import { type ChatReceipt } from "@/components/chat-receipt";
+import { describeInterval } from "@/core/calendar-time";
 // Imported rather than restated. A hand-copied duplicate is how a new status ends up
 // rendering the catch-all sentence in CARD_COPY.stoppedShort, which for read_only would
 // be actively false.
@@ -40,6 +42,12 @@ export type ChatHistoryTurn = {
    * which is the part this whole card exists to not depend on.
    */
   calendar?: CalendarOutcome | null;
+  /**
+   * A calendar change this turn prepared that is still waiting. Rehydrated alongside the
+   * outcome so the Confirm button survives a reload rather than the change becoming
+   * unreachable and, worse, being described as abandoned.
+   */
+  pendingEffect?: { id: number; payloadHash: string; payload: unknown } | null;
 };
 
 type Turn = ChatHistoryTurn & {
@@ -354,6 +362,7 @@ export function Chat({
                         }
                         workPlan={turn.workPlan}
                         calendar={turn.calendar}
+                        pendingEffect={turn.pendingEffect}
                         onReply={(text) => {
                           setInput(text);
                           textareaRef.current?.focus();
@@ -511,6 +520,7 @@ function AssistantTurn({
   onRecommendationDecision,
   workPlan,
   calendar,
+  pendingEffect,
   onReply,
   pending,
 }: {
@@ -524,6 +534,7 @@ function AssistantTurn({
   ) => void;
   workPlan?: Turn["workPlan"];
   calendar?: CalendarOutcome | null;
+  pendingEffect?: ChatHistoryTurn["pendingEffect"];
   /** Fills the composer. Choosing an alternative is a message the user sends, not an act. */
   onReply: (text: string) => void;
   pending: boolean;
@@ -549,7 +560,12 @@ function AssistantTurn({
           />
         )}
         {calendar ? (
-          <CalendarActionCard workPlan={workPlan} outcome={calendar} onReply={onReply} />
+          <CalendarActionCard
+            workPlan={workPlan}
+            storedPendingEffect={pendingEffect}
+            outcome={calendar}
+            onReply={onReply}
+          />
         ) : (
           workPlan && <WorkPlanCard workPlan={workPlan} />
         )}
@@ -568,20 +584,24 @@ function AssistantTurn({
  */
 function CalendarActionCard({
   workPlan,
+  storedPendingEffect,
   outcome,
   onReply,
 }: {
   // Optional: the outcomes worth surfacing most — nothing connected, or a request Zeus
   // recognized and could not resolve — never produced a run to attach to.
   workPlan?: Turn["workPlan"];
+  storedPendingEffect?: ChatHistoryTurn["pendingEffect"];
   outcome: CalendarOutcome;
   onReply: (text: string) => void;
 }) {
   const [decided, setDecided] = useState<"executed" | "declined" | "reverted" | null>(null);
   const [busy, setBusy] = useState<"confirm" | "decline" | "revert" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const now = useClientNow();
   const done = workPlan?.completedEffects ?? [];
-  const pending = workPlan?.pendingEffects[0];
+  // The live run's own effect while the turn is on screen; the stored one after a reload.
+  const pending = workPlan?.pendingEffects[0] ?? storedPendingEffect ?? undefined;
 
   async function decide(action: "confirm" | "decline" | "revert", effectId: number, hash?: string) {
     if (busy) return;
@@ -621,7 +641,7 @@ function CalendarActionCard({
       >
         <p className="text-[0.85rem] leading-6">
           {decided === "executed"
-            ? `Done. ${pending?.previewText ?? VERB[outcome.kind]}.`
+            ? `${VERB[outcome.kind]}.`
             : decided === "reverted"
               ? CARD_COPY.undone
               : CARD_COPY.nothingWasSent}
@@ -640,8 +660,9 @@ function CalendarActionCard({
         <>
           <p className="text-[0.85rem] font-medium leading-6">
             {VERB[outcome.kind]}
-            {done[0] ? ` — ${done[0].previewText}` : "."}
+            {outcome.change === null && done[0] ? ` — ${done[0].previewText}` : "."}
           </p>
+          <ChangeSummary change={outcome.change} kind={outcome.kind} now={now} />
           {outcome.consideredEvents !== null && outcome.kind !== "read" && (
             <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
               Checked {outcome.consideredEvents}{" "}
@@ -683,7 +704,7 @@ function CalendarActionCard({
           <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
             {outcome.conflicts.map((conflict) => (
               <li key={`${conflict.startsAt}-${conflict.title ?? ""}`}>
-                {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt)}
+                {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt, now)}
               </li>
             ))}
           </ul>
@@ -697,11 +718,11 @@ function CalendarActionCard({
                   <button
                     key={slot.startsAt}
                     type="button"
-                    onClick={() => onReply(alternativeReply(outcome.kind, slot.startsAt))}
+                    onClick={() => onReply(alternativeReply(outcome.kind, slot, now))}
                     className="rounded-md border px-2.5 py-1 text-[0.74rem]"
                     style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
                   >
-                    {timeRange(slot.startsAt, slot.endsAt)}
+                    {timeRange(slot.startsAt, slot.endsAt, now)}
                   </button>
                 ))}
               </div>
@@ -719,12 +740,12 @@ function CalendarActionCard({
                 key={candidate.externalId}
                 type="button"
                 onClick={() =>
-                  onReply(`I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt)}.`)
+                  onReply(`I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt, now)}.`)
                 }
                 className="rounded-md border px-2.5 py-1 text-[0.74rem]"
                 style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
               >
-                {candidate.title ?? "An event"} · {localLabel(candidate.startsAt)}
+                {candidate.title ?? "An event"} · {localLabel(candidate.startsAt, now)}
               </button>
             ))}
           </div>
@@ -748,13 +769,13 @@ function CalendarActionCard({
                     type="button"
                     onClick={() =>
                       onReply(
-                        `I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt)}.`,
+                        `I mean ${candidate.title ?? "the one"} at ${localLabel(candidate.startsAt, now)}.`,
                       )
                     }
                     className="rounded-md border px-2.5 py-1 text-[0.74rem]"
                     style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
                   >
-                    {candidate.title ?? "An event"} · {localLabel(candidate.startsAt)}
+                    {candidate.title ?? "An event"} · {localLabel(candidate.startsAt, now)}
                   </button>
                 ))}
               </div>
@@ -787,7 +808,7 @@ function CalendarActionCard({
           </a>
           .
         </p>
-      ) : outcome.status === "awaiting_confirmation" && pending ? (
+      ) : outcome.status === "awaiting_confirmation" ? (
         <>
           {outcome.reason === "calendar_conflict" ? (
             <>
@@ -797,30 +818,37 @@ function CalendarActionCard({
               <ul className="mt-2 space-y-1 text-[0.78rem]" style={{ color: "var(--shell-muted)" }}>
                 {outcome.conflicts.map((conflict) => (
                   <li key={`${conflict.startsAt}-${conflict.title ?? ""}`}>
-                    {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt)}
+                    {conflict.title ?? "An event"} · {timeRange(conflict.startsAt, conflict.endsAt, now)}
                   </li>
                 ))}
               </ul>
-              <p className="mt-3 text-[0.8rem] leading-5">{pending.previewText}</p>
+              <ChangeSummary change={outcome.change} kind={outcome.kind} now={now} />
               <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
                 {CARD_COPY.confirmDespiteOverlap}
               </p>
             </>
           ) : (
             <>
-              <p className="text-[0.85rem] font-medium leading-6">{pending.previewText}</p>
+              <p className="text-[0.85rem] font-medium leading-6">
+                {NOT_DONE[outcome.kind]} yet — {CHANGE.awaiting}
+              </p>
+              <ChangeSummary change={outcome.change} kind={outcome.kind} now={now} />
               <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-                {CARD_COPY.nothingSentYet}
+                {outcome.reason === "inferred_details"
+                  ? CHANGE.inferredDetails
+                  : CARD_COPY.nothingSentYet}
               </p>
             </>
           )}
-          <pre
-            className="mt-3 overflow-x-auto rounded-md border px-2.5 py-2 font-mono text-[0.66rem] leading-5"
-            style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
-            aria-label="Exact Google Calendar request"
-          >
-            {JSON.stringify(pending.payload, null, 2)}
-          </pre>
+          {pending && (
+            <pre
+              className="mt-3 overflow-x-auto rounded-md border px-2.5 py-2 font-mono text-[0.66rem] leading-5"
+              style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
+              aria-label="Exact Google Calendar request"
+            >
+              {JSON.stringify(pending.payload, null, 2)}
+            </pre>
+          )}
           {outcome.reason === "calendar_conflict" && outcome.alternatives.length > 0 && (
             <>
               <p className="mt-3 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
@@ -831,36 +859,46 @@ function CalendarActionCard({
                   <button
                     key={slot.startsAt}
                     type="button"
-                    onClick={() => onReply(alternativeReply(outcome.kind, slot.startsAt))}
+                    onClick={() => onReply(alternativeReply(outcome.kind, slot, now))}
                     className="rounded-md border px-2.5 py-1 text-[0.74rem]"
                     style={{ borderColor: "var(--shell-line)", color: "var(--shell-fg)" }}
                   >
-                    {timeRange(slot.startsAt, slot.endsAt)}
+                    {timeRange(slot.startsAt, slot.endsAt, now)}
                   </button>
                 ))}
               </div>
             </>
           )}
-          <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
-            <button
-              type="button"
-              disabled={busy !== null}
-              onClick={() => void decide("confirm", pending.id, pending.payloadHash)}
-              className="rounded-md px-3 py-1.5 font-medium disabled:opacity-50"
-              style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
-            >
-              {busy === "confirm" ? "Sending…" : "Confirm"}
-            </button>
-            <button
-              type="button"
-              disabled={busy !== null}
-              onClick={() => void decide("decline", pending.id)}
-              className="underline underline-offset-2 disabled:opacity-50"
-              style={{ color: "var(--shell-muted)" }}
-            >
-              Don&apos;t
-            </button>
-          </div>
+          {pending ? (
+            <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.75rem]">
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => void decide("confirm", pending.id, pending.payloadHash)}
+                className="rounded-md px-3 py-1.5 font-medium disabled:opacity-50"
+                style={{ background: "var(--shell-elevated)", color: "var(--shell-fg)" }}
+              >
+                {busy === "confirm" ? "Sending…" : "Confirm"}
+              </button>
+              <button
+                type="button"
+                disabled={busy !== null}
+                onClick={() => void decide("decline", pending.id)}
+                className="underline underline-offset-2 disabled:opacity-50"
+                style={{ color: "var(--shell-muted)" }}
+              >
+                Don&apos;t
+              </button>
+            </div>
+          ) : (
+            // Rebuilt from storage, where the live effect is no longer to hand. It is still
+            // waiting, and saying so beats the alternative this replaced: a reload turned a
+            // pending change into "Nothing changed. I stopped before making the change." and
+            // took the Confirm button with it.
+            <p className="mt-3 text-[0.75rem]" style={{ color: "var(--shell-muted)" }}>
+              {CARD_COPY.nothingSentYet}
+            </p>
+          )}
         </>
       ) : (
         <p className="text-[0.85rem] leading-6">{CARD_COPY.stoppedShort}</p>
@@ -874,28 +912,93 @@ function CalendarActionCard({
   );
 }
 
-function localLabel(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleString(undefined, {
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function alternativeReply(kind: CalendarOutcome["kind"], startsAt: string): string {
-  return kind === "create"
-    ? `Add it at ${localLabel(startsAt)}.`
-    : `Move it to ${localLabel(startsAt)}.`;
-}
-
-function timeRange(startsAt: string, endsAt: string | null): string {
-  const end = endsAt ? new Date(endsAt) : null;
-  const endLabel = end && !Number.isNaN(end.getTime())
-    ? end.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+/**
+ * Which event, out of which minutes, into which.
+ *
+ * Rendered from `outcome.change`, which is stored with the turn, so it survives a reload —
+ * unlike the effect preview, which is only in hand on the turn the run happened. Nothing
+ * here is read out of the assistant's prose.
+ */
+function ChangeSummary({
+  change,
+  kind,
+  now,
+}: {
+  change: CalendarOutcome["change"];
+  kind: CalendarOutcome["kind"];
+  now: string | null;
+}) {
+  if (change === null) return null;
+  const title = change.title ?? "That event";
+  const from = change.from
+    ? describeInterval(change.from.startsAt, change.from.endsAt, change.timezone, now)
     : null;
-  return endLabel ? `${localLabel(startsAt)}–${endLabel}` : localLabel(startsAt);
+  const to = change.to
+    ? describeInterval(change.to.startsAt, change.to.endsAt, change.timezone, now)
+    : null;
+  return (
+    <div className="mt-1 text-[0.8rem] leading-6" style={{ color: "var(--shell-muted)" }}>
+      <span style={{ color: "var(--shell-fg)" }}>{title}</span>
+      {from !== null && (
+        <>
+          {" "}
+          {kind === "cancel" ? CHANGE.cancelledWas : CHANGE.from} {from}
+        </>
+      )}
+      {to !== null && (
+        <>
+          {" "}
+          {CHANGE.to} <span style={{ color: "var(--shell-fg)" }}>{to}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The browser's clock, but only after mount.
+ *
+ * Null on the server and on the first client render, so "tomorrow" never resolves against
+ * two different clocks and hydration stays quiet. `describeInterval` names the day outright
+ * until this arrives.
+ */
+const subscribeNever = () => () => {};
+/** Fixed at load. A day label needs to know which day it is, not which minute. */
+const CLIENT_LOADED_AT = new Date().toISOString();
+const clientNow = () => CLIENT_LOADED_AT;
+const serverNow = () => null;
+
+function useClientNow(): string | null {
+  return useSyncExternalStore(subscribeNever, clientNow, serverNow);
+}
+
+function browserZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function localLabel(value: string, now: string | null): string {
+  return describeInterval(value, null, browserZone(), now) || value;
+}
+
+function timeRange(startsAt: string, endsAt: string | null, now: string | null): string {
+  return describeInterval(startsAt, endsAt, browserZone(), now) || startsAt;
+}
+
+/**
+ * A chosen slot goes back into the composer as the whole window, not just its start.
+ *
+ * Saying only "move it to 10:30" sends a message with no end time in it, which is reclassified
+ * from scratch — and a move with no stated end keeps the event's current length, so a
+ * half-hour opening would quietly become an hour again. The offered slot and the requested
+ * slot have to be the same slot.
+ */
+function alternativeReply(
+  kind: CalendarOutcome["kind"],
+  slot: { startsAt: string; endsAt: string },
+  now: string | null,
+): string {
+  const when = timeRange(slot.startsAt, slot.endsAt, now);
+  return kind === "create" ? `Add it ${when}.` : `Move it to ${when}.`;
 }
 
 function WorkPlanCard({ workPlan }: { workPlan: NonNullable<Turn["workPlan"]> }) {

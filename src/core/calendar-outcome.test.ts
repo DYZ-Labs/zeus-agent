@@ -28,6 +28,7 @@ const OUTCOME: CalendarOutcome = {
   nearMisses: [
     { externalId: "sushi", title: "Sushi with Mark", startsAt: "2026-08-20T18:00:00.000Z" },
   ],
+  change: null,
   consideredEvents: 1,
   coverage: {
     from: "2026-08-15T09:00:00.000Z",
