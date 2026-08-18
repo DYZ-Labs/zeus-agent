@@ -12,8 +12,9 @@ export const dynamic = "force-dynamic";
  * The full record of one external request.
  *
  * Zeus's whole claim about acting is that the user can check it afterwards, so this page
- * shows the chain end to end: what was proposed, which message confirmed it, whether it
- * was actually sent, and whether it was undone.
+ * shows the chain end to end: what was proposed, which message confirmed it, whether it was
+ * actually sent, and — for a move or a cancel — what the event was beforehand. With the card
+ * gone from a completed change, this is where its receipt lives.
  */
 export default async function EffectPage({
   params,
@@ -102,10 +103,9 @@ export default async function EffectPage({
               {effect.prior_state_json}
             </pre>
             <p className="mt-2 max-w-[68ch] text-[0.78rem] leading-6" style={{ color: "var(--shell-faint)" }}>
-              Captured from the calendar read that preceded this change, so undo can restore
-              the fields Zeus itself set. Attendees, description, recurrence, reminders, and
-              conferencing were never read and are not restored — and un-cancelling an event
-              does not recall the cancellation notices it already sent.
+              Captured from the calendar read that preceded this change, so the record says
+              what the event was before Zeus touched it. Attendees, description, recurrence,
+              reminders, and conferencing were never read and are not here.
             </p>
           </Section>
         )}

@@ -169,8 +169,8 @@ function dayText(timestamp: number, timezone: string, nowMs: number | null): str
  *
  * The failure this replaces: `previewFor` emitted raw UTC ISO instants, so the text a person
  * read before approving a change was `2026-08-20T10:30:00.000Z–2026-08-20T11:30:00.000Z`,
- * while the card wrote the same window a third way and the model wrote it a fourth. A window
- * nobody can read at a glance is a window nobody checks.
+ * while the UI and model each wrote the same window another way. A window nobody can read at
+ * a glance is a window nobody checks.
  *
  * `now` only decides whether a day is named or called today/tomorrow; it never changes which
  * instants are described. Pass null to always name the day — which is what a server render

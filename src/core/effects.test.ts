@@ -21,15 +21,19 @@ import {
 } from "./calendar-policy";
 import {
   authorizeEffectByPolicy,
+  batchPayloadHash,
   confirmEffect,
+  confirmEffectBatch,
+  confirmationSentence,
   declineEffect,
   effectsForRun,
   executeConfirmedEffect,
   expireStaleEffects,
   listPendingEffects,
   payloadHash,
+  pendingConfirmationOffer,
+  pendingEffectsForConfirmation,
   proposeEffect,
-  revertEffect,
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
 
@@ -429,20 +433,22 @@ describe("executing sends the confirmed bytes and nothing else", () => {
     expect(result.errorCode).toBe("capability_unavailable");
   }, 30_000);
 
-  it("records how to undo a created event, and undoes it on request", async () => {
+  it("records no way to undo itself, and never calls the service twice", async () => {
     await grantCalendar();
     const effect = propose();
     confirmEffect(db, effect.id, effect.payload_hash, confirmationMessage(effect.payload_hash));
     await executeConfirmedEffect(db, effect.id);
 
-    const reverted = await revertEffect(
-      db,
-      effect.id,
-      confirmationMessage(effect.payload_hash, "undo it"),
-    );
-
-    expect(reverted.status).toBe("reverted");
-    expect(recordedCalls()[1]).toEqual({ event_id: "evt-1", status: "cancelled" });
+    // One request left the machine, and no second one was prepared to take it back. Undoing
+    // a change is a request the user makes, through the same gates as any other.
+    expect(recordedCalls()).toHaveLength(1);
+    expect(
+      db
+        .prepare<[number], { reversal_json: string | null }>(
+          "SELECT reversal_json FROM proposed_effect WHERE id = ?",
+        )
+        .get(effect.id),
+    ).toEqual({ reversal_json: null });
   }, 30_000);
 });
 
@@ -591,7 +597,7 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
     ).toThrow(/authorized once, one way/u);
   }, 30_000);
 
-  it("lets the user undo a reschedule, because the calendar was read first", async () => {
+  it("keeps what the event looked like before, because the calendar was read first", async () => {
     await grantCalendar();
     const { runId, stepId } = workRun();
     const effect = proposeEffect(db, {
@@ -625,42 +631,14 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
 
     await executeConfirmedEffect(db, effect.id);
 
-    // Undo restores the times Zeus itself changed, and only those.
-    expect(effectsForRun(db, runId)[0]?.reversal).toEqual({
-      slot: "calendar.update_event",
-      payload: {
-        event_id: "evt-1",
-        start: "2026-08-20T15:00:00Z",
-        end: "2026-08-20T16:00:00Z",
-      },
+    // Nothing acts on this now. It is what the receipt shows when the user asks what Zeus
+    // changed — the times it replaced, kept because the calendar was read before it wrote.
+    expect(JSON.parse(effectsForRun(db, runId)[0]?.prior_state_json ?? "null")).toMatchObject({
+      external_id: "evt-1",
+      title: "Design review",
+      start: "2026-08-20T15:00:00Z",
+      end: "2026-08-20T16:00:00Z",
     });
-  }, 30_000);
-
-  it("offers no undo for an update it has no snapshot for", async () => {
-    await grantCalendar();
-    const { runId, stepId } = workRun();
-    const effect = proposeEffect(db, {
-      workRunId: runId,
-      workStepId: stepId,
-      slot: "calendar.update_event",
-      payload: { event_id: "evt-2", start: "2026-08-20T16:00:00Z" },
-      previewText: "Move an event.",
-      providerRequestKey: "req-blind",
-      conflictCheck: {
-        status: "clear",
-        coverage: {},
-        considered_events: 1,
-        conflicts: [],
-      },
-    });
-    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
-      requestMessageId: userMessageId,
-      policy: "calendar_direct_execution",
-    });
-
-    await executeConfirmedEffect(db, effect.id);
-
-    expect(effectsForRun(db, runId)[0]?.reversal).toBeNull();
   }, 30_000);
 });
 
@@ -761,5 +739,172 @@ describe("payload hashing", () => {
     expect(
       payloadHash("calendar.create_event", "create_event", { a: 1 }),
     ).not.toBe(payloadHash("calendar.create_event", "create_event_v2", { a: 1 }));
+  });
+});
+
+/**
+ * One confirmation for a set of payloads, which is what clearing a window prepares.
+ *
+ * The guarantee has to survive being stated once for several rows: the digest still comes
+ * from the exact bytes, is still recomputed from storage rather than taken from the caller,
+ * and still has to appear in a message the user actually sent.
+ */
+describe("confirming a prepared set", () => {
+  function proposeTwo() {
+    const { runId, stepId } = workRun();
+    const first = proposeEffect(db, {
+      workRunId: runId,
+      workStepId: stepId,
+      slot: "calendar.update_event",
+      payload: { event_id: "evt-1", status: "cancelled" },
+      previewText: "Cancel “Design review”.",
+      providerRequestKey: "clear:evt-1",
+    });
+    const second = proposeEffect(db, {
+      workRunId: runId,
+      workStepId: stepId,
+      slot: "calendar.update_event",
+      payload: { event_id: "evt-2", status: "cancelled" },
+      previewText: "Cancel “Gym”.",
+      providerRequestKey: "clear:evt-2",
+    });
+    return { first, second };
+  }
+
+  it("does not depend on the order the payloads were prepared in", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    expect(batchPayloadHash([first, second])).toBe(batchPayloadHash([second, first]));
+  });
+
+  it("gives a single request its own hash, so one sentence covers both shapes", async () => {
+    await grantCalendar();
+    const effect = propose();
+    expect(batchPayloadHash([effect])).toBe(effect.payload_hash);
+  });
+
+  it("confirms every member from one message naming the set", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+    const messageId = confirmationMessage(hash, confirmationSentence(hash, 2));
+
+    const confirmed = confirmEffectBatch(db, [first.id, second.id], hash, messageId);
+
+    expect(confirmed.map((effect) => effect.status)).toEqual(["confirmed", "confirmed"]);
+    expect(confirmed.every((effect) => effect.confirmation_kind === "user_message")).toBe(true);
+    // Each row keeps its own ledger entry citing the user's message, so the receipt log reads
+    // the same way whether one request was authorized or four.
+    for (const effect of confirmed) {
+      const event = effect.events.find((entry) => entry.event_type === "confirmed");
+      expect(event?.source_message_id).toBe(messageId);
+    }
+  });
+
+  it("refuses a message that names only one member of the set", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+    const messageId = confirmationMessage(
+      first.payload_hash,
+      confirmationSentence(first.payload_hash),
+    );
+
+    expect(() => confirmEffectBatch(db, [first.id, second.id], hash, messageId)).toThrow(
+      /exact request hash/iu,
+    );
+    expect(listPendingEffects(db)).toHaveLength(2);
+  });
+
+  /**
+   * The failure the recomputation exists for: a payload added after the user read the list
+   * changes the digest, so the sentence they sent no longer authorizes anything.
+   */
+  it("fails closed when the set changed after the user read it", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+    const messageId = confirmationMessage(hash, confirmationSentence(hash, 2));
+    const third = proposeEffect(db, {
+      workRunId: first.work_run_id,
+      workStepId: first.work_step_id,
+      slot: "calendar.update_event",
+      payload: { event_id: "evt-3", status: "cancelled" },
+      previewText: "Cancel “Lunch”.",
+      providerRequestKey: "clear:evt-3",
+    });
+
+    expect(() =>
+      confirmEffectBatch(db, [first.id, second.id, third.id], hash, messageId),
+    ).toThrow(/does not match this exact set/iu);
+    expect(listPendingEffects(db)).toHaveLength(3);
+  });
+
+  it("refuses a set an assistant message named", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+    const assistantId = appendMessage(
+      db,
+      conversationId,
+      "assistant",
+      confirmationSentence(hash, 2),
+    ).id;
+
+    expect(() => confirmEffectBatch(db, [first.id, second.id], hash, assistantId)).toThrow(
+      /stored user message/iu,
+    );
+  });
+
+  it("finds the set a message authorizes, and nothing when it names no live hash", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+
+    const matched = pendingEffectsForConfirmation(db, confirmationSentence(hash, 2));
+    expect(matched?.hash).toBe(hash);
+    expect(matched?.effects.map((effect) => effect.id).sort()).toEqual(
+      [first.id, second.id].sort(),
+    );
+    expect(pendingEffectsForConfirmation(db, "yes please go ahead")).toBeNull();
+  });
+
+  /**
+   * The composer is emptied every time the user sends anything else, so the offer has to be
+   * answerable on any turn — not only on the one that asked. A reply saying "the line is in
+   * your message box" is only true because this is recomputed each time.
+   */
+  it("still names the outstanding set several turns later", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    expect(pendingConfirmationOffer(db)).toEqual({
+      hash: batchPayloadHash([first, second]),
+      count: 2,
+    });
+  });
+
+  it("offers nothing once the set is settled", async () => {
+    await grantCalendar();
+    const { first, second } = proposeTwo();
+    const hash = batchPayloadHash([first, second])!;
+    confirmEffectBatch(
+      db,
+      [first.id, second.id],
+      hash,
+      confirmationMessage(hash, confirmationSentence(hash, 2)),
+    );
+    expect(pendingConfirmationOffer(db)).toBeNull();
+  });
+
+  it("prefers the one payload a message names over the set it belongs to", async () => {
+    await grantCalendar();
+    const { first } = proposeTwo();
+
+    const matched = pendingEffectsForConfirmation(
+      db,
+      confirmationSentence(first.payload_hash),
+    );
+    expect(matched?.effects).toHaveLength(1);
+    expect(matched?.hash).toBe(first.payload_hash);
   });
 });

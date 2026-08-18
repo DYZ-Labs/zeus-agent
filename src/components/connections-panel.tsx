@@ -267,7 +267,7 @@ function GoogleCalendarCard({
  *
  * It removes the interruption and nothing else: a collision, a calendar Zeus could not
  * read, or an ambiguous event still stops and asks, whatever this says, and every change
- * still writes a receipt you can undo.
+ * still writes a receipt.
  */
 function DirectExecutionToggle({ enabled }: { enabled: boolean }) {
   return (

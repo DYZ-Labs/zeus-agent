@@ -1,5 +1,4 @@
 import { directExecutionAllowance } from "./calendar-policy";
-import type { CalendarLedgerEntry } from "./calendar-outcome";
 import { readCalendarCoverage } from "./calendar-sync";
 import {
   CAPABILITY_SLOTS,
@@ -74,12 +73,18 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
         bound.status === "ready"
           ? bound.enabled === 0
             ? "disabled"
-            : "no_enabled_capability"
+            // A ready, enabled connector that still cannot serve a call is almost always a
+            // credential name with no value in this process — an operator problem. Naming it
+            // "no_enabled_capability" sent the user to Settings to grant an access they had
+            // already granted.
+            : bound.missingEnvVarNames.length > 0
+              ? "missing_environment"
+              : "no_enabled_capability"
           : bound.status
       );
 
-  // Asked about the general case — a change the user spelled out themselves — because this
-  // block describes the setting rather than judging any particular request.
+  // Describe the standing setting for a change whose details the user supplied. Individual
+  // requests may still narrow this allowance when their times came from an earlier proposal.
   const allowance = directExecutionAllowance(db, { detailsFrom: "user_message" });
   return {
     connected: usable !== null || bound !== null,
@@ -115,59 +120,13 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
 export function renderCapabilityBlock(
   state: CalendarCapabilityState,
   context: EvaluationContext,
-  ledger: readonly CalendarLedgerEntry[] = [],
 ): string {
   const lines = [
     `Today is ${localDate(context)} (${context.local_weekday}), local time ` +
       `${context.local_time}, timezone ${context.timezone}.`,
     ...calendarLines(state),
-    ...ledgerLines(ledger, state.connected),
   ];
   return `<capabilities>\n${escapeCapabilityData(lines.join("\n"))}\n</capabilities>`;
-}
-
-/**
- * What this conversation has and has not already done to the calendar.
- *
- * The one historical claim in the block that is about Zeus's own actions, and it belongs
- * here for the same reason `lastReadAt` does: it is resolved fresh every turn from the
- * ledger, so it cannot go stale in the way a sentence in the transcript does. Without it,
- * "have you moved it?" on a turn that runs no calendar work has nothing to answer from but
- * whatever Zeus last said, which is not a record of anything.
- *
- * Executed and pending are stated separately and never merged. A prepared request is the
- * thing most easily mistaken for a completed one, and this block is where that mistake would
- * become an answer.
- */
-function ledgerLines(
-  ledger: readonly CalendarLedgerEntry[],
-  connected: boolean,
-): string[] {
-  // Said on every turn of a connected conversation, including — especially — when the answer
-  // is none. An absent line is not a denial, and "Zeus has changed nothing here" is the
-  // sentence that was missing when a reply claimed otherwise.
-  if (!connected) return [];
-  const done = ledger.filter((entry) => entry.status === "executed");
-  const waiting = ledger.filter((entry) => entry.status === "pending_confirmation");
-  const lines: string[] = [];
-  if (done.length > 0) {
-    lines.push(
-      "Calendar changes Zeus has carried out in this conversation, oldest first: " +
-        `${done.map((entry) => entry.preview).join(" ")} This is the record of what was ` +
-        "actually sent; it is the only thing that says a change went through.",
-    );
-  }
-  if (waiting.length > 0) {
-    lines.push(
-      "Calendar changes prepared in this conversation and still waiting for the user, " +
-        `oldest first: ${waiting.map((entry) => entry.preview).join(" ")} None of these has ` +
-        "happened.",
-    );
-  }
-  if (done.length === 0) {
-    lines.push("Zeus has carried out no calendar changes in this conversation.");
-  }
-  return lines;
 }
 
 function calendarLines(state: CalendarCapabilityState): string[] {
@@ -181,13 +140,24 @@ function calendarLines(state: CalendarCapabilityState): string[] {
   if (!state.canRead && !state.canCreate && !state.canUpdate) {
     // A service that did not answer is not a connection the user has to repair, and saying
     // so sends them to Settings to fix something that was never broken. The grant is still
-    // theirs; Zeus already tried again this turn and will try again on the next request.
+    // theirs, and Zeus retries on its own — but only turns that need the calendar actually
+    // pay for the attempt, so this line must not claim one happened.
     if (state.temporarilyUnreachable) {
       return [
         `Calendar: ${name} is connected, and did not answer just now. The connection is ` +
-          "intact and needs nothing from the user; Zeus tried again this turn and will try " +
-          "again on the next request. It cannot say what is on the calendar until one of " +
-          "those succeeds.",
+          "intact and needs nothing from the user; Zeus retries on its own and will pick " +
+          "it back up when the service answers. The schedule block, if present, is from " +
+          "the last successful read.",
+      ];
+    }
+    // Missing server-side configuration is the operator's to fix. Sending the user to
+    // Settings over it is the exact misdirection the unreachable branch above exists to
+    // prevent, one layer down.
+    if (state.unusableReason === "missing_environment" && state.unusableStatus === "ready") {
+      return [
+        `Calendar: ${name} is connected but cannot be used right now (server configuration ` +
+          "missing). This deployment is missing a server-side setting; the operator of this " +
+          "Zeus has to restore it, and nothing in the user's Settings will change it.",
       ];
     }
     const reconnect = state.unusableReason === "reconnect_required";
@@ -216,11 +186,12 @@ function calendarLines(state: CalendarCapabilityState): string[] {
   const writes = [
     state.canCreate ? "add new events" : null,
     state.canUpdate ? "move or cancel existing events" : null,
+    state.canUpdate ? "clear everything out of a stretch of time" : null,
   ].filter((entry): entry is string => entry !== null);
   lines.push(
     canWrite
       ? `Calendar: ${name} is connected. Zeus can ${state.canRead ? "read it, and " : ""}` +
-          `${writes.join(" and ")} when the user asks.`
+          `${series(writes)} when the user asks.`
       : `Calendar: ${name} is connected for reading only. Zeus can read it, and cannot add, ` +
           "move, or cancel anything; that needs a further permission in Settings, under Connections.",
   );
@@ -231,18 +202,34 @@ function calendarLines(state: CalendarCapabilityState): string[] {
             `${state.remainingToday} more allowed today. Zeus still reads the calendar first ` +
             "and still stops to ask when the time is taken, the calendar cannot be read, " +
             "more than one event matches, or the times came from something Zeus suggested " +
-            "rather than from the user."
+            "rather than from the user. Clearing a stretch of time always stops to ask, and " +
+            "lists everything it would cancel first."
         : "Calendar changes without asking each time: off. Every change stops for the user to " +
             "confirm the exact request.",
     );
   }
+  // Whether a read has ever succeeded, never when it happened. This line is relayed as "I",
+  // so a timestamp here becomes Zeus telling the user what time it went and looked — which
+  // is an audit log talking, not someone who knows their schedule. The distinction that
+  // earns its place is never-read versus read, and the schedule block's own `state`
+  // attribute carries stale versus current.
   lines.push(
     state.lastReadAt === null
       ? "Zeus has never successfully read this calendar."
-      : `Zeus last read this calendar at ${state.lastReadAt}. That read is not part of this ` +
-          "turn: only a work result in this turn says what is on the calendar now.",
+      : "Zeus has read this calendar; the schedule block in this " +
+          "message is from that read and says whether it is current or stale. A read or " +
+          "change performed this turn is shown only by a calendar result or work result " +
+          "in this turn. What Zeus already did to the calendar in this conversation is " +
+          "recorded separately in the calendar history block.",
   );
   return lines;
+}
+
+/** "a", "a and b", "a, b, and c" — so the sentence reads the way a person would say it. */
+function series(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  if (parts.length === 2) return parts.join(" and ");
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
 }
 
 function localDate(context: EvaluationContext): string {

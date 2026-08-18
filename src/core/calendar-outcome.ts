@@ -5,11 +5,15 @@ import { CalendarOutcome } from "./schema";
 /**
  * The deterministic account of what a calendar request did, kept with the turn.
  *
- * Live, the outcome reaches the browser in the streaming frame and drives the card. Reload
- * the page and that frame is gone, which left the assistant's prose as the only surviving
- * record of what happened — the one thing the card exists so as not to depend on. A change
- * carried out, a change waiting on confirmation, and a change refused are then
+ * Without it, the assistant's prose is the only surviving record of what happened, and a
+ * change carried out, a change waiting on confirmation, and a change refused become
  * indistinguishable except by whatever the model happened to write.
+ *
+ * It has two readers, and the second is the point. The browser reads it so a reload still
+ * shows what Zeus did. `calendarHistoryFor` reads it so the *model* does — because every
+ * block of a turn is thrown away when the turn ends, and a model replayed only bare prose has
+ * no evidence a calendar was ever touched. The prompt then correctly refuses to claim
+ * anything, and Zeus denies work it has receipts for.
  *
  * Stored rather than recomputed. Most outcomes could be rebuilt from the run, the way
  * `response-context.ts` rebuilds a memory trace — but the two worth surfacing most, nothing
@@ -59,118 +63,79 @@ export function calendarOutcomesIn(
   return outcomes;
 }
 
+/**
+ * What Zeus already did to the calendar in this conversation, oldest first.
+ *
+ * Bounded by count and scoped to the conversation rather than to the model's message window,
+ * deliberately. The window holds twenty messages; a calendar change made forty messages ago
+ * is still a change that was made, and dropping it is exactly how "have you added it?" came
+ * to be answered with a disclaimer.
+ *
+ * A record of Zeus's own actions, never of the calendar's contents. What is on the calendar
+ * now still needs a fresh read.
+ */
+export type CalendarHistoryEntry = {
+  assistantMessageId: number;
+  at: string;
+  kind: CalendarOutcome["kind"];
+  status: CalendarOutcome["status"];
+  reason: string | null;
+  /** The event's own title travels in here, so every reader guards it as external text. */
+  preview: string | null;
+  /**
+   * What a confirmation line for this turn would have named.
+   *
+   * Kept so a later "no" can be matched to the set the user was actually asked about, rather
+   * than to whatever happens to be pending in the store. Never given to the model — it is a
+   * digest, and a reply reciting one helps nobody.
+   */
+  confirmationHash: string | null;
+};
+
+export const MAX_CALENDAR_HISTORY = 15;
+
+export function calendarHistoryFor(
+  db: Db,
+  conversationId: number,
+  limit: number = MAX_CALENDAR_HISTORY,
+): CalendarHistoryEntry[] {
+  const rows = db
+    .prepare<[number, number], {
+      assistant_message_id: number;
+      created_at: string;
+      outcome_json: string;
+    }>(
+      `SELECT o.assistant_message_id, o.created_at, o.outcome_json
+       FROM calendar_outcome o
+       JOIN message m ON m.id = o.assistant_message_id
+       WHERE m.conversation_id = ?
+       ORDER BY o.assistant_message_id DESC
+       LIMIT ?`,
+    )
+    .all(conversationId, Math.max(1, limit));
+  const entries: CalendarHistoryEntry[] = [];
+  // Newest-first from SQLite so the cap keeps the most recent; reversed here so the model
+  // reads them in the order they happened.
+  for (const row of rows.reverse()) {
+    const parsed = CalendarOutcome.safeParse(safeJson(row.outcome_json));
+    if (!parsed.success) continue;
+    entries.push({
+      assistantMessageId: row.assistant_message_id,
+      at: row.created_at,
+      kind: parsed.data.kind,
+      status: parsed.data.status,
+      reason: parsed.data.reason,
+      preview: parsed.data.preview,
+      confirmationHash: parsed.data.confirmationHash,
+    });
+  }
+  return entries;
+}
+
 function safeJson(value: string): unknown {
   try {
     return JSON.parse(value) as unknown;
   } catch {
     return null;
   }
-}
-
-/**
- * What this conversation actually changed, and what it is still waiting on.
- *
- * The gap this closes: on any turn where no calendar work runs, the model receives no
- * `<calendar_result>` and no `<work_result>`, the stored transcript is raw text, and the
- * `<memory>` block has no calendar content by design. So "have you moved it?" had nothing to
- * answer from except Zeus's own earlier sentence — which is how a change it had described
- * one way was reaffirmed as done, in a different way, with nothing able to contradict it.
- *
- * Read from `proposed_effect`, not from the prose and not from `calendar_outcome`: `executed`
- * is set after the connector call returns, so it is the difference between a request that
- * was prepared and one that left the machine. A pending row is reported as pending, never
- * folded in with the rest.
- */
-
-export type CalendarLedgerEntry = {
-  status: "executed" | "pending_confirmation";
-  preview: string;
-  at: string;
-};
-
-const LEDGER_LIMIT = 8;
-
-export function conversationCalendarLedger(
-  db: Db,
-  conversationId: number,
-): CalendarLedgerEntry[] {
-  const rows = db
-    .prepare<[number, number], { status: string; preview_text: string; updated_at: string }>(
-      `SELECT e.status, e.preview_text, e.updated_at
-       FROM proposed_effect e
-       JOIN work_run r ON r.id = e.work_run_id
-       JOIN work_plan p ON p.id = r.work_plan_id
-       JOIN message m ON m.id = p.source_message_id
-       WHERE m.conversation_id = ?
-         AND e.status IN ('executed', 'pending_confirmation')
-         AND e.effect_kind IN ('schedule', 'modify_external')
-       ORDER BY e.id DESC
-       LIMIT ?`,
-    )
-    .all(conversationId, LEDGER_LIMIT);
-  return rows
-    .map((row) => ({
-      status: row.status === "executed"
-        ? ("executed" as const)
-        : ("pending_confirmation" as const),
-      preview: row.preview_text,
-      at: row.updated_at,
-    }))
-    .reverse();
-}
-
-/**
- * Calendar changes still waiting on the user, keyed by the turn that proposed them.
- *
- * The card's Confirm button used to live entirely in the streaming frame, so a reload left a
- * genuinely pending change with no way to accept it — and, because the branch was guarded on
- * the effect being present, described as one Zeus had stopped before making. The effect is
- * durable; only the route to it was not.
- *
- * Tied back to the assistant turn through the plan's source message: the reply that reported
- * the proposal is the next assistant message after the request that prompted it.
- */
-export type PendingCalendarEffect = {
-  id: number;
-  payloadHash: string;
-  payload: unknown;
-};
-
-export function pendingCalendarEffectsIn(
-  db: Db,
-  conversationId: number,
-): Map<number, PendingCalendarEffect> {
-  const rows = db
-    .prepare<[number, string], {
-      id: number;
-      payload_hash: string;
-      payload_json: string;
-      assistant_message_id: number | null;
-    }>(
-      `SELECT e.id, e.payload_hash, e.payload_json,
-              (SELECT MIN(m2.id) FROM message m2
-                WHERE m2.conversation_id = m.conversation_id
-                  AND m2.role = 'assistant'
-                  AND m2.id > p.source_message_id) AS assistant_message_id
-       FROM proposed_effect e
-       JOIN work_run r ON r.id = e.work_run_id
-       JOIN work_plan p ON p.id = r.work_plan_id
-       JOIN message m ON m.id = p.source_message_id
-       WHERE m.conversation_id = ?
-         AND e.status = 'pending_confirmation'
-         AND e.expires_at > ?
-         AND e.effect_kind IN ('schedule', 'modify_external')
-       ORDER BY e.id ASC`,
-    )
-    .all(conversationId, now());
-  const pending = new Map<number, PendingCalendarEffect>();
-  for (const row of rows) {
-    if (row.assistant_message_id === null) continue;
-    pending.set(row.assistant_message_id, {
-      id: row.id,
-      payloadHash: row.payload_hash,
-      payload: safeJson(row.payload_json),
-    });
-  }
-  return pending;
 }

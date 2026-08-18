@@ -2026,6 +2026,54 @@ WHERE enabled = 0
   );
 `;
 
+/**
+ * Clearing a window is a fourth kind of calendar request.
+ *
+ * `calendar_outcome.kind` pinned the three single-event actions plus a read, so a bulk clear
+ * could not be recorded at all — and an outcome that cannot be stored is one a later turn
+ * cannot recall, which is the whole failure this table exists to prevent. SQLite cannot widen
+ * a CHECK in place, so the table is rebuilt and copied.
+ */
+const CALENDAR_CLEAR_OUTCOME_KIND = `
+ALTER TABLE calendar_outcome RENAME TO calendar_outcome_clear_legacy;
+CREATE TABLE calendar_outcome (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  kind                 TEXT NOT NULL
+                       CHECK (kind IN ('create','reschedule','cancel','clear','read')),
+  status               TEXT NOT NULL,
+  outcome_json         TEXT NOT NULL,
+  created_at           TEXT NOT NULL
+);
+INSERT INTO calendar_outcome
+  (assistant_message_id, kind, status, outcome_json, created_at)
+SELECT assistant_message_id, kind, status, outcome_json, created_at
+FROM calendar_outcome_clear_legacy;
+DROP TABLE calendar_outcome_clear_legacy;
+`;
+
+/**
+ * The standing schedule block a turn rendered for the model, kept with the assistant turn.
+ *
+ * Assistant-context data over an external, expiring cache: not memory, not evidence, never
+ * indexed, never exported, and with no path to extraction or retrieval. Stored because the
+ * cache it was rendered from reconciles and expires — without this row, "Why did Zeus say
+ * that?" about a schedule claim stops being answerable an hour after the claim. Cascades
+ * with its message, exactly like `calendar_outcome`.
+ */
+const SCHEDULE_TURN_CONTEXT = `
+CREATE TABLE schedule_context (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  state         TEXT NOT NULL CHECK (state IN ('current','stale','unread')),
+  as_of         TEXT,
+  window_from   TEXT,
+  window_to     TEXT,
+  events_shown  INTEGER NOT NULL CHECK (events_shown >= 0),
+  events_total  INTEGER NOT NULL CHECK (events_total >= 0),
+  snapshot_json TEXT NOT NULL,
+  created_at    TEXT NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2058,4 +2106,6 @@ export const MIGRATIONS: readonly Migration[] = [
     id: "028_connector_reachability_is_not_consent",
     sql: CONNECTOR_REACHABILITY_IS_NOT_CONSENT,
   },
+  { id: "029_schedule_turn_context", sql: SCHEDULE_TURN_CONTEXT },
+  { id: "030_calendar_clear_outcome_kind", sql: CALENDAR_CLEAR_OUTCOME_KIND },
 ];

@@ -1144,13 +1144,18 @@ export type CalendarActionSetting = z.infer<typeof CalendarActionSetting>;
 /**
  * How one calendar request ended, decided deterministically rather than read out of prose.
  *
- * The card, the model's sentences, and the stored record all descend from this, so they
- * cannot disagree. Assistant-authored outcome data: never a fact, never evidence, and never
- * supplied as memory — the event titles it carries are somebody else's writing.
+ * The model's sentences and the stored record both descend from this, so they cannot
+ * disagree. Assistant-authored outcome data: never a fact, never evidence, and never supplied
+ * as memory — the event titles it carries are somebody else's writing.
  *
  * Note `nearMisses`, which is not a list of what is on the calendar. It is the entries that
  * *failed* the match, kept so a refusal can ask which was meant instead of asserting that
  * the event does not exist. A lookup that missed is not evidence of absence.
+ *
+ * Fields added after the first release carry `.default(...)`. A stored row is read back with
+ * `safeParse` and dropped on failure, so a bare required addition would silently erase every
+ * outcome written before it — including the ones a later turn needs in order to say what it
+ * already did.
  */
 export const CalendarOutcomeEvent = z
   .object({
@@ -1163,10 +1168,9 @@ export const CalendarOutcomeEvent = z
 /**
  * The window a calendar request actually resolved to, kept with the outcome.
  *
- * Without this the deterministic record said only *that* something was moved, so the panel
- * could not show which minutes and the model wrote them from its reading of the
- * conversation. That is how a reply promising 10:00-10:30 accompanied a change to
- * 10:30-11:30 with nothing to contradict it.
+ * Without this the deterministic record said only *that* something was moved, so the model
+ * rebuilt the minutes from the conversation. That is how a reply promising 10:00-10:30
+ * accompanied a change to 10:30-11:30 with nothing to contradict it.
  *
  * `from` is null for a create and `to` is null for a cancel: each is the side that does not
  * exist, rather than a value that could not be worked out.
@@ -1183,7 +1187,7 @@ export type CalendarOutcomeChange = z.infer<typeof CalendarOutcomeChange>;
 
 export const CalendarOutcome = z
   .object({
-    kind: z.enum(["create", "reschedule", "cancel", "read"]),
+    kind: z.enum(["create", "reschedule", "cancel", "clear", "read"]),
     status: z.enum([
       "done",
       "awaiting_confirmation",
@@ -1194,6 +1198,7 @@ export const CalendarOutcome = z
       "no_connector",
       "read_only",
       "needs_clarification",
+      "declined",
       "failed",
     ]),
     reason: z.string().nullable(),
@@ -1210,8 +1215,8 @@ export const CalendarOutcome = z
     alternatives: z.array(z.object({ startsAt: z.string(), endsAt: z.string() }).strict()),
     candidates: z.array(CalendarOutcomeEvent),
     nearMisses: z.array(CalendarOutcomeEvent),
-    /** Nullable so a row stored before this field existed still parses rather than vanishing. */
-    change: CalendarOutcomeChange.nullable(),
+    /** Defaulted so a row stored before this field existed still parses rather than vanishing. */
+    change: CalendarOutcomeChange.nullable().default(null),
     consideredEvents: z.number().nullable(),
     coverage: z
       .object({
@@ -1222,9 +1227,66 @@ export const CalendarOutcome = z
       })
       .strict()
       .nullable(),
+    /**
+     * The one human sentence for what this request did or would do, copied from the effect's
+     * own preview so a later turn can say it without re-reading anything.
+     *
+     * Third-party text: it carries the event's title, so every reader guards it.
+     */
+    preview: z.string().nullable().default(null),
+    /**
+     * Two events on the user's calendar claiming the same minutes, found by the same overlap
+     * rule the write gate uses. Only a read populates this; a write reports what collides
+     * with the requested time in `conflicts` instead.
+     */
+    overlaps: z
+      .array(
+        z
+          .object({ first: CalendarOutcomeEvent, second: CalendarOutcomeEvent })
+          .strict(),
+      )
+      .default([]),
+    /** What a confirmation message must name to authorize every payload this request prepared. */
+    confirmationHash: z.string().nullable().default(null),
   })
   .strict();
 export type CalendarOutcome = z.infer<typeof CalendarOutcome>;
+
+export const ScheduleSnapshotEvent = z
+  .object({
+    id: z.string(),
+    title: z.string().nullable(),
+    startsAt: z.string(),
+    endsAt: z.string().nullable(),
+    location: z.string().nullable(),
+    allDay: z.boolean(),
+    inProgress: z.boolean(),
+  })
+  .strict();
+export type ScheduleSnapshotEvent = z.infer<typeof ScheduleSnapshotEvent>;
+
+/**
+ * The standing schedule context a chat turn rendered for the model, kept with the turn.
+ *
+ * External, untrusted, disposable data — never memory and never evidence. Stored beside the
+ * calendar outcome for the same reason that is: the cache it was rendered from expires and
+ * reconciles, so without this snapshot "Why did Zeus say that?" stops being answerable the
+ * hour after Zeus said it. Titles and locations are stored post-guard, so a withheld line
+ * stays withheld in the record too.
+ */
+export const ScheduleSnapshot = z
+  .object({
+    state: z.enum(["current", "stale", "unread"]),
+    asOf: z.string().nullable(),
+    window: z.object({ from: z.string(), to: z.string() }).strict().nullable(),
+    /** The events actually shown, post-guard; capped, so this is not the whole window. */
+    events: z.array(ScheduleSnapshotEvent),
+    eventsShown: z.number().int().min(0),
+    eventsTotal: z.number().int().min(0),
+    withheld: z.boolean(),
+  })
+  .strict();
+export type ScheduleSnapshot = z.infer<typeof ScheduleSnapshot>;
 
 /**
  * A disposable copy of what a connector reported. Never evidence: an invite someone else

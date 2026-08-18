@@ -78,6 +78,36 @@ export function intervalsOverlap(
   return aStart < bEnd - OVERLAP_GRACE_MS && bStart < aEnd - OVERLAP_GRACE_MS;
 }
 
+/** Two of the user's own events claiming the same minutes. */
+export type EventOverlap = { first: CachedEvent; second: CachedEvent };
+
+/**
+ * Every pair of already-scheduled events that collide, in calendar order.
+ *
+ * The counterpart of `findConflicts`, which asks what collides with a time Zeus is about to
+ * take. This asks what already collides with itself, and it lives here rather than in
+ * `detectors.ts` so a clash Zeus reports when asked is the same clash it would raise on its
+ * own — one overlap rule, one grace window, one answer.
+ *
+ * Assumes the list is sorted by start, as every reader of the event cache supplies it.
+ */
+export function overlappingPairs(events: readonly CachedEvent[]): EventOverlap[] {
+  const pairs: EventOverlap[] = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const first = events[index];
+    if (!first) continue;
+    const firstEnd = endOf(first);
+    for (let other = index + 1; other < events.length; other += 1) {
+      const second = events[other];
+      if (!second) continue;
+      // Sorted input, so the first non-overlapping successor ends the run for this event.
+      if (startOf(second) >= firstEnd - OVERLAP_GRACE_MS) break;
+      pairs.push({ first, second });
+    }
+  }
+  return pairs;
+}
+
 /** Cached events claiming any of the candidate's minutes, earliest first. */
 export function findConflicts(
   events: readonly CachedEvent[],

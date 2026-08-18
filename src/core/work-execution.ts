@@ -11,10 +11,11 @@ import {
   priorStateOf,
   resolvedEnd,
 } from "./calendar-actions";
-import type { CalendarWriteRequest } from "./calendar-actions";
+import type { CalendarSingleWriteRequest, CalendarWriteRequest } from "./calendar-actions";
 import {
   MAX_COVERAGE_AGE_MS,
   checkCalendarConflicts,
+  overlappingPairs,
   resolveTargetEvent,
 } from "./calendar-conflicts";
 import type { CalendarCoverage, FreeSlot } from "./calendar-conflicts";
@@ -26,6 +27,7 @@ import {
   calendarWindow,
   readCalendarCoverage,
 } from "./calendar-sync";
+import { startOf } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
 import { availableCapabilityForEffect, availableEffectKinds, getConnector } from "./connectors";
 import type { BoundCapability } from "./connectors";
@@ -33,6 +35,7 @@ import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
 import {
   authorizeEffectByPolicy,
+  batchPayloadHash,
   effectsForRun,
   executeConfirmedEffect,
   proposeEffect,
@@ -58,6 +61,8 @@ import {
   WorkPlanProposal as WorkPlanProposalSchema,
 } from "./schema";
 import { structuredFacetConditionMatches } from "./stewardship";
+import { containsSensitiveSecret, inspectUntrustedWorkData } from "./untrusted-data";
+import type { UntrustedWorkDataIssue } from "./untrusted-data";
 import type {
   SafeStepExecutionInput,
   SafeStepExecutionResult,
@@ -549,20 +554,45 @@ async function executeExternalRead(
 
   // The window is passed through rather than recomputed, so the coverage row records the
   // window that was actually asked for.
+  const readAt = new Date();
   let events: ReturnType<typeof cacheCalendarEvents>;
   try {
-    events = cacheCalendarEvents(db, available.connector.id, result.value, new Date(), window);
+    events = cacheCalendarEvents(db, available.connector.id, result.value, readAt, window);
   } catch {
     // Parsing happens before the cache transaction. A malformed success response therefore
     // proves neither an empty calendar nor that the requested window was covered.
     return calendarReadFailure(input, "invalid_calendar_response", attempts);
   }
-  const content = JSON.stringify({ window, event_count: events.length, events }, null, 2);
+  // Read back through the same cache the write gate consults, so a clash reported in chat and
+  // a clash that would block a write are found in the same events by the same rule. Computed
+  // here rather than left to the model: "do these two meetings collide?" is arithmetic, and a
+  // model reading a JSON blob is the wrong instrument for it.
+  const overlaps = overlappingPairs(cachedEvents(db, readAt)).map(({ first, second }) => ({
+    first: overlapEvent(first),
+    second: overlapEvent(second),
+  }));
+  const content = JSON.stringify(
+    {
+      window,
+      event_count: events.length,
+      events,
+      overlaps,
+      considered_events: events.length,
+      coverage: {
+        from: window.from,
+        to: window.to,
+        fetchedAt: readAt.toISOString(),
+        eventCount: events.length,
+      },
+    },
+    null,
+    2,
+  );
   const unsafe = inspectUntrustedWorkData(content);
   if (unsafe) return sensitivePause(db, input, unsafe, 0, 1);
 
   return {
-    output: { window, event_count: events.length },
+    output: { window, event_count: events.length, overlapping_pairs: overlaps.length },
     artifacts: [
       {
         kind: "research_notes",
@@ -578,6 +608,11 @@ async function executeExternalRead(
     modelCalls: 0,
     toolCalls: attempts,
   };
+}
+
+/** The shape every calendar event takes inside an artifact's JSON detail. */
+function overlapEvent(event: CachedEvent): Record<string, unknown> {
+  return { external_id: event.external_id, title: event.title, starts_at: event.starts_at };
 }
 
 /** Total calls a single read step may make. One retry, not a queue. */
@@ -670,7 +705,9 @@ async function prepareExternalRequest(
   // around is not a gate.
   const calendarRequest = parseCalendarRequest(input.plan.objective);
   if (calendarRequest && isCalendarWriteRequest(calendarRequest)) {
-    return executeCalendarWrite(db, input, available, calendarRequest);
+    return calendarRequest.kind === "clear"
+      ? executeCalendarClear(db, input, available, calendarRequest)
+      : executeCalendarWrite(db, input, available, calendarRequest);
   }
 
   const response = await openai().responses.create({
@@ -813,6 +850,8 @@ function calendarGate(
   const setting = getCalendarActionSetting(db);
 
   let target: CachedEvent | null = null;
+  // Everything but a create needs a genuinely fresh read before it can name an existing
+  // event — including a clear, which names every event in a window at once.
   if (request.kind !== "create") {
     if (!coverage) {
       return {
@@ -840,8 +879,20 @@ function calendarGate(
           request,
           reason: "stale_coverage",
           coverage,
-          detail: "Zeus last read the calendar too long ago to act on it.",
+          // The same claim as the card's old stale line, and it reaches the model too: this
+          // artifact is rendered into <work_result>. Say why nothing happened without
+          // dating the read. `reason` and `coverage` keep the diagnostic precision.
+          detail: "The calendar could not be confirmed current, so nothing was changed.",
         }),
+      };
+    }
+    if (request.kind === "clear") {
+      return {
+        status: "clear",
+        target: null,
+        events: events.length,
+        coverage,
+        checkedAt: at.toISOString(),
       };
     }
     const resolution = resolveTargetEvent(events, request.reference, {
@@ -951,6 +1002,26 @@ function checkCalendarStep(
 ): SafeStepExecutionResult {
   const gate = calendarGate(db, input, request);
   if (gate.status === "refused") return gate.result;
+  if (request.kind === "clear") {
+    const selection = eventsInsideWindow(db, request);
+    if (selection.status === "too_many") return tooManyToClear(input, request, selection.count);
+    return {
+      output: { checked: true, status: "listed", in_window: selection.events.length },
+      artifacts: [calendarArtifact(
+        input,
+        selection.events.length === 0
+          ? "Nothing is in that window"
+          : "What is in that window",
+        {
+          request,
+          targets: selection.events.map(targetDetail),
+          coverage: gate.coverage,
+          considered_events: gate.events,
+        },
+      )],
+      toolCalls: 0,
+    };
+  }
   if (gate.status === "conflict") {
     return {
       output: {
@@ -984,11 +1055,155 @@ function checkCalendarStep(
   };
 }
 
+/**
+ * Widest a single clear may go. Past this Zeus refuses rather than truncating: a list that
+ * silently stops at twenty reads as "this is everything", and it would not be.
+ */
+const MAX_CLEAR_EVENTS = 20;
+
+type ClearSelection =
+  | { status: "selected"; events: CachedEvent[] }
+  | { status: "too_many"; count: number };
+
+/**
+ * Every cached event that starts inside the window, in calendar order.
+ *
+ * Containment is by start time, not by overlap. An event that began before the window and
+ * runs into it was not scheduled for the stretch the user asked to clear, and cancelling
+ * somebody's all-day flight because they wanted their Thursday afternoon back is exactly the
+ * kind of surprise a bulk operation must not produce.
+ */
+function eventsInsideWindow(
+  db: Db,
+  request: Extract<CalendarWriteRequest, { kind: "clear" }>,
+): ClearSelection {
+  const from = Date.parse(request.from);
+  const to = Date.parse(request.to);
+  const events = cachedEvents(db, new Date(), { includeEnded: true }).filter((event) => {
+    const starts = startOf(event);
+    return Number.isFinite(starts) && starts >= from && starts < to;
+  });
+  return events.length > MAX_CLEAR_EVENTS
+    ? { status: "too_many", count: events.length }
+    : { status: "selected", events };
+}
+
+function targetDetail(event: CachedEvent): Record<string, unknown> {
+  return { external_id: event.external_id, title: event.title, starts_at: event.starts_at };
+}
+
+function tooManyToClear(
+  input: SafeStepExecutionInput,
+  request: CalendarWriteRequest,
+  count: number,
+): SafeStepExecutionResult {
+  return calendarRefusal(input, "calendar_clear_too_large", {
+    request,
+    reason: "too_many_events",
+    considered_events: count,
+    detail:
+      `That window holds ${count} events, more than the ${MAX_CLEAR_EVENTS} Zeus will clear ` +
+      "in one request. Nothing was changed.",
+  });
+}
+
+/**
+ * Empty a window: one exact cancellation per event, and one confirmation for all of them.
+ *
+ * Kept apart from `executeCalendarWrite` for the reason the kinds are kept apart. That
+ * function's shape is "one resolved target, one payload, maybe execute"; this one's is "every
+ * event in a span, N payloads, always ask". Folding them together would mean putting the
+ * standing-policy branch within reach of a bulk delete.
+ *
+ * The standing setting is never consulted here, whatever it says. Direct execution exists so
+ * that a verified, unconflicted, single change need not interrupt anyone; a request to remove
+ * everything from a stretch of someone's week is not that, and the itemized list Zeus shows
+ * before asking is the entire safeguard.
+ */
+function executeCalendarClear(
+  db: Db,
+  input: SafeStepExecutionInput,
+  available: BoundCapability,
+  request: Extract<CalendarWriteRequest, { kind: "clear" }>,
+): SafeStepExecutionResult {
+  // Re-gated immediately before proposing, like every other write: the read that matters is
+  // the last one, not the one the previous step reported.
+  const gate = calendarGate(db, input, request);
+  if (gate.status === "refused") return gate.result;
+  const selection = eventsInsideWindow(db, request);
+  if (selection.status === "too_many") return tooManyToClear(input, request, selection.count);
+
+  if (selection.events.length === 0) {
+    // Nothing to cancel is a completed request, not a failed one — and it is only sayable
+    // because the gate above proved the window was actually read.
+    return {
+      output: { cleared: 0, in_window: 0 },
+      artifacts: [calendarArtifact(input, "Nothing was in that window", {
+        request,
+        targets: [],
+        coverage: gate.coverage,
+        considered_events: gate.events,
+      })],
+      toolCalls: 0,
+    };
+  }
+
+  const prepared: { id: number; preview: string; hash: string }[] = [];
+  for (const event of selection.events) {
+    const payload = buildCalendarPayload(request, event);
+    const mismatch = payloadSchemaMismatch(available.capability.input_schema_json, payload);
+    if (mismatch) {
+      return { pause: { code: "payload_invalid", message: mismatch }, toolCalls: 0 };
+    }
+    const effect = proposeEffect(db, {
+      workRunId: input.run.id,
+      workStepId: input.step.id,
+      slot: available.capability.slot,
+      payload,
+      previewText: previewFor(request, event, gate.checkedAt),
+      // Distinct per event: the key exists so one logical send cannot happen twice, and
+      // these are several sends, not one retried.
+      providerRequestKey: `${input.providerRequestKey}:${event.external_id}`,
+      requestMessageId: input.plan.source_message_id,
+      priorState: priorStateOf(event),
+      conflictCheck: {
+        status: "clear_window",
+        checked_at: gate.checkedAt,
+        coverage: gate.coverage,
+        considered_events: gate.events,
+        conflicts: [],
+      },
+    });
+    prepared.push({ id: effect.id, preview: effect.preview_text, hash: effect.payload_hash });
+  }
+
+  const confirmationHash = batchPayloadHash(
+    prepared.map((entry) => ({ payload_hash: entry.hash })),
+  );
+  return {
+    output: { prepared: prepared.length, confirmation_hash: confirmationHash },
+    artifacts: [calendarArtifact(input, "Nothing cleared yet — waiting for your confirmation", {
+      request,
+      targets: selection.events.map(targetDetail),
+      effects: prepared,
+      confirmation_hash: confirmationHash,
+      coverage: gate.coverage,
+      considered_events: gate.events,
+    })],
+    toolCalls: 0,
+    pause: {
+      code: "effect_confirmation_required",
+      message: "Clearing a window always waits for one confirmation covering every change",
+      requiresReauthorization: false,
+    },
+  };
+}
+
 async function executeCalendarWrite(
   db: Db,
   input: SafeStepExecutionInput,
   available: BoundCapability,
-  request: CalendarWriteRequest,
+  request: CalendarSingleWriteRequest,
 ): Promise<SafeStepExecutionResult> {
   // Checked again here, deliberately. The check that matters is the one immediately before
   // the send, not the one a previous step reported.
@@ -1112,6 +1327,7 @@ async function executeCalendarWrite(
 function pendingConflictHeading(kind: CalendarWriteRequest["kind"]): string {
   if (kind === "reschedule") return "Not moved yet — the destination is occupied";
   if (kind === "create") return "Not added yet — the requested time is occupied";
+  if (kind === "clear") return "Nothing cleared yet";
   return "Not changed yet — the requested time is occupied";
 }
 
@@ -1523,42 +1739,10 @@ function isWebSource(value: unknown): value is { title: string; url: string } {
   return typeof record.title === "string" && typeof record.url === "string";
 }
 
-function containsSensitiveSecret(value: string): boolean {
-  return /\bsk-[A-Za-z0-9_-]{16,}\b/u.test(value) ||
-    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u.test(value) ||
-    /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/iu.test(value) ||
-    /\b(?:password|passcode|api[_ -]?key|secret|session[_ -]?token|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S{6,}/iu.test(value) ||
-    /\b(?:account|routing)(?:\s+(?:number|no\.?))?\s*[:=]\s*[0-9 -]{6,24}\b/iu.test(value) ||
-    /\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/u.test(value) ||
-    /\b(?:\d[ -]*?){13,19}\b/u.test(value);
-}
-
-function containsExplicitHighSensitivity(value: string): boolean {
-  return /\b(?:i (?:was|have been|am) diagnosed with|my (?:diagnosis|medical record|therapy notes?|psychiatric (?:record|history))|i am (?:hiv positive|pregnant))\b/iu.test(value) ||
-    /\b(?:i (?:was|have been) arrested|my (?:criminal record|pending charges|lawsuit|attorney said))\b/iu.test(value) ||
-    /\b(?:my (?:salary|net worth|tax id|social security number) (?:is|:)|i owe \$?\d)\b/iu.test(value) ||
-    /\b(?:my (?:sexual orientation|sex life|intimate relationship)|i am (?:gay|lesbian|bisexual|transgender))\b/iu.test(value);
-}
-
-export type UntrustedWorkDataIssue = "sensitive_data" | "instruction_injection";
-
-/** Conservative guard applied before untrusted data is persisted or sent to another step. */
-export function inspectUntrustedWorkData(value: string): UntrustedWorkDataIssue | null {
-  if (containsSensitiveSecret(value) || containsExplicitHighSensitivity(value)) {
-    return "sensitive_data";
-  }
-  if (
-    /(?:ignore|disregard|override|forget)\s+(?:all\s+)?(?:previous|prior|system|developer)\s+(?:instructions?|messages?|rules?)/iu.test(value) ||
-    /(?:reveal|print|exfiltrate|send)\s+(?:the\s+)?(?:system prompt|developer message|api key|password|secret)/iu.test(value) ||
-    /<\/?(?:system|developer|tool)>/iu.test(value) ||
-    /\bsystem\s+(?:update|directive|notice)\s*:\s*[^\n]{0,200}\b(?:search|private context|hidden context|memory|verbatim)\b/iu.test(value) ||
-    /\b(?:search|quote|return|copy|repeat)\b[^\n]{0,120}\b(?:private|hidden|internal)\s+(?:context|memory|instructions?)\b[^\n]{0,80}\bverbatim\b/iu.test(value) ||
-    /\byou are now (?:an?|the)\b/iu.test(value)
-  ) {
-    return "instruction_injection";
-  }
-  return null;
-}
+// Moved to untrusted-data.ts so the schedule context and chat renderer can share the exact
+// guard without importing the work executor. Re-exported here because this module is where
+// the rest of the codebase historically found it.
+export { inspectUntrustedWorkData, type UntrustedWorkDataIssue } from "./untrusted-data";
 
 function sensitivePause(
   db: Db,
@@ -1595,11 +1779,16 @@ function sensitivePause(
 }
 
 /**
- * How a resumed run should treat a request this step already made.
+ * How a resumed run should treat requests this step already made.
  *
- * Only an executed request lets the step finish; the whole design rests on a step never
+ * Only executed requests let the step finish; the whole design rests on a step never
  * completing on the strength of an intention. Anything else parks the run again with the
  * reason, so the user can resume, re-propose, or cancel rather than being looped.
+ *
+ * Written for a set rather than for one, because clearing a window prepares several payloads
+ * in a single step. Something still pending outranks something executed: a partly-confirmed
+ * set is a step that has not finished, and reporting it as done would let the run complete
+ * with changes the user never authorized still sitting in the queue.
  */
 function settledEffectForStep(
   db: Db,
@@ -1609,18 +1798,43 @@ function settledEffectForStep(
     (effect) => effect.work_step_id === input.step.id,
   );
   if (existing.length === 0) return null;
-  const executed = existing.find((effect) => effect.status === "executed");
-  if (executed) {
+  const pending = existing.filter((effect) => effect.status === "pending_confirmation");
+  const executed = existing.filter((effect) => effect.status === "executed");
+  if (pending.length > 0) {
     return {
-      output: { proposed_effect_id: executed.id, status: "executed" },
+      pause: {
+        code: "effect_confirmation_required",
+        message: existing.length > 1
+          ? "This step prepared several external requests and is waiting for one confirmation"
+          : "This step prepared an external request and is waiting for confirmation",
+        requiresReauthorization: false,
+      },
+      modelCalls: 0,
+      toolCalls: 0,
+    };
+  }
+  if (executed.length > 0) {
+    return {
+      output: {
+        proposed_effect_id: executed[0]?.id ?? null,
+        executed_count: executed.length,
+        status: "executed",
+      },
       artifacts: [
         {
           kind: "draft",
           title: input.step.title,
-          content:
-            `Sent after your confirmation.\n\n${executed.preview_text}\n\n` +
-            `Request: ${JSON.stringify(executed.payload, null, 2)}\n\n` +
-            `Receipt: effect ${executed.id} · ${executed.payload_hash}`,
+          content: [
+            executed.length > 1
+              ? `${executed.length} requests sent after your confirmation.`
+              : "Sent after your confirmation.",
+            ...executed.map(
+              (effect) =>
+                `${effect.preview_text}\n\n` +
+                `Request: ${JSON.stringify(effect.payload, null, 2)}\n\n` +
+                `Receipt: effect ${effect.id} · ${effect.payload_hash}`,
+            ),
+          ].join("\n\n"),
           citations: [],
           sourceMessageIds: [],
           sourceMemoryItems: [],
@@ -1631,17 +1845,7 @@ function settledEffectForStep(
     };
   }
   const latest = existing[existing.length - 1];
-  if (!latest || latest.status === "pending_confirmation") {
-    return {
-      pause: {
-        code: "effect_confirmation_required",
-        message: "This step prepared an external request and is waiting for confirmation",
-        requiresReauthorization: false,
-      },
-      modelCalls: 0,
-      toolCalls: 0,
-    };
-  }
+  if (!latest) return null;
   return {
     pause: {
       code: `effect_${latest.status}`,

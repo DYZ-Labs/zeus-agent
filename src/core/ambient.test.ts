@@ -4,6 +4,15 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const ambientMocks = vi.hoisted(() => ({
+  restoreConnectorReachability: vi.fn(async () => false),
+}));
+
+vi.mock("./mcp-client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./mcp-client")>()),
+  restoreConnectorReachability: ambientMocks.restoreConnectorReachability,
+}));
+
 import {
   ambientDeliveriesForLocalDay,
   buildAmbientEvaluationContext,
@@ -13,6 +22,7 @@ import {
   getFreshCoarseLocation,
   isQuietLocalTime,
   recordCoarseLocation,
+  refreshExternalSignals,
   resolveTodayOpportunity,
   runAmbientEvaluation,
   updateAmbientSetting,
@@ -49,6 +59,23 @@ function dueCommitment(db: ReturnType<typeof openTestDb>) {
     sourceMessageId: message.id,
   });
 }
+
+describe("the scheduled refresh", () => {
+  it("gives an unreachable connector its handshake instead of no-oping forever", async () => {
+    const db = openTestDb();
+
+    const result = await refreshExternalSignals(db);
+
+    // Nothing is connected here, so the sync itself degrades — but the heal was attempted,
+    // which is what keeps a background refresh from silently skipping a repairable outage.
+    expect(ambientMocks.restoreConnectorReachability).toHaveBeenCalledWith(
+      db,
+      "calendar.list_events",
+      { signal: undefined },
+    );
+    expect(result.synced).toBe(false);
+  });
+});
 
 function notifier(result = true): AmbientNotifier & { calls: AmbientNotification[] } {
   const calls: AmbientNotification[] = [];

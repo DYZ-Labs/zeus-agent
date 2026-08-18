@@ -1,7 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { readCalendarCoverage } from "@/core/calendar-sync";
 import { createCandidate, getCandidate, listCandidates } from "@/core/candidates";
-import { getConnectorByPresetId, toolSchemaHash } from "@/core/connectors";
+import {
+  bindCapability,
+  createConnector,
+  getConnectorByPresetId,
+  recordConnectorVerification,
+  setCapabilityEnabled,
+  setConnectorEnabled,
+  toolSchemaHash,
+} from "@/core/connectors";
 import {
   appendMessage,
   createConversation,
@@ -22,6 +31,8 @@ const actionMocks = vi.hoisted(() => ({
   embedFacet: vi.fn(async () => true),
   embedPassage: vi.fn(async () => true),
   probeConnectorPreset: vi.fn(),
+  verifyConnector: vi.fn(),
+  callCapability: vi.fn(),
 }));
 
 vi.mock("@/server/db", () => ({ getDb: actionMocks.getDb }));
@@ -42,6 +53,8 @@ vi.mock("@/core/mcp-client", async (importOriginal) => {
   return {
     ...actual,
     probeConnectorPreset: actionMocks.probeConnectorPreset,
+    verifyConnector: actionMocks.verifyConnector,
+    callCapability: actionMocks.callCapability,
   };
 });
 
@@ -52,6 +65,7 @@ import {
   configureConnectorPresetAction,
   deleteConversationFromHistoryAction,
   removeConversationFromHistoryAction,
+  verifyConnectorAction,
 } from "./actions";
 import { ConnectorError } from "@/core/mcp-client";
 
@@ -314,7 +328,82 @@ describe("guided connector actions", () => {
     expect(actionMocks.probeConnectorPreset).not.toHaveBeenCalled();
     expect(getConnectorByPresetId(db, "google-calendar-official")).toBeNull();
   });
+
+  it("warms the schedule cache when a verified connector serves the calendar", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const connectorId = connectCalendarDirectly(db);
+    actionMocks.verifyConnector.mockResolvedValue({ tools: [] });
+    actionMocks.callCapability.mockResolvedValue({
+      value: { events: [] },
+      text: "",
+      isError: false,
+    });
+    const form = new FormData();
+    form.set("id", String(connectorId));
+
+    await verifyConnectorAction(form);
+
+    // The verify succeeded, so the user's schedule should be warm before their next turn.
+    expect(actionMocks.callCapability).toHaveBeenCalledOnce();
+    expect(readCalendarCoverage(db)).not.toBeNull();
+  });
+
+  it("does not read a calendar through a connector that serves none", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const conversation = createConversation(db, { title: "Connections", source: "web" });
+    const sourceMessageId = appendMessage(db, conversation.id, "user", "connect", {
+      origin: "user_action",
+      recallState: "blocked",
+    }).id;
+    const connector = createConnector(db, {
+      label: "Notes",
+      transport: "stdio",
+      command: "node",
+      args: ["./notes.js"],
+      sourceMessageId,
+    });
+    actionMocks.verifyConnector.mockResolvedValue({ tools: [] });
+    const form = new FormData();
+    form.set("id", String(connector.id));
+
+    await verifyConnectorAction(form);
+
+    expect(actionMocks.callCapability).not.toHaveBeenCalled();
+  });
 });
+
+/** A connected, verified calendar connector, built from the core primitives. */
+function connectCalendarDirectly(db: ReturnType<typeof openTestDb>): number {
+  const conversation = createConversation(db, { title: "Connections", source: "web" });
+  const sourceMessageId = appendMessage(db, conversation.id, "user", "connect my calendar", {
+    origin: "user_action",
+    recallState: "blocked",
+  }).id;
+  const connector = createConnector(db, {
+    label: "Calendar",
+    transport: "stdio",
+    command: "node",
+    args: ["./calendar-server.js"],
+    sourceMessageId,
+  });
+  recordConnectorVerification(db, connector.id, { status: "ready" });
+  setConnectorEnabled(db, connector.id, true, sourceMessageId);
+  const capability = bindCapability(db, {
+    connectorId: connector.id,
+    slot: "calendar.list_events",
+    remoteToolName: "list_events",
+    inputSchema: {
+      type: "object",
+      properties: { from: { type: "string" }, to: { type: "string" } },
+      required: ["from", "to"],
+    },
+    sourceMessageId,
+  });
+  setCapabilityEnabled(db, capability.id, true, sourceMessageId);
+  return connector.id;
+}
 
 function facetItem(sourceMessageId: number, quote: string) {
   return {

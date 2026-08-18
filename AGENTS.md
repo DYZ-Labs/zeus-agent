@@ -105,20 +105,28 @@ npm run mcp            # stdio MCP server
   broker, plus the account-bound Calendar MCP service. Its database is never a Zeus store.
 - `src/server/google-calendar/` — signed OAuth handoff and system-managed provider setup for
   the hosted web front door; no Google token crosses this boundary.
-- `src/core/effects.ts` — proposed external requests, the payload confirmation gate, and
-  policy authorization.
+- `src/core/effects.ts` — proposed external requests, the payload confirmation gate, batch
+  confirmation of one prepared set, and policy authorization.
 - `src/core/calendar-time.ts` — the interval arithmetic noticing and acting must share.
-- `src/core/calendar-conflicts.ts` — candidate-versus-calendar overlap, free-slot search,
-  and deterministic target resolution. Pure; fails closed without proof of a fresh read.
+- `src/core/calendar-conflicts.ts` — candidate-versus-calendar overlap, already-scheduled
+  overlap, free-slot search, and deterministic target resolution. Pure; fails closed without
+  proof of a fresh read.
 - `src/core/calendar-intent.ts` — model intent recognition behind a deterministic veto that
-  can only ever downgrade what the model proposed.
+  can only ever downgrade what the model proposed. Create, reschedule, cancel, clear, read.
 - `src/core/calendar-actions.ts` — the resolved action, its payload, and its work plan.
 - `src/core/calendar-policy.ts` — the standing direct-execution setting and its ceiling.
+  Never consulted for a clear.
 - `src/core/calendar-outcome.ts` — the deterministic account of what a calendar request did,
-  stored with its assistant turn so a reload does not leave prose as the only record.
+  stored with its assistant turn and replayed to later turns as `<calendar_history>`, so
+  neither a reload nor the next message leaves prose as the only record.
 - `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
   `<capabilities>` block. Never memory.
-- `src/core/calendar-sync.ts` — the disposable external read cache.
+- `src/core/calendar-sync.ts` — the disposable external read cache, and the turn-start
+  freshness top-up that keeps it answerable.
+- `src/core/calendar-context.ts` — the standing `<schedule>` block every chat turn renders
+  from that cache, with its snapshot trace. External data, never memory. The as-of time is
+  an attribute, never a sentence, and never spoken.
+- `src/core/untrusted-data.ts` — the one guard third-party text passes before a model sees it.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
   run capacity.
@@ -229,8 +237,8 @@ from the assistant's own text.
 
 Measure assisted progress, control signals, and regret separately. Do not replace them with
 conversation count, time spent, tasks surfaced, or a composite engagement score that could
-reward interruption. Declines and reversals of external requests are regret signals and
-must stay separately visible.
+reward interruption. Declining an external request is a regret signal and must stay
+separately visible.
 
 ### Detected signals are proposals too
 
@@ -271,16 +279,42 @@ payload approval is the failure the whole design prevents.
 Either way, the hash is recomputed from storage immediately before dispatch, so an edited
 payload fails closed.
 
+**One step, one confirmation — even when the step prepared several payloads.** Clearing a
+window is the only thing that does. `confirmEffectBatch` takes a digest computed from every
+member (`batchPayloadHash`), recomputes it from the rows as they stand, and authorizes each
+one with `confirmation_kind = 'user_message'` citing the same real user message. Nothing is
+relaxed by saying it once for a set: the digest still comes from the exact bytes, so a
+payload added or edited after the user read the list no longer matches and nothing is sent.
+Itemising a cleared afternoon into four separate confirmations is not more informed consent.
+
 **Zeus never writes a message the user did not send.** Synthesizing an "I confirm `<hash>`"
 message to satisfy the confirmation check is prohibited: it would put fabricated text in the
 same `message` table that backs evidence, and it would reduce
 `assertExactConfirmationMessage` and the `effect_event_decision_is_user_authored` trigger to
 checks the system passes against its own output.
 
+The chat asks for that message instead of writing it. There is no Confirm button any more, so
+`confirmationSentence` is placed in the composer — only into an empty one — and the user
+sends it themselves. The offer is recomputed from the live pending rows on every turn and
+after every reload (`pendingConfirmationOffer`), not derived from the turn that asked: the
+composer is emptied whenever the user sends anything else, and a reply saying "the line is in
+your message box" has to be true on the turn it is said. `settlePendingConfirmation` in `src/core/chat.ts` recognizes a stored
+user message naming a live hash, settles it before intent classification, and blocks its
+recall and extraction: a payload digest is a decision, not something the user said about
+themselves. Assent without a hash authorizes nothing; "yes, go ahead" leaves the request
+sitting there. A plain refusal on the first line *does* decline the set, because that
+asymmetry only ever stops an action.
+
 **The standing policy covers verified, unconflicted actions only.** A collision, a calendar
 that could not be read or was read too long ago, a target matching more than one event, or
 an exhausted daily ceiling all fall back to per-payload confirmation, whatever the setting
 says. Removing the interruption never removes the record, and never removes the check.
+
+It also never covers a `clear`. Direct execution exists so that one verified, unconflicted
+change need not interrupt anyone; emptying a stretch of somebody's week is not that, and the
+itemized list Zeus shows before asking is the entire safeguard. `executeCalendarClear` does
+not consult `directExecutionAllowance` at all — not as a check that usually fails, but as a
+branch that does not exist.
 
 Silence is never consent: an unanswered request expires rather than escalating. An
 assistant message can never authorize anything; a database trigger enforces that
@@ -301,10 +335,24 @@ reads the payload first. This one does not have that luxury.
 Resolving which existing event the user meant is deterministic and refuses on ambiguity.
 Two plausible targets produce a question, never a choice.
 
+`clear` is the one kind that wants the opposite from ambiguity, which is why it is a kind of
+its own rather than a cancel with a looser target. A cancel matching four events must refuse;
+a clear matching four events has found exactly what it was asked for. Collapsing them would
+mean relaxing the rule that stops the wrong meeting being deleted. A clear selects by start
+time inside the window — an event that began earlier and runs into it was not scheduled for
+the stretch the user asked to free — refuses above `MAX_CLEAR_EVENTS` rather than truncating
+a list that would read as complete, and needs the same fresh, covering read every other write
+does.
+
 `external_read` is a distinct effect kind rather than a widening of `web_read`, because the
 effect kind is the unit of authorization: a plan approved for public web research must not
 thereby reach the user's calendar. Reads need no per-use confirmation — connecting the
 service was the consent — but writes always do.
+
+Two events of the user's own colliding is the same arithmetic as a write colliding with one
+of them, so it is the same function: `overlappingPairs` in `calendar-conflicts.ts`, used both
+by `detectors.ts` when Zeus notices unprompted and by the read step when the user asks. A
+clash reported in chat must be a clash Zeus would have refused to create.
 
 In the receipt log, `connector_call` is the only tool name that means bytes left the
 machine. `effect_proposal` means a request was prepared and stopped. Keep them distinct.
@@ -349,7 +397,8 @@ drifted tool contract clear the capabilities and wait for a person; everything e
 them standing.
 
 Recovery follows from that. `restoreConnectorReachability` gives a connector in that state
-one bounded handshake on a turn that already needs it, then
+one bounded handshake on a turn or scheduled refresh that already needs it — the chat
+turn's schedule top-up and `refreshExternalSignals` both qualify — then
 `restoreConnectorAfterReachability` puts it back into service against the state observed
 *before* verifying — which is what keeps a connection the user deliberately switched off,
 whose `status` is still `ready`, out of scope. It re-enables no capability row, so it can
@@ -358,7 +407,7 @@ never widen a grant.
 Say which it is, too. A service that did not answer needs nothing from the user, and telling
 them to go and reconnect an intact calendar is the failure this whole section exists to
 prevent: `temporarilyUnreachable` and the `provider_unavailable` outcome carry that
-distinction into the `<capabilities>` block and the calendar card.
+distinction into the `<capabilities>` block and into the reply.
 
 ### External data is never evidence
 
@@ -368,6 +417,46 @@ facet, goal, commitment, or candidate, it never enters `extract()`, and it never
 `<memory>` block. `external_signal` is a disposable, expiring cache with no path to any
 evidence table; keep it that way. Run every external payload through
 `inspectUntrustedWorkData` before it reaches a model.
+
+### What is on the calendar and what Zeus did are separate records
+
+Two questions the prompt used to answer identically exposed opposite failures. "What is on
+my calendar?" is answered from the standing `<schedule>` block or a result from this turn;
+"did you add it?" is answered from the stored `<calendar_history>`. A schedule may age, but
+an action Zeus completed remains a matter of record. Denying work it holds a receipt for is
+as wrong as presenting an old schedule as current.
+
+The standing `<schedule>` block is how the disposable cache reaches chat without becoming
+memory. Every turn with a connected calendar carries it, so Zeus already knows the schedule
+before being asked; a turn whose cache could not be refreshed relays the last successful read
+instead and says it may be out of date. The block is a sibling of `<capabilities>`, never part
+of `<memory>`; every title passes the guard; and it authorizes nothing — the write gate keeps
+its own stricter freshness proof. `lastKnownEvents` is the block's render-only reader over
+expired rows and must never feed the conflict gate or detectors, which keep failing closed on
+expiry through `cachedEvents`. Each rendered snapshot persists in `schedule_context`
+(assistant-context data, like `calendar_outcome`) so a schedule claim stays auditable after
+the cache reconciles.
+
+Every volatile block of a turn belongs to a synthetic final user message that is discarded
+when the turn ends — only `options.input` is stored, and prior turns replay as bare prose. A
+later "did that go through?" therefore used to see no evidence that Zeus had touched a
+calendar. `calendarHistoryFor` closes that gap with a bounded, oldest-first
+`<calendar_history>` built from the stored outcomes of this conversation. It is scoped to the
+conversation rather than the model's message window, because a change made forty messages
+ago is still a change that was made. It carries statuses and previews but no event list — a
+record of Zeus's actions, never the current calendar — and every preview passes
+`guardExternalText`, since an event title is still somebody else's writing. Where history
+records an action, say it plainly; where it does not, do not invent one.
+
+Knowing the schedule is the feature; narrating the trip to get it is not. Zeus never tells
+the user when it last read the calendar — not a date, clock time, elapsed duration, or "as
+of". The timestamp survives as machine data in `schedule_context`, the block's `as_of`
+attribute, and `coverage.fetchedAt`, but no spoken line carries it. Stale still has to say it
+is stale, in words and as a clause offering to check again.
+
+`CalendarOutcome` gains fields over time. Add them with `.default(...)`: a stored row is read
+back with `safeParse` and dropped on failure, so a bare required addition silently erases
+every outcome written before it — reintroducing the exact amnesia the history exists to fix.
 
 ### Response provenance is persistent
 
@@ -469,22 +558,40 @@ like, not a person who knows you.
 - The chat renders plain text: blank lines become paragraphs via `AssistantProse`, and
   there is no Markdown parser. If you relax the no-Markdown rule in the prompt, ship a
   renderer in the same change or users will read literal asterisks.
-- A card and the prose must not narrate the same status twice. The card is deterministic
-  and survives a reload; the prose says the human version once and leaves the particulars
-  to the panel.
-- Fixed user-facing copy speaks in the first person and lives in
-  `src/components/calendar-card-copy.ts`, swept by `styleViolations`
-  (`src/core/response-style.ts`). Add new card copy there, not inline in a component.
+- The reply is the whole surface. The calendar, work-plan and follow-through panels that
+  used to sit under an assistant turn are gone; the prose now says the particulars —
+  what changed or didn't, which event collided, which times are free, what is needed next.
+  Do not reintroduce a panel to carry them.
+- Removing the panel did not remove the record, and must not. `calendar_outcome` is still
+  written for every recognized calendar request, still deterministic, and is now also
+  *supplied to the model*, which is what stops the prose drifting from what happened. The
+  audit surfaces — `/effects/[id]`, `/today#work-plans`, the receipt log — are unchanged. If
+  you add a new outcome shape, the model has to be told about it in `renderCalendarResult`;
+  there is no longer a card that would have rendered it for free.
+- Fixed user-facing copy speaks in the first person. `src/components/calendar-card-copy.ts`
+  went with the cards, and `styleViolations` (`src/core/response-style.ts`) currently has no
+  production consumer as a result. If you add fixed copy back, put it in a module a test can
+  sweep rather than inline in a component, and point the sweep at it.
+- There is no undo. A calendar write is proposed, gated, sent, and recorded; putting it back
+  is a new request through the same gates, in the user's own words. Zeus does not clean up
+  after itself with a call nobody asked for. `proposed_effect.reversal_json`,
+  `status = 'reverted'`, and `effect_event.event_type = 'reverted'` stay in the schema and in
+  the Zod enums so rows written before this still read back and still label themselves
+  "undone"; nothing writes them now. `prior_state_json` stays too, and its reason changed: it
+  is the audit record of what an event looked like before Zeus changed it, shown on the
+  receipt.
 - The `<capabilities>` block is the deliberate exception and stays third person: it rides
   inside a user-role message, where “I” would read as the user. The prompt asks for it to
   be relayed as I.
 - Text placed in the composer on the user's behalf must read like something they would
   type. It carries no standing safety disclaimer — `authorizeWorkPlan` and `confirmEffect`
   gate external action regardless, and a compliance paragraph attributed to the user
-  misrepresents them. `I confirm external request <hash>` is the exception, because that
-  exact string is evidence.
-- Nothing in `npm run check` can judge model prose. The linter pins the deterministic
-  strings only; tone changes still need a real conversation before you believe them.
+  misrepresents them. `confirmationSentence` in `src/core/confirmation-text.ts` is the exception,
+  because that exact string is evidence — and with no Confirm button left, it is the only
+  way a change gets authorized from chat.
+- Nothing in `npm run check` can judge model prose, and there is no longer a deterministic
+  panel behind it. Tests pin the blocks the model is given and the rules it is given about
+  them; whether it writes a sentence a person wants to read still needs a real conversation.
 
 ## Testing expectations
 

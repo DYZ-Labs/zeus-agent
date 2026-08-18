@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { confirmEffectAction, declineEffectAction, revertEffectAction } from "@/app/actions";
+import { confirmEffectAction, declineEffectAction } from "@/app/actions";
 import type { ProposedEffectView } from "@/core/effects";
 
 /**
@@ -146,14 +146,6 @@ function ExecutedEffectRow({ effect }: { effect: ProposedEffectView }) {
         <Link href={`/effects/${effect.id}`} className="underline underline-offset-2">
           receipt
         </Link>
-        {!reverted && effect.reversal_json !== null ? (
-          <form action={revertEffectAction}>
-            <input type="hidden" name="id" value={effect.id} />
-            <button type="submit" className="underline underline-offset-2">
-              undo
-            </button>
-          </form>
-        ) : null}
       </div>
     </li>
   );

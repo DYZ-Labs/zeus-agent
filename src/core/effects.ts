@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { confirmationSentence } from "./confirmation-text";
 import { availableCapability, getCapability, getConnector } from "./connectors";
 import type { ConnectorView } from "./connectors";
 import type { Db } from "./db";
@@ -32,6 +33,13 @@ import type {
  * - `standing_policy` — a calendar action the user enabled direct execution for, which a
  *   deterministic conflict check cleared against a freshly read window. The row cites the
  *   user's actual request. It is not a confirmation and is never recorded as one.
+ *
+ * A step that prepares several payloads at once — clearing a window is the only one that
+ * does — is confirmed by `confirmEffectBatch`, over a hash computed from every member. That
+ * is still `user_message`: still the user's own message, still naming a digest of the exact
+ * bytes, still recomputed from storage before dispatch so an edited payload fails closed. The
+ * guarantee is unchanged; it is stated once for a set instead of once per row, because
+ * itemising a cleared afternoon into four separate confirmations is not more informed consent.
  *
  * Either way, execution sends those bytes and no others: the hash is recomputed from
  * storage immediately before dispatch, so an edited payload fails closed.
@@ -70,9 +78,10 @@ export type ProposeEffectInput = {
   conflictCheck?: Record<string, unknown> | null;
 };
 
+// No parsed `reversal`. Nothing writes `reversal_json` any more, so the field could only
+// ever be null; the column stays so rows written before this still read back intact.
 export type ProposedEffectView = ProposedEffect & {
   payload: unknown;
-  reversal: unknown;
   capability: ConnectorCapability;
   connector: ConnectorView;
   events: EffectEvent[];
@@ -91,6 +100,8 @@ const SELECT_EFFECT = `
          idempotency_key, provider_request_key, expires_at, created_at, updated_at
   FROM proposed_effect
 `;
+
+export { confirmationSentence };
 
 /** Canonical digest of what would be sent. Key order must not change it. */
 export function payloadHash(
@@ -255,6 +266,131 @@ export function confirmEffect(
       message_id: sourceMessageId,
     });
     return requireView(db, id);
+  })();
+}
+
+/**
+ * The digest a message must name to authorize a whole prepared set.
+ *
+ * Order-independent by construction: the member hashes are sorted before digesting, so the
+ * value depends on the payloads and on nothing else. Add, remove, or edit a payload and the
+ * digest changes, which is what lets the check be recomputed from storage at confirmation
+ * time rather than trusted from whatever produced it.
+ *
+ * A single-member set returns that member's own hash, so there is one string in the product
+ * and one sentence in the composer whether the user is moving one meeting or clearing four.
+ */
+export function batchPayloadHash(effects: readonly { payload_hash: string }[]): string | null {
+  if (effects.length === 0) return null;
+  if (effects.length === 1) return effects[0]?.payload_hash ?? null;
+  const members = effects.map((effect) => effect.payload_hash).sort();
+  return createHash("sha256").update(`batch\n${members.join("\n")}`).digest("hex");
+}
+
+/**
+ * The confirmation still owed, if any, as the one line that would settle it.
+ *
+ * The composer is the only affordance a prose-only chat has for authorizing a change, and it
+ * is emptied every time the user sends anything else. Recomputed from the live pending rows
+ * on every turn and after every reload, so the offer is present for exactly as long as there
+ * is something to accept — otherwise a reply saying "the line is in your message box" is
+ * describing a box that no longer holds it.
+ */
+export function pendingConfirmationOffer(
+  db: Db,
+  options: { at?: Date } = {},
+): { hash: string; count: number } | null {
+  const pending = listPendingEffects(db, options);
+  if (pending.length === 0) return null;
+  // The newest run's set: one step prepares them together and one line confirms them together.
+  const newestRun = Math.max(...pending.map((effect) => effect.work_run_id));
+  const group = pending.filter((effect) => effect.work_run_id === newestRun);
+  const hash = batchPayloadHash(group);
+  return hash === null ? null : { hash, count: group.length };
+}
+
+/**
+ * The pending set a user message authorizes, if any.
+ *
+ * Matching on the stored hash rather than on the sentence around it: the phrasing is the
+ * user's, the digest is ours, and only the digest decides. A message that names no live hash
+ * matches nothing and is an ordinary chat turn.
+ */
+export function pendingEffectsForConfirmation(
+  db: Db,
+  content: string,
+  options: { at?: Date } = {},
+): { effects: ProposedEffectView[]; hash: string } | null {
+  const pending = listPendingEffects(db, options);
+  if (pending.length === 0) return null;
+
+  const single = pending.find((effect) => content.includes(effect.payload_hash));
+  if (single) return { effects: [single], hash: single.payload_hash };
+
+  // Grouped by run, because that is the unit a step prepares: one cleared window, one hash.
+  const byRun = new Map<number, ProposedEffectView[]>();
+  for (const effect of pending) {
+    const group = byRun.get(effect.work_run_id) ?? [];
+    group.push(effect);
+    byRun.set(effect.work_run_id, group);
+  }
+  for (const group of byRun.values()) {
+    const hash = batchPayloadHash(group);
+    if (hash !== null && content.includes(hash)) return { effects: group, hash };
+  }
+  return null;
+}
+
+/**
+ * Accept every payload one step prepared, on one confirmation.
+ *
+ * Deliberately not `confirmEffect` in a loop over a hash the caller supplies. The digest is
+ * recomputed here from the rows as they stand, so a payload edited or added after the user
+ * read the list no longer matches and nothing is sent. Each member is then checked exactly as
+ * a single confirmation checks one — still pending, capability still granted — and each gets
+ * its own `confirmed` event citing the user's own message, so the ledger reads the same way
+ * whether one request was authorized or four.
+ */
+export function confirmEffectBatch(
+  db: Db,
+  ids: readonly number[],
+  batchHashToConfirm: string,
+  sourceMessageId: number,
+): ProposedEffectView[] {
+  return db.transaction((): ProposedEffectView[] => {
+    const effects = ids.map((id) => requireEffect(db, id));
+    if (effects.length === 0) throw new Error("Unknown external request");
+    for (const effect of effects) {
+      assertPending(effect);
+      if (effect.confirmation_kind === "standing_policy") {
+        throw new Error("This request was already authorized by your standing setting");
+      }
+    }
+    if (batchPayloadHash(effects) !== batchHashToConfirm) {
+      throw new Error("That confirmation does not match this exact set of external requests");
+    }
+    assertExactConfirmationMessage(db, sourceMessageId, batchHashToConfirm);
+    for (const effect of effects) {
+      const capability = getCapability(db, effect.connector_capability_id);
+      if (!capability || capability.enabled !== 1) {
+        throw new Error("The capability behind this request is no longer available");
+      }
+    }
+    for (const effect of effects) {
+      setStatus(db, effect.id, "confirmed");
+      appendEffectEvent(db, effect.id, "confirmed", sourceMessageId, {
+        batch_hash: batchHashToConfirm,
+        batch_size: effects.length,
+      });
+      logEvent({
+        event: "effect_confirmed",
+        outcome: "ok",
+        effect: effect.effect_kind,
+        effect_id: effect.id,
+        message_id: sourceMessageId,
+      });
+    }
+    return effects.map((effect) => requireView(db, effect.id));
   })();
 }
 
@@ -437,15 +573,11 @@ export async function executeConfirmedEffect(
     }
     finishConnectorCallReceipt(db, receiptId, "completed", null);
 
-    const reversal = reversalFor(capability.slot, result.value, effect);
+    // Nothing is prepared to take this back. Undoing a change is a request the user makes,
+    // through the same gates as any other — Zeus does not hold a second call in reserve.
     db.transaction(() => {
-      if (reversal) {
-        db.prepare<[string, string, number]>(
-          "UPDATE proposed_effect SET reversal_json = ?, updated_at = ? WHERE id = ?",
-        ).run(JSON.stringify(reversal), now(), id);
-      }
       setStatus(db, id, "executed");
-      appendEffectEvent(db, id, "executed", null, { reversible: reversal !== null });
+      appendEffectEvent(db, id, "executed", null, null);
     })();
     logEvent({
       event: "effect_executed",
@@ -520,47 +652,6 @@ function finishConnectorCallReceipt(
   ).run(status, errorCode, now(), receiptId);
 }
 
-/**
- * Undo an executed effect, where the connected service offers a way.
- *
- * A reversal is a fresh external call and therefore needs its own user message. Zeus does
- * not quietly clean up after itself.
- */
-export async function revertEffect(
-  db: Db,
-  id: number,
-  sourceMessageId: number,
-  options: { signal?: AbortSignal } = {},
-): Promise<ProposedEffectView> {
-  const effect = requireEffect(db, id);
-  if (effect.status !== "executed") {
-    throw new Error("Only an executed external request can be reverted");
-  }
-  assertUserMessage(db, sourceMessageId);
-  if (!effect.reversal_json) {
-    throw new Error("That connected service offers no way to undo this");
-  }
-  const reversal = JSON.parse(effect.reversal_json) as {
-    slot: CapabilitySlot;
-    payload: Record<string, unknown>;
-  };
-  const result = await callCapability(db, reversal.slot, reversal.payload, {
-    signal: options.signal,
-  });
-  if (result.isError) throw new Error("That connected service refused to undo the change");
-  db.transaction(() => {
-    setStatus(db, id, "reverted");
-    appendEffectEvent(db, id, "reverted", sourceMessageId, null);
-  })();
-  logEvent({
-    event: "effect_reverted",
-    outcome: "ok",
-    effect: effect.effect_kind,
-    effect_id: id,
-  });
-  return requireView(db, id);
-}
-
 export function effectEvents(db: Db, id: number): EffectEvent[] {
   return db
     .prepare<[number], EffectEvent>(
@@ -576,79 +667,6 @@ function fail(db: Db, id: number, errorCode: string): EffectExecutionResult {
     appendEffectEvent(db, id, "failed", null, { error_code: errorCode });
   })();
   return { effect: requireEffect(db, id), status: "failed", errorCode };
-}
-
-/**
- * What it would take to undo this — from the service's own answer, plus whatever Zeus read
- * beforehand.
- *
- * A created event is reversible because the service returns an id. An update is reversible
- * only because the calendar is now read before it is written: `prior_state_json` holds what
- * the cache said about the target moments earlier.
- *
- * That reversal is deliberately narrow. It restores only keys this payload actually set,
- * and only when the snapshot has a value for each of them, because the cache holds five
- * fields and nothing else. Attendees, description, recurrence, reminders, and conferencing
- * were never read and are not restored — and an un-cancelled event does not un-send the
- * cancellation notices. A partial undo offered as a complete one would be worse than none.
- */
-const REVERSIBLE_UPDATE_KEYS = ["start", "end", "status", "title", "location"] as const;
-
-function reversalFor(
-  slot: CapabilitySlot,
-  value: unknown,
-  effect: ProposedEffect,
-): { slot: CapabilitySlot; payload: Record<string, unknown> } | null {
-  if (slot === "calendar.create_event") {
-    const id = externalIdOf(value);
-    if (id === null) return null;
-    return { slot: "calendar.update_event", payload: { event_id: id, status: "cancelled" } };
-  }
-  if (slot !== "calendar.update_event") return null;
-
-  const prior = parseRecord(effect.prior_state_json);
-  const payload = parseRecord(effect.payload_json);
-  if (!prior || !payload) return null;
-  const eventId = payload.event_id;
-  if (typeof eventId !== "string" || eventId.length === 0) return null;
-
-  const changed = Object.keys(payload).filter((key) => key !== "event_id" && key !== "time_zone");
-  if (changed.length === 0) return null;
-  if (!changed.every((key) => (REVERSIBLE_UPDATE_KEYS as readonly string[]).includes(key))) {
-    return null;
-  }
-
-  const restore: Record<string, unknown> = { event_id: eventId };
-  for (const key of changed) {
-    // Un-cancelling is the one restoration the snapshot cannot supply, because a cached
-    // event is only ever cached while it is live.
-    const priorValue = key === "status" ? (prior.status ?? "confirmed") : prior[key];
-    if (priorValue === undefined || priorValue === null) return null;
-    restore[key] = priorValue;
-  }
-  return { slot: "calendar.update_event", payload: restore };
-}
-
-function parseRecord(value: string | null): Record<string, unknown> | null {
-  if (value === null) return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function externalIdOf(value: unknown): string | null {
-  if (value === null || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  for (const key of ["id", "event_id", "eventId"]) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.length > 0) return candidate;
-  }
-  return null;
 }
 
 function setStatus(db: Db, id: number, status: ProposedEffect["status"]): void {
@@ -745,7 +763,6 @@ function view(db: Db, row: ProposedEffect): ProposedEffectView {
   return {
     ...row,
     payload: JSON.parse(row.payload_json),
-    reversal: row.reversal_json === null ? null : JSON.parse(row.reversal_json),
     capability,
     connector,
     events: effectEvents(db, row.id),
