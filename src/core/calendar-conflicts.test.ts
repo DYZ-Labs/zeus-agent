@@ -6,6 +6,7 @@ import {
   findFreeSlots,
   MAX_COVERAGE_AGE_MS,
   MAX_NEAR_MISSES,
+  overlappingPairs,
   resolveTargetEvent,
 } from "./calendar-conflicts";
 import type { CalendarCoverage, CandidateEvent } from "./calendar-conflicts";
@@ -465,5 +466,62 @@ describe("resolving which event the user meant", () => {
       dateLocal: "2026-08-19",
     }, { timezone: "Asia/Tokyo", now: NOW });
     expect(result).toMatchObject({ status: "resolved" });
+  });
+});
+
+/**
+ * Collisions the user already has, as opposed to one Zeus is about to cause.
+ *
+ * The same rule and the same grace window as `findConflicts`, so a clash Zeus reports when
+ * asked in chat is the clash it would have refused to create — and the clash the background
+ * detector would have raised on its own.
+ */
+describe("clashes already on the calendar", () => {
+  it("finds two events claiming the same minutes", () => {
+    const pairs = overlappingPairs([
+      event({ external_id: "a", starts_at: "2026-08-17T13:00:00.000Z", ends_at: "2026-08-17T14:00:00.000Z" }),
+      event({ external_id: "b", starts_at: "2026-08-17T13:30:00.000Z", ends_at: "2026-08-17T14:30:00.000Z" }),
+    ]);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]?.first.external_id).toBe("a");
+    expect(pairs[0]?.second.external_id).toBe("b");
+  });
+
+  it("leaves back-to-back meetings alone, the same as the write gate does", () => {
+    expect(
+      overlappingPairs([
+        event({ external_id: "a", starts_at: "2026-08-17T13:00:00.000Z", ends_at: "2026-08-17T14:00:00.000Z" }),
+        event({ external_id: "b", starts_at: "2026-08-17T14:00:00.000Z", ends_at: "2026-08-17T15:00:00.000Z" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("reports every colliding pair when one event swallows several", () => {
+    const pairs = overlappingPairs([
+      event({ external_id: "all-day", starts_at: "2026-08-17T09:00:00.000Z", ends_at: "2026-08-17T18:00:00.000Z" }),
+      event({ external_id: "standup", starts_at: "2026-08-17T10:00:00.000Z", ends_at: "2026-08-17T10:15:00.000Z" }),
+      event({ external_id: "review", starts_at: "2026-08-17T11:00:00.000Z", ends_at: "2026-08-17T12:00:00.000Z" }),
+    ]);
+    expect(pairs.map((pair) => `${pair.first.external_id}/${pair.second.external_id}`)).toEqual([
+      "all-day/standup",
+      "all-day/review",
+    ]);
+  });
+
+  it("treats an event with no end the way everything else does", () => {
+    // An hour, per ASSUMED_DURATION_MS — long enough to collide with the next thing.
+    expect(
+      overlappingPairs([
+        event({ external_id: "a", starts_at: "2026-08-17T13:00:00.000Z" }),
+        event({ external_id: "b", starts_at: "2026-08-17T13:30:00.000Z" }),
+      ]),
+    ).toHaveLength(1);
+  });
+
+  it("finds nothing in an empty or single-event calendar", () => {
+    expect(overlappingPairs([])).toEqual([]);
+    expect(
+      overlappingPairs([event({ external_id: "a", starts_at: "2026-08-17T13:00:00.000Z" })]),
+    ).toEqual([]);
   });
 });

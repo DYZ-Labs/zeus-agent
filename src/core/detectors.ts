@@ -1,11 +1,12 @@
 import { cachedEvents } from "./calendar-sync";
+import { overlappingPairs } from "./calendar-conflicts";
 import {
   clock,
   endOf,
   label,
   mentions,
   normalizedPlace,
-  OVERLAP_GRACE_MS,
+  startOf,
 } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
 import type { Db } from "./db";
@@ -121,34 +122,26 @@ export function signalSubject(signal: DetectedSignal): Record<string, unknown> {
 }
 
 
-/** Two events claiming the same minutes. The most checkable observation there is. */
+/**
+ * Two events claiming the same minutes. The most checkable observation there is.
+ *
+ * The pairing itself comes from `overlappingPairs`, so a collision Zeus raises unprompted and
+ * one it reports when asked in chat are found by the same rule. This adds only the wording.
+ */
 function detectCalendarOverlaps(events: readonly CachedEvent[]): Draft[] {
-  const drafts: Draft[] = [];
-  for (let index = 0; index < events.length; index += 1) {
-    const first = events[index];
-    if (!first) continue;
-    const firstEnd = endOf(first);
-    for (let other = index + 1; other < events.length; other += 1) {
-      const second = events[other];
-      if (!second) continue;
-      const secondStart = Date.parse(second.starts_at);
-      if (secondStart >= firstEnd - OVERLAP_GRACE_MS) break;
-      drafts.push({
-        detector: "calendar_overlap",
-        dedupeKey: `calendar_overlap:${first.external_id}:${second.external_id}`,
-        subject: { event_ids: [first.external_id, second.external_id] },
-        commitmentId: null,
-        severity: 70,
-        why:
-          `${label(first)} runs until ${clock(firstEnd)} and ${label(second)} starts at ` +
-          `${clock(secondStart)}.`,
-        suggestedAction: `Decide which of ${label(first)} and ${label(second)} to move.`,
-        effectKind: "modify_external",
-        occursAt: second.starts_at,
-      });
-    }
-  }
-  return drafts;
+  return overlappingPairs(events).map(({ first, second }) => ({
+    detector: "calendar_overlap" as const,
+    dedupeKey: `calendar_overlap:${first.external_id}:${second.external_id}`,
+    subject: { event_ids: [first.external_id, second.external_id] },
+    commitmentId: null,
+    severity: 70,
+    why:
+      `${label(first)} runs until ${clock(endOf(first))} and ${label(second)} starts at ` +
+      `${clock(startOf(second))}.`,
+    suggestedAction: `Decide which of ${label(first)} and ${label(second)} to move.`,
+    effectKind: "modify_external" as const,
+    occursAt: second.starts_at,
+  }));
 }
 
 /**

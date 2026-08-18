@@ -2026,6 +2026,31 @@ WHERE enabled = 0
   );
 `;
 
+/**
+ * Clearing a window is a fourth kind of calendar request.
+ *
+ * `calendar_outcome.kind` pinned the three single-event actions plus a read, so a bulk clear
+ * could not be recorded at all — and an outcome that cannot be stored is one a later turn
+ * cannot recall, which is the whole failure this table exists to prevent. SQLite cannot widen
+ * a CHECK in place, so the table is rebuilt and copied.
+ */
+const CALENDAR_CLEAR_OUTCOME_KIND = `
+ALTER TABLE calendar_outcome RENAME TO calendar_outcome_clear_legacy;
+CREATE TABLE calendar_outcome (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  kind                 TEXT NOT NULL
+                       CHECK (kind IN ('create','reschedule','cancel','clear','read')),
+  status               TEXT NOT NULL,
+  outcome_json         TEXT NOT NULL,
+  created_at           TEXT NOT NULL
+);
+INSERT INTO calendar_outcome
+  (assistant_message_id, kind, status, outcome_json, created_at)
+SELECT assistant_message_id, kind, status, outcome_json, created_at
+FROM calendar_outcome_clear_legacy;
+DROP TABLE calendar_outcome_clear_legacy;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2058,4 +2083,5 @@ export const MIGRATIONS: readonly Migration[] = [
     id: "028_connector_reachability_is_not_consent",
     sql: CONNECTOR_REACHABILITY_IS_NOT_CONSENT,
   },
+  { id: "029_calendar_clear_outcome_kind", sql: CALENDAR_CLEAR_OUTCOME_KIND },
 ];

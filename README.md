@@ -81,7 +81,10 @@ contextual follow-through.
   short-lived named coarse zones, deterministic background evaluation, and no model call
   in the worker.
 - A local-first guided Google Calendar connection plus advanced custom MCP servers, with
-  per-capability grants, live input-schema hashes, and no stored credentials.
+  per-capability grants, live input-schema hashes, and no stored credentials. Ask in plain
+  words to add, move, cancel, or clear a window, or to check what clashes; Zeus reads the
+  calendar first, answers in ordinary sentences rather than a status panel, and keeps a
+  deterministic record of what it did that later turns can still cite.
 - Deterministic detection of calendar overlaps, tight turnarounds, deadline collisions, and
   unscheduled commitments, delivered through the same gates as every other interruption.
 - A **Today** view with one best current action, external requests awaiting your
@@ -688,6 +691,13 @@ resources. A selected write permission lets Zeus carry out changes you ask for o
 read your calendar and found the time free; anything it cannot verify still stops at the
 exact-payload confirmation gate.
 
+That gate lives in the conversation. When a change needs your word — the time is taken, the
+calendar could not be read, or you asked to clear a whole window — Zeus explains why and puts
+the exact confirmation line in your message box. Sending it is what authorizes the change, so
+the message naming the payload is genuinely yours; saying "yes, go ahead" without it does
+nothing, and a plain "no" drops the request. Clearing a window always asks, whatever your
+standing setting says, and lists every event it would cancel first.
+
 ## MCP integration
 
 Zeus exposes the same database through a stdio MCP server. A generic client
@@ -876,7 +886,10 @@ What is sent to a connected service:
 - Only the calls a capability you granted permits: a bounded read of your calendar window,
   and exactly the payload recorded in `proposed_effect` — after you confirmed it by its
   hash, or after the conflict gate cleared it under the standing setting you enabled. The
-  effect page always says which of the two authorized it.
+  effect page always says which of the two authorized it. Clearing a window prepares one
+  payload per event and takes one confirmation over a digest of all of them; the digest is
+  recomputed from storage before anything is sent, so an edited or added payload fails
+  closed.
 - Nothing else. A connector never receives your memory, your transcripts, or any
   environment variable you did not name for it.
 
@@ -898,7 +911,7 @@ commit them.
   restored, and un-cancelling does not recall the notices already sent.
 - The conflict check is only as good as the calendar Zeus can see. It reads your primary
   calendar; a secondary or shared calendar it was never granted is invisible to it. The
-  chat card says how many events it checked, so the scope of the check is visible rather
+  reply says how many events it checked, so the scope of the check is visible rather
   than implied.
 - Detectors read only your calendar and your accepted commitments. They notice overlapping
   events, tight turnarounds between different places, deadlines on already-full days, and

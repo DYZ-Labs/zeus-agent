@@ -9,7 +9,13 @@
  * The value is less in policing the model — nothing here runs on a reply — than in
  * pinning the copy Zeus ships with. Every fixed sentence the user reads is code, and code
  * drifts back toward "Zeus could not…" one edit at a time unless something fails when it
- * does. `styleViolations` is what the copy tests assert against.
+ * does.
+ *
+ * It currently pins nothing. The calendar card copy was its one consumer, and the cards are
+ * gone: the reply is the whole surface now, and no offline check can judge a sentence a model
+ * wrote. Kept rather than deleted because the next piece of fixed user-facing copy should be
+ * swept by it — put such copy in a module a test can import, and point the sweep at it,
+ * rather than inlining it in a component where nothing will ever notice it drifting.
  *
  * Deliberately conservative: a rule that fires on ordinary prose is a rule someone
  * disables. Each pattern below is scoped tightly enough to be worth trusting.

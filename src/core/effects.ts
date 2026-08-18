@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { confirmationSentence } from "./confirmation-text";
 import { availableCapability, getCapability, getConnector } from "./connectors";
 import type { ConnectorView } from "./connectors";
 import type { Db } from "./db";
@@ -32,6 +33,13 @@ import type {
  * - `standing_policy` — a calendar action the user enabled direct execution for, which a
  *   deterministic conflict check cleared against a freshly read window. The row cites the
  *   user's actual request. It is not a confirmation and is never recorded as one.
+ *
+ * A step that prepares several payloads at once — clearing a window is the only one that
+ * does — is confirmed by `confirmEffectBatch`, over a hash computed from every member. That
+ * is still `user_message`: still the user's own message, still naming a digest of the exact
+ * bytes, still recomputed from storage before dispatch so an edited payload fails closed. The
+ * guarantee is unchanged; it is stated once for a set instead of once per row, because
+ * itemising a cleared afternoon into four separate confirmations is not more informed consent.
  *
  * Either way, execution sends those bytes and no others: the hash is recomputed from
  * storage immediately before dispatch, so an edited payload fails closed.
@@ -91,6 +99,8 @@ const SELECT_EFFECT = `
          idempotency_key, provider_request_key, expires_at, created_at, updated_at
   FROM proposed_effect
 `;
+
+export { confirmationSentence };
 
 /** Canonical digest of what would be sent. Key order must not change it. */
 export function payloadHash(
@@ -255,6 +265,131 @@ export function confirmEffect(
       message_id: sourceMessageId,
     });
     return requireView(db, id);
+  })();
+}
+
+/**
+ * The digest a message must name to authorize a whole prepared set.
+ *
+ * Order-independent by construction: the member hashes are sorted before digesting, so the
+ * value depends on the payloads and on nothing else. Add, remove, or edit a payload and the
+ * digest changes, which is what lets the check be recomputed from storage at confirmation
+ * time rather than trusted from whatever produced it.
+ *
+ * A single-member set returns that member's own hash, so there is one string in the product
+ * and one sentence in the composer whether the user is moving one meeting or clearing four.
+ */
+export function batchPayloadHash(effects: readonly { payload_hash: string }[]): string | null {
+  if (effects.length === 0) return null;
+  if (effects.length === 1) return effects[0]?.payload_hash ?? null;
+  const members = effects.map((effect) => effect.payload_hash).sort();
+  return createHash("sha256").update(`batch\n${members.join("\n")}`).digest("hex");
+}
+
+/**
+ * The confirmation still owed, if any, as the one line that would settle it.
+ *
+ * The composer is the only affordance a prose-only chat has for authorizing a change, and it
+ * is emptied every time the user sends anything else. Recomputed from the live pending rows
+ * on every turn and after every reload, so the offer is present for exactly as long as there
+ * is something to accept — otherwise a reply saying "the line is in your message box" is
+ * describing a box that no longer holds it.
+ */
+export function pendingConfirmationOffer(
+  db: Db,
+  options: { at?: Date } = {},
+): { hash: string; count: number } | null {
+  const pending = listPendingEffects(db, options);
+  if (pending.length === 0) return null;
+  // The newest run's set: one step prepares them together and one line confirms them together.
+  const newestRun = Math.max(...pending.map((effect) => effect.work_run_id));
+  const group = pending.filter((effect) => effect.work_run_id === newestRun);
+  const hash = batchPayloadHash(group);
+  return hash === null ? null : { hash, count: group.length };
+}
+
+/**
+ * The pending set a user message authorizes, if any.
+ *
+ * Matching on the stored hash rather than on the sentence around it: the phrasing is the
+ * user's, the digest is ours, and only the digest decides. A message that names no live hash
+ * matches nothing and is an ordinary chat turn.
+ */
+export function pendingEffectsForConfirmation(
+  db: Db,
+  content: string,
+  options: { at?: Date } = {},
+): { effects: ProposedEffectView[]; hash: string } | null {
+  const pending = listPendingEffects(db, options);
+  if (pending.length === 0) return null;
+
+  const single = pending.find((effect) => content.includes(effect.payload_hash));
+  if (single) return { effects: [single], hash: single.payload_hash };
+
+  // Grouped by run, because that is the unit a step prepares: one cleared window, one hash.
+  const byRun = new Map<number, ProposedEffectView[]>();
+  for (const effect of pending) {
+    const group = byRun.get(effect.work_run_id) ?? [];
+    group.push(effect);
+    byRun.set(effect.work_run_id, group);
+  }
+  for (const group of byRun.values()) {
+    const hash = batchPayloadHash(group);
+    if (hash !== null && content.includes(hash)) return { effects: group, hash };
+  }
+  return null;
+}
+
+/**
+ * Accept every payload one step prepared, on one confirmation.
+ *
+ * Deliberately not `confirmEffect` in a loop over a hash the caller supplies. The digest is
+ * recomputed here from the rows as they stand, so a payload edited or added after the user
+ * read the list no longer matches and nothing is sent. Each member is then checked exactly as
+ * a single confirmation checks one — still pending, capability still granted — and each gets
+ * its own `confirmed` event citing the user's own message, so the ledger reads the same way
+ * whether one request was authorized or four.
+ */
+export function confirmEffectBatch(
+  db: Db,
+  ids: readonly number[],
+  batchHashToConfirm: string,
+  sourceMessageId: number,
+): ProposedEffectView[] {
+  return db.transaction((): ProposedEffectView[] => {
+    const effects = ids.map((id) => requireEffect(db, id));
+    if (effects.length === 0) throw new Error("Unknown external request");
+    for (const effect of effects) {
+      assertPending(effect);
+      if (effect.confirmation_kind === "standing_policy") {
+        throw new Error("This request was already authorized by your standing setting");
+      }
+    }
+    if (batchPayloadHash(effects) !== batchHashToConfirm) {
+      throw new Error("That confirmation does not match this exact set of external requests");
+    }
+    assertExactConfirmationMessage(db, sourceMessageId, batchHashToConfirm);
+    for (const effect of effects) {
+      const capability = getCapability(db, effect.connector_capability_id);
+      if (!capability || capability.enabled !== 1) {
+        throw new Error("The capability behind this request is no longer available");
+      }
+    }
+    for (const effect of effects) {
+      setStatus(db, effect.id, "confirmed");
+      appendEffectEvent(db, effect.id, "confirmed", sourceMessageId, {
+        batch_hash: batchHashToConfirm,
+        batch_size: effects.length,
+      });
+      logEvent({
+        event: "effect_confirmed",
+        outcome: "ok",
+        effect: effect.effect_kind,
+        effect_id: effect.id,
+        message_id: sourceMessageId,
+      });
+    }
+    return effects.map((effect) => requireView(db, effect.id));
   })();
 }
 
