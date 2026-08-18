@@ -5,7 +5,6 @@ import {
   declineEffect,
   executeConfirmedEffect,
   getProposedEffect,
-  revertEffect,
 } from "@/core/effects";
 import { appendMessage, createConversation, listConversations } from "@/core/conversations";
 import { createSafeWorkExecutor } from "@/core/work-execution";
@@ -28,7 +27,7 @@ export const maxDuration = 300;
  */
 const Body = z
   .object({
-    action: z.enum(["confirm", "decline", "revert"]),
+    action: z.enum(["confirm", "decline"]),
     payloadHash: z.string().regex(/^[0-9a-f]{64}$/u).optional(),
   })
   .strict();
@@ -53,15 +52,6 @@ export async function POST(
   if (!effect) return Response.json({ error: "Unknown external request." }, { status: 404 });
 
   try {
-    if (parsed.data.action === "revert") {
-      if (effect.status !== "executed") {
-        return Response.json({ error: "Only a completed change can be undone." }, { status: 409 });
-      }
-      const source = decisionMessage(access.db, `Undo this external change: ${effect.preview_text}`);
-      await revertEffect(access.db, id, source.id);
-      return Response.json({ effect: getProposedEffect(access.db, id), outcome: "reverted" });
-    }
-
     if (effect.status !== "pending_confirmation") {
       return Response.json({ error: "That request has already been decided." }, { status: 409 });
     }

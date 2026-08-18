@@ -116,7 +116,7 @@ npm run mcp            # stdio MCP server
 - `src/core/calendar-policy.ts` — the standing direct-execution setting and its ceiling.
 - `src/core/calendar-outcome.ts` — the deterministic account of what a calendar request did,
   stored with its assistant turn so a reload does not leave prose as the only record. Always
-  recorded; rendered only for a write.
+  recorded; rendered only for a write that did not go through.
 - `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
   `<capabilities>` block. Never memory.
 - `src/core/calendar-sync.ts` — the disposable external read cache, and the turn-start
@@ -235,8 +235,8 @@ from the assistant's own text.
 
 Measure assisted progress, control signals, and regret separately. Do not replace them with
 conversation count, time spent, tasks surfaced, or a composite engagement score that could
-reward interruption. Declines and reversals of external requests are regret signals and
-must stay separately visible.
+reward interruption. Declining an external request is a regret signal and must stay
+separately visible.
 
 ### Detected signals are proposals too
 
@@ -496,18 +496,40 @@ like, not a person who knows you.
 - The chat renders plain text: blank lines become paragraphs via `AssistantProse`, and
   there is no Markdown parser. If you relax the no-Markdown rule in the prompt, ship a
   renderer in the same change or users will read literal asterisks.
-- A card and the prose must not narrate the same status twice. The card is deterministic
-  and survives a reload; the prose says the human version once and leaves the particulars
-  to the panel.
-- A read gets no card. `CalendarActionCard` returns null for `kind: "read"`, and
-  `CalendarCardKind` excludes it so writing copy for one is a build error. Nothing changed,
-  so there is no receipt to put under the answer — and read-shaped refusals (nothing
-  connected, a calendar needing reconnection, a request that could not be classified) go
-  with it, which is why the prompt tells the model that a read result has no panel and its
-  reply must carry the whole answer. The `calendar_outcome` row is still written; only the
-  rendering is gone. The suppression lives inside the card rather than at the render site
-  in `chat.tsx`, because that ternary falls through to `WorkPlanCard` — which would list the
-  very read steps the card was hiding.
+- A card and the prose must not narrate the same status twice, and once a change goes
+  through there is no card to narrate it with. The card is the deterministic record of
+  something that did *not* happen and survives a reload; the reply is the only account of
+  something that did, so it names what changed rather than deferring to a panel that is not
+  there.
+- A card means something did not happen. `CalendarActionCard` returns null whenever
+  `rendersCard` says so — any read, and any completed create, reschedule, or cancel. A read
+  changed nothing, so there is no receipt to put under the answer, and read-shaped refusals
+  (nothing connected, a calendar needing reconnection, a request that could not be
+  classified) go with it, because the reply already has to say what is missing and where to
+  change it. A completed write does have a receipt, but it belongs on `/today` and
+  `/effects/<id>` rather than under every reply — which is why the prompt tells the model
+  that a completed change and a read both have no panel beneath them and its reply has to
+  carry the whole answer, drawing the particulars from `what_it_did`. `rendersCard` is a
+  type predicate, so past it the card cannot index copy by `read` and cannot write a branch
+  for `done` at all; both are build errors rather than regressions someone notices in
+  conversation. The `calendar_outcome` row is written in every case; only the rendering is
+  conditional. The suppression lives inside the card rather than at the render site in
+  `chat.tsx`, because that ternary falls through to `WorkPlanCard` — which would list the
+  very steps the card was hiding.
+- The one exception is a panel answering its own buttons. Confirming or declining in chat
+  streams no new assistant turn, so the panel that asked has to say what became of the click
+  or the two would look identical: the card simply gone, above prose saying nothing had been
+  sent yet. `CARD_COPY.sent` and `CARD_COPY.nothingWasSent` are deliberately bare — what
+  changed is the reply's to say, and repeating it under the reply is the same status
+  narrated twice. Do not grow them into a headline, a preview, or a receipt link.
+- There is no undo. A calendar write is proposed, gated, sent, and recorded; putting it back
+  is a new request through the same gates, in the user's own words. Zeus does not clean up
+  after itself with a call nobody asked for. `proposed_effect.reversal_json`,
+  `status = 'reverted'`, and `effect_event.event_type = 'reverted'` stay in the schema and in
+  the Zod enums so rows written before this still read back and still label themselves
+  "undone"; nothing writes them now. `prior_state_json` stays too, and its reason changed: it
+  is the audit record of what an event looked like before Zeus changed it, shown on the
+  receipt.
 - Fixed user-facing copy speaks in the first person and lives in
   `src/components/calendar-card-copy.ts`, swept by `styleViolations`
   (`src/core/response-style.ts`). Add new card copy there, not inline in a component.

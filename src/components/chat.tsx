@@ -14,8 +14,8 @@ import {
   TARGET_NOT_FOUND,
   UNVERIFIABLE,
   UNVERIFIABLE_FALLBACK,
-  VERB,
   WORK_CARD_COPY,
+  rendersCard,
 } from "@/components/calendar-card-copy";
 import {
   CHAT_UPDATED_EVENT,
@@ -35,9 +35,10 @@ export type ChatHistoryTurn = {
   role: "user" | "assistant";
   text: string;
   /**
-   * How a calendar request ended. Stored with the turn, so the deterministic account of what
-   * happened survives a reload — otherwise the only durable record is the model's prose,
-   * which is the part this whole card exists to not depend on.
+   * How a calendar request ended. Stored with the turn, so the deterministic account of
+   * everything Zeus did *not* do survives a reload rather than resting on the model's prose.
+   * A change that went through is the deliberate exception: it renders no card, so there the
+   * reply is the account and the receipt is the durable copy.
    */
   calendar?: CalendarOutcome | null;
 };
@@ -59,13 +60,6 @@ type Turn = ChatHistoryTurn & {
       expiresAt: string;
       capabilitySlot: string;
       connectorLabel: string;
-    }>;
-    completedEffects?: Array<{
-      id: number;
-      previewText: string;
-      connectorLabel: string;
-      authorizedByPolicy: boolean;
-      reversible: boolean;
     }>;
   };
   /** Set on the assistant turn once the stream closes. */
@@ -549,10 +543,11 @@ function AssistantTurn({
           />
         )}
         {/*
-          A read renders nothing, and the card decides that for itself rather than this
-          ternary deciding it: an outcome exists for every calendar request, so this branch
-          must keep being taken. Testing `calendar.kind` here instead would fall through to
-          the read's own WorkPlanCard, which lists the very steps the card was hiding.
+          A read and a completed change both render nothing, and the card decides that for
+          itself rather than this ternary deciding it: an outcome exists for every calendar
+          request, so this branch must keep being taken. Testing `calendar.kind` or
+          `calendar.status` here instead would fall through to that request's own
+          WorkPlanCard, which lists the very steps the card was hiding.
         */}
         {calendar ? (
           <CalendarActionCard workPlan={workPlan} outcome={calendar} onReply={onReply} />
@@ -565,7 +560,11 @@ function AssistantTurn({
 }
 
 /**
- * What Zeus did to the calendar, or why it did not.
+ * Why Zeus did not change the calendar, and what would settle it.
+ *
+ * Only that. A change that went through renders nothing here — the reply is the account of
+ * it, and the receipt on `/today` is the durable copy — so everything below is a collision,
+ * a question, or a refusal.
  *
  * Everything here is rendered from the deterministic outcome rather than from the
  * assistant's prose, so the card cannot claim something the run did not do. Choosing an
@@ -583,13 +582,12 @@ function CalendarActionCard({
   outcome: CalendarOutcome;
   onReply: (text: string) => void;
 }) {
-  const [decided, setDecided] = useState<"executed" | "declined" | "reverted" | null>(null);
-  const [busy, setBusy] = useState<"confirm" | "decline" | "revert" | null>(null);
+  const [decided, setDecided] = useState<"executed" | "declined" | null>(null);
+  const [busy, setBusy] = useState<"confirm" | "decline" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const done = workPlan?.completedEffects ?? [];
   const pending = workPlan?.pendingEffects[0];
 
-  async function decide(action: "confirm" | "decline" | "revert", effectId: number, hash?: string) {
+  async function decide(action: "confirm" | "decline", effectId: number, hash?: string) {
     if (busy) return;
     setBusy(action);
     setActionError(null);
@@ -606,7 +604,9 @@ function CalendarActionCard({
       if (!response.ok || !body?.outcome) {
         throw new Error(body?.error ?? "That action could not be completed.");
       }
-      if (body.outcome === "executed" || body.outcome === "declined" || body.outcome === "reverted") {
+      // A failed execute leaves `decided` null on purpose: nothing happened, so the card
+      // stays and `actionError` says why. The rule holds — a card means it did not happen.
+      if (body.outcome === "executed" || body.outcome === "declined") {
         setDecided(body.outcome);
       } else {
         throw new Error("The change did not go through.");
@@ -618,14 +618,24 @@ function CalendarActionCard({
     }
   }
 
-  // A read changed nothing, so there is no receipt to put under the reply. Read-shaped
-  // refusals go with it — nothing connected, a calendar that needs reconnecting, a request
-  // that could not be classified — because the reply already has to say what is missing and
-  // where to change it. The calendar_outcome row is still written either way, so what
-  // happened stays recorded; only the rendering is gone. Placed below the hooks so they
-  // still run unconditionally.
-  if (outcome.kind === "read") return null;
+  // A card is the record of a change that did not happen. A completed create, reschedule,
+  // or cancel renders nothing: the reply is the account of it, and the receipt on /today is
+  // the durable copy. A read renders nothing either — nothing changed, so there is no
+  // receipt to put under the answer — and read-shaped refusals go with it, because the
+  // reply already has to say what is missing and where to change it. The calendar_outcome
+  // row is written in every case, so what happened stays recorded; only the rendering is
+  // conditional. Placed below the hooks so they still run unconditionally, and inside the
+  // component rather than at the render site in chat.tsx, because that ternary falls
+  // through to WorkPlanCard — which would list the very steps this card was hiding.
+  if (!rendersCard(outcome)) return null;
 
+  // A panel that asked has to answer its own buttons. Nothing else is streamed after a
+  // decision — no new assistant turn follows the click — so without this, confirming and
+  // declining would look identical from the outside: the panel simply gone, above prose
+  // written a moment earlier saying nothing had been sent yet.
+  //
+  // This is the one place a card reports that something happened, and it stays deliberately
+  // bare. What changed is the reply's to say; this says only that the request went.
   if (decided) {
     return (
       <aside
@@ -634,15 +644,17 @@ function CalendarActionCard({
         aria-label="Calendar change"
       >
         <p className="text-[0.85rem] leading-6">
-          {decided === "executed"
-            ? `Done. ${pending?.previewText ?? VERB[outcome.kind]}.`
-            : decided === "reverted"
-              ? CARD_COPY.undone
-              : CARD_COPY.nothingWasSent}
+          {decided === "executed" ? CARD_COPY.sent : CARD_COPY.nothingWasSent}
         </p>
       </aside>
     );
   }
+
+  // Awaiting confirmation with no pending request in hand means this turn was rehydrated
+  // after a reload, which does not restore the work plan. Zeus cannot tell from here
+  // whether the user went on to confirm, so it says nothing rather than reporting that it
+  // stopped — which would be a flat contradiction of a change that did go through.
+  if (outcome.status === "awaiting_confirmation" && !pending) return null;
 
   return (
     <aside
@@ -650,46 +662,7 @@ function CalendarActionCard({
       style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
       aria-label="Calendar change"
     >
-      {outcome.status === "done" ? (
-        <>
-          <p className="text-[0.85rem] font-medium leading-6">
-            {VERB[outcome.kind]}
-            {done[0] ? ` — ${done[0].previewText}` : "."}
-          </p>
-          {outcome.consideredEvents !== null && (
-            <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
-              Checked {outcome.consideredEvents}{" "}
-              {outcome.consideredEvents === 1 ? "event" : "events"} {CARD_COPY.checkedFirst}
-            </p>
-          )}
-          {done[0] && (
-            <div className="mt-3 flex flex-wrap items-center gap-4 text-[0.75rem]">
-              <a
-                href={`/effects/${done[0].id}`}
-                className="underline underline-offset-2"
-                style={{ color: "var(--shell-muted)" }}
-              >
-                Receipt
-              </a>
-              {done[0].reversible && (
-                <button
-                  type="button"
-                  disabled={busy !== null}
-                  onClick={() => void decide("revert", done[0]!.id)}
-                  className="underline underline-offset-2 disabled:opacity-50"
-                  style={{ color: "var(--shell-muted)" }}
-                >
-                  {busy === "revert"
-                    ? "Undoing…"
-                    : outcome.kind === "cancel"
-                      ? "Restore this event"
-                      : "Undo"}
-                </button>
-              )}
-            </div>
-          )}
-        </>
-      ) : outcome.status === "blocked_by_conflict" ? (
+      {outcome.status === "blocked_by_conflict" ? (
         <>
           <p className="text-[0.85rem] font-medium leading-6">
             {NOT_DONE[outcome.kind]} — {CARD_COPY.blockedByConflict}

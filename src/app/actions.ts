@@ -40,7 +40,6 @@ import {
   declineEffect,
   executeConfirmedEffect,
   getProposedEffect,
-  revertEffect,
 } from "@/core/effects";
 import { ConnectorError, probeConnectorPreset, verifyConnector } from "@/core/mcp-client";
 import { createSafeWorkExecutor } from "@/core/work-execution";
@@ -1153,21 +1152,6 @@ export async function declineEffectAction(formData: FormData): Promise<void> {
   if (!effect || effect.status !== "pending_confirmation") return;
   const source = curationMessage(db, `Do not send this external request: ${effect.preview_text}`);
   declineEffect(db, id, source.id, reason || undefined);
-  revalidatePath("/today");
-}
-
-export async function revertEffectAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
-  if (!Number.isInteger(id)) return;
-  const db = await requireOwnerDb();
-  const effect = getProposedEffect(db, id);
-  if (!effect || effect.status !== "executed") return;
-  const source = curationMessage(db, `Undo this external change: ${effect.preview_text}`);
-  try {
-    await revertEffect(db, id, source.id);
-  } catch (error) {
-    redirect(`/today?effect_error=${encodeURIComponent(connectorErrorMessage(error))}#confirmations`);
-  }
   revalidatePath("/today");
 }
 

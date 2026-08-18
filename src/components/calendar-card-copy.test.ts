@@ -9,10 +9,11 @@ import {
   TARGET_NOT_FOUND,
   UNVERIFIABLE,
   UNVERIFIABLE_FALLBACK,
-  VERB,
   WORK_CARD_COPY,
+  rendersCard,
 } from "@/components/calendar-card-copy";
 import { describeViolations, styleViolations } from "@/core/response-style";
+import { CalendarOutcome } from "@/core/schema";
 
 /**
  * The cards are the densest concentration of fixed copy Zeus ships, and they used to be
@@ -27,7 +28,6 @@ function everyString(): Array<[string, string]> {
       value,
     ]),
     ["CLARIFICATION_FALLBACK", CLARIFICATION_FALLBACK],
-    ...Object.entries(VERB).map(([key, value]): [string, string] => [`VERB.${key}`, value]),
     ...Object.entries(NOT_DONE).map(([key, value]): [string, string] => [
       `NOT_DONE.${key}`,
       value,
@@ -67,18 +67,50 @@ describe("calendar card copy", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("covers every outcome kind that has a card, so none falls through to a blank verb", () => {
-    // The Record types make this exhaustive at compile time; this catches an empty string
-    // slipped in to satisfy the type, and keeps the two maps from drifting apart.
-    // No `read`: a read changed nothing and renders no card, so a verb for it would be copy
-    // the user can never see, and CalendarCardKind makes writing one a build error.
-    expect(Object.keys(VERB).sort()).toEqual(["cancel", "create", "reschedule"]);
-    expect(Object.keys(NOT_DONE).sort()).toEqual(Object.keys(VERB).sort());
-    for (const [kind, verb] of Object.entries(VERB)) {
-      expect(verb, `VERB.${kind}`).not.toBe("");
-      // The card is the durable record of whether a change happened. If these ever
-      // collide, an awaiting_confirmation turn reads as a completed one after a reload.
-      expect(NOT_DONE[kind as keyof typeof NOT_DONE], `NOT_DONE.${kind}`).not.toBe(verb);
+  it("covers every write kind, and only ever headlines a change that did not happen", () => {
+    // The Record type makes this exhaustive at compile time; this catches an empty string
+    // slipped in to satisfy it. No `read`: a read changed nothing and renders no card, so
+    // copy for it could never be seen, and CalendarCardKind makes writing some a build error.
+    expect(Object.keys(NOT_DONE).sort()).toEqual(["cancel", "create", "reschedule"]);
+    for (const [kind, text] of Object.entries(NOT_DONE)) {
+      expect(text, `NOT_DONE.${kind}`).not.toBe("");
+      // There is no success verb any more, so this map is the only headline a card can
+      // show. A string here that could read as a completed change is the failure the old
+      // VERB/NOT_DONE collision check guarded against, one layer closer to the user.
+      expect(text, `NOT_DONE.${kind}`).toMatch(/^Not /u);
+    }
+  });
+});
+
+/**
+ * The card's whole reason to exist, in the one form a node-only suite can hold.
+ *
+ * `CalendarActionCard` lives in a `.tsx` file the runner never loads and there is no DOM to
+ * render it into, so this predicate is the only part of the rule a test can reach. Driving
+ * it off the Zod enums rather than a hand-written list means a status added later fails here
+ * until someone decides which side of the rule it belongs on.
+ */
+describe("a card appears only when something did not happen", () => {
+  const KINDS = CalendarOutcome.shape.kind.options;
+  const STATUSES = CalendarOutcome.shape.status.options;
+
+  it("shows nothing once the change went through", () => {
+    for (const kind of KINDS) {
+      expect(rendersCard({ kind, status: "done" }), `${kind}/done`).toBe(false);
+    }
+  });
+
+  it("shows nothing for a read, whatever became of it", () => {
+    for (const status of STATUSES) {
+      expect(rendersCard({ kind: "read", status }), `read/${status}`).toBe(false);
+    }
+  });
+
+  it("shows a card for every write that did not go through, so none goes unreported", () => {
+    for (const kind of KINDS.filter((entry) => entry !== "read")) {
+      for (const status of STATUSES.filter((entry) => entry !== "done")) {
+        expect(rendersCard({ kind, status }), `${kind}/${status}`).toBe(true);
+      }
     }
   });
 });

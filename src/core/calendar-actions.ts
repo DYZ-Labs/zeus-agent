@@ -77,8 +77,8 @@ export function parseCalendarRequest(objective: string): CalendarRequest | null 
  * The exact bytes, built from the resolved request and the resolved target.
  *
  * Cancelling is an update with `status: "cancelled"` rather than a delete, which is what the
- * connected service actually offers — so it needs no capability slot of its own, and it
- * remains reversible in the one sense that matters: the event can be put back.
+ * connected service actually offers — so it needs no capability slot of its own, and the
+ * event and its history stay where a delete would have removed them.
  */
 export function buildCalendarPayload(
   request: CalendarWriteRequest,
@@ -105,7 +105,7 @@ export function buildCalendarPayload(
   return { event_id: target.external_id, status: "cancelled" };
 }
 
-/** What the cache knew about the target, so an update can be undone rather than merely regretted. */
+/** What the cache knew about the target, so the receipt can say what it was before Zeus changed it. */
 export function priorStateOf(target: CachedEvent | null): Record<string, unknown> | null {
   if (!target) return null;
   return {
