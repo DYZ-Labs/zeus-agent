@@ -1203,6 +1203,42 @@ export const CalendarOutcome = z
   .strict();
 export type CalendarOutcome = z.infer<typeof CalendarOutcome>;
 
+export const ScheduleSnapshotEvent = z
+  .object({
+    id: z.string(),
+    title: z.string().nullable(),
+    startsAt: z.string(),
+    endsAt: z.string().nullable(),
+    location: z.string().nullable(),
+    allDay: z.boolean(),
+    inProgress: z.boolean(),
+  })
+  .strict();
+export type ScheduleSnapshotEvent = z.infer<typeof ScheduleSnapshotEvent>;
+
+/**
+ * The standing schedule context a chat turn rendered for the model, kept with the turn.
+ *
+ * External, untrusted, disposable data — never memory and never evidence. Stored beside the
+ * calendar outcome for the same reason that is: the cache it was rendered from expires and
+ * reconciles, so without this snapshot "Why did Zeus say that?" stops being answerable the
+ * hour after Zeus said it. Titles and locations are stored post-guard, so a withheld line
+ * stays withheld in the record too.
+ */
+export const ScheduleSnapshot = z
+  .object({
+    state: z.enum(["current", "stale", "unread"]),
+    asOf: z.string().nullable(),
+    window: z.object({ from: z.string(), to: z.string() }).strict().nullable(),
+    /** The events actually shown, post-guard; capped, so this is not the whole window. */
+    events: z.array(ScheduleSnapshotEvent),
+    eventsShown: z.number().int().min(0),
+    eventsTotal: z.number().int().min(0),
+    withheld: z.boolean(),
+  })
+  .strict();
+export type ScheduleSnapshot = z.infer<typeof ScheduleSnapshot>;
+
 /**
  * A disposable copy of what a connector reported. Never evidence: an invite someone else
  * wrote is not the user speaking, so it may shape a plan but can never become memory.

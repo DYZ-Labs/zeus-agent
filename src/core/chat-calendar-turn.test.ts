@@ -69,6 +69,7 @@ vi.mock("./mcp-client", async (importOriginal) => ({
   restoreConnectorReachability: mocks.restoreConnectorReachability,
 }));
 
+import { cacheCalendarEvents } from "./calendar-sync";
 import { streamTurn } from "./chat";
 import {
   availableCapability,
@@ -362,5 +363,153 @@ describe("a connection that stopped answering is not a connection the user lost"
       reason: "reconnect_required",
     });
     expect(sentToModel).toContain("Reconnect required");
+  });
+});
+
+/**
+ * The standing schedule block: Zeus already knows the calendar before being asked.
+ *
+ * The failure this replaces was structural, not conversational. A turn the intent gate did
+ * not recognize — "what does my day look like?", "am I free at 3?", or just "hey" — carried
+ * no calendar data at all, and the prompt then required the model to say it didn't look.
+ */
+describe("every turn already knows the schedule", () => {
+  it("syncs and renders the schedule on a turn that never mentioned the calendar", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    mocks.callCapability.mockResolvedValue({
+      value: {
+        events: [
+          {
+            id: "standup",
+            title: "Standup",
+            starts_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        ],
+      },
+      text: "",
+      isError: false,
+    });
+
+    const { result, sentToModel } = await turn("hey", db);
+
+    // No calendar request was recognized, so there is no card — but the block is there,
+    // fresh, with the event, between capabilities and memory.
+    expect(result.calendar).toBeNull();
+    expect(mocks.callCapability).toHaveBeenCalledOnce();
+    expect(sentToModel).toContain('<schedule state="current"');
+    expect(sentToModel).toContain("“Standup”");
+    expect(sentToModel.indexOf("<capabilities>")).toBeLessThan(sentToModel.indexOf("<schedule"));
+    expect(sentToModel.indexOf("<schedule")).toBeLessThan(sentToModel.indexOf("<memory"));
+  });
+
+  it("answers from the fresh cache without spending another connector call", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    cacheCalendarEvents(db, 1, {
+      events: [
+        {
+          id: "standup",
+          title: "Standup",
+          starts_at: new Date(Date.now() + 3_600_000).toISOString(),
+        },
+      ],
+    });
+
+    const { sentToModel } = await turn("am I free at 3?", db);
+
+    expect(mocks.callCapability).not.toHaveBeenCalled();
+    expect(sentToModel).toContain('<schedule state="current"');
+    expect(sentToModel).toContain("“Standup”");
+  });
+
+  it("degrades to the dated last-known schedule when the refresh fails mid-turn", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000);
+    cacheCalendarEvents(
+      db,
+      1,
+      {
+        events: [
+          {
+            id: "standup",
+            title: "Standup",
+            starts_at: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        ],
+      },
+      twoHoursAgo,
+    );
+    mocks.callCapability.mockRejectedValue(new Error("provider down"));
+
+    const { sentToModel } = await turn("hey", db);
+
+    expect(sentToModel).toContain('<schedule state="stale"');
+    expect(sentToModel).toContain(`as_of="${twoHoursAgo.toISOString()}"`);
+    expect(sentToModel).toContain("A newer read has not succeeded");
+    expect(sentToModel).toContain("“Standup”");
+  });
+
+  it("tries to heal an unreachable connector even when nobody asked about the calendar", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    recordConnectorVerification(db, 1, { status: "unreachable", errorCode: "call_failed" });
+    // Move the recorded failure outside the cooldown, as time passing would.
+    db.prepare<[string, number]>("UPDATE connector SET updated_at = ? WHERE id = ?").run(
+      new Date(Date.now() - 20 * 60_000).toISOString(),
+      1,
+    );
+
+    const { sentToModel } = await turn("hey", db);
+
+    expect(mocks.restoreConnectorReachability).toHaveBeenCalledWith(
+      db,
+      "calendar.list_events",
+      expect.anything(),
+    );
+    // Still down: the block says unknown, and the capability line stays truthful.
+    expect(sentToModel).toContain('<schedule state="unread"');
+    expect(sentToModel).toContain("needs nothing from the user");
+  });
+
+  it("does not read twice when the turn already ran a calendar read plan", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+    mocks.classifyCalendarIntent.mockResolvedValue(null);
+
+    const { result, sentToModel } = await turn("What is on my calendar tomorrow?", db);
+
+    // One connector call: the plan's read. The top-up found its coverage fresh.
+    expect(result.calendar).toMatchObject({ kind: "read", status: "done" });
+    expect(mocks.callCapability).toHaveBeenCalledOnce();
+    expect(sentToModel).toContain('<schedule state="current"');
+  });
+
+  it("stores the turn's snapshot so a schedule claim stays auditable", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events"]);
+
+    const { result } = await turn("hey", db);
+
+    const stored = db
+      .prepare<[number], { state: string }>(
+        "SELECT state FROM schedule_context WHERE assistant_message_id = ?",
+      )
+      .get(result.message.id);
+    expect(stored?.state).toBe("current");
+  });
+
+  it("carries no schedule block at all when nothing is connected", async () => {
+    const db = openTestDb();
+
+    const { result, sentToModel } = await turn("hey", db);
+
+    expect(result.calendar).toBeNull();
+    expect(sentToModel).not.toContain("<schedule");
+    const rows = db
+      .prepare<[], { total: number }>("SELECT COUNT(*) AS total FROM schedule_context")
+      .get();
+    expect(rows?.total).toBe(0);
   });
 });

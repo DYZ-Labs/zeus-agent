@@ -73,7 +73,13 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
         bound.status === "ready"
           ? bound.enabled === 0
             ? "disabled"
-            : "no_enabled_capability"
+            // A ready, enabled connector that still cannot serve a call is almost always a
+            // credential name with no value in this process — an operator problem. Naming it
+            // "no_enabled_capability" sent the user to Settings to grant an access they had
+            // already granted.
+            : bound.missingEnvVarNames.length > 0
+              ? "missing_environment"
+              : "no_enabled_capability"
           : bound.status
       );
 
@@ -132,13 +138,24 @@ function calendarLines(state: CalendarCapabilityState): string[] {
   if (!state.canRead && !state.canCreate && !state.canUpdate) {
     // A service that did not answer is not a connection the user has to repair, and saying
     // so sends them to Settings to fix something that was never broken. The grant is still
-    // theirs; Zeus already tried again this turn and will try again on the next request.
+    // theirs, and Zeus retries on its own — but only turns that need the calendar actually
+    // pay for the attempt, so this line must not claim one happened.
     if (state.temporarilyUnreachable) {
       return [
         `Calendar: ${name} is connected, and did not answer just now. The connection is ` +
-          "intact and needs nothing from the user; Zeus tried again this turn and will try " +
-          "again on the next request. It cannot say what is on the calendar until one of " +
-          "those succeeds.",
+          "intact and needs nothing from the user; Zeus retries on its own and will pick " +
+          "it back up when the service answers. The schedule block, if present, is from " +
+          "the last successful read.",
+      ];
+    }
+    // Missing server-side configuration is the operator's to fix. Sending the user to
+    // Settings over it is the exact misdirection the unreachable branch above exists to
+    // prevent, one layer down.
+    if (state.unusableReason === "missing_environment" && state.unusableStatus === "ready") {
+      return [
+        `Calendar: ${name} is connected but cannot be used right now (server configuration ` +
+          "missing). This deployment is missing a server-side setting; the operator of this " +
+          "Zeus has to restore it, and nothing in the user's Settings will change it.",
       ];
     }
     const reconnect = state.unusableReason === "reconnect_required";
@@ -189,8 +206,9 @@ function calendarLines(state: CalendarCapabilityState): string[] {
   lines.push(
     state.lastReadAt === null
       ? "Zeus has never successfully read this calendar."
-      : `Zeus last read this calendar at ${state.lastReadAt}. That read is not part of this ` +
-          "turn: only a work result in this turn says what is on the calendar now.",
+      : `Zeus last read this calendar at ${state.lastReadAt}; the schedule block in this ` +
+          "message is from that read. A read or change performed this turn is shown only " +
+          "by a calendar result or work result in this turn.",
   );
   return lines;
 }

@@ -226,8 +226,16 @@ describe("the turn tells the model what Zeus can do", () => {
     expect(final).toContain("not connected");
     expect(final).toContain("Australia/Sydney");
     expect(final.indexOf("<capabilities>")).toBeLessThan(final.indexOf("<memory"));
-    // And the prompt must forbid answering from anything else.
-    expect(body.instructions).toContain("Never state what is or is not on the user's calendar");
+    // No calendar is connected, so there is no schedule block — the biconditional the
+    // prompt relies on: block absent means (and only means) nothing is connected.
+    expect(final).not.toContain("<schedule");
+    // The prompt must anchor calendar answers to the standing block, and the reply the
+    // whole feature exists to abolish must no longer be scripted anywhere.
+    expect(body.instructions).toContain(
+      "Never say you didn't look at, didn't check, or have no access to the calendar",
+    );
+    expect(body.instructions).not.toContain("say plainly that you didn't look");
+    expect(body.instructions).not.toContain("You have no standing knowledge");
   });
 
   it("asks for a voice, not only for a list of things not to claim", async () => {

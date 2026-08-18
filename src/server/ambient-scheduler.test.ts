@@ -41,40 +41,36 @@ afterEach(() => {
 });
 
 describe("who is responsible for refreshing signals", () => {
-  it("stays off locally, where a LaunchAgent already does it", () => {
-    expect(ambientRefreshSettings({ mode: "local" }, { NODE_ENV: "production" })).toMatchObject({
-      enabled: false,
-      reason: "not_hosted",
+  it("runs by default everywhere: the standing schedule block depends on this cache", () => {
+    expect(ambientRefreshSettings({})).toMatchObject({
+      enabled: true,
+      reason: "default_on",
+    });
+    expect(ambientRefreshSettings({ NODE_ENV: "production" })).toMatchObject({
+      enabled: true,
+      reason: "default_on",
     });
   });
 
-  it("runs on a hosted deployment, where nothing else would", () => {
-    expect(
-      ambientRefreshSettings({ mode: "configured" }, { NODE_ENV: "production" }),
-    ).toMatchObject({ enabled: true, reason: "hosted" });
-  });
-
   it("can be forced either way, and refuses a setting it cannot read", () => {
+    expect(ambientRefreshSettings({ ZEUS_SIGNAL_REFRESH: "on" })).toMatchObject({
+      enabled: true,
+      reason: "explicitly_enabled",
+    });
     expect(
-      ambientRefreshSettings({ mode: "local" }, { ZEUS_SIGNAL_REFRESH: "on" }),
-    ).toMatchObject({ enabled: true, reason: "explicitly_enabled" });
-    expect(
-      ambientRefreshSettings(
-        { mode: "configured" },
-        { NODE_ENV: "production", ZEUS_SIGNAL_REFRESH: "off" },
-      ),
+      ambientRefreshSettings({ NODE_ENV: "production", ZEUS_SIGNAL_REFRESH: "off" }),
     ).toMatchObject({ enabled: false, reason: "explicitly_disabled" });
-    expect(() => ambientRefreshSettings({ mode: "local" }, { ZEUS_SIGNAL_REFRESH: "maybe" }))
+    expect(() => ambientRefreshSettings({ ZEUS_SIGNAL_REFRESH: "maybe" }))
       .toThrow(/must be 'on' or 'off'/u);
   });
 
   it("clamps an unreasonable interval and refuses one that is not a number", () => {
-    expect(ambientRefreshSettings({ mode: "local" }, { ZEUS_SIGNAL_REFRESH_MINUTES: "1" })
+    expect(ambientRefreshSettings({ ZEUS_SIGNAL_REFRESH_MINUTES: "1" })
       .intervalMinutes).toBe(5);
-    expect(ambientRefreshSettings({ mode: "local" }, { ZEUS_SIGNAL_REFRESH_MINUTES: "9000" })
+    expect(ambientRefreshSettings({ ZEUS_SIGNAL_REFRESH_MINUTES: "9000" })
       .intervalMinutes).toBe(180);
     expect(() =>
-      ambientRefreshSettings({ mode: "local" }, { ZEUS_SIGNAL_REFRESH_MINUTES: "half an hour" }),
+      ambientRefreshSettings({ ZEUS_SIGNAL_REFRESH_MINUTES: "half an hour" }),
     ).toThrow(/whole number/u);
   });
 });
