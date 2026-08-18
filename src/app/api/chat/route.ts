@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { BUDGET_MESSAGES, checkModelBudget, logBudgetDenial } from "@/core/budget";
 import { streamTurn } from "@/core/chat";
+import { pendingConfirmationOffer } from "@/core/effects";
 import { createConversation, getConversation } from "@/core/conversations";
 import type { Db } from "@/core/db";
 import { errorSignature, logEvent } from "@/core/observability";
@@ -159,34 +160,18 @@ function privateChatResponse(
           opportunityId: result.context.recommendation
             ? result.context.opportunityId
             : null,
-          workPlan: result.work
-            ? {
-                id: result.work.planId,
-                runId: result.work.run.id,
-                status: result.work.run.status,
-                errorCode: result.work.run.error_code,
-                artifacts: result.work.artifacts.map((artifact) => ({
-                  id: artifact.id,
-                  title: artifact.title,
-                  kind: artifact.kind,
-                })),
-                pendingEffects: result.work.pendingEffects.map((effect) => ({
-                  id: effect.id,
-                  previewText: effect.preview_text,
-                  payload: effect.payload,
-                  payloadHash: effect.payload_hash,
-                  expiresAt: effect.expires_at,
-                  capabilitySlot: effect.capability.slot,
-                  connectorLabel: effect.connector.label,
-                })),
-                // No completedEffects. A change that went through renders no card, so the
-                // browser has nothing to draw with them; the model still gets them through
-                // <work_result>, which is where the reply's particulars now come from.
-              }
-            : null,
-          // A sibling of workPlan, not a field inside it: the outcomes that matter most —
-          // nothing connected, or a request Zeus could not resolve — never had a run.
+          // The deterministic account of a calendar request, and the only structured thing
+          // the chat still needs: the reply says what happened, and this carries the exact
+          // hash that authorizes anything still waiting. The run's artifacts and raw payloads
+          // are deliberately not streamed — nothing renders them, and a payload sent to a
+          // page that never shows it is exposure without a purpose. They remain at
+          // /effects/[id] and /today#work-plans.
           calendar: result.calendar,
+          // Recomputed every turn rather than derived from this turn's outcome. The composer
+          // is emptied whenever the user sends anything else, so a change asked about three
+          // messages ago still needs its line put back — and the reply is allowed to say it
+          // is there only because this puts it there.
+          awaitingConfirmation: pendingConfirmationOffer(db),
           extractionFailed: result.learned === null,
         });
 

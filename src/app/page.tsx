@@ -1,6 +1,7 @@
 import { Chat, type ChatHistoryTurn } from "@/components/chat";
 import { calendarOutcomesIn } from "@/core/calendar-outcome";
 import { getConversation, messagesIn } from "@/core/conversations";
+import { pendingConfirmationOffer } from "@/core/effects";
 import { hasCredentials } from "@/core/openai";
 import { getOwnerAccess } from "@/server/auth/access";
 import { redirect } from "next/navigation";
@@ -55,6 +56,7 @@ export default async function ChatPage({
       initialPrompt={prompt}
       initialTurns={initialTurns}
       initialConversationId={conversation?.id}
+      awaitingConfirmation={db ? pendingConfirmationOffer(db) : null}
     />
   );
 }

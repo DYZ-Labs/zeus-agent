@@ -1144,13 +1144,18 @@ export type CalendarActionSetting = z.infer<typeof CalendarActionSetting>;
 /**
  * How one calendar request ended, decided deterministically rather than read out of prose.
  *
- * The card, the model's sentences, and the stored record all descend from this, so they
- * cannot disagree. Assistant-authored outcome data: never a fact, never evidence, and never
- * supplied as memory — the event titles it carries are somebody else's writing.
+ * The model's sentences and the stored record both descend from this, so they cannot
+ * disagree. Assistant-authored outcome data: never a fact, never evidence, and never supplied
+ * as memory — the event titles it carries are somebody else's writing.
  *
  * Note `nearMisses`, which is not a list of what is on the calendar. It is the entries that
  * *failed* the match, kept so a refusal can ask which was meant instead of asserting that
  * the event does not exist. A lookup that missed is not evidence of absence.
+ *
+ * Fields added after the first release carry `.default(...)`. A stored row is read back with
+ * `safeParse` and dropped on failure, so a bare required addition would silently erase every
+ * outcome written before it — including the ones a later turn needs in order to say what it
+ * already did.
  */
 export const CalendarOutcomeEvent = z
   .object({
@@ -1162,7 +1167,7 @@ export const CalendarOutcomeEvent = z
 
 export const CalendarOutcome = z
   .object({
-    kind: z.enum(["create", "reschedule", "cancel", "read"]),
+    kind: z.enum(["create", "reschedule", "cancel", "clear", "read"]),
     status: z.enum([
       "done",
       "awaiting_confirmation",
@@ -1173,6 +1178,7 @@ export const CalendarOutcome = z
       "no_connector",
       "read_only",
       "needs_clarification",
+      "declined",
       "failed",
     ]),
     reason: z.string().nullable(),
@@ -1199,6 +1205,27 @@ export const CalendarOutcome = z
       })
       .strict()
       .nullable(),
+    /**
+     * The one human sentence for what this request did or would do, copied from the effect's
+     * own preview so a later turn can say it without re-reading anything.
+     *
+     * Third-party text: it carries the event's title, so every reader guards it.
+     */
+    preview: z.string().nullable().default(null),
+    /**
+     * Two events on the user's calendar claiming the same minutes, found by the same overlap
+     * rule the write gate uses. Only a read populates this; a write reports what collides
+     * with the requested time in `conflicts` instead.
+     */
+    overlaps: z
+      .array(
+        z
+          .object({ first: CalendarOutcomeEvent, second: CalendarOutcomeEvent })
+          .strict(),
+      )
+      .default([]),
+    /** What a confirmation message must name to authorize every payload this request prepared. */
+    confirmationHash: z.string().nullable().default(null),
   })
   .strict();
 export type CalendarOutcome = z.infer<typeof CalendarOutcome>;

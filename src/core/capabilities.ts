@@ -184,11 +184,12 @@ function calendarLines(state: CalendarCapabilityState): string[] {
   const writes = [
     state.canCreate ? "add new events" : null,
     state.canUpdate ? "move or cancel existing events" : null,
+    state.canUpdate ? "clear everything out of a stretch of time" : null,
   ].filter((entry): entry is string => entry !== null);
   lines.push(
     canWrite
       ? `Calendar: ${name} is connected. Zeus can ${state.canRead ? "read it, and " : ""}` +
-          `${writes.join(" and ")} when the user asks.`
+          `${series(writes)} when the user asks.`
       : `Calendar: ${name} is connected for reading only. Zeus can read it, and cannot add, ` +
           "move, or cancel anything; that needs a further permission in Settings, under Connections.",
   );
@@ -198,7 +199,8 @@ function calendarLines(state: CalendarCapabilityState): string[] {
         ? "Calendar changes without asking each time: on, and " +
             `${state.remainingToday} more allowed today. Zeus still reads the calendar first ` +
             "and still stops to ask when the time is taken, the calendar cannot be read, or " +
-            "more than one event matches."
+            "more than one event matches. Clearing a stretch of time always stops to ask, and " +
+            "lists everything it would cancel first."
         : "Calendar changes without asking each time: off. Every change stops for the user to " +
             "confirm the exact request.",
     );
@@ -212,10 +214,19 @@ function calendarLines(state: CalendarCapabilityState): string[] {
     state.lastReadAt === null
       ? "Zeus has never successfully read this calendar."
       : "Zeus has read this calendar; the schedule block in this " +
-          "message is from that read. A read or change performed this turn is shown only " +
-          "by a calendar result or work result in this turn.",
+          "message is from that read and says whether it is current or stale. A read or " +
+          "change performed this turn is shown only by a calendar result or work result " +
+          "in this turn. What Zeus already did to the calendar in this conversation is " +
+          "recorded separately in the calendar history block.",
   );
   return lines;
+}
+
+/** "a", "a and b", "a, b, and c" — so the sentence reads the way a person would say it. */
+function series(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  if (parts.length === 2) return parts.join(" and ");
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
 }
 
 function localDate(context: EvaluationContext): string {

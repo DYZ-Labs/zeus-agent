@@ -369,3 +369,110 @@ describe("wall-clock to instant", () => {
     expect(localToUtc("2026-08-18", "UTC")).toBeNull();
   });
 });
+
+/**
+ * Emptying a stretch of time, which is the one calendar action that touches several events
+ * at once — and therefore the one where a misread span is expensive.
+ */
+describe("clearing a window", () => {
+  function clearIntent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
+    return intent({
+      intent: "clear",
+      title: null,
+      starts_at_local: "2026-08-20T12:00",
+      ends_at_local: "2026-08-20T18:00",
+      target: null,
+      ...overrides,
+    });
+  }
+
+  it("resolves a span the user described at both ends", () => {
+    expect(
+      resolveCalendarRequest("clear my Thursday afternoon", clearIntent(), CONTEXT),
+    ).toEqual({
+      status: "request",
+      request: {
+        kind: "clear",
+        from: "2026-08-20T12:00:00.000Z",
+        to: "2026-08-20T18:00:00.000Z",
+        timezone: "UTC",
+      },
+      note: null,
+    });
+  });
+
+  /**
+   * Inferring the missing end would be deciding how much of someone's day disappears, which
+   * is not a detail worth guessing to save one question.
+   */
+  it.each([
+    ["no end", { ends_at_local: null }],
+    ["no start", { starts_at_local: null }],
+    ["an unreadable bound", { ends_at_local: "later on" }],
+  ])("refuses a span missing %s", (_label, overrides) => {
+    expect(
+      resolveCalendarRequest("clear my afternoon", clearIntent(overrides), CONTEXT),
+    ).toMatchObject({ status: "refused", reason: "no_clear_window" });
+  });
+
+  it.each([
+    ["inverted", { starts_at_local: "2026-08-20T18:00", ends_at_local: "2026-08-20T12:00" }],
+    ["longer than a week", { starts_at_local: "2026-08-20T00:00", ends_at_local: "2026-09-20T00:00" }],
+  ])("refuses a span that is %s", (_label, overrides) => {
+    expect(
+      resolveCalendarRequest("clear all of that", clearIntent(overrides), CONTEXT),
+    ).toMatchObject({ status: "refused", reason: "implausible_clear_window" });
+  });
+
+  it("refuses a guessed span, the same as any other write", () => {
+    expect(
+      resolveCalendarRequest("clear some of tomorrow", clearIntent({ confidence: "low" }), CONTEXT),
+    ).toMatchObject({ status: "refused", reason: "low_confidence_write" });
+  });
+
+  it.each([
+    ["negated", { is_negated: true }],
+    ["hypothetical", { is_hypothetical_or_quoted: true }],
+    ["about someone else", { is_about_another_person: true }],
+  ])("never clears anything when the request is %s", (_label, overrides) => {
+    expect(
+      resolveCalendarRequest("clear my Thursday", clearIntent(overrides), CONTEXT),
+    ).toMatchObject({ status: "refused" });
+  });
+
+  it("says both new refusals out loud, because the user did ask for something", () => {
+    expect(refusalIsSpoken("no_clear_window")).toBe(true);
+    expect(refusalIsSpoken("implausible_clear_window")).toBe(true);
+    expect(SPOKEN_REFUSAL_REASONS).toContain("no_clear_window");
+  });
+
+  it("reaches the classifier from the words people actually use", () => {
+    for (const message of [
+      "clear my Thursday afternoon",
+      "wipe Friday morning off my calendar",
+      "get everything off my Monday",
+    ]) {
+      expect(mayBeCalendarRequest(message)).toBe(true);
+      expect(directCalendarReadRequest(message, CONTEXT)).toBeNull();
+    }
+  });
+});
+
+/**
+ * A conversation already about the calendar lowers the bar for what reaches the classifier.
+ * Without it, "and after that?" was dropped before anything could recognize it.
+ */
+describe("following up on a calendar turn", () => {
+  it.each(["and after that?", "did that go through?", "the second one", "move it later"])(
+    "passes a short follow-up to the classifier: %j",
+    (message) => {
+      expect(mayBeCalendarRequest(message)).toBe(false);
+      expect(mayBeCalendarRequest(message, { afterCalendarTurn: true })).toBe(true);
+    },
+  );
+
+  it("does not widen to an essay, which is a change of subject rather than a follow-up", () => {
+    const long = "I have been thinking about the pitch deck all week and ".repeat(3);
+    expect(mayBeCalendarRequest(long, { afterCalendarTurn: true })).toBe(false);
+  });
+});

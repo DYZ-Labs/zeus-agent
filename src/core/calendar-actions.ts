@@ -31,11 +31,20 @@ export type CalendarRequest =
       timezone: string;
     }
   | { kind: "cancel"; reference: EventReference; timezone: string }
+  /**
+   * Everything inside a span, rather than one event picked out of it.
+   *
+   * Its own kind rather than a cancel with a looser target, because the two want opposite
+   * things from ambiguity: a cancel that matches four events must refuse, and a clear that
+   * matches four events has found exactly what it was asked for. Collapsing them would mean
+   * relaxing the rule that stops the wrong meeting being deleted.
+   */
+  | { kind: "clear"; from: string; to: string; timezone: string }
   | { kind: "read"; from: string; to: string; timezone: string };
 
 export type CalendarWriteRequest = Extract<
   CalendarRequest,
-  { kind: "create" | "reschedule" | "cancel" }
+  { kind: "create" | "reschedule" | "cancel" | "clear" }
 >;
 
 const OPEN = "<calendar_request>";
@@ -65,7 +74,7 @@ export function parseCalendarRequest(objective: string): CalendarRequest | null 
     if (parsed === null || typeof parsed !== "object") return null;
     const record = parsed as Record<string, unknown>;
     return typeof record.kind === "string" &&
-      ["create", "reschedule", "cancel", "read"].includes(record.kind)
+      ["create", "reschedule", "cancel", "clear", "read"].includes(record.kind)
       ? (parsed as CalendarRequest)
       : null;
   } catch {
@@ -94,6 +103,8 @@ export function buildCalendarPayload(
     };
   }
   if (!target) throw new Error("A change needs a resolved event to change");
+  // A clear cancels each of its events one at a time, so each payload is a cancel. The
+  // caller supplies the target; nothing here decides which events are in scope.
   if (request.kind === "reschedule") {
     return {
       event_id: target.external_id,
@@ -130,6 +141,12 @@ export function previewFor(
   }
   if (request.kind === "reschedule") {
     return `Move “${name}” to ${request.startsAt}–${request.endsAt}.`;
+  }
+  if (request.kind === "clear") {
+    // Names the event, not the window: this is the sentence shown against one exact payload,
+    // and "clear Thursday afternoon" repeated four times would say nothing about what each
+    // request would actually remove.
+    return `Cancel “${name}”, clearing ${request.from} to ${request.to}.`;
   }
   return `Cancel “${name}”.`;
 }
@@ -176,7 +193,9 @@ export function calendarActionWorkPlanProposal(
     ? "Create the event"
     : request.kind === "reschedule"
       ? "Move the event"
-      : "Cancel the event";
+      : request.kind === "clear"
+        ? "Clear the window"
+        : "Cancel the event";
   return {
     objective,
     steps: [
@@ -189,28 +208,36 @@ export function calendarActionWorkPlanProposal(
         depends_on: [],
       },
       {
-        title: "Check the requested time",
-        instruction:
-          "Resolve the exact change from the request and the calendar that was just read, " +
-          "and check the requested time against existing events. Do not send anything.",
+        title: request.kind === "clear" ? "List what is in the window" : "Check the requested time",
+        instruction: request.kind === "clear"
+          ? "Resolve every event inside the requested window from the calendar that was just " +
+            "read, so the user can see exactly what would be cancelled. Do not send anything."
+          : "Resolve the exact change from the request and the calendar that was just read, " +
+            "and check the requested time against existing events. Do not send anything.",
         effect_kind: "prepare_local",
         depends_on: [1],
       },
       {
         title: action,
-        instruction:
-          `${action} exactly as resolved. A free destination may follow the user's standing ` +
-          "setting. An occupied destination must prepare the exact change and pause for one " +
-          "explicit confirmation. An ambiguous target or unverifiable read stops here.",
+        instruction: request.kind === "clear"
+          ? "Prepare one exact cancellation for every event inside the window and pause. " +
+            "Clearing a window is never carried out unattended, however the standing setting " +
+            "is configured; it waits for one confirmation covering all of them."
+          : `${action} exactly as resolved. A free destination may follow the user's standing ` +
+            "setting. An occupied destination must prepare the exact change and pause for one " +
+            "explicit confirmation. An ambiguous target or unverifiable read stops here.",
         effect_kind: writeEffect,
         depends_on: [2],
       },
     ],
     allowed_effects: ["external_read", "prepare_local", writeEffect],
     completion_criteria: [
-      "The calendar was read, the requested time was checked against it, and the change was " +
-        "either made under the applicable authorization or left pending as one exact, " +
-        "conflict-disclosing request for the user to confirm.",
+      request.kind === "clear"
+        ? "The calendar was read, every event inside the window was resolved from it, and each " +
+          "cancellation was left pending as an exact request until the user confirmed the set."
+        : "The calendar was read, the requested time was checked against it, and the change was " +
+          "either made under the applicable authorization or left pending as one exact, " +
+          "conflict-disclosing request for the user to confirm.",
     ],
     limits: {
       max_model_tool_calls: 10,

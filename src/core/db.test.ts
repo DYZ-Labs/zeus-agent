@@ -796,3 +796,87 @@ function spawnMigrationWriter(path: string): {
   });
   return { ready, done };
 }
+
+/**
+ * 029 widens `calendar_outcome.kind` so a cleared window can be recorded at all.
+ *
+ * SQLite cannot alter a CHECK in place, so the table is rebuilt and copied — and an outcome
+ * lost in that copy is a change Zeus made and can no longer say it made, which is exactly the
+ * failure the table exists to prevent.
+ */
+describe("clear-window migration keeps every stored outcome", () => {
+  const clearIndex = MIGRATIONS.findIndex(
+    (migration) => migration.id === "030_calendar_clear_outcome_kind",
+  );
+  const beforeClear = MIGRATIONS.slice(0, clearIndex);
+
+  function storeAtTwentyEight(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db, beforeClear);
+    db.exec(`
+      INSERT INTO conversation (id, title, source, started_at, updated_at)
+      VALUES (1, 'Calendar', 'web', '2026-08-14T00:00:00.000Z', '2026-08-14T00:00:00.000Z');
+      INSERT INTO message (id, conversation_id, role, content, created_at)
+      VALUES (1, 1, 'user', 'add lunch', '2026-08-14T00:00:00.000Z'),
+             (2, 1, 'assistant', 'Added.', '2026-08-14T00:00:00.000Z');
+      INSERT INTO calendar_outcome
+        (assistant_message_id, kind, status, outcome_json, created_at)
+      VALUES (2, 'create', 'done', '{"kind":"create"}', '2026-08-14T00:00:00.000Z');
+    `);
+    return db;
+  }
+
+  it("carries existing rows across and accepts the new kind", () => {
+    const db = storeAtTwentyEight();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO calendar_outcome
+             (assistant_message_id, kind, status, outcome_json, created_at)
+           VALUES (1, 'clear', 'done', '{}', '2026-08-14T00:00:00.000Z')`,
+        )
+        .run(),
+    ).toThrow();
+
+    migrate(db, MIGRATIONS.slice(0, clearIndex + 1));
+
+    expect(
+      db.prepare("SELECT kind, status FROM calendar_outcome WHERE assistant_message_id = 2").get(),
+    ).toEqual({ kind: "create", status: "done" });
+    db.prepare(
+      `INSERT INTO calendar_outcome
+         (assistant_message_id, kind, status, outcome_json, created_at)
+       VALUES (1, 'clear', 'awaiting_confirmation', '{}', '2026-08-14T00:00:00.000Z')`,
+    ).run();
+    expect(
+      db.prepare("SELECT COUNT(*) AS count FROM calendar_outcome").get(),
+    ).toEqual({ count: 2 });
+    db.close();
+  });
+
+  it("still refuses a kind nothing in the code can produce", () => {
+    const db = storeAtTwentyEight();
+    migrate(db, MIGRATIONS.slice(0, clearIndex + 1));
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO calendar_outcome
+             (assistant_message_id, kind, status, outcome_json, created_at)
+           VALUES (1, 'purchase', 'done', '{}', '2026-08-14T00:00:00.000Z')`,
+        )
+        .run(),
+    ).toThrow();
+    db.close();
+  });
+
+  it("keeps the row tied to its message, so deleting a source still takes it", () => {
+    const db = storeAtTwentyEight();
+    migrate(db, MIGRATIONS.slice(0, clearIndex + 1));
+    db.prepare("DELETE FROM message WHERE id = 2").run();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM calendar_outcome").get()).toEqual({
+      count: 0,
+    });
+    db.close();
+  });
+});

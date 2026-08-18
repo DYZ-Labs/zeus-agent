@@ -37,11 +37,22 @@ const MAX_PRIOR_CHARS = 500;
 const MAX_DURATION_MS = 24 * 3_600_000;
 const DEFAULT_DURATION_MS = 60 * 60_000;
 const MAX_FUTURE_MS = 400 * 86_400_000;
+/**
+ * Widest stretch a single request may empty.
+ *
+ * A week is already a lot to lose to one misread sentence, and every hour past it makes the
+ * itemized list Zeus shows before asking longer than anyone reads.
+ */
+const MAX_CLEAR_WINDOW_MS = 7 * 86_400_000;
 const MAX_PAST_MS = 24 * 3_600_000;
 
 const SYSTEM_PROMPT = `You classify whether the user's latest message asks for something to happen to their own calendar, and extract the details needed to carry it out.
 
-Return intent "create" to add a new event, "reschedule" to move an existing one, "cancel" to remove one, "read" to look at the calendar, and "none" for everything else. "none" is the right answer far more often than not: ordinary conversation that merely mentions a time, a date, or a meeting is not a request to change anything.
+Return intent "create" to add a new event, "reschedule" to move an existing one, "cancel" to remove one, "clear" to empty a whole stretch of time of everything in it, "read" to look at the calendar, and "none" for everything else. "none" is the right answer far more often than not: ordinary conversation that merely mentions a time, a date, or a meeting is not a request to change anything.
+
+The line between "cancel" and "clear" is how many events are meant. "cancel my 3pm" and "clear that dinner" both name one event, so both are "cancel". "clear my Thursday afternoon", "wipe Friday", "get everything off my Monday morning" name a span of time and everything inside it, so they are "clear". For "clear", put the start of the span in starts_at_local and its end in ends_at_local, and leave title and target null.
+
+Spans have ordinary meanings and you should use them: a whole day is midnight to midnight, morning is 00:00 to 12:00, afternoon is 12:00 to 18:00, evening is 18:00 to 23:59, "the rest of today" runs from the supplied local time to midnight. "clear my Thursday afternoon" on Thursday 2026-03-05 is therefore starts_at_local "2026-03-05T12:00" and ends_at_local "2026-03-05T18:00". If the user asked to empty a stretch of time, answer "clear" — even when you are unsure of the exact bounds, in which case fill in what you can and use confidence "low". Do not answer "none" for a request you understood; the system decides what is safe to act on, and answering "none" only means the user is told nothing at all.
 
 A question about whether Calendar is connected, linked, permitted, or available is intent "none". It asks about Zeus's capability, not about the contents of the calendar, and must not trigger a calendar read.
 
@@ -71,7 +82,7 @@ const TargetReference = z
  */
 export const CalendarIntent = z
   .object({
-    intent: z.enum(["create", "reschedule", "cancel", "read", "none"]),
+    intent: z.enum(["create", "reschedule", "cancel", "clear", "read", "none"]),
     confidence: z.enum(["low", "medium", "high"]),
     title: z.string().max(200).nullable(),
     starts_at_local: z.string().max(20).nullable(),
@@ -91,8 +102,17 @@ export type CalendarIntent = z.infer<typeof CalendarIntent>;
  * This is not a gate and must never become one — that is exactly the mistake the old
  * regexes made. A false positive costs one low-effort model call; a false negative is the
  * bug. So it only asks "could this conceivably be about a calendar?" and errs toward yes.
+ *
+ * `afterCalendarTurn` says a calendar request already happened in this conversation. A
+ * follow-up to one carries almost none of the nouns below — "and after that?", "move it
+ * later", "the second one", "did that go through?" — so a conversation already about the
+ * calendar lowers the bar to any short message. The classifier sees the earlier user messages
+ * and can tell an actual follow-up from a change of subject; the veto behind it is unchanged.
  */
-export function mayBeCalendarRequest(input: string): boolean {
+export function mayBeCalendarRequest(
+  input: string,
+  options: { afterCalendarTurn?: boolean } = {},
+): boolean {
   const normalized = input.replace(/\s+/gu, " ").trim();
   if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
   const subject =
@@ -120,7 +140,8 @@ export function mayBeCalendarRequest(input: string): boolean {
     subject.test(normalized) ||
     schedulingVerb.test(normalized) ||
     (action.test(normalized) && (temporal.test(normalized) || hourRange.test(normalized))) ||
-    (shortReply && (temporal.test(normalized) || hourRange.test(normalized)))
+    (shortReply && (temporal.test(normalized) || hourRange.test(normalized))) ||
+    (shortReply && options.afterCalendarTurn === true)
   );
 }
 
@@ -306,7 +327,9 @@ export type CalendarRefusalReason =
   | "unparsable_end"
   | "implausible_duration"
   | "implausible_date"
-  | "no_title";
+  | "no_title"
+  | "no_clear_window"
+  | "implausible_clear_window";
 
 /**
  * Refusals the user should hear about, and the ones that must stay silent.
@@ -327,6 +350,8 @@ export const SPOKEN_REFUSAL_REASONS = [
   "implausible_duration",
   "implausible_date",
   "no_title",
+  "no_clear_window",
+  "implausible_clear_window",
 ] as const satisfies readonly CalendarRefusalReason[];
 
 export function refusalIsSpoken(reason: CalendarRefusalReason): boolean {
@@ -397,6 +422,23 @@ export function resolveCalendarRequest(
 
   // A low-confidence read costs nothing; a low-confidence write changes someone's week.
   if (intent.confidence === "low") return refuse("low_confidence_write");
+
+  if (intent.intent === "clear") {
+    // A span with one end missing is not a span, and inferring the other end would decide how
+    // much of someone's day disappears. Both bounds or nothing.
+    if (!intent.starts_at_local || !intent.ends_at_local) return refuse("no_clear_window");
+    const from = localToUtc(intent.starts_at_local, timezone);
+    const to = localToUtc(intent.ends_at_local, timezone);
+    if (!from || !to) return refuse("no_clear_window");
+    const opens = Date.parse(from);
+    const closes = Date.parse(to);
+    const at = Date.parse(context.evaluated_at);
+    if (closes <= opens || closes - opens > MAX_CLEAR_WINDOW_MS) {
+      return refuse("implausible_clear_window");
+    }
+    if (opens > at + MAX_FUTURE_MS || closes < at - MAX_PAST_MS) return refuse("implausible_date");
+    return act({ kind: "clear", from, to, timezone });
+  }
 
   if (intent.intent === "cancel") {
     const reference = resolveReference(intent, timezone);
