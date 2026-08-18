@@ -27,18 +27,25 @@ export const CLARIFICATION: Record<string, string> = {
 
 export const CLARIFICATION_FALLBACK = "I couldn't work out what you wanted changed.";
 
-export const VERB: Record<CalendarOutcome["kind"], string> = {
+/**
+ * The kinds a card can be about, which is every kind except a read.
+ *
+ * A read changed nothing, so it has no receipt to render and no card of its own; the reply
+ * is the whole answer. Excluding it here rather than by convention means a card that tries
+ * to headline a read is a build error, not a regression someone notices in conversation.
+ */
+export type CalendarCardKind = Exclude<CalendarOutcome["kind"], "read">;
+
+export const VERB: Record<CalendarCardKind, string> = {
   create: "Added to your calendar",
   reschedule: "Moved",
   cancel: "Cancelled",
-  read: "Read your calendar",
 };
 
-export const NOT_DONE: Record<CalendarOutcome["kind"], string> = {
+export const NOT_DONE: Record<CalendarCardKind, string> = {
   create: "Not added",
   reschedule: "Not moved",
   cancel: "Not cancelled",
-  read: "Not read",
 };
 
 export const TARGET_NOT_FOUND = {
@@ -59,8 +66,9 @@ export const UNVERIFIABLE: Record<string, string> = {
     "Nothing changed. I couldn't reach your calendar just now, so I didn't act. Your connection is fine; ask again in a moment.",
   no_read_capability:
     "Nothing changed. I can't read your calendar with the permissions I have, so I couldn't check and didn't act.",
-  stale_coverage:
-    "Nothing changed. I last looked at your calendar too long ago to act on it. Ask again and I'll read it fresh.",
+  // No `stale_coverage`. Why the read was too old to act on is the errand, not the answer,
+  // and dating it was the one card line that still told the user when Zeus last looked.
+  // It falls through to the fallback below, which says the part they can act on.
   unsupported_calendar_schema:
     "Nothing changed. Your calendar service describes events in a form I can't safely read, so I stopped.",
   remote_reported_error:

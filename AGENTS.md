@@ -115,13 +115,15 @@ npm run mcp            # stdio MCP server
 - `src/core/calendar-actions.ts` — the resolved action, its payload, and its work plan.
 - `src/core/calendar-policy.ts` — the standing direct-execution setting and its ceiling.
 - `src/core/calendar-outcome.ts` — the deterministic account of what a calendar request did,
-  stored with its assistant turn so a reload does not leave prose as the only record.
+  stored with its assistant turn so a reload does not leave prose as the only record. Always
+  recorded; rendered only for a write.
 - `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
   `<capabilities>` block. Never memory.
 - `src/core/calendar-sync.ts` — the disposable external read cache, and the turn-start
   freshness top-up that keeps it answerable.
 - `src/core/calendar-context.ts` — the standing `<schedule>` block every chat turn renders
-  from that cache, with its as-of time and its snapshot trace. External data, never memory.
+  from that cache, with its snapshot trace. External data, never memory. The as-of time is
+  an attribute, never a sentence, and never spoken.
 - `src/core/untrusted-data.ts` — the one guard third-party text passes before a model sees it.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
@@ -377,13 +379,22 @@ evidence table; keep it that way. Run every external payload through
 The standing `<schedule>` block is how that cache reaches chat without becoming memory.
 Every turn with a connected calendar carries it, so Zeus already knows the schedule before
 being asked and never replies that it didn't look; a turn whose cache could not be refreshed
-relays the last successful read with its as-of time instead. The block is a sibling of
-`<capabilities>`, never part of `<memory>`; every title passes the guard; and it authorizes
+relays the last successful read instead, saying it may be out of date. The block is a sibling
+of `<capabilities>`, never part of `<memory>`; every title passes the guard; and it authorizes
 nothing — the write gate keeps its own stricter freshness proof. `lastKnownEvents` is the
 block's render-only reader over expired rows and must never feed the conflict gate or the
 detectors, which keep failing closed on expiry through `cachedEvents`. Each turn's rendered
 snapshot persists in `schedule_context` (assistant-context data, like `calendar_outcome`)
 so a schedule claim stays auditable after the cache reconciles.
+
+Knowing the schedule is the feature; narrating the trip to go and get it is not. Zeus never
+tells the user when it last read the calendar — not a date, not a clock time, not how long
+ago. The as-of survives as machine data in three places that need it (`schedule_context`,
+the block's `as_of` attribute, `coverage.fetchedAt`) and in none that are spoken: no prose
+line in the block carries it, and `<capabilities>` says only whether a read has ever
+succeeded, because that block is relayed as "I". This does not soften the honesty rule it
+replaced. Stale still has to say it is stale — in words, as a clause offering to check
+again, which is what a person would say and a timestamp never was.
 
 ### Response provenance is persistent
 
@@ -488,6 +499,15 @@ like, not a person who knows you.
 - A card and the prose must not narrate the same status twice. The card is deterministic
   and survives a reload; the prose says the human version once and leaves the particulars
   to the panel.
+- A read gets no card. `CalendarActionCard` returns null for `kind: "read"`, and
+  `CalendarCardKind` excludes it so writing copy for one is a build error. Nothing changed,
+  so there is no receipt to put under the answer — and read-shaped refusals (nothing
+  connected, a calendar needing reconnection, a request that could not be classified) go
+  with it, which is why the prompt tells the model that a read result has no panel and its
+  reply must carry the whole answer. The `calendar_outcome` row is still written; only the
+  rendering is gone. The suppression lives inside the card rather than at the render site
+  in `chat.tsx`, because that ternary falls through to `WorkPlanCard` — which would list the
+  very read steps the card was hiding.
 - Fixed user-facing copy speaks in the first person and lives in
   `src/components/calendar-card-copy.ts`, swept by `styleViolations`
   (`src/core/response-style.ts`). Add new card copy there, not inline in a component.

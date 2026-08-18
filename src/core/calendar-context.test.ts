@@ -21,10 +21,13 @@ import { type Db, openTestDb } from "./db";
 import type { EvaluationContext, ScheduleSnapshot } from "./schema";
 
 /**
- * The standing schedule block: the cache, said out loud, with the time it was read.
+ * The standing schedule block: the cache, said out loud.
  *
  * The failure this suite guards against is a turn with a warm cache and a reply that says
- * "I didn't look" — or its mirror, a stale cache presented as a fresh read.
+ * "I didn't look" — or its mirror, a stale cache presented as a fresh read. A third failure
+ * sits between them: answering with the errand rather than the answer, by dating the read
+ * out loud. The as-of survives as an attribute, for `schedule_context` and for the
+ * stale/current split; no prose line may carry it.
  */
 
 // A Tuesday morning: 2026-08-18T14:00Z is 10:00 in New York.
@@ -78,6 +81,17 @@ beforeEach(() => {
 
 function build(): ScheduleSnapshot | null {
   return buildScheduleContext(db, CONTEXT, calendarCapabilityState(db));
+}
+
+/**
+ * The block's sentences, without its attributes.
+ *
+ * The attribute line legitimately carries times — `window_from` is the read instant,
+ * because that is where the cached window starts. Prose is the part the model imitates and
+ * therefore the part that must stay free of them.
+ */
+function prose(block: string): string {
+  return block.slice(block.indexOf(">\n") + 2, block.lastIndexOf("\n</schedule>"));
 }
 
 function seed(events: unknown[], at: Date = AT): void {
@@ -153,6 +167,18 @@ describe("what the block says in each state", () => {
     expect(block).toContain("never memory about the user");
   });
 
+  it("dates itself for the audit trail without leaving a read time to recite", () => {
+    // The prose lines are what the model imitates, so a timestamp written into one comes
+    // back out of the model as "I last read your calendar at 14:00Z". The attribute is not
+    // a sentence and does not read as one.
+    seed([{ id: "e1", title: "Design review", starts_at: "2026-08-18T19:00:00Z" }]);
+    const block = renderScheduleBlock(build()!, CONTEXT);
+    expect(block).toContain(`as_of="${NOW}"`);
+    expect(prose(block)).not.toContain(NOW);
+    // Nor a localized rendering of it, which is what a prose line would reach for.
+    expect(prose(block)).not.toContain("10:00");
+  });
+
   it("caps a dense week and says how much it held back", () => {
     seed(
       Array.from({ length: 25 }, (_, index) => ({
@@ -166,7 +192,7 @@ describe("what the block says in each state", () => {
     expect(renderScheduleBlock(schedule!, CONTEXT)).toContain("+5 more through");
   });
 
-  it("presents an expired cache as the last read, dated, never as current", () => {
+  it("presents an expired cache as the last read, never as current", () => {
     const twoHoursAgo = new Date(AT.getTime() - 2 * 3_600_000);
     seed(
       [{ id: "e1", title: "Design review", starts_at: "2026-08-18T19:00:00Z" }],
@@ -178,6 +204,8 @@ describe("what the block says in each state", () => {
     expect(block).toContain('state="stale"');
     expect(block).toContain("as Zeus last read it");
     expect(block).toContain("A newer read has not succeeded");
+    // Stale says so in words. "Two hours ago" is the errand, not the caveat.
+    expect(prose(block)).not.toContain(twoHoursAgo.toISOString());
     // The last-known contents are still worth saying — that is the point of the state.
     expect(block).toContain("“Design review”");
   });

@@ -236,6 +236,14 @@ describe("the turn tells the model what Zeus can do", () => {
     );
     expect(body.instructions).not.toContain("say plainly that you didn't look");
     expect(body.instructions).not.toContain("You have no standing knowledge");
+    // Knowing the schedule is the feature; narrating the trip to go and get it is not.
+    // The prompt used to ask for the as-of time outright, which is how a reply came to
+    // open with when Zeus last read the calendar instead of what is on it.
+    expect(body.instructions).toContain("Never say when you last read it either");
+    expect(body.instructions).not.toContain("give the as-of time when currency matters");
+    expect(body.instructions).not.toContain("with its as-of time");
+    // A read renders no card, so that reply cannot defer its particulars to a panel.
+    expect(body.instructions).toContain("a read has no panel beneath it");
   });
 
   it("asks for a voice, not only for a list of things not to claim", async () => {
@@ -495,6 +503,32 @@ describe("reporting what happened to the calendar", () => {
     expect(block).toContain("near_misses_that_did_not_match");
     expect(block).toContain('status="target_not_found"');
     expect(block).toContain("Sushi");
+  });
+
+  it("gives the model the window it covered, but not when it went and looked", () => {
+    const block = renderCalendarResult({
+      kind: "read",
+      status: "done",
+      reason: null,
+      note: null,
+      conflicts: [],
+      alternatives: [],
+      candidates: [],
+      nearMisses: [],
+      consideredEvents: 4,
+      coverage: {
+        from: "2026-08-18T14:00:00.000Z",
+        to: "2026-09-17T14:00:00.000Z",
+        fetchedAt: "2026-08-18T14:00:00.000Z",
+        eventCount: 4,
+      },
+    });
+    // "Nothing in the next 30 days" needs the window. Nothing the model is allowed to say
+    // needs the read time, and this block rides beside <schedule> on exactly the turn where
+    // reciting one would be worst.
+    expect(block).toContain("2026-09-17T14:00:00.000Z");
+    expect(block).toContain('"eventCount":4');
+    expect(block).not.toContain("fetchedAt");
   });
 
   it("withholds third-party text that reads as an instruction, and says that it did", () => {

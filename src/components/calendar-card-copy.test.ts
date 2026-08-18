@@ -67,10 +67,12 @@ describe("calendar card copy", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("covers every outcome kind, so no card falls through to a blank verb", () => {
+  it("covers every outcome kind that has a card, so none falls through to a blank verb", () => {
     // The Record types make this exhaustive at compile time; this catches an empty string
     // slipped in to satisfy the type, and keeps the two maps from drifting apart.
-    expect(Object.keys(VERB).sort()).toEqual(["cancel", "create", "read", "reschedule"]);
+    // No `read`: a read changed nothing and renders no card, so a verb for it would be copy
+    // the user can never see, and CalendarCardKind makes writing one a build error.
+    expect(Object.keys(VERB).sort()).toEqual(["cancel", "create", "reschedule"]);
     expect(Object.keys(NOT_DONE).sort()).toEqual(Object.keys(VERB).sort());
     for (const [kind, verb] of Object.entries(VERB)) {
       expect(verb, `VERB.${kind}`).not.toBe("");

@@ -20,15 +20,20 @@ import { guardExternalText } from "./untrusted-data";
  * the same turn — and the intent gate that triggers those reads is deliberately narrow. On
  * every other turn Zeus had a warm 30-day cache it was forbidden to mention, so the honest
  * reply to "what does my day look like?" was "I didn't look." This block is what makes
- * "Zeus already knows your schedule" true: the cache, said out loud, with the time it was
- * read.
+ * "Zeus already knows your schedule" true: the cache, said out loud.
  *
  * It is external, untrusted, disposable data and stays that way. It is a sibling of
  * `<capabilities>`, never part of `<memory>`; nothing here reaches facts, facets,
  * candidates, or extraction. Every title and location passes the same guard the work
- * renderer uses, and the block disclaims its own currency: the as-of time is part of the
- * data, and a stale cache says so rather than posing as a fresh read. The write gate keeps
- * its own, stricter freshness proof — nothing rendered here authorizes anything.
+ * renderer uses. The write gate keeps its own, stricter freshness proof — nothing rendered
+ * here authorizes anything.
+ *
+ * The as-of time is an attribute and never a sentence. The block still has to disclaim its
+ * own currency — a stale cache says so rather than posing as a fresh read — but it does it
+ * in words, because the prose lines are what the model imitates, and a timestamp written
+ * into one comes back out as "I last read your calendar at 07:13Z". Zeus telling the user
+ * when it went and looked is a machine describing its own errand. `as_of` stays for the
+ * audit trail and for the model to tell stale from current; `state` carries the meaning.
  */
 
 /** How far ahead the block lists events in detail. Beyond this, a truthful count. */
@@ -122,19 +127,16 @@ export function renderScheduleBlock(
     );
   } else if (schedule.state === "stale") {
     lines.push(
-      `The user's schedule as Zeus last read it, at ${schedule.asOf}. A newer read has ` +
-        "not succeeded; the capabilities block says whether the connection needs anything.",
+      "The user's schedule as Zeus last read it. A newer read has not succeeded; the " +
+        "capabilities block says whether the connection needs anything.",
     );
     if (schedule.events.length === 0) {
       lines.push("That read holds no upcoming events.");
     }
   } else if (schedule.eventsTotal === 0) {
-    lines.push(
-      `Zeus read the full window at ${schedule.asOf} and verified it holds no upcoming ` +
-        "events.",
-    );
+    lines.push("Zeus read the full window and verified it holds no upcoming events.");
   } else {
-    lines.push(`The user's upcoming schedule, read at ${schedule.asOf}.`);
+    lines.push("The user's upcoming schedule, as last read.");
   }
   if (schedule.events.length > 0) {
     lines.push(

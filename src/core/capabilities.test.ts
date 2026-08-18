@@ -253,6 +253,9 @@ describe("what Zeus can actually do, stated rather than implied", () => {
     // this turn's own result block. Both halves stated, neither inflated.
     expect(block).toContain("the schedule block in this message is from that read");
     expect(block).toContain("shown only by a calendar result or work result in this turn");
+    // Whether a read has happened, never when. This block is relayed as "I", so the
+    // timestamp would come back out of the model as Zeus dating its own errand.
+    expect(block).not.toContain(state.lastReadAt!);
   });
 
   it("cannot be closed early by a connector label", () => {
