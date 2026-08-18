@@ -1,6 +1,7 @@
 import type { EventReference } from "./calendar-conflicts";
+import { describeInterval, endOf, startOf } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
-import type { CapabilitySlot, WorkPlanProposal } from "./schema";
+import type { CalendarOutcomeChange, CapabilitySlot, WorkPlanProposal } from "./schema";
 
 /**
  * One calendar change, fully resolved before any plan exists.
@@ -14,6 +15,15 @@ import type { CapabilitySlot, WorkPlanProposal } from "./schema";
  * authorization is bound to this exact action rather than to "some calendar work".
  */
 
+/**
+ * Where the particulars of a change came from.
+ *
+ * `earlier_proposal` means the user accepted something Zeus put to them — "ok do it" — so
+ * the minutes being written were never typed by them. It travels with the request, and
+ * therefore inside the plan hash, because it is part of what is being authorized.
+ */
+export type CalendarDetailsFrom = "user_message" | "earlier_proposal";
+
 export type CalendarRequest =
   | {
       kind: "create";
@@ -22,15 +32,30 @@ export type CalendarRequest =
       endsAt: string;
       location: string | null;
       timezone: string;
+      detailsFrom: CalendarDetailsFrom;
     }
   | {
       kind: "reschedule";
       reference: EventReference;
       startsAt: string;
-      endsAt: string;
+      /**
+       * Null means keep the length the event already has.
+       *
+       * A move is not a redefinition. Committing to an end here would mean guessing one,
+       * because the target is not resolved until the calendar has been read — and the guess
+       * that used to be made was a flat hour, which quietly turned a half-hour block into a
+       * long one and a two-hour block into a short one.
+       */
+      endsAt: string | null;
       timezone: string;
+      detailsFrom: CalendarDetailsFrom;
     }
-  | { kind: "cancel"; reference: EventReference; timezone: string }
+  | {
+      kind: "cancel";
+      reference: EventReference;
+      timezone: string;
+      detailsFrom: CalendarDetailsFrom;
+    }
   /**
    * Everything inside a span, rather than one event picked out of it.
    *
@@ -39,12 +64,23 @@ export type CalendarRequest =
    * matches four events has found exactly what it was asked for. Collapsing them would mean
    * relaxing the rule that stops the wrong meeting being deleted.
    */
-  | { kind: "clear"; from: string; to: string; timezone: string }
+  | {
+      kind: "clear";
+      from: string;
+      to: string;
+      timezone: string;
+      detailsFrom: CalendarDetailsFrom;
+    }
   | { kind: "read"; from: string; to: string; timezone: string };
 
 export type CalendarWriteRequest = Extract<
   CalendarRequest,
   { kind: "create" | "reschedule" | "cancel" | "clear" }
+>;
+
+export type CalendarSingleWriteRequest = Extract<
+  CalendarRequest,
+  { kind: "create" | "reschedule" | "cancel" }
 >;
 
 const OPEN = "<calendar_request>";
@@ -109,11 +145,62 @@ export function buildCalendarPayload(
     return {
       event_id: target.external_id,
       start: request.startsAt,
-      end: request.endsAt,
+      end: resolvedEnd(request, target),
       time_zone: request.timezone,
     };
   }
   return { event_id: target.external_id, status: "cancelled" };
+}
+
+/**
+ * When the move stated no end, the event keeps its own length.
+ *
+ * `endOf` already owns the rule for an event whose end the service did not give us, so a
+ * calendar entry with no end behaves here exactly as it does in the overlap check rather
+ * than acquiring a second, quieter definition.
+ */
+export function resolvedEnd(
+  request: Extract<CalendarRequest, { kind: "reschedule" }>,
+  target: CachedEvent,
+): string {
+  if (request.endsAt !== null) return request.endsAt;
+  const duration = endOf(target) - startOf(target);
+  const start = Date.parse(request.startsAt);
+  return new Date(start + duration).toISOString();
+}
+
+/**
+ * The change itself — which event, out of which minutes, into which — resolved once and
+ * carried wherever it needs to be said.
+ *
+ * The stored outcome and the model both read this rather than deriving a window from prose,
+ * which is what stops the reported change from disagreeing with the payload.
+ */
+export function changeOf(
+  request: CalendarSingleWriteRequest,
+  target: CachedEvent | null,
+): CalendarOutcomeChange {
+  const title = request.kind === "create" ? request.title : (target?.title ?? null);
+  const from = target ? { startsAt: target.starts_at, endsAt: target.ends_at } : null;
+  const timezone = request.timezone;
+  if (request.kind === "cancel") return { title, timezone, from, to: null };
+  if (request.kind === "create") {
+    return {
+      title,
+      timezone,
+      from: null,
+      to: { startsAt: request.startsAt, endsAt: request.endsAt },
+    };
+  }
+  return {
+    title,
+    timezone,
+    from,
+    to: {
+      startsAt: request.startsAt,
+      endsAt: target ? resolvedEnd(request, target) : request.endsAt,
+    },
+  };
 }
 
 /** What the cache knew about the target, so the receipt can say what it was before Zeus changed it. */
@@ -129,26 +216,36 @@ export function priorStateOf(target: CachedEvent | null): Record<string, unknown
   };
 }
 
+/**
+ * The sentence a person reads before approving a change, in their own clock.
+ *
+ * It used to render UTC ISO instants — `to 2026-08-20T10:30:00.000Z–2026-08-20T11:30:00.000Z`
+ * — which is unreadable at exactly the moment reading matters. A reschedule also says where
+ * the event is coming from, because the whole question being asked is whether the move is
+ * the one that was agreed.
+ */
 export function previewFor(
   request: CalendarWriteRequest,
   target: CachedEvent | null,
+  now: string,
 ): string {
   const name = request.kind === "create"
     ? request.title
     : (target?.title ?? "that event");
+  const when = (startsAt: string, endsAt: string | null) =>
+    describeInterval(startsAt, endsAt, request.timezone, now);
   if (request.kind === "create") {
-    return `Create “${name}” from ${request.startsAt} to ${request.endsAt}.`;
+    return `Create “${name}” ${when(request.startsAt, request.endsAt)}.`;
   }
   if (request.kind === "reschedule") {
-    return `Move “${name}” to ${request.startsAt}–${request.endsAt}.`;
+    const to = when(request.startsAt, target ? resolvedEnd(request, target) : request.endsAt);
+    const from = target ? when(target.starts_at, target.ends_at) : null;
+    return from === null
+      ? `Move “${name}” to ${to}.`
+      : `Move “${name}” from ${from} to ${to}.`;
   }
-  if (request.kind === "clear") {
-    // Names the event, not the window: this is the sentence shown against one exact payload,
-    // and "clear Thursday afternoon" repeated four times would say nothing about what each
-    // request would actually remove.
-    return `Cancel “${name}”, clearing ${request.from} to ${request.to}.`;
-  }
-  return `Cancel “${name}”.`;
+  const at = target ? when(target.starts_at, target.ends_at) : null;
+  return at === null ? `Cancel “${name}”.` : `Cancel “${name}”, ${at}.`;
 }
 
 /**

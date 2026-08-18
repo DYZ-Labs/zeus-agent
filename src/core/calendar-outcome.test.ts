@@ -33,6 +33,7 @@ const OUTCOME: CalendarOutcome = {
   nearMisses: [
     { externalId: "sushi", title: "Sushi with Mark", startsAt: "2026-08-20T18:00:00.000Z" },
   ],
+  change: null,
   consideredEvents: 1,
   coverage: {
     from: "2026-08-15T09:00:00.000Z",
@@ -170,6 +171,7 @@ describe("what Zeus already did, for the model rather than the page", () => {
     expect(calendarHistoryFor(db, conversationId)).toHaveLength(1);
     const parsed = CalendarOutcome.safeParse(legacy);
     expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.change).toBeNull();
     expect(parsed.success && parsed.data.preview).toBeNull();
     expect(parsed.success && parsed.data.overlaps).toEqual([]);
   });

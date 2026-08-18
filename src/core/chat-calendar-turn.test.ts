@@ -90,6 +90,7 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
   return {
     intent: "reschedule",
     confidence: "high",
+    details_from: "user_message",
     title: null,
     starts_at_local: "2026-08-17T19:30",
     ends_at_local: null,
@@ -204,6 +205,32 @@ async function nextTurn(db: Db, conversationId: number, input: string) {
   };
   return { result, sentToModel: body.input.at(-1)?.content ?? "" };
 }
+
+describe("resolving what a short reply is agreeing to", () => {
+  it("shows the classifier its own earlier reply, labelled as its own", async () => {
+    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    appendMessage(db, conversation.id, "user", "what should i do");
+    appendMessage(
+      db,
+      conversation.id,
+      "assistant",
+      "Move “wake up and shower” to 10:00–10:30 AM.",
+    );
+
+    await nextTurn(db, conversation.id, "ok do it");
+
+    const passed = mocks.classifyCalendarIntent.mock.calls.at(-1)?.[1] as {
+      priorTurns: { role: string; text: string }[];
+    };
+    expect(passed.priorTurns).toContainEqual({
+      role: "assistant",
+      text: "Move “wake up and shower” to 10:00–10:30 AM.",
+    });
+    expect(passed.priorTurns).toContainEqual({ role: "user", text: "what should i do" });
+  });
+});
 
 describe("a recognized calendar request is never silent", () => {
   it("reads a connected calendar on the first turn of every new conversation", async () => {

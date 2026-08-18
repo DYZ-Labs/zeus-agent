@@ -1,3 +1,4 @@
+import type { CalendarDetailsFrom } from "./calendar-actions";
 import type { Db } from "./db";
 import { now } from "./db";
 import { CalendarActionSetting } from "./schema";
@@ -12,6 +13,13 @@ import { CalendarActionSetting } from "./schema";
  * time is free. A collision, an unreadable calendar, or an ambiguous target all fall back
  * to asking, whatever this says.
  *
+ * So does a change whose particulars Zeus supplied. The conflict gate checks the
+ * *destination*; it has nothing to say about whether the request itself is the one that was
+ * agreed, and an hour nobody asked for collides with nothing precisely because it is free.
+ * When the times were carried over from something Zeus proposed rather than something the
+ * user wrote, the one remaining check is the user reading it — so the change is prepared and
+ * shown instead of sent.
+ *
  * The daily ceiling is a backstop rather than a budget. It exists so that a
  * misclassification loop costs a handful of events and then stops on its own, instead of
  * discovering the problem by the state of somebody's week.
@@ -19,7 +27,7 @@ import { CalendarActionSetting } from "./schema";
 
 export type DirectExecutionAllowance = {
   allowed: boolean;
-  reason: "disabled" | "daily_limit" | null;
+  reason: "disabled" | "daily_limit" | "inferred_details" | null;
   usedToday: number;
   limit: number;
 };
@@ -83,7 +91,7 @@ export function updateCalendarActionSetting(
  */
 export function directExecutionAllowance(
   db: Db,
-  options: { at?: Date } = {},
+  options: { at?: Date; detailsFrom?: CalendarDetailsFrom } = {},
 ): DirectExecutionAllowance {
   const setting = getCalendarActionSetting(db);
   const at = options.at ?? new Date();
@@ -99,6 +107,12 @@ export function directExecutionAllowance(
   const usedToday = used?.count ?? 0;
   if (setting.direct_execution !== 1) {
     return { allowed: false, reason: "disabled", usedToday, limit: setting.daily_limit };
+  }
+  // Anything that is not plainly the user's own words is treated as inferred. A request that
+  // reached here without saying where its details came from — a plan encoded before this
+  // field existed, say — is exactly the case that should ask rather than assume.
+  if (options.detailsFrom !== "user_message") {
+    return { allowed: false, reason: "inferred_details", usedToday, limit: setting.daily_limit };
   }
   if (usedToday >= setting.daily_limit) {
     return { allowed: false, reason: "daily_limit", usedToday, limit: setting.daily_limit };

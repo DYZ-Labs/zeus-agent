@@ -83,7 +83,9 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
           : bound.status
       );
 
-  const allowance = directExecutionAllowance(db);
+  // Describe the standing setting for a change whose details the user supplied. Individual
+  // requests may still narrow this allowance when their times came from an earlier proposal.
+  const allowance = directExecutionAllowance(db, { detailsFrom: "user_message" });
   return {
     connected: usable !== null || bound !== null,
     canRead: read !== null,
@@ -198,8 +200,9 @@ function calendarLines(state: CalendarCapabilityState): string[] {
       state.directExecution
         ? "Calendar changes without asking each time: on, and " +
             `${state.remainingToday} more allowed today. Zeus still reads the calendar first ` +
-            "and still stops to ask when the time is taken, the calendar cannot be read, or " +
-            "more than one event matches. Clearing a stretch of time always stops to ask, and " +
+            "and still stops to ask when the time is taken, the calendar cannot be read, " +
+            "more than one event matches, or the times came from something Zeus suggested " +
+            "rather than from the user. Clearing a stretch of time always stops to ask, and " +
             "lists everything it would cancel first."
         : "Calendar changes without asking each time: off. Every change stops for the user to " +
             "confirm the exact request.",

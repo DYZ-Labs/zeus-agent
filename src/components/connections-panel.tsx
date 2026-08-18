@@ -289,7 +289,8 @@ function DirectExecutionToggle({ enabled }: { enabled: boolean }) {
           </span>
           <span className="mt-1 block text-[0.75rem]" style={{ color: "var(--shell-faint)" }}>
             Zeus reads your calendar first and only acts when the time is free. A clash, a
-            calendar it cannot read, or an unclear event always stops and asks.
+            calendar it cannot read, an unclear event, or times Zeus worked out from its own
+            suggestion rather than from you always stop and ask.
           </span>
         </span>
       </label>

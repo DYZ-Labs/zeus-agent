@@ -28,6 +28,7 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
   return {
     intent: "create",
     confidence: "high",
+    details_from: "user_message",
     title: "Lunch with Sam",
     starts_at_local: "2026-08-18T12:00",
     ends_at_local: null,
@@ -123,6 +124,39 @@ describe("noticing that a message might be about a calendar", () => {
     "",
   ])("skips %j without paying for a model call", (message) => {
     expect(mayBeCalendarRequest(message)).toBe(false);
+  });
+});
+
+describe("the messages that used to reach nothing at all", () => {
+  // Every message in the reported conversation failed this filter, so no calendar was ever
+  // opened and no result block ever reached the model — which is why it answered from its own
+  // earlier sentences and described a change that never happened. The filter is meant to be
+  // over-inclusive: a false positive costs one cheap classifier call, a false negative costs
+  // the whole feature.
+  it.each([
+    "so can i go out at 1030",
+    "can i shower in 30 mins?",
+    "but im going out at 1030",
+    "free at 7?",
+    "am i busy from 9.30",
+  ])("notices %j", (message) => {
+    expect(mayBeCalendarRequest(message)).toBe(true);
+  });
+
+  it("notices an acceptance only when what it accepts was a calendar request", () => {
+    const proposal = "Your calendar blocks 10–11, so move “wake up and shower” to 10–10:30.";
+    expect(mayBeCalendarRequest("ok do it", { previousAssistantText: proposal })).toBe(true);
+    expect(mayBeCalendarRequest("go ahead", { previousAssistantText: proposal })).toBe(true);
+    // The same words after anything else are just words. Judging them on their own is what
+    // would turn every "ok" in every conversation into a classifier call.
+    expect(
+      mayBeCalendarRequest("ok do it", { previousAssistantText: "Here's a draft of the essay." }),
+    ).toBe(false);
+    expect(mayBeCalendarRequest("ok do it")).toBe(false);
+  });
+
+  it("does not read a year as a time of day", () => {
+    expect(mayBeCalendarRequest("it happened in 2026 apparently")).toBe(false);
   });
 });
 
@@ -240,6 +274,79 @@ describe("changing an existing event", () => {
       },
       note: null,
     });
+  });
+
+  it("keeps the event's own length when a move states no new end", () => {
+    // The bug this replaces, exactly: a move with no stated end took `start + 1 hour`, so an
+    // agreed 10:00-10:30 was written as 10:30-11:30 — half an hour late and twice as long.
+    // The length is not knowable here, because the target is not resolved until the calendar
+    // has been read, so the honest answer is to say nothing rather than guess an hour.
+    expect(
+      resolveCalendarRequest(
+        "push wake up and shower to 10:30",
+        intent({
+          intent: "reschedule",
+          title: null,
+          starts_at_local: "2026-08-17T10:30",
+          ends_at_local: null,
+          target: { title_text: "wake up and shower", starts_at_local: null, date_local: null },
+        }),
+        CONTEXT,
+      ),
+    ).toMatchObject({
+      status: "request",
+      request: {
+        kind: "reschedule",
+        startsAt: "2026-08-17T10:30:00.000Z",
+        endsAt: null,
+      },
+    });
+  });
+
+  it("takes the stated end of a move over the event's current length", () => {
+    // The turn from the report: Zeus proposed 10:00-10:30, the user said "ok do it". Both
+    // ends of the agreed window have to survive to the request, or the change carried out is
+    // not the one that was agreed.
+    expect(
+      resolveCalendarRequest(
+        "ok do it",
+        intent({
+          intent: "reschedule",
+          title: null,
+          starts_at_local: "2026-08-17T10:00",
+          ends_at_local: "2026-08-17T10:30",
+          details_from: "earlier_proposal",
+          target: { title_text: "wake up and shower", starts_at_local: null, date_local: null },
+        }),
+        CONTEXT,
+      ),
+    ).toMatchObject({
+      status: "request",
+      request: {
+        kind: "reschedule",
+        startsAt: "2026-08-17T10:00:00.000Z",
+        endsAt: "2026-08-17T10:30:00.000Z",
+        // Carried through so the standing setting can decline to act unattended on times the
+        // user never typed.
+        detailsFrom: "earlier_proposal",
+      },
+    });
+  });
+
+  it("still refuses a move whose stated end is before its start", () => {
+    expect(
+      resolveCalendarRequest(
+        "move dinner to 7pm until 6pm",
+        intent({
+          intent: "reschedule",
+          title: null,
+          starts_at_local: "2026-08-17T19:00",
+          ends_at_local: "2026-08-17T18:00",
+          target: { title_text: "dinner", starts_at_local: null, date_local: null },
+        }),
+        CONTEXT,
+      ),
+    ).toMatchObject({ status: "refused", reason: "implausible_duration" });
   });
 
   it("cancels by description", () => {
@@ -396,6 +503,7 @@ describe("clearing a window", () => {
         from: "2026-08-20T12:00:00.000Z",
         to: "2026-08-20T18:00:00.000Z",
         timezone: "UTC",
+        detailsFrom: "user_message",
       },
       note: null,
     });

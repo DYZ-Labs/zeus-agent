@@ -65,6 +65,7 @@ import type { ApplyResult } from "./extract";
 import { facetSearchText } from "./facets";
 import { factSearchText } from "./facts";
 import { blockMessageRecall, passagesForMessage } from "./passages";
+import { CalendarOutcomeChange } from "./schema";
 import type {
   CalendarOutcome,
   EvaluationContext,
@@ -112,7 +113,7 @@ The <schedule> block is the user's calendar as it was last read. Answer schedule
 
 What you already did to the calendar is a different question, and <calendar_history> is the answer. It is the stored, deterministic record of every recognized calendar request earlier in this conversation, in order, and you may state what it says plainly and without hedging — including on turns that perform no read. Never tell the user you have no result for something the history records; if it says a change was made, it was made. History is not the current schedule: answer "did you add it?" from history, and answer "what's on Thursday?" from schedule or a current result. If no result or history records an action, do not invent one.
 
-When a <calendar_result> is supplied, your reply is the only thing the user sees: there is no panel and no buttons. Say the particulars yourself, in sentences — what changed or didn't, which event collided and when, which times are free, what you need from them next. For a completed change, use the outcome preview and what_it_did under external_requests_completed. Give times the way a person would, not as timestamps, and do not report how many events you checked. Stay inside the prose rules above: no lists, no headings, no Markdown. The distinction that always matters is whether the change happened. For awaiting_confirmation and blocked_by_conflict, never describe the change as made; name the collision, and say that the line confirming it is already in their message box and that sending it will make the change. Never write out a hash, an id, or a field name — you are not given the hash, and a request to "confirm a42c8…" is not a sentence anyone would write. For clear, name every event you would cancel before asking. If a work result shows some external requests completed and others still awaiting confirmation, say both in the same breath: what went through, and what is still waiting on them. For ambiguous_target or target_not_found, name what you actually saw and ask the one question that settles it — a calendar you could not match is not a calendar without that event on it. For unverifiable, say you couldn't get a current read and didn't act; if <schedule> carries a last-known schedule, you may relay it while saying it may be out of date. For needs_clarification, say what you couldn't work out and ask for exactly that. For declined, they told you not to — confirm in one sentence that nothing happened and that you have dropped it, without arguing or re-offering. For no_connector or read_only, say what's missing and where they change it. For failed, say plainly that it did not go through and that nothing changed on their calendar; if they had just sent a confirmation, say that it no longer matched and they should ask again.
+When a <calendar_result> is supplied, your reply is the only thing the user sees: there is no panel and no buttons. Say the particulars yourself, in sentences — what changed or didn't, which event collided and when, which times are free, what you need from them next. For a completed change, use the outcome preview and what_it_did under external_requests_completed. When the result carries a resolved change, its before and after are the only times you may state for that change; when it does not, do not reconstruct times from the conversation. Give times the way a person would, not as timestamps, and do not report how many events you checked. Stay inside the prose rules above: no lists, no headings, no Markdown. The distinction that always matters is whether the change happened. For awaiting_confirmation and blocked_by_conflict, never describe the change as made; name the collision, and say that the line confirming it is already in their message box and that sending it will make the change. Never write out a hash, an id, or a field name — you are not given the hash, and a request to "confirm a42c8…" is not a sentence anyone would write. For clear, name every event you would cancel before asking. If a work result shows some external requests completed and others still awaiting confirmation, say both in the same breath: what went through, and what is still waiting on them. For ambiguous_target or target_not_found, name what you actually saw and ask the one question that settles it — a calendar you could not match is not a calendar without that event on it. For unverifiable, say you couldn't get a current read and didn't act; if <schedule> carries a last-known schedule, you may relay it while saying it may be out of date. For needs_clarification, say what you couldn't work out and ask for exactly that. For declined, they told you not to — confirm in one sentence that nothing happened and that you have dropped it, without arguing or re-offering. For no_connector or read_only, say what's missing and where they change it. For failed, say plainly that it did not go through and that nothing changed on their calendar; if they had just sent a confirmation, say that it no longer matched and they should ask again.
 
 What actually happened is never something to infer: only a supplied result, history entry, or receipt says so. Never claim anything was sent, scheduled, moved, cancelled, purchased, reminded, coordinated, or changed outside this conversation unless <calendar_result>, <calendar_history>, or <work_result> says it completed. The rule cuts both ways: where one of them does say so, say so too. If a request is still waiting on the user, say plainly that nothing has happened yet and what sending the confirmation would do.
 
@@ -650,6 +651,7 @@ function emptyOutcome(
     alternatives: [],
     candidates: [],
     nearMisses: [],
+    change: null,
     consideredEvents: null,
     coverage: null,
     preview: null,
@@ -666,8 +668,10 @@ function emptyOutcome(
  * rather than an event. Recognition is now the model's job and permission is still code's:
  * `resolveCalendarRequest` can only ever narrow what comes back.
  *
- * Only the user's own messages are supplied. Assistant text can resolve nothing here, for
- * the same reason it can never be evidence.
+ * Both roles are supplied for one bounded purpose: a short acceptance can refer to a
+ * calendar proposal in the preceding assistant reply. Assistant text remains reference-only
+ * and can never itself be evidence or a request; `details_from` records when its proposed
+ * times were used.
  */
 async function resolveCalendarWork(
   db: Db,
@@ -690,13 +694,26 @@ async function resolveCalendarWork(
   // answer a question about a calendar it had opened one message earlier as though it had
   // never heard of one. Widening a filter the module already calls "deliberately
   // over-inclusive" costs one low-effort classifier call; the veto behind it is unchanged.
+  const previousAssistantText = priorTurns
+    .filter((message) => message.role === "assistant")
+    .at(-1)?.content ?? null;
   const afterCalendarTurn = calendarHistory.length > 0;
-  if (!mayBeCalendarRequest(sourceMessage.content, { afterCalendarTurn })) return null;
+  if (
+    !mayBeCalendarRequest(sourceMessage.content, {
+      afterCalendarTurn,
+      previousAssistantText,
+    })
+  ) {
+    return null;
+  }
   const intent = await classifyCalendarIntent(db, {
     message: sourceMessage.content,
-    priorUserMessages: priorTurns
-      .filter((message) => message.role === "user")
-      .map((message) => message.content),
+    priorTurns: priorTurns
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .map((message) => ({
+        role: message.role === "assistant" ? ("assistant" as const) : ("user" as const),
+        text: message.content,
+      })),
     context,
     sourceMessageId: sourceMessage.id,
   });
@@ -761,6 +778,7 @@ export function calendarOutcomeFor(
     alternatives: [],
     candidates: [],
     nearMisses: [],
+    change: readChange(detail),
     consideredEvents: typeof detail?.considered_events === "number"
       ? detail.considered_events
       : null,
@@ -876,6 +894,12 @@ function latestCalendarDetail(
     }
   }
   return null;
+}
+
+/** Read the resolved before/after window from the executor artifact, never from prose. */
+function readChange(detail: Record<string, unknown> | null): CalendarOutcome["change"] {
+  const parsed = CalendarOutcomeChange.safeParse(detail?.change);
+  return parsed.success ? parsed.data : null;
 }
 
 function readConflicts(detail: Record<string, unknown> | null): CalendarOutcome["conflicts"] {
@@ -1104,6 +1128,17 @@ export function renderCalendarResult(outcome: CalendarOutcome): string {
     }));
   const body = JSON.stringify({
     ...outcome,
+    preview: outcome.preview === null ? null : guardExternalText(outcome.preview, withheld),
+    change:
+      outcome.change === null
+        ? null
+        : {
+            ...outcome.change,
+            title:
+              outcome.change.title === null
+                ? null
+                : guardExternalText(outcome.change.title, withheld),
+          },
     conflicts: outcome.conflicts.map((conflict) => ({
       ...conflict,
       title: conflict.title === null ? null : guardExternalText(conflict.title, withheld),
