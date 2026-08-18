@@ -4,6 +4,7 @@ import { syncCalendar } from "./calendar-sync";
 import type { Db } from "./db";
 import { now } from "./db";
 import { getSignal, runDetectors } from "./detectors";
+import { restoreConnectorReachability } from "./mcp-client";
 import { logEvent } from "./observability";
 import type {
   AmbientDeliveryAttempt,
@@ -388,17 +389,17 @@ const MIN_REFRESH_MINUTES = 5;
 const MAX_REFRESH_MINUTES = 180;
 
 /**
- * Whether this process is the one responsible for refreshing signals.
+ * Whether this process refreshes signals on a timer.
  *
- * Locally a macOS LaunchAgent already runs `refreshExternalSignals` on a timer, so the
- * server doing it too would spend a second set of calls against the same connector budget
- * to learn the same thing. Hosted, nothing runs it at all — which is why a hosted
- * deployment never noticed a double-booking no matter how long it was left running. The
- * default follows that split, and `ZEUS_SIGNAL_REFRESH` overrides it in either direction
- * for the deployment that does not match the assumption.
+ * On by default everywhere. The standing schedule block answers "what's my day look like?"
+ * from this cache, so a deployment where nothing refreshes it is a Zeus that greets every
+ * conversation with a stale calendar — which is exactly what the old hosted-only default
+ * produced for local runs. A tick with nothing connected costs one SQLite lookup and no
+ * network. A macOS install that also runs the LaunchAgent spends a second, budget-bounded
+ * read per interval; `ZEUS_SIGNAL_REFRESH=off` remains the opt-out for that, and for any
+ * deployment that wants the worker to own refresh entirely.
  */
 export function ambientRefreshSettings(
-  configuration: { mode: string },
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): AmbientRefreshSettings {
   const intervalMinutes = refreshIntervalSetting(environment.ZEUS_SIGNAL_REFRESH_MINUTES);
@@ -414,13 +415,7 @@ export function ambientRefreshSettings(
     throw new Error("ZEUS_SIGNAL_REFRESH must be 'on' or 'off'");
   }
 
-  const hosted =
-    configuration.mode === "configured" && environment.NODE_ENV === "production";
-  return {
-    enabled: hosted,
-    intervalMinutes,
-    reason: hosted ? "hosted" : "not_hosted",
-  };
+  return { enabled: true, intervalMinutes, reason: "default_on" };
 }
 
 function refreshIntervalSetting(raw: string | undefined): number {
@@ -437,6 +432,12 @@ export async function refreshExternalSignals(
   options: { at?: Date; signal?: AbortSignal } = {},
 ): Promise<{ synced: boolean; detected: number; resolved: number }> {
   const at = options.at ?? new Date();
+  // `syncCalendar` refuses an unavailable capability, so without this a connector left
+  // `unreachable` by one bad minute kept every scheduled refresh a silent no-op until a chat
+  // turn happened to be recognized as a calendar request. A scheduled refresh needs the
+  // calendar as much as that turn does; the restore re-enables no capability row, so it can
+  // heal sooner but can never widen a grant.
+  await restoreConnectorReachability(db, "calendar.list_events", { signal: options.signal });
   const synced = await syncCalendar(db, { at, signal: options.signal });
   const result = runDetectors(db, { at });
   logEvent({

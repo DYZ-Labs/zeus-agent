@@ -806,7 +806,7 @@ function spawnMigrationWriter(path: string): {
  */
 describe("clear-window migration keeps every stored outcome", () => {
   const clearIndex = MIGRATIONS.findIndex(
-    (migration) => migration.id === "029_calendar_clear_outcome_kind",
+    (migration) => migration.id === "030_calendar_clear_outcome_kind",
   );
   const beforeClear = MIGRATIONS.slice(0, clearIndex);
 

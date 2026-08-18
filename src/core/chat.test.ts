@@ -226,12 +226,30 @@ describe("the turn tells the model what Zeus can do", () => {
     expect(final).toContain("not connected");
     expect(final).toContain("Australia/Sydney");
     expect(final.indexOf("<capabilities>")).toBeLessThan(final.indexOf("<memory"));
-    // And the prompt must forbid answering from anything else.
-    expect(body.instructions).toContain("Never state what is or is not on their calendar now");
-    // The chat renders prose and nothing else now, so a prompt that still promises a panel
-    // would be telling the model to leave out the details with nothing left to show them.
-    expect(body.instructions).not.toContain("panel directly below your reply");
+    // No calendar is connected, so there is no schedule block — the biconditional the
+    // prompt relies on: block absent means (and only means) nothing is connected.
+    expect(final).not.toContain("<schedule");
+    // The prompt must anchor calendar answers to the standing block, and the reply the
+    // whole feature exists to abolish must no longer be scripted anywhere.
+    expect(body.instructions).toContain(
+      "Never say you didn't look at, didn't check, or have no access to the calendar",
+    );
+    expect(body.instructions).not.toContain("say plainly that you didn't look");
+    expect(body.instructions).not.toContain("You have no standing knowledge");
+    // Knowing the schedule is the feature; narrating the trip to go and get it is not.
+    // The prompt used to ask for the as-of time outright, which is how a reply came to
+    // open with when Zeus last read the calendar instead of what is on it.
+    expect(body.instructions).toContain("Never say when you last read it either");
+    expect(body.instructions).not.toContain("give the as-of time when currency matters");
+    expect(body.instructions).not.toContain("with its as-of time");
+    // The chat renders prose and nothing else, so every calendar outcome carries its own
+    // particulars instead of deferring them to a UI that no longer exists.
     expect(body.instructions).toContain("there is no panel and no buttons");
+    expect(body.instructions).not.toContain("A panel appears below your reply");
+    expect(body.instructions).not.toContain("a panel directly below your reply already shows");
+    // It is told where completed particulars live, and where earlier actions live.
+    expect(body.instructions).toContain("what_it_did under external_requests_completed");
+    expect(body.instructions).toContain("<calendar_history> is the answer");
   });
 
   it("asks for a voice, not only for a list of things not to claim", async () => {
@@ -494,6 +512,35 @@ describe("reporting what happened to the calendar", () => {
     expect(block).toContain("near_misses_that_did_not_match");
     expect(block).toContain('status="target_not_found"');
     expect(block).toContain("Sushi");
+  });
+
+  it("gives the model the window it covered, but not when it went and looked", () => {
+    const block = renderCalendarResult({
+      kind: "read",
+      status: "done",
+      reason: null,
+      note: null,
+      conflicts: [],
+      alternatives: [],
+      candidates: [],
+      nearMisses: [],
+      consideredEvents: 4,
+      coverage: {
+        from: "2026-08-18T14:00:00.000Z",
+        to: "2026-09-17T14:00:00.000Z",
+        fetchedAt: "2026-08-18T14:00:00.000Z",
+        eventCount: 4,
+      },
+      preview: null,
+      overlaps: [],
+      confirmationHash: null,
+    });
+    // "Nothing in the next 30 days" needs the window. Nothing the model is allowed to say
+    // needs the read time, and this block rides beside <schedule> on exactly the turn where
+    // reciting one would be worst.
+    expect(block).toContain("2026-09-17T14:00:00.000Z");
+    expect(block).toContain('"eventCount":4');
+    expect(block).not.toContain("fetchedAt");
   });
 
   it("withholds third-party text that reads as an instruction, and says that it did", () => {

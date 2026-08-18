@@ -59,6 +59,8 @@ import {
   WorkPlanProposal as WorkPlanProposalSchema,
 } from "./schema";
 import { structuredFacetConditionMatches } from "./stewardship";
+import { containsSensitiveSecret, inspectUntrustedWorkData } from "./untrusted-data";
+import type { UntrustedWorkDataIssue } from "./untrusted-data";
 import type {
   SafeStepExecutionInput,
   SafeStepExecutionResult,
@@ -550,9 +552,10 @@ async function executeExternalRead(
 
   // The window is passed through rather than recomputed, so the coverage row records the
   // window that was actually asked for.
+  const readAt = new Date();
   let events: ReturnType<typeof cacheCalendarEvents>;
   try {
-    events = cacheCalendarEvents(db, available.connector.id, result.value, new Date(), window);
+    events = cacheCalendarEvents(db, available.connector.id, result.value, readAt, window);
   } catch {
     // Parsing happens before the cache transaction. A malformed success response therefore
     // proves neither an empty calendar nor that the requested window was covered.
@@ -562,8 +565,7 @@ async function executeExternalRead(
   // a clash that would block a write are found in the same events by the same rule. Computed
   // here rather than left to the model: "do these two meetings collide?" is arithmetic, and a
   // model reading a JSON blob is the wrong instrument for it.
-  const at = new Date();
-  const overlaps = overlappingPairs(cachedEvents(db, at)).map(({ first, second }) => ({
+  const overlaps = overlappingPairs(cachedEvents(db, readAt)).map(({ first, second }) => ({
     first: overlapEvent(first),
     second: overlapEvent(second),
   }));
@@ -577,7 +579,7 @@ async function executeExternalRead(
       coverage: {
         from: window.from,
         to: window.to,
-        fetchedAt: at.toISOString(),
+        fetchedAt: readAt.toISOString(),
         eventCount: events.length,
       },
     },
@@ -875,7 +877,10 @@ function calendarGate(
           request,
           reason: "stale_coverage",
           coverage,
-          detail: "Zeus last read the calendar too long ago to act on it.",
+          // The same claim as the card's old stale line, and it reaches the model too: this
+          // artifact is rendered into <work_result>. Say why nothing happened without
+          // dating the read. `reason` and `coverage` keep the diagnostic precision.
+          detail: "The calendar could not be confirmed current, so nothing was changed.",
         }),
       };
     }
@@ -1707,42 +1712,10 @@ function isWebSource(value: unknown): value is { title: string; url: string } {
   return typeof record.title === "string" && typeof record.url === "string";
 }
 
-function containsSensitiveSecret(value: string): boolean {
-  return /\bsk-[A-Za-z0-9_-]{16,}\b/u.test(value) ||
-    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/u.test(value) ||
-    /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/iu.test(value) ||
-    /\b(?:password|passcode|api[_ -]?key|secret|session[_ -]?token|access[_ -]?token|refresh[_ -]?token)\s*[:=]\s*\S{6,}/iu.test(value) ||
-    /\b(?:account|routing)(?:\s+(?:number|no\.?))?\s*[:=]\s*[0-9 -]{6,24}\b/iu.test(value) ||
-    /\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/u.test(value) ||
-    /\b(?:\d[ -]*?){13,19}\b/u.test(value);
-}
-
-function containsExplicitHighSensitivity(value: string): boolean {
-  return /\b(?:i (?:was|have been|am) diagnosed with|my (?:diagnosis|medical record|therapy notes?|psychiatric (?:record|history))|i am (?:hiv positive|pregnant))\b/iu.test(value) ||
-    /\b(?:i (?:was|have been) arrested|my (?:criminal record|pending charges|lawsuit|attorney said))\b/iu.test(value) ||
-    /\b(?:my (?:salary|net worth|tax id|social security number) (?:is|:)|i owe \$?\d)\b/iu.test(value) ||
-    /\b(?:my (?:sexual orientation|sex life|intimate relationship)|i am (?:gay|lesbian|bisexual|transgender))\b/iu.test(value);
-}
-
-export type UntrustedWorkDataIssue = "sensitive_data" | "instruction_injection";
-
-/** Conservative guard applied before untrusted data is persisted or sent to another step. */
-export function inspectUntrustedWorkData(value: string): UntrustedWorkDataIssue | null {
-  if (containsSensitiveSecret(value) || containsExplicitHighSensitivity(value)) {
-    return "sensitive_data";
-  }
-  if (
-    /(?:ignore|disregard|override|forget)\s+(?:all\s+)?(?:previous|prior|system|developer)\s+(?:instructions?|messages?|rules?)/iu.test(value) ||
-    /(?:reveal|print|exfiltrate|send)\s+(?:the\s+)?(?:system prompt|developer message|api key|password|secret)/iu.test(value) ||
-    /<\/?(?:system|developer|tool)>/iu.test(value) ||
-    /\bsystem\s+(?:update|directive|notice)\s*:\s*[^\n]{0,200}\b(?:search|private context|hidden context|memory|verbatim)\b/iu.test(value) ||
-    /\b(?:search|quote|return|copy|repeat)\b[^\n]{0,120}\b(?:private|hidden|internal)\s+(?:context|memory|instructions?)\b[^\n]{0,80}\bverbatim\b/iu.test(value) ||
-    /\byou are now (?:an?|the)\b/iu.test(value)
-  ) {
-    return "instruction_injection";
-  }
-  return null;
-}
+// Moved to untrusted-data.ts so the schedule context and chat renderer can share the exact
+// guard without importing the work executor. Re-exported here because this module is where
+// the rest of the codebase historically found it.
+export { inspectUntrustedWorkData, type UntrustedWorkDataIssue } from "./untrusted-data";
 
 function sensitivePause(
   db: Db,

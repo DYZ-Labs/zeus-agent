@@ -2,12 +2,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { calendarCapabilityState, renderCapabilityBlock } from "./capabilities";
 import { updateCalendarActionSetting } from "./calendar-policy";
+import { cacheCalendarEvents } from "./calendar-sync";
 import {
   bindCapability,
+  configureGoogleCalendarCapabilities,
   createConnector,
   recordConnectorVerification,
   setCapabilityEnabled,
   setConnectorEnabled,
+  toolSchemaHash,
   upsertGoogleCalendarConnector,
 } from "./connectors";
 import { appendMessage, createConversation } from "./conversations";
@@ -144,6 +147,41 @@ describe("what Zeus can actually do, stated rather than implied", () => {
     expect(block).toContain("needs nothing from the user");
     expect(block).not.toContain("cannot be used");
     expect(block).not.toContain("Settings");
+    // Only turns that need the calendar pay for the revive handshake, so the block must
+    // not assert that this turn did.
+    expect(block).not.toContain("tried again this turn");
+    expect(block).toContain("retries on its own");
+  });
+
+  it("blames the operator, not the user, for a missing server-side setting", () => {
+    const connector = upsertGoogleCalendarConnector(db, {
+      connectionId: "12345678-1234-1234-1234-123456789abc",
+      mcpUrl: "https://calendar.example.test/mcp",
+      sourceMessageId: userMessageId,
+    });
+    recordConnectorVerification(db, connector.id, { status: "ready" });
+    configureGoogleCalendarCapabilities(db, {
+      connectorId: connector.id,
+      tools: [
+        {
+          name: "list_events",
+          description: null,
+          inputSchema: { type: "object", properties: { from: {}, to: {} } },
+          schemaHash: toolSchemaHash({ type: "object", properties: { from: {}, to: {} } }),
+          readOnlyHint: true,
+        },
+      ],
+      scopes: ["https://www.googleapis.com/auth/calendar.events.readonly"],
+      sourceMessageId: userMessageId,
+    });
+    // The web process has no broker key, so the granted capability cannot serve a call —
+    // an operator problem the old wording reported as "given Calendar access in Settings".
+    const state = calendarCapabilityState(db);
+    expect(state.unusableReason).toBe("missing_environment");
+    const block = renderCapabilityBlock(state, CONTEXT);
+    expect(block).toContain("operator");
+    expect(block).not.toContain("Settings, under Connections");
+    expect(block).not.toContain("given Calendar access");
   });
 
   it("still asks for a reconnection when the authorization is the thing that failed", () => {
@@ -203,6 +241,21 @@ describe("what Zeus can actually do, stated rather than implied", () => {
     connectorWith(["calendar.list_events"]);
     const block = renderCapabilityBlock(calendarCapabilityState(db), CONTEXT);
     expect(block).toContain("never successfully read");
+  });
+
+  it("points a recorded read at the schedule block, not at this turn's actions", () => {
+    const connectorId = connectorWith(["calendar.list_events"]);
+    cacheCalendarEvents(db, connectorId, { events: [] });
+    const state = calendarCapabilityState(db);
+    expect(state.lastReadAt).not.toBeNull();
+    const block = renderCapabilityBlock(state, CONTEXT);
+    // The standing schedule descends from that read; a change made this turn still needs
+    // this turn's own result block. Both halves stated, neither inflated.
+    expect(block).toContain("the schedule block in this message is from that read");
+    expect(block).toContain("shown only by a calendar result or work result in this turn");
+    // Whether a read has happened, never when. This block is relayed as "I", so the
+    // timestamp would come back out of the model as Zeus dating its own errand.
+    expect(block).not.toContain(state.lastReadAt!);
   });
 
   it("cannot be closed early by a connector label", () => {

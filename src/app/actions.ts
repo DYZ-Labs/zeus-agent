@@ -17,6 +17,7 @@ import {
 } from "@/core/backfill";
 import { updateAmbientSetting } from "@/core/ambient";
 import { updateCalendarActionSetting } from "@/core/calendar-policy";
+import { syncCalendar } from "@/core/calendar-sync";
 import {
   CAPABILITY_SLOTS,
   ConnectorPresetError,
@@ -39,7 +40,6 @@ import {
   declineEffect,
   executeConfirmedEffect,
   getProposedEffect,
-  revertEffect,
 } from "@/core/effects";
 import { ConnectorError, probeConnectorPreset, verifyConnector } from "@/core/mcp-client";
 import { createSafeWorkExecutor } from "@/core/work-execution";
@@ -978,6 +978,16 @@ export async function verifyConnectorAction(formData: FormData): Promise<void> {
   } catch (error) {
     redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
   }
+  // A verify that put a calendar back into service should also put its schedule back: warm
+  // the cache now rather than on the next turn. `syncCalendar` never throws and refuses on
+  // its own when this connector serves no calendar capability.
+  const connector = getConnector(db, id);
+  if (
+    connector?.provider === "google_calendar" ||
+    connector?.capabilities.some((capability) => capability.slot === "calendar.list_events")
+  ) {
+    await syncCalendar(db, { signal: AbortSignal.timeout(10_000) });
+  }
   revalidatePath("/settings");
 }
 
@@ -1142,21 +1152,6 @@ export async function declineEffectAction(formData: FormData): Promise<void> {
   if (!effect || effect.status !== "pending_confirmation") return;
   const source = curationMessage(db, `Do not send this external request: ${effect.preview_text}`);
   declineEffect(db, id, source.id, reason || undefined);
-  revalidatePath("/today");
-}
-
-export async function revertEffectAction(formData: FormData): Promise<void> {
-  const id = Number(formData.get("id"));
-  if (!Number.isInteger(id)) return;
-  const db = await requireOwnerDb();
-  const effect = getProposedEffect(db, id);
-  if (!effect || effect.status !== "executed") return;
-  const source = curationMessage(db, `Undo this external change: ${effect.preview_text}`);
-  try {
-    await revertEffect(db, id, source.id);
-  } catch (error) {
-    redirect(`/today?effect_error=${encodeURIComponent(connectorErrorMessage(error))}#confirmations`);
-  }
   revalidatePath("/today");
 }
 

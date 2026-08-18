@@ -110,7 +110,7 @@ flowchart LR
     J -->|"yes"| K["Stop\nshow the exact payload"]
     K --> L{"Verified free, or confirmed by hash?"}
     L -->|"clashes / unreadable / silence"| M["Nothing happens\nrefuse, decline, or expire"]
-    L -->|"yes"| N["Send exactly those bytes\nreceipt + undo where possible"]
+    L -->|"yes"| N["Send exactly those bytes\nreceipt"]
     M --> I
     N --> I
     H --> I
@@ -904,15 +904,14 @@ commit them.
   reminder, or shopping capability yet, and `purchase` is refused unconditionally — the
   storage layer will not even record it. Zeus can research and draft around those, but it
   stops before the action and never claims otherwise.
-- Undoing an external request works where the service's answer or Zeus's own prior read
-  makes it possible. A created event can be cancelled. A moved or cancelled event can be
-  restored from the snapshot taken during the read that preceded the change — but only the
-  fields Zeus read. Attendees, description, recurrence, reminders, and conferencing are not
-  restored, and un-cancelling does not recall the notices already sent.
+- There is no undo. A change Zeus made is a change your calendar now has; putting it back is
+  a new request through the same gates. What Zeus keeps is the record: the exact payload, who
+  authorized it, the check it ran, and — for a move or a cancel — what the event looked like
+  before, on the receipt at `/effects/<id>`.
 - The conflict check is only as good as the calendar Zeus can see. It reads your primary
   calendar; a secondary or shared calendar it was never granted is invisible to it. The
-  reply says how many events it checked, so the scope of the check is visible rather
-  than implied.
+  receipt records the check it ran and how many events it covered, so the scope of the
+  check is visible rather than implied.
 - Detectors read only your calendar and your accepted commitments. They notice overlapping
   events, tight turnarounds between different places, deadlines on already-full days, and
   commitments with no time set aside. They are deliberately literal and will not infer that

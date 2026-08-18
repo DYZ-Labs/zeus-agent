@@ -121,7 +121,12 @@ npm run mcp            # stdio MCP server
   neither a reload nor the next message leaves prose as the only record.
 - `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
   `<capabilities>` block. Never memory.
-- `src/core/calendar-sync.ts` — the disposable external read cache.
+- `src/core/calendar-sync.ts` — the disposable external read cache, and the turn-start
+  freshness top-up that keeps it answerable.
+- `src/core/calendar-context.ts` — the standing `<schedule>` block every chat turn renders
+  from that cache, with its snapshot trace. External data, never memory. The as-of time is
+  an attribute, never a sentence, and never spoken.
+- `src/core/untrusted-data.ts` — the one guard third-party text passes before a model sees it.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
   run capacity.
@@ -232,8 +237,8 @@ from the assistant's own text.
 
 Measure assisted progress, control signals, and regret separately. Do not replace them with
 conversation count, time spent, tasks surfaced, or a composite engagement score that could
-reward interruption. Declines and reversals of external requests are regret signals and
-must stay separately visible.
+reward interruption. Declining an external request is a regret signal and must stay
+separately visible.
 
 ### Detected signals are proposals too
 
@@ -392,7 +397,8 @@ drifted tool contract clear the capabilities and wait for a person; everything e
 them standing.
 
 Recovery follows from that. `restoreConnectorReachability` gives a connector in that state
-one bounded handshake on a turn that already needs it, then
+one bounded handshake on a turn or scheduled refresh that already needs it — the chat
+turn's schedule top-up and `refreshExternalSignals` both qualify — then
 `restoreConnectorAfterReachability` puts it back into service against the state observed
 *before* verifying — which is what keeps a connection the user deliberately switched off,
 whose `status` is still `ready`, out of scope. It re-enables no capability row, so it can
@@ -412,28 +418,41 @@ facet, goal, commitment, or candidate, it never enters `extract()`, and it never
 evidence table; keep it that way. Run every external payload through
 `inspectUntrustedWorkData` before it reaches a model.
 
-### What Zeus did is a matter of record; what is on the calendar is not
+### What is on the calendar and what Zeus did are separate records
 
-Two questions the prompt used to answer identically, and the conflation is a reported bug.
-"What is on my calendar?" genuinely needs a fresh read, and the rule stands: never say what
-is or is not there unless a `<calendar_result>` or `<work_result>` block in *this* turn
-supplies it. "Did you add it?" does not. Zeus has a stored `calendar_outcome` for every
-calendar request it recognized, and denying work it holds a receipt for is its own failure.
+Two questions the prompt used to answer identically exposed opposite failures. "What is on
+my calendar?" is answered from the standing `<schedule>` block or a result from this turn;
+"did you add it?" is answered from the stored `<calendar_history>`. A schedule may age, but
+an action Zeus completed remains a matter of record. Denying work it holds a receipt for is
+as wrong as presenting an old schedule as current.
 
-Every block of a turn belongs to a synthetic final user message that is discarded when the
-turn ends — only `options.input` is stored, and prior turns replay as bare prose. So a model
-asked "did that go through?" saw no evidence a calendar had ever been opened, and correctly
-refused to claim anything. The correct refusal was the bug.
+The standing `<schedule>` block is how the disposable cache reaches chat without becoming
+memory. Every turn with a connected calendar carries it, so Zeus already knows the schedule
+before being asked; a turn whose cache could not be refreshed relays the last successful read
+instead and says it may be out of date. The block is a sibling of `<capabilities>`, never part
+of `<memory>`; every title passes the guard; and it authorizes nothing — the write gate keeps
+its own stricter freshness proof. `lastKnownEvents` is the block's render-only reader over
+expired rows and must never feed the conflict gate or detectors, which keep failing closed on
+expiry through `cachedEvents`. Each rendered snapshot persists in `schedule_context`
+(assistant-context data, like `calendar_outcome`) so a schedule claim stays auditable after
+the cache reconciles.
 
-`calendarHistoryFor` closes it: a bounded, oldest-first `<calendar_history>` block built from
-the stored outcomes of this conversation. Scoped to the conversation rather than to the
-model's message window, because a change made forty messages ago is still a change that was
-made. It carries a status and a preview and no event list — a record of Zeus's actions, never
-of the calendar's contents — and every preview goes through `guardExternalText`, since an
-event title in it is still somebody else's writing.
+Every volatile block of a turn belongs to a synthetic final user message that is discarded
+when the turn ends — only `options.input` is stored, and prior turns replay as bare prose. A
+later "did that go through?" therefore used to see no evidence that Zeus had touched a
+calendar. `calendarHistoryFor` closes that gap with a bounded, oldest-first
+`<calendar_history>` built from the stored outcomes of this conversation. It is scoped to the
+conversation rather than the model's message window, because a change made forty messages
+ago is still a change that was made. It carries statuses and previews but no event list — a
+record of Zeus's actions, never the current calendar — and every preview passes
+`guardExternalText`, since an event title is still somebody else's writing. Where history
+records an action, say it plainly; where it does not, do not invent one.
 
-Two rules follow, and both belong in the prompt. Where the history records something, say it
-plainly. Where it records nothing, the honest answer is still that you did not look.
+Knowing the schedule is the feature; narrating the trip to get it is not. Zeus never tells
+the user when it last read the calendar — not a date, clock time, elapsed duration, or "as
+of". The timestamp survives as machine data in `schedule_context`, the block's `as_of`
+attribute, and `coverage.fetchedAt`, but no spoken line carries it. Stale still has to say it
+is stale, in words and as a clause offering to check again.
 
 `CalendarOutcome` gains fields over time. Add them with `.default(...)`: a stored row is read
 back with `safeParse` and dropped on failure, so a bare required addition silently erases
@@ -553,13 +572,21 @@ like, not a person who knows you.
   went with the cards, and `styleViolations` (`src/core/response-style.ts`) currently has no
   production consumer as a result. If you add fixed copy back, put it in a module a test can
   sweep rather than inline in a component, and point the sweep at it.
+- There is no undo. A calendar write is proposed, gated, sent, and recorded; putting it back
+  is a new request through the same gates, in the user's own words. Zeus does not clean up
+  after itself with a call nobody asked for. `proposed_effect.reversal_json`,
+  `status = 'reverted'`, and `effect_event.event_type = 'reverted'` stay in the schema and in
+  the Zod enums so rows written before this still read back and still label themselves
+  "undone"; nothing writes them now. `prior_state_json` stays too, and its reason changed: it
+  is the audit record of what an event looked like before Zeus changed it, shown on the
+  receipt.
 - The `<capabilities>` block is the deliberate exception and stays third person: it rides
   inside a user-role message, where “I” would read as the user. The prompt asks for it to
   be relayed as I.
 - Text placed in the composer on the user's behalf must read like something they would
   type. It carries no standing safety disclaimer — `authorizeWorkPlan` and `confirmEffect`
   gate external action regardless, and a compliance paragraph attributed to the user
-  misrepresents them. `confirmationSentence` in `src/core/effects.ts` is the exception,
+  misrepresents them. `confirmationSentence` in `src/core/confirmation-text.ts` is the exception,
   because that exact string is evidence — and with no Confirm button left, it is the only
   way a change gets authorized from chat.
 - Nothing in `npm run check` can judge model prose, and there is no longer a deterministic
