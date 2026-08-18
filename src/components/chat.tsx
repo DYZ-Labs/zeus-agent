@@ -548,6 +548,12 @@ function AssistantTurn({
             onDecision={onRecommendationDecision}
           />
         )}
+        {/*
+          A read renders nothing, and the card decides that for itself rather than this
+          ternary deciding it: an outcome exists for every calendar request, so this branch
+          must keep being taken. Testing `calendar.kind` here instead would fall through to
+          the read's own WorkPlanCard, which lists the very steps the card was hiding.
+        */}
         {calendar ? (
           <CalendarActionCard workPlan={workPlan} outcome={calendar} onReply={onReply} />
         ) : (
@@ -612,6 +618,14 @@ function CalendarActionCard({
     }
   }
 
+  // A read changed nothing, so there is no receipt to put under the reply. Read-shaped
+  // refusals go with it — nothing connected, a calendar that needs reconnecting, a request
+  // that could not be classified — because the reply already has to say what is missing and
+  // where to change it. The calendar_outcome row is still written either way, so what
+  // happened stays recorded; only the rendering is gone. Placed below the hooks so they
+  // still run unconditionally.
+  if (outcome.kind === "read") return null;
+
   if (decided) {
     return (
       <aside
@@ -642,7 +656,7 @@ function CalendarActionCard({
             {VERB[outcome.kind]}
             {done[0] ? ` — ${done[0].previewText}` : "."}
           </p>
-          {outcome.consideredEvents !== null && outcome.kind !== "read" && (
+          {outcome.consideredEvents !== null && (
             <p className="mt-1 text-[0.72rem]" style={{ color: "var(--shell-faint)" }}>
               Checked {outcome.consideredEvents}{" "}
               {outcome.consideredEvents === 1 ? "event" : "events"} {CARD_COPY.checkedFirst}

@@ -203,10 +203,15 @@ function calendarLines(state: CalendarCapabilityState): string[] {
             "confirm the exact request.",
     );
   }
+  // Whether a read has ever succeeded, never when it happened. This line is relayed as "I",
+  // so a timestamp here becomes Zeus telling the user what time it went and looked — which
+  // is an audit log talking, not someone who knows their schedule. The distinction that
+  // earns its place is never-read versus read, and the schedule block's own `state`
+  // attribute carries stale versus current.
   lines.push(
     state.lastReadAt === null
       ? "Zeus has never successfully read this calendar."
-      : `Zeus last read this calendar at ${state.lastReadAt}; the schedule block in this ` +
+      : "Zeus has read this calendar; the schedule block in this " +
           "message is from that read. A read or change performed this turn is shown only " +
           "by a calendar result or work result in this turn.",
   );

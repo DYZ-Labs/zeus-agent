@@ -856,7 +856,10 @@ function calendarGate(
           request,
           reason: "stale_coverage",
           coverage,
-          detail: "Zeus last read the calendar too long ago to act on it.",
+          // The same claim as the card's old stale line, and it reaches the model too: this
+          // artifact is rendered into <work_result>. Say why nothing happened without
+          // dating the read. `reason` and `coverage` keep the diagnostic precision.
+          detail: "The calendar could not be confirmed current, so nothing was changed.",
         }),
       };
     }
