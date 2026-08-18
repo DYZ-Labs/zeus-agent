@@ -61,10 +61,18 @@ export const UNVERIFIABLE: Record<string, string> = {
     "Nothing changed. I can't read your calendar with the permissions I have, so I couldn't check and didn't act.",
   stale_coverage:
     "Nothing changed. I last looked at your calendar too long ago to act on it. Ask again and I'll read it fresh.",
+  unsupported_calendar_schema:
+    "Nothing changed. Your calendar service describes events in a form I can't safely read, so I stopped.",
+  remote_reported_error:
+    "Nothing changed. Your calendar answered with an error instead of events, so I couldn't check. Ask again in a moment.",
+  invalid_calendar_response:
+    "Nothing changed. Your calendar sent back something I couldn't read as events, so I couldn't check.",
+  planning_failed:
+    "Nothing changed. I couldn't set that request up safely, so I stopped before touching anything.",
 };
 
 export const UNVERIFIABLE_FALLBACK =
-  "Nothing changed. I couldn't read your calendar, so I can't promise that time is free and didn't act on it.";
+  "Nothing changed. I couldn't get a current read of your calendar, so I stopped without acting.";
 
 export const CARD_COPY = {
   checkedFirst: "on your calendar first.",

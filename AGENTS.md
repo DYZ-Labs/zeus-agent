@@ -118,7 +118,11 @@ npm run mcp            # stdio MCP server
   stored with its assistant turn so a reload does not leave prose as the only record.
 - `src/core/capabilities.ts` — what Zeus can do right now, resolved every turn into the
   `<capabilities>` block. Never memory.
-- `src/core/calendar-sync.ts` — the disposable external read cache.
+- `src/core/calendar-sync.ts` — the disposable external read cache, and the turn-start
+  freshness top-up that keeps it answerable.
+- `src/core/calendar-context.ts` — the standing `<schedule>` block every chat turn renders
+  from that cache, with its as-of time and its snapshot trace. External data, never memory.
+- `src/core/untrusted-data.ts` — the one guard third-party text passes before a model sees it.
 - `src/core/detectors.ts` — deterministic conflict detection over that cache.
 - `src/core/budget.ts`, `src/core/concurrency.ts` — durable model/connector ceilings and
   run capacity.
@@ -349,7 +353,8 @@ drifted tool contract clear the capabilities and wait for a person; everything e
 them standing.
 
 Recovery follows from that. `restoreConnectorReachability` gives a connector in that state
-one bounded handshake on a turn that already needs it, then
+one bounded handshake on a turn or scheduled refresh that already needs it — the chat
+turn's schedule top-up and `refreshExternalSignals` both qualify — then
 `restoreConnectorAfterReachability` puts it back into service against the state observed
 *before* verifying — which is what keeps a connection the user deliberately switched off,
 whose `status` is still `ready`, out of scope. It re-enables no capability row, so it can
@@ -368,6 +373,17 @@ facet, goal, commitment, or candidate, it never enters `extract()`, and it never
 `<memory>` block. `external_signal` is a disposable, expiring cache with no path to any
 evidence table; keep it that way. Run every external payload through
 `inspectUntrustedWorkData` before it reaches a model.
+
+The standing `<schedule>` block is how that cache reaches chat without becoming memory.
+Every turn with a connected calendar carries it, so Zeus already knows the schedule before
+being asked and never replies that it didn't look; a turn whose cache could not be refreshed
+relays the last successful read with its as-of time instead. The block is a sibling of
+`<capabilities>`, never part of `<memory>`; every title passes the guard; and it authorizes
+nothing — the write gate keeps its own stricter freshness proof. `lastKnownEvents` is the
+block's render-only reader over expired rows and must never feed the conflict gate or the
+detectors, which keep failing closed on expiry through `cachedEvents`. Each turn's rendered
+snapshot persists in `schedule_context` (assistant-context data, like `calendar_outcome`)
+so a schedule claim stays auditable after the cache reconciles.
 
 ### Response provenance is persistent
 

@@ -8,6 +8,7 @@ import {
   verifyOAuthResult,
   type GoogleCalendarOAuthResult,
 } from "@/calendar-broker/protocol";
+import { syncCalendar } from "@/core/calendar-sync";
 import {
   configureGoogleCalendarCapabilities,
   getGoogleCalendarConnector,
@@ -89,6 +90,10 @@ export async function applyGoogleCalendarResult(
     scopes: result.scopes,
     sourceMessageId: source.id,
   });
+  // Warm the schedule cache from minute zero, so the very first conversation after
+  // connecting already knows what is on the calendar. `syncCalendar` never throws; a
+  // failure here is caught up by the background refresh and the next chat turn.
+  await syncCalendar(db, { signal: AbortSignal.timeout(10_000) });
 }
 
 export async function disconnectGoogleCalendarGrant(

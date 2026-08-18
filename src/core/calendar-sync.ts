@@ -1,9 +1,14 @@
 import type { CalendarCoverage } from "./calendar-conflicts";
 import { endOf } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
-import { availableCapability } from "./connectors";
+import {
+  CAPABILITY_SLOTS,
+  availableCapability,
+  connectorAwaitingReachability,
+  listConnectors,
+} from "./connectors";
 import type { Db } from "./db";
-import { callCapability } from "./mcp-client";
+import { callCapability, restoreConnectorReachability } from "./mcp-client";
 import { errorSignature, logEvent } from "./observability";
 
 /**
@@ -18,8 +23,28 @@ import { errorSignature, logEvent } from "./observability";
  */
 
 const WINDOW_DAYS = 30;
-const CACHE_TTL_MS = 60 * 60 * 1000;
+/** How long a cached row remains visible to `cachedEvents` after the read that wrote it. */
+export const CACHE_TTL_MS = 60 * 60 * 1000;
 const MAX_EVENTS = 250;
+
+/**
+ * How stale the proof-of-read may be before a chat turn refreshes it.
+ *
+ * Equal to the background refresh cadence, so on a healthy deployment the turn-start check
+ * is a pure SQLite read and never spends a connector call. Deliberately looser than the
+ * write gate's ten minutes — an action still gets its own fresh read — and tighter than the
+ * one-hour row expiry, so a conversational answer normally comes from an unexpired cache.
+ */
+export const CHAT_COVERAGE_TTL_MS = 15 * 60_000;
+
+/**
+ * How long a chat turn will wait on a refresh before answering from what it has.
+ *
+ * Shorter than the connector call timeout because someone is waiting on a reply: a provider
+ * that cannot answer in this window gets reported as a stale schedule with an honest as-of
+ * time, not as a turn that hangs.
+ */
+export const CHAT_SYNC_TIMEOUT_MS = 6_000;
 
 export type CalendarEvent = {
   id: string;
@@ -83,6 +108,70 @@ export async function syncCalendar(
     });
     return null;
   }
+}
+
+export type CalendarCacheFreshness =
+  | "fresh"
+  | "synced"
+  | "restored_and_synced"
+  | "sync_failed"
+  | "unavailable"
+  | "no_connector";
+
+/**
+ * Make the schedule cache fresh enough for a chat turn to answer from, if it can.
+ *
+ * Called at the start of every turn, so it must cost nothing when there is nothing to do:
+ * fresh coverage returns before any capability lookup, and a missing connector returns
+ * before any network. When the connector is merely unreachable it gets the same bounded
+ * revive a recognized calendar request gets — a schedule question the intent gate missed
+ * still deserves a calendar that heals — but at most once per TTL window, because the
+ * connector row's `updated_at` records every verification attempt, success or failure.
+ *
+ * Never throws and never calls a model. A failure here degrades the turn to the last-known
+ * schedule with an honest as-of time; it must not replace the reply with an error.
+ */
+export async function ensureFreshCalendarCache(
+  db: Db,
+  options: { at?: Date; signal?: AbortSignal } = {},
+): Promise<CalendarCacheFreshness> {
+  const at = options.at ?? new Date();
+  const coverage = readCalendarCoverage(db);
+  if (coverage && at.getTime() - Date.parse(coverage.fetchedAt) <= CHAT_COVERAGE_TTL_MS) {
+    return "fresh";
+  }
+  let restored = false;
+  if (!availableCapability(db, "calendar.list_events")) {
+    const awaiting = connectorAwaitingReachability(db, "calendar.list_events");
+    if (!awaiting) return calendarConnectorExists(db) ? "unavailable" : "no_connector";
+    // `updated_at` moves on every recorded verification, so a handshake that just failed is
+    // not retried on the very next turn — the background refresh owns the steady cadence.
+    if (at.getTime() - Date.parse(awaiting.updated_at) <= CHAT_COVERAGE_TTL_MS) {
+      return "unavailable";
+    }
+    restored = await restoreConnectorReachability(db, "calendar.list_events", {
+      signal: options.signal,
+    });
+    if (!restored) return "unavailable";
+  }
+  const deadline = AbortSignal.timeout(CHAT_SYNC_TIMEOUT_MS);
+  const synced = await syncCalendar(db, {
+    at,
+    signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
+  });
+  if (!synced) return "sync_failed";
+  return restored ? "restored_and_synced" : "synced";
+}
+
+/** Whether any calendar connector exists at all, usable or not. Mirrors the capability block. */
+function calendarConnectorExists(db: Db): boolean {
+  return listConnectors(db).some(
+    (connector) =>
+      connector.provider === "google_calendar" ||
+      connector.capabilities.some((capability) =>
+        (CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
+      ),
+  );
 }
 
 /**
@@ -267,6 +356,31 @@ export function cachedEvents(
     .all(at.toISOString(), new Date(at.getTime() - 2 * 86_400_000).toISOString())
     .filter((event) => Number.isFinite(Date.parse(event.starts_at)));
   if (options.includeEnded) return rows;
+  return rows.filter((event) => endOf(event) > at.getTime());
+}
+
+/**
+ * Cached calendar rows regardless of expiry — the last thing a successful read wrote.
+ *
+ * Render-only, for the standing schedule block's degraded state: when a refresh has not
+ * succeeded lately, the honest answer is the schedule as it was last read, said with its
+ * as-of time, not silence. Readable during an outage because the expired-row sweep runs
+ * only inside `cacheCalendarEvents`, which only a successful read reaches.
+ *
+ * Never hand this to the conflict gate or the detectors: both must keep failing closed on
+ * expiry, and `cachedEvents` is the reader that enforces that.
+ */
+export function lastKnownEvents(db: Db, at: Date): CachedEvent[] {
+  const rows = db
+    .prepare<[string], CachedEvent>(
+      `SELECT external_id, starts_at, ends_at, location,
+              json_extract(payload_json, '$.title') AS title
+       FROM external_signal
+       WHERE kind = 'calendar_event' AND starts_at IS NOT NULL AND starts_at > ?
+       ORDER BY starts_at, external_id`,
+    )
+    .all(new Date(at.getTime() - 2 * 86_400_000).toISOString())
+    .filter((event) => Number.isFinite(Date.parse(event.starts_at)));
   return rows.filter((event) => endOf(event) > at.getTime());
 }
 

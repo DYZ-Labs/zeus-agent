@@ -8,10 +8,10 @@ import {
 import { openDb } from "@/core/db";
 import { errorSignature, logEvent } from "@/core/observability";
 import { listStores } from "@/core/stores";
-import { getAuthConfiguration } from "@/server/auth/config";
 
 /**
- * Keep the cached calendar, and therefore the detectors, current on a hosted deployment.
+ * Keep the cached calendar — and therefore the standing schedule block and the detectors —
+ * current on every deployment.
  *
  * `refreshExternalSignals` had exactly one caller: a macOS LaunchAgent. That is fine on the
  * machine it was written for and leaves a hosted deployment with an `external_signal` table
@@ -46,7 +46,7 @@ const globalForScheduler = globalThis as typeof globalThis & {
 export function startAmbientScheduler(): AmbientRefreshSettings {
   let settings: AmbientRefreshSettings;
   try {
-    settings = ambientRefreshSettings(getAuthConfiguration());
+    settings = ambientRefreshSettings();
   } catch (error) {
     // A malformed setting is the operator's mistake to see, not a reason to refuse to
     // serve the person whose memory this is. Loud, and off.

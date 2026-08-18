@@ -17,6 +17,7 @@ import {
 } from "@/core/backfill";
 import { updateAmbientSetting } from "@/core/ambient";
 import { updateCalendarActionSetting } from "@/core/calendar-policy";
+import { syncCalendar } from "@/core/calendar-sync";
 import {
   CAPABILITY_SLOTS,
   ConnectorPresetError,
@@ -977,6 +978,16 @@ export async function verifyConnectorAction(formData: FormData): Promise<void> {
     await verifyConnector(db, id);
   } catch (error) {
     redirect(`/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`);
+  }
+  // A verify that put a calendar back into service should also put its schedule back: warm
+  // the cache now rather than on the next turn. `syncCalendar` never throws and refuses on
+  // its own when this connector serves no calendar capability.
+  const connector = getConnector(db, id);
+  if (
+    connector?.provider === "google_calendar" ||
+    connector?.capabilities.some((capability) => capability.slot === "calendar.list_events")
+  ) {
+    await syncCalendar(db, { signal: AbortSignal.timeout(10_000) });
   }
   revalidatePath("/settings");
 }
