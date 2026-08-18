@@ -244,6 +244,15 @@ describe("the turn tells the model what Zeus can do", () => {
     expect(body.instructions).not.toContain("with its as-of time");
     // A read renders no card, so that reply cannot defer its particulars to a panel.
     expect(body.instructions).toContain("a read has no panel beneath it");
+    // Neither can a change that went through. The sentence that promised a panel for every
+    // write is the exact failure mode to guard against: the model would say the human
+    // version once and leave the particulars to a panel that is no longer rendered.
+    expect(body.instructions).toContain(
+      "A panel appears below your reply only when a create, reschedule, or cancel did not happen",
+    );
+    expect(body.instructions).not.toContain("a panel directly below your reply already shows");
+    // And it is told where those particulars now live, because <calendar_result> has none.
+    expect(body.instructions).toContain("what_it_did under external_requests_completed");
   });
 
   it("asks for a voice, not only for a list of things not to claim", async () => {

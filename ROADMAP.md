@@ -64,10 +64,11 @@ Design constraints worth stating before anyone writes code:
   does not ask to renew at the moment it wants permission.
 
 **`send`.** Email or messaging behind a recipient allowlist, drafted then confirmed. This is
-a harder bar than `schedule` for one reason: **a sent message has no undo.** Phase 1's
-reversal machinery works because a created calendar event can be cancelled; nothing
-comparable exists here. That asymmetry should shape the UI, not be papered over — the
-confirmation for a send has to read differently from the confirmation for a hold.
+a harder bar than `schedule` for one reason: **a sent message cannot be taken back.** Zeus
+offers no undo for a calendar change either, but a calendar change can be reversed by asking
+— a new request through the same gates — and a sent message cannot be. That asymmetry is
+with *asking*, and it should shape the UI rather than be papered over: the confirmation for
+a send has to read differently from the confirmation for a hold.
 
 **Open question.** Whether standing grants should apply to `send` at all in this phase, or
 only to `schedule` and `modify_external` until there is a year of evidence. The
@@ -107,8 +108,8 @@ out to be the model's job and permission code's — the same split as `extract` 
 
 Two things fell out of doing it. Once the payload is built deterministically from a resolved
 intent, no model stands between the request and the bytes, and the whole write path became
-testable offline. And once a write reads the calendar first, undo for updates became
-possible for the first time.
+testable offline. And once a write reads the calendar first, the prior state is sitting in
+the read cache, so the receipt can say what an event was before Zeus changed it.
 
 `isExplicitBoundedWorkRequest` survives, and it is still the right target for this phase.
 Replace it with an explicit **propose → approve → execute** loop in chat: Zeus offers a
@@ -170,16 +171,23 @@ it is not a JSON Schema validator — that would be a new dependency for a check
 service performs authoritatively anyway. A `send` capability with a complex schema may
 change that calculation. Revisit in Phase 2, not before.
 
-**Undo is a property of the service, plus whatever Zeus happened to read.** A created event
-can be cancelled because the service returns an id. An update became reversible only as a
-side effect of something else: once a write reads the calendar first, the prior state is
-sitting in the read cache, and `prior_state_json` captures it before anything changes.
+**Undo was built, shipped, and then removed. Do not rebuild it.** The machinery worked: a
+created event could be cancelled because the service returns an id, and an update was
+reversible as a side effect of reading the calendar first, with `prior_state_json` holding
+what the cache knew before anything changed.
 
-Note what that does and does not buy. The reversal restores the fields Zeus itself set, and
-only from the five the cache holds. Attendees, description, recurrence, reminders, and
-conferencing were never read and are not restored; un-cancelling does not recall the notices
-already sent. Label a partial undo as partial. Assume no undo unless a specific capability
-proves otherwise.
+What it could never be was honest about its own limits. The reversal restored only the
+fields Zeus itself set, and only from the five the cache holds — attendees, description,
+recurrence, reminders, and conferencing were never read and were never restored, and
+un-cancelling does not recall the notices already sent. A partial undo offered as a button
+labelled "Undo" is a promise the code cannot keep, and it earned a card under every completed
+change to hold it.
+
+Reversing a change is now a request the user makes, in their own words, through the same
+gates as the change itself. That is slower and it is truthful, and it costs nothing to build.
+`prior_state_json` survives for the reason that always justified it: the receipt can say what
+an event was before Zeus touched it. Assume no undo for any future capability, and do not
+add one back for `send`.
 
 **Steps that span a confirmation need explicit settlement.** A resumed run re-enters a
 paused write step, and without a settled-effect check it re-proposes forever. Any future

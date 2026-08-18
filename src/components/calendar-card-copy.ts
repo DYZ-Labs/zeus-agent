@@ -3,6 +3,10 @@ import type { CalendarOutcome } from "@/core/schema";
 /**
  * Every fixed sentence the calendar and work cards show the user.
  *
+ * A card is the record of something that did *not* happen, so almost everything here is
+ * copy for a refusal, a collision, or a question. Once a change goes through there is no
+ * card and no fixed sentence at all: the reply is the account of it.
+ *
  * Lifted out of the components for two reasons. It is the densest concentration of
  * user-facing copy in the app, so a test can sweep it with `styleViolations` and keep the
  * first-person voice from eroding one edit at a time; and a plain module imports into a
@@ -36,12 +40,35 @@ export const CLARIFICATION_FALLBACK = "I couldn't work out what you wanted chang
  */
 export type CalendarCardKind = Exclude<CalendarOutcome["kind"], "read">;
 
-export const VERB: Record<CalendarCardKind, string> = {
-  create: "Added to your calendar",
-  reschedule: "Moved",
-  cancel: "Cancelled",
-};
+/** The statuses a card can be about, which is every status except a change that went through. */
+export type CalendarCardStatus = Exclude<CalendarOutcome["status"], "done">;
 
+/**
+ * Whether this outcome gets a card at all.
+ *
+ * A card is the record of a change that did not happen. A completed create, reschedule, or
+ * cancel renders nothing — the reply names what changed, and the durable copy is the
+ * receipt on `/today` and `/effects/<id>`. A read renders nothing either, because nothing
+ * changed and there is no receipt to put under the answer.
+ *
+ * A function rather than two conditions inside the component, because nothing here can
+ * render a component: the suite is node-only. This is the one form of the rule a test can
+ * hold, and it is swept across the whole status enum so a status added later has to be
+ * classified rather than falling silently into the null branch.
+ *
+ * A type predicate rather than a plain boolean, so the rule is structural as well as
+ * behavioural: past this guard the card cannot index its copy by `read`, and cannot write a
+ * branch for `done` at all. Both are build errors rather than regressions someone notices
+ * in conversation.
+ */
+export function rendersCard<T extends Pick<CalendarOutcome, "kind" | "status">>(
+  outcome: T,
+): outcome is T & { kind: CalendarCardKind; status: CalendarCardStatus } {
+  return outcome.kind !== "read" && outcome.status !== "done";
+}
+
+// No success verb lives here. Nothing renders a headline for a change that went through,
+// so one would be copy the user could never see — the same reason there is no `read` entry.
 export const NOT_DONE: Record<CalendarCardKind, string> = {
   create: "Not added",
   reschedule: "Not moved",
@@ -83,7 +110,6 @@ export const UNVERIFIABLE_FALLBACK =
   "Nothing changed. I couldn't get a current read of your calendar, so I stopped without acting.";
 
 export const CARD_COPY = {
-  checkedFirst: "on your calendar first.",
   blockedByConflict: "that destination was occupied.",
   ambiguousTarget: "Nothing changed — more than one event matches.",
   needsClarificationSuffix: "Say it again with the detail I was missing and I'll try.",
@@ -94,7 +120,11 @@ export const CARD_COPY = {
   nothingSentYet: "Nothing has been sent yet.",
   freeNearby: "Free nearby:",
   stoppedShort: "Nothing changed. I stopped before making the change.",
-  undone: "Undone.",
+  // The two answers a confirmation panel gives its own buttons, and the only place a card
+  // reports that something happened. Deliberately the bare fact that the request went, with
+  // no verb and no preview: the reply already names what changed, and repeating it here
+  // would be the same status narrated twice.
+  sent: "Sent.",
   nothingWasSent: "Nothing was sent.",
 } as const;
 

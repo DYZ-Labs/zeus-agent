@@ -29,7 +29,6 @@ import {
   listPendingEffects,
   payloadHash,
   proposeEffect,
-  revertEffect,
 } from "./effects";
 import { verifyConnector } from "./mcp-client";
 
@@ -429,20 +428,22 @@ describe("executing sends the confirmed bytes and nothing else", () => {
     expect(result.errorCode).toBe("capability_unavailable");
   }, 30_000);
 
-  it("records how to undo a created event, and undoes it on request", async () => {
+  it("records no way to undo itself, and never calls the service twice", async () => {
     await grantCalendar();
     const effect = propose();
     confirmEffect(db, effect.id, effect.payload_hash, confirmationMessage(effect.payload_hash));
     await executeConfirmedEffect(db, effect.id);
 
-    const reverted = await revertEffect(
-      db,
-      effect.id,
-      confirmationMessage(effect.payload_hash, "undo it"),
-    );
-
-    expect(reverted.status).toBe("reverted");
-    expect(recordedCalls()[1]).toEqual({ event_id: "evt-1", status: "cancelled" });
+    // One request left the machine, and no second one was prepared to take it back. Undoing
+    // a change is a request the user makes, through the same gates as any other.
+    expect(recordedCalls()).toHaveLength(1);
+    expect(
+      db
+        .prepare<[number], { reversal_json: string | null }>(
+          "SELECT reversal_json FROM proposed_effect WHERE id = ?",
+        )
+        .get(effect.id),
+    ).toEqual({ reversal_json: null });
   }, 30_000);
 });
 
@@ -591,7 +592,7 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
     ).toThrow(/authorized once, one way/u);
   }, 30_000);
 
-  it("lets the user undo a reschedule, because the calendar was read first", async () => {
+  it("keeps what the event looked like before, because the calendar was read first", async () => {
     await grantCalendar();
     const { runId, stepId } = workRun();
     const effect = proposeEffect(db, {
@@ -625,42 +626,14 @@ describe("acting on a standing setting, without pretending it was confirmed", ()
 
     await executeConfirmedEffect(db, effect.id);
 
-    // Undo restores the times Zeus itself changed, and only those.
-    expect(effectsForRun(db, runId)[0]?.reversal).toEqual({
-      slot: "calendar.update_event",
-      payload: {
-        event_id: "evt-1",
-        start: "2026-08-20T15:00:00Z",
-        end: "2026-08-20T16:00:00Z",
-      },
+    // Nothing acts on this now. It is what the receipt shows when the user asks what Zeus
+    // changed — the times it replaced, kept because the calendar was read before it wrote.
+    expect(JSON.parse(effectsForRun(db, runId)[0]?.prior_state_json ?? "null")).toMatchObject({
+      external_id: "evt-1",
+      title: "Design review",
+      start: "2026-08-20T15:00:00Z",
+      end: "2026-08-20T16:00:00Z",
     });
-  }, 30_000);
-
-  it("offers no undo for an update it has no snapshot for", async () => {
-    await grantCalendar();
-    const { runId, stepId } = workRun();
-    const effect = proposeEffect(db, {
-      workRunId: runId,
-      workStepId: stepId,
-      slot: "calendar.update_event",
-      payload: { event_id: "evt-2", start: "2026-08-20T16:00:00Z" },
-      previewText: "Move an event.",
-      providerRequestKey: "req-blind",
-      conflictCheck: {
-        status: "clear",
-        coverage: {},
-        considered_events: 1,
-        conflicts: [],
-      },
-    });
-    authorizeEffectByPolicy(db, effect.id, effect.payload_hash, {
-      requestMessageId: userMessageId,
-      policy: "calendar_direct_execution",
-    });
-
-    await executeConfirmedEffect(db, effect.id);
-
-    expect(effectsForRun(db, runId)[0]?.reversal).toBeNull();
   }, 30_000);
 });
 

@@ -511,14 +511,14 @@ describe("a calendar change reads first, checks, then acts", () => {
     expect(run.status).toBe("completed");
     const effect = effectsForRun(db, run.id)[0];
     expect(effect?.payload).toMatchObject({ event_id: "evt-review" });
-    // Undo exists only because the calendar was read before it was written.
-    expect(effect?.reversal).toEqual({
-      slot: "calendar.update_event",
-      payload: {
-        event_id: "evt-review",
-        start: "2026-08-20T15:00:00Z",
-        end: "2026-08-20T16:00:00Z",
-      },
+    // The snapshot of what it looked like before exists only because the calendar was read
+    // first. Nothing acts on it now; it is what the receipt shows when the user asks what
+    // Zeus changed.
+    expect(JSON.parse(effect?.prior_state_json ?? "null")).toMatchObject({
+      external_id: "evt-review",
+      title: "Design review",
+      start: "2026-08-20T15:00:00Z",
+      end: "2026-08-20T16:00:00Z",
     });
   }, 30_000);
 

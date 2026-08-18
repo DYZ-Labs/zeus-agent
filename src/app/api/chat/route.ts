@@ -179,13 +179,9 @@ function privateChatResponse(
                   capabilitySlot: effect.capability.slot,
                   connectorLabel: effect.connector.label,
                 })),
-                completedEffects: result.work.completedEffects.map((effect) => ({
-                  id: effect.id,
-                  previewText: effect.preview_text,
-                  connectorLabel: effect.connector.label,
-                  authorizedByPolicy: effect.confirmation_kind === "standing_policy",
-                  reversible: effect.reversal !== null,
-                })),
+                // No completedEffects. A change that went through renders no card, so the
+                // browser has nothing to draw with them; the model still gets them through
+                // <work_result>, which is where the reply's particulars now come from.
               }
             : null,
           // A sibling of workPlan, not a field inside it: the outcomes that matter most —

@@ -70,9 +70,10 @@ export type ProposeEffectInput = {
   conflictCheck?: Record<string, unknown> | null;
 };
 
+// No parsed `reversal`. Nothing writes `reversal_json` any more, so the field could only
+// ever be null; the column stays so rows written before this still read back intact.
 export type ProposedEffectView = ProposedEffect & {
   payload: unknown;
-  reversal: unknown;
   capability: ConnectorCapability;
   connector: ConnectorView;
   events: EffectEvent[];
@@ -437,15 +438,11 @@ export async function executeConfirmedEffect(
     }
     finishConnectorCallReceipt(db, receiptId, "completed", null);
 
-    const reversal = reversalFor(capability.slot, result.value, effect);
+    // Nothing is prepared to take this back. Undoing a change is a request the user makes,
+    // through the same gates as any other — Zeus does not hold a second call in reserve.
     db.transaction(() => {
-      if (reversal) {
-        db.prepare<[string, string, number]>(
-          "UPDATE proposed_effect SET reversal_json = ?, updated_at = ? WHERE id = ?",
-        ).run(JSON.stringify(reversal), now(), id);
-      }
       setStatus(db, id, "executed");
-      appendEffectEvent(db, id, "executed", null, { reversible: reversal !== null });
+      appendEffectEvent(db, id, "executed", null, null);
     })();
     logEvent({
       event: "effect_executed",
@@ -520,47 +517,6 @@ function finishConnectorCallReceipt(
   ).run(status, errorCode, now(), receiptId);
 }
 
-/**
- * Undo an executed effect, where the connected service offers a way.
- *
- * A reversal is a fresh external call and therefore needs its own user message. Zeus does
- * not quietly clean up after itself.
- */
-export async function revertEffect(
-  db: Db,
-  id: number,
-  sourceMessageId: number,
-  options: { signal?: AbortSignal } = {},
-): Promise<ProposedEffectView> {
-  const effect = requireEffect(db, id);
-  if (effect.status !== "executed") {
-    throw new Error("Only an executed external request can be reverted");
-  }
-  assertUserMessage(db, sourceMessageId);
-  if (!effect.reversal_json) {
-    throw new Error("That connected service offers no way to undo this");
-  }
-  const reversal = JSON.parse(effect.reversal_json) as {
-    slot: CapabilitySlot;
-    payload: Record<string, unknown>;
-  };
-  const result = await callCapability(db, reversal.slot, reversal.payload, {
-    signal: options.signal,
-  });
-  if (result.isError) throw new Error("That connected service refused to undo the change");
-  db.transaction(() => {
-    setStatus(db, id, "reverted");
-    appendEffectEvent(db, id, "reverted", sourceMessageId, null);
-  })();
-  logEvent({
-    event: "effect_reverted",
-    outcome: "ok",
-    effect: effect.effect_kind,
-    effect_id: id,
-  });
-  return requireView(db, id);
-}
-
 export function effectEvents(db: Db, id: number): EffectEvent[] {
   return db
     .prepare<[number], EffectEvent>(
@@ -576,79 +532,6 @@ function fail(db: Db, id: number, errorCode: string): EffectExecutionResult {
     appendEffectEvent(db, id, "failed", null, { error_code: errorCode });
   })();
   return { effect: requireEffect(db, id), status: "failed", errorCode };
-}
-
-/**
- * What it would take to undo this — from the service's own answer, plus whatever Zeus read
- * beforehand.
- *
- * A created event is reversible because the service returns an id. An update is reversible
- * only because the calendar is now read before it is written: `prior_state_json` holds what
- * the cache said about the target moments earlier.
- *
- * That reversal is deliberately narrow. It restores only keys this payload actually set,
- * and only when the snapshot has a value for each of them, because the cache holds five
- * fields and nothing else. Attendees, description, recurrence, reminders, and conferencing
- * were never read and are not restored — and an un-cancelled event does not un-send the
- * cancellation notices. A partial undo offered as a complete one would be worse than none.
- */
-const REVERSIBLE_UPDATE_KEYS = ["start", "end", "status", "title", "location"] as const;
-
-function reversalFor(
-  slot: CapabilitySlot,
-  value: unknown,
-  effect: ProposedEffect,
-): { slot: CapabilitySlot; payload: Record<string, unknown> } | null {
-  if (slot === "calendar.create_event") {
-    const id = externalIdOf(value);
-    if (id === null) return null;
-    return { slot: "calendar.update_event", payload: { event_id: id, status: "cancelled" } };
-  }
-  if (slot !== "calendar.update_event") return null;
-
-  const prior = parseRecord(effect.prior_state_json);
-  const payload = parseRecord(effect.payload_json);
-  if (!prior || !payload) return null;
-  const eventId = payload.event_id;
-  if (typeof eventId !== "string" || eventId.length === 0) return null;
-
-  const changed = Object.keys(payload).filter((key) => key !== "event_id" && key !== "time_zone");
-  if (changed.length === 0) return null;
-  if (!changed.every((key) => (REVERSIBLE_UPDATE_KEYS as readonly string[]).includes(key))) {
-    return null;
-  }
-
-  const restore: Record<string, unknown> = { event_id: eventId };
-  for (const key of changed) {
-    // Un-cancelling is the one restoration the snapshot cannot supply, because a cached
-    // event is only ever cached while it is live.
-    const priorValue = key === "status" ? (prior.status ?? "confirmed") : prior[key];
-    if (priorValue === undefined || priorValue === null) return null;
-    restore[key] = priorValue;
-  }
-  return { slot: "calendar.update_event", payload: restore };
-}
-
-function parseRecord(value: string | null): Record<string, unknown> | null {
-  if (value === null) return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function externalIdOf(value: unknown): string | null {
-  if (value === null || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  for (const key of ["id", "event_id", "eventId"]) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.length > 0) return candidate;
-  }
-  return null;
 }
 
 function setStatus(db: Db, id: number, status: ProposedEffect["status"]): void {
@@ -745,7 +628,6 @@ function view(db: Db, row: ProposedEffect): ProposedEffectView {
   return {
     ...row,
     payload: JSON.parse(row.payload_json),
-    reversal: row.reversal_json === null ? null : JSON.parse(row.reversal_json),
     capability,
     connector,
     events: effectEvents(db, row.id),
