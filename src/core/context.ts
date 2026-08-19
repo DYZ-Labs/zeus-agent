@@ -36,6 +36,8 @@ import type {
 import { entitiesMentioned, search } from "./search";
 import {
   evaluateOpportunity,
+  getStewardshipSetting,
+  isExplicitTrigger,
   recommendationForOpportunity,
   structuredFacetConditionMatches,
 } from "./stewardship";
@@ -103,8 +105,13 @@ export type MemoryContext = {
   projects: ProjectView[];
   facets: UnderstandingFacetView[];
   recommendation: FollowThroughRecommendation | null;
-  /** Durable recommendation-cycle id shared by every delivery channel. */
-  opportunityId: number;
+  /**
+   * Durable recommendation-cycle id shared by every delivery channel.
+   *
+   * Null when the turn never evaluated one: mode `off` and nothing explicitly requested.
+   * There is no recommendation to deliver, so there is nothing to record a delivery against.
+   */
+  opportunityId: number | null;
   /** Compatibility alias for callers that only need the selected commitment. */
   nudge: CommitmentView | null;
   items: RecallItem[];
@@ -238,13 +245,23 @@ export async function buildContext(
   const personalization = computePersonalizationProfile(db);
   const evaluationContext =
     options.evaluationContext ?? buildEvaluationContextForTrigger(db, "chat");
-  const cycle = evaluateOpportunity(
-    db,
-    evaluationContext,
-    query,
-    { sourceMessageId: options.querySourceMessageId ?? null },
-  );
-  const recommendation = recommendationForOpportunity(db, cycle.id);
+  // In mode `off` an unrequested turn does not open a recommendation cycle at all.
+  // `evaluateRecommendations` would already return nothing, so this changes no answer — it
+  // stops the row. A cycle is a durable record that Zeus considered interrupting, and
+  // writing one per ordinary turn under a mode that forbids interrupting is a ledger of a
+  // decision never taken. Explicit triggers keep evaluating, which is what preserves
+  // "what should I do next" as the mode default moves to `off`.
+  const cycle =
+    getStewardshipSetting(db).mode !== "off" ||
+    isExplicitTrigger(evaluationContext.trigger, query)
+      ? evaluateOpportunity(
+          db,
+          evaluationContext,
+          query,
+          { sourceMessageId: options.querySourceMessageId ?? null },
+        )
+      : null;
+  const recommendation = cycle ? recommendationForOpportunity(db, cycle.id) : null;
   const followThroughQuery = recommendation
     ? `${recommendation.commitment_title} ${recommendation.goal_title ?? ""}`.trim()
     : null;
@@ -583,7 +600,7 @@ export async function buildContext(
     projects: selectedProjects,
     facets: selectedFacets,
     recommendation,
-    opportunityId: cycle.id,
+    opportunityId: cycle?.id ?? null,
     nudge: selectedCommitments.find((item) => item.id === recommendation?.commitment_id) ?? null,
     items: selectedItems,
     plan,
