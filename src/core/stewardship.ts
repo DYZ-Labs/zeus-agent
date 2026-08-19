@@ -1,3 +1,4 @@
+import { briefRequest } from "./brief";
 import type { Db } from "./db";
 import { now } from "./db";
 import { getSignal, listOpenSignals } from "./detectors";
@@ -150,6 +151,11 @@ export function isExplicitTrigger(
 }
 
 function explicitFollowThroughRequest(query: string): boolean {
+  // Asking for the brief is asking what to do next — the brief's own NEXT section is this
+  // recommendation. Calling `briefRequest` rather than copying its pattern keeps one
+  // definition: two would drift, and the drift that matters is a brief whose next-step
+  // section is silently empty because mode `off` was never bypassed.
+  if (briefRequest(query)) return true;
   return /\b(?:what (?:should|can) i (?:do|work on|focus on)|what(?:'s| is) (?:my )?next (?:step|action)|what next|next action|help me (?:prioriti[sz]e|choose|decide|focus|follow through)|show me (?:my )?(?:priorities|commitments|to[ -]?dos?))\b/iu.test(
     query,
   );
