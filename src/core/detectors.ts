@@ -14,6 +14,7 @@ import { now } from "./db";
 import { listCommitments, listGoals } from "./intentions";
 import type { CommitmentView } from "./schema";
 import type { DetectedSignal, DetectorKind, EffectKind } from "./schema";
+import { guardExternalText } from "./untrusted-data";
 
 /**
  * Deterministic noticing.
@@ -121,6 +122,26 @@ export function signalSubject(signal: DetectedSignal): Record<string, unknown> {
     : {};
 }
 
+/**
+ * Event titles and locations are somebody else's text, and a signal's wording is not a dead
+ * end. `signalChatPrompt` splices `why` into a prefilled chat prompt, which arrives back as
+ * a *user* message — the one channel Zeus reads as instructions rather than as data. An
+ * event anyone can put on the calendar must not be able to reach it.
+ *
+ * Guarding where the sentence is composed rather than where it is displayed means the stored
+ * row is already safe, so every reader inherits that instead of each surface having to
+ * remember. The witness is local because a signal has no per-turn "some text was withheld"
+ * channel to report into: the marker in the sentence is the report.
+ */
+function safeExternal(value: string): string {
+  return guardExternalText(value, { any: false });
+}
+
+/** `label`, over a title that has already passed the guard. */
+function safeLabel(event: CachedEvent): string {
+  return label({ ...event, title: event.title === null ? null : safeExternal(event.title) });
+}
+
 
 /**
  * Two events claiming the same minutes. The most checkable observation there is.
@@ -136,9 +157,9 @@ function detectCalendarOverlaps(events: readonly CachedEvent[]): Draft[] {
     commitmentId: null,
     severity: 70,
     why:
-      `${label(first)} runs until ${clock(endOf(first))} and ${label(second)} starts at ` +
+      `${safeLabel(first)} runs until ${clock(endOf(first))} and ${safeLabel(second)} starts at ` +
       `${clock(startOf(second))}.`,
-    suggestedAction: `Decide which of ${label(first)} and ${label(second)} to move.`,
+    suggestedAction: `Decide which of ${safeLabel(first)} and ${safeLabel(second)} to move.`,
     effectKind: "modify_external" as const,
     occursAt: second.starts_at,
   }));
@@ -171,9 +192,10 @@ function detectTravelGaps(events: readonly CachedEvent[]): Draft[] {
       commitmentId: null,
       severity: 55,
       why:
-        `${Math.round(gap / 60_000)} minutes separate ${label(first)} at ${first.location} ` +
-        `from ${label(second)} at ${second.location}.`,
-      suggestedAction: `Check whether ${label(second)} still works, or move it.`,
+        `${Math.round(gap / 60_000)} minutes separate ${safeLabel(first)} at ` +
+        `${safeExternal(first.location)} from ${safeLabel(second)} at ` +
+        `${safeExternal(second.location)}.`,
+      suggestedAction: `Check whether ${safeLabel(second)} still works, or move it.`,
       effectKind: "modify_external",
       occursAt: second.starts_at,
     });
