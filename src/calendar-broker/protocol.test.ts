@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import {
   envelopeTimes,
   signBrokerEnvelope,
+  verifyGmailOAuthRequest,
+  verifyGmailOAuthResult,
   verifyOAuthRequest,
   verifyOAuthResult,
 } from "./protocol";
@@ -34,6 +36,31 @@ describe("Google Calendar broker envelopes", () => {
       ...envelopeTimes(AT, 5 * 60),
     };
     expect(verifyOAuthResult(signBrokerEnvelope(result, KEY), KEY, AT)).toEqual(result);
+  });
+
+  it("keeps Gmail envelopes distinct from Calendar envelopes", () => {
+    const accountId = randomUUID();
+    const request = {
+      kind: "google_gmail_oauth_request" as const,
+      accountId,
+      returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
+      nonce: randomUUID(),
+      ...envelopeTimes(AT),
+    };
+    const result = {
+      kind: "google_gmail_oauth_result" as const,
+      accountId,
+      connectionId: randomUUID(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      ...envelopeTimes(AT, 5 * 60),
+    };
+
+    const signedRequest = signBrokerEnvelope(request, KEY);
+    const signedResult = signBrokerEnvelope(result, KEY);
+    expect(verifyGmailOAuthRequest(signedRequest, KEY, AT)).toEqual(request);
+    expect(verifyGmailOAuthResult(signedResult, KEY, AT)).toEqual(result);
+    expect(() => verifyOAuthRequest(signedRequest, KEY, AT)).toThrow();
+    expect(() => verifyOAuthResult(signedResult, KEY, AT)).toThrow();
   });
 
   it("rejects tampering, expiry, and short service keys", () => {

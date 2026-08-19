@@ -15,6 +15,7 @@ vi.mock("@/app/actions", () => ({
     message: "",
   }),
   disconnectGoogleCalendarAction: async () => undefined,
+  disconnectGoogleGmailAction: async () => undefined,
   removeConnectorAction: async () => undefined,
 }));
 
@@ -105,22 +106,20 @@ describe("Gmail is a second connection, not a second component", () => {
     expect(html).not.toContain("calendar.list_events");
   });
 
-  it("offers no hosted path for a preset that has none", () => {
-    // `gmail.readonly` is a restricted scope, so hosted Gmail needs app verification and an
-    // annual assessment. Until that is a funded decision there is nowhere for a hosted
-    // Connect button to go, and offering one would be a dead end.
+  it("starts the account-bound hosted Gmail OAuth path when it is configured", () => {
     const html = renderToStaticMarkup(
       createElement(PresetConnection, {
         preset: GMAIL_PRESET,
         icon: createElement(MailIcon),
         defaultSlots: ["email.search_threads"],
+        hostedStartHref: "/api/integrations/google-gmail/start",
         connector: null,
         localMode: false,
-        available: false,
+        available: true,
       }),
     );
 
-    expect(html).not.toContain("/api/integrations");
-    expect(html).toContain("Gmail connections are unavailable right now.");
+    expect(html).toContain('/api/integrations/google-gmail/start');
+    expect(html).toContain(">Connect</a>");
   });
 })

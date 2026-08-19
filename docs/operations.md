@@ -177,6 +177,8 @@ redeploys.
 | `ZEUS_SIGNAL_REFRESH_MINUTES` | No | `15` | How often that refresh runs |
 | `GOOGLE_CALENDAR_BROKER_URL` | For hosted Calendar | — | Exact HTTPS origin of the separate Calendar broker |
 | `GOOGLE_CALENDAR_BROKER_SERVICE_KEY` | For hosted Calendar | — | Shared Zeus-to-broker key; at least 32 bytes and never exposed to generic connectors |
+| `GOOGLE_GMAIL_BROKER_URL` | For hosted Gmail | — | Exact HTTPS origin of the broker service with Gmail enabled |
+| `GOOGLE_GMAIL_BROKER_SERVICE_KEY` | For hosted Gmail | — | Independent Zeus-to-Gmail-broker key; at least 32 bytes |
 | `ZEUS_SYNCHRONOUS` | No | `full` | `full` fsyncs each commit; `normal` trades host-crash durability for speed |
 | `ZEUS_MIGRATION_BACKUP_RETENTION` | No | `3` | Pre-migration copies kept per store, pruned when a migration runs |
 | `ZEUS_SNAPSHOT_SCHEDULER` | No | on when hosted | In-process scheduled snapshots (`on`/`off`) |
@@ -661,10 +663,10 @@ automatically. Export still operates on one store at a time — deliberately, so
 directory never mixes two people's personal data — so point `ZEUS_DB` at that account's
 UUID-named database to export it or to open MCP against it.
 
-## Multi-user Google Calendar
+## Multi-user Google Calendar and Gmail
 
-Google Calendar uses a separate credential-broker service. Zeus stores an opaque broker
-connection id and the reviewed MCP schemas, but never a Google access token, refresh
+Hosted Google connections use a separate credential-broker service. Zeus stores opaque
+broker connection ids and reviewed MCP schemas, but never a Google access token, refresh
 token, OAuth client secret, or token-encryption key. Each broker grant is bound to the
 immutable Supabase UUID from the user's personal Zeus store.
 
@@ -704,6 +706,34 @@ requested time is free; a collision, an unreadable calendar, or an ambiguous eve
 for your exact confirmation. Turn confirmations back on for everything with **Make changes
 without asking me each time** on the same screen. Disconnect first revokes the Google grant
 and only then removes the local connector row.
+
+Hosted Gmail runs through the same broker service but uses a separate Google Cloud project,
+OAuth web client, and broker key. That separation matters: revoking Gmail must not invalidate
+the user's Calendar grant. In the Gmail project, enable both `gmail.googleapis.com` and
+`gmailmcp.googleapis.com`, register
+`https://calendar.zeusagent.dev/oauth/gmail/callback`, and configure the broker service with:
+
+```bash
+GOOGLE_GMAIL_BROKER_SERVICE_KEY=<at least 32 independent random bytes>
+GOOGLE_GMAIL_OAUTH_CLIENT_ID=<Gmail web client id>
+GOOGLE_GMAIL_OAUTH_CLIENT_SECRET=<Gmail web client secret>
+GOOGLE_GMAIL_OAUTH_REDIRECT_URI=https://calendar.zeusagent.dev/oauth/gmail/callback
+```
+
+Set the matching values on the main Zeus service:
+
+```bash
+GOOGLE_GMAIL_BROKER_URL=https://calendar.zeusagent.dev
+GOOGLE_GMAIL_BROKER_SERVICE_KEY=<the same Gmail broker service key>
+```
+
+The Gmail OAuth consent screen must declare only
+`https://www.googleapis.com/auth/gmail.readonly`. This is a Google restricted scope: test
+users can connect while the app is in testing, but a public external app needs Google's OAuth
+verification and recurring security assessment. The broker encrypts each account's refresh
+token and filters Google's MCP surface to `search_threads` and `get_thread`; draft, label,
+trash, spam, and every other write tool remain undiscoverable and undispatchable. Disconnect
+revokes the Gmail grant before removing its provider row from the user's store.
 
 ## Commands
 
@@ -793,7 +823,8 @@ What is sent to OpenAI:
 What is sent to a connected service:
 
 - Only the calls a capability you granted permits: a bounded read of your calendar window,
-  and exactly the payload recorded in `proposed_effect` — after you confirmed it by its
+  a bounded Gmail inbox search or explicitly requested thread read, and exactly the payload
+  recorded in `proposed_effect` — after you confirmed it by its
   hash, or after the conflict gate cleared it under the standing setting you enabled. The
   effect page always says which of the two authorized it. Clearing a window prepares one
   payload per event and takes one confirmation over a digest of all of them; the digest is
@@ -809,10 +840,9 @@ commit them.
 
 ## Known limitations
 
-- Calendar is the only capability Zeus knows how to fill. There is no email, messaging,
-  reminder, or shopping capability yet, and `purchase` is refused unconditionally — the
-  storage layer will not even record it. Zeus can research and draft around those, but it
-  stops before the action and never claims otherwise.
+- Zeus can read Calendar and Gmail, but Gmail is read-only: there is no email send, label,
+  trash, or spam capability. Messaging, reminders, shopping, and purchases are also absent;
+  `purchase` is refused unconditionally and the storage layer will not even record it.
 - There is no undo. A change Zeus made is a change your calendar now has; putting it back is
   a new request through the same gates. What Zeus keeps is the record: the exact payload, who
   authorized it, the check it ran, and — for a move or a cancel — what the event looked like

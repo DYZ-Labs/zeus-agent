@@ -1806,6 +1806,66 @@ ON connector(provider)
 WHERE provider = 'google_calendar';
 `;
 
+/** A second first-party Google grant needs its own locked provider identity. */
+const GOOGLE_GMAIL_PROVIDER = `
+ALTER TABLE connector RENAME TO connector_google_provider_legacy;
+
+CREATE TABLE connector (
+  id                    INTEGER PRIMARY KEY,
+  label                 TEXT NOT NULL,
+  transport             TEXT NOT NULL CHECK (transport IN ('stdio','http')),
+  command               TEXT,
+  args_json             TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(args_json)),
+  cwd                   TEXT,
+  url                   TEXT,
+  env_var_names_json    TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(env_var_names_json)),
+  discovered_tools_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(discovered_tools_json)),
+  status                TEXT NOT NULL DEFAULT 'unverified'
+                        CHECK (status IN ('unverified','ready','unreachable','disabled')),
+  enabled               INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id     INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  last_verified_at      TEXT,
+  last_error_code       TEXT,
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  preset_id             TEXT,
+  provider              TEXT NOT NULL DEFAULT 'generic'
+                        CHECK (provider IN ('generic','google_calendar','google_gmail')),
+  provider_connection_id TEXT,
+  CHECK (
+    (transport = 'stdio' AND command IS NOT NULL AND length(command) > 0 AND url IS NULL)
+    OR
+    (transport = 'http' AND url IS NOT NULL AND length(url) > 0
+      AND command IS NULL AND cwd IS NULL)
+  ),
+  CHECK (enabled = 0 OR status = 'ready')
+);
+
+INSERT INTO connector
+  (id, label, transport, command, args_json, cwd, url, env_var_names_json,
+   discovered_tools_json, status, enabled, source_message_id, last_verified_at,
+   last_error_code, created_at, updated_at, preset_id, provider,
+   provider_connection_id)
+SELECT id, label, transport, command, args_json, cwd, url, env_var_names_json,
+       discovered_tools_json, status, enabled, source_message_id, last_verified_at,
+       last_error_code, created_at, updated_at, preset_id, provider,
+       provider_connection_id
+FROM connector_google_provider_legacy;
+
+DROP TABLE connector_google_provider_legacy;
+
+CREATE INDEX connector_enabled_idx ON connector(enabled, id);
+CREATE UNIQUE INDEX connector_preset_unique_idx
+ON connector(preset_id)
+WHERE preset_id IS NOT NULL;
+CREATE UNIQUE INDEX connector_google_calendar_provider_idx
+ON connector(provider)
+WHERE provider = 'google_calendar';
+CREATE UNIQUE INDEX connector_google_gmail_provider_idx
+ON connector(provider)
+WHERE provider = 'google_gmail';
+`;
+
 /**
  * Direct calendar execution: a second, *named* authorization path — never the absence of one.
  *
@@ -2359,4 +2419,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "034_email_external_data", sql: EMAIL_EXTERNAL_DATA },
   { id: "035_inbox_turn_context", sql: INBOX_TURN_CONTEXT },
   { id: "036_email_detectors", sql: EMAIL_DETECTORS },
+  { id: "037_google_gmail_provider", sql: GOOGLE_GMAIL_PROVIDER },
 ];

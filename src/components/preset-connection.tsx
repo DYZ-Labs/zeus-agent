@@ -6,10 +6,11 @@ import { useActionState, useEffect, type ReactNode } from "react";
 import {
   configureConnectorPresetAction,
   disconnectGoogleCalendarAction,
+  disconnectGoogleGmailAction,
   removeConnectorAction,
   type ConnectorSetupState,
 } from "@/app/actions";
-import type { ConnectorPreset } from "@/core/connector-catalog";
+import { GMAIL_PRESET_ID, type ConnectorPreset } from "@/core/connector-catalog";
 import type { ConnectorView } from "@/core/connectors";
 import type { CapabilitySlot } from "@/core/schema";
 
@@ -27,10 +28,9 @@ const INITIAL_STATE: ConnectorSetupState = {
  * preset carries the identity now; what stays as props is the part presets genuinely differ
  * on: an icon, and whether there is a hosted path at all.
  *
- * `hostedStartHref` is null for a preset that only exists locally. Gmail is one: its scopes
- * are restricted, so a hosted multi-account deployment would need app verification and an
- * annual security assessment before anyone else could consent. Calendar reaches its broker
- * instead.
+ * `hostedStartHref` is null for a preset without an account-bound broker path. Local mode
+ * still uses the user's own Application Default Credentials; hosted mode always starts the
+ * provider-specific OAuth flow instead of spending process-wide credentials.
  */
 export function PresetConnection({
   preset,
@@ -107,7 +107,13 @@ export function PresetConnection({
               <SecondaryButton label="Disconnect" />
             </form>
           ) : (
-            <form action={disconnectGoogleCalendarAction}>
+            <form
+              action={
+                preset.id === GMAIL_PRESET_ID
+                  ? disconnectGoogleGmailAction
+                  : disconnectGoogleCalendarAction
+              }
+            >
               <SecondaryButton label="Disconnect" />
             </form>
           )

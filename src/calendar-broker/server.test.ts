@@ -7,23 +7,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   configureGoogleCalendarCapabilities,
+  configureGoogleGmailCapabilities,
+  GOOGLE_GMAIL_BROKER_SERVICE_KEY,
   upsertGoogleCalendarConnector,
+  upsertGoogleGmailConnector,
 } from "../core/connectors";
 import { appendMessage, createConversation } from "../core/conversations";
 import { openTestDb } from "../core/db";
 import { callCapability, verifyConnector } from "../core/mcp-client";
 import { bindAppOwner } from "../core/owner";
 import type { CalendarBrokerConfiguration } from "./config";
+import { GMAIL_READ_SCOPE } from "./gmail";
 import { CALENDAR_READ_SCOPE, CALENDAR_WRITE_SCOPE } from "./google";
 import {
   envelopeTimes,
   signBrokerEnvelope,
+  verifyGmailOAuthResult,
   verifyOAuthResult,
 } from "./protocol";
 import { createCalendarBrokerServer } from "./server";
 import { CalendarBrokerStore } from "./store";
 
 const SERVICE_KEY = "broker-service-key-that-is-longer-than-thirty-two-bytes";
+const GMAIL_SERVICE_KEY = "gmail-service-key-that-is-longer-than-thirty-two-bytes";
 let store: CalendarBrokerStore;
 let server: ReturnType<typeof createCalendarBrokerServer>;
 let origin: string;
@@ -37,6 +43,15 @@ beforeEach(async () => {
     const url = String(input);
     if (url === "https://oauth2.googleapis.com/token") {
       const body = String(init?.body);
+      if (body.includes("gmail-client-id")) {
+        return body.includes("grant_type=authorization_code")
+          ? Response.json({
+              access_token: "gmail-oauth-access",
+              refresh_token: "gmail-refresh-secret",
+              scope: GMAIL_READ_SCOPE,
+            })
+          : Response.json({ access_token: "gmail-access" });
+      }
       return body.includes("grant_type=authorization_code")
         ? Response.json({
             access_token: "oauth-access",
@@ -44,6 +59,10 @@ beforeEach(async () => {
             scope: CALENDAR_READ_SCOPE,
           })
         : Response.json({ access_token: "calendar-access" });
+    }
+    if (url === "https://gmail.example.test/mcp") {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer gmail-access");
+      return gmailMcpResponse(init);
     }
     if (url.includes("/calendar/v3/calendars/primary/events")) {
       if (init?.method === "POST") {
@@ -71,6 +90,13 @@ beforeEach(async () => {
     googleClientId: "client-id",
     googleClientSecret: "client-secret",
     googleRedirectUri: "https://calendar-dev.zeusagent.dev/oauth/google/callback",
+    gmail: {
+      serviceKey: GMAIL_SERVICE_KEY,
+      clientId: "gmail-client-id",
+      clientSecret: "gmail-client-secret",
+      redirectUri: "https://calendar-dev.zeusagent.dev/oauth/gmail/callback",
+      remoteMcpUrl: "https://gmail.example.test/mcp",
+    },
   };
   server = createCalendarBrokerServer(configuration, store, fetcher);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -83,6 +109,7 @@ afterEach(async () => {
   );
   store.close();
   delete process.env.GOOGLE_CALENDAR_BROKER_SERVICE_KEY;
+  delete process.env.GOOGLE_GMAIL_BROKER_SERVICE_KEY;
 });
 
 describe("the multi-user Google Calendar broker", () => {
@@ -189,6 +216,88 @@ describe("the multi-user Google Calendar broker", () => {
   });
 });
 
+describe("the multi-user Gmail broker", () => {
+  it("connects one account and exposes only the two read tools", async () => {
+    const result = await connectGmail();
+    expect(store.getGmailGrant(result.connectionId, accountId)?.refreshToken).toBe(
+      "gmail-refresh-secret",
+    );
+
+    const client = new Client({ name: "test-zeus", version: "0.0.1" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`${origin}/gmail/mcp/${result.connectionId}`),
+      {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
+            "X-Zeus-Account-Id": accountId,
+          },
+        },
+      },
+    ));
+    expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+      "get_thread",
+      "search_threads",
+    ]);
+    const searched = await client.callTool({
+      name: "search_threads",
+      arguments: { query: "in:inbox newer_than:7d", pageSize: 50 },
+    });
+    expect(searched.isError).not.toBe(true);
+    expect(JSON.stringify(searched.content)).toContain("thread-1");
+    const blocked = await client.callTool({
+      name: "create_draft",
+      arguments: { to: "attacker@example.test", body: "must not leave" },
+    });
+    expect(blocked.isError).toBe(true);
+    expect(JSON.stringify(blocked.content)).toContain("read-only tools only");
+    await client.close();
+
+    const wrongAccount = await fetch(`${origin}/gmail/mcp/${result.connectionId}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
+        "Content-Type": "application/json",
+        "X-Zeus-Account-Id": randomUUID(),
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    expect(wrongAccount.status).toBe(404);
+  });
+
+  it("serves the locked Gmail provider transport in hosted Zeus", async () => {
+    process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = GMAIL_SERVICE_KEY;
+    const result = await connectGmail();
+    const db = openTestDb();
+    bindAppOwner(db, { supabaseUserId: accountId, email: "owner@example.com" });
+    const conversation = createConversation(db, { title: "Connections", source: "web" });
+    const source = appendMessage(db, conversation.id, "user", "Connect Gmail", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    const connector = upsertGoogleGmailConnector(db, {
+      connectionId: result.connectionId,
+      mcpUrl: `${origin}/gmail/mcp/${result.connectionId}`,
+      sourceMessageId: source.id,
+    });
+    const verified = await verifyConnector(db, connector.id);
+    configureGoogleGmailCapabilities(db, {
+      connectorId: connector.id,
+      tools: verified.tools,
+      scopes: result.scopes,
+      sourceMessageId: source.id,
+    });
+
+    const searched = await callCapability(db, "email.search_threads", {
+      query: "in:inbox newer_than:7d",
+      pageSize: 50,
+    });
+    expect(searched.isError).toBe(false);
+    expect(searched.value).toMatchObject({ threads: [{ id: "thread-1" }] });
+    db.close();
+  });
+});
+
 async function connectCalendar() {
   const started = await fetch(
     `${origin}/oauth/google/start?request=${encodeURIComponent(oauthRequest())}`,
@@ -219,4 +328,95 @@ function oauthRequest(): string {
     nonce: randomUUID(),
     ...envelopeTimes(),
   }, SERVICE_KEY);
+}
+
+async function connectGmail() {
+  const request = signBrokerEnvelope({
+    kind: "google_gmail_oauth_request",
+    accountId,
+    returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
+    nonce: randomUUID(),
+    ...envelopeTimes(),
+  }, GMAIL_SERVICE_KEY);
+  const started = await fetch(
+    `${origin}/oauth/gmail/start?request=${encodeURIComponent(request)}`,
+    { redirect: "manual" },
+  );
+  expect(started.status).toBe(303);
+  const google = new URL(started.headers.get("location")!);
+  expect(google.searchParams.get("scope")).toBe(GMAIL_READ_SCOPE);
+  expect(google.searchParams.get("prompt")).toBe("consent");
+  expect(google.searchParams.get("redirect_uri")).toBe(
+    "https://calendar-dev.zeusagent.dev/oauth/gmail/callback",
+  );
+  const state = google.searchParams.get("state");
+  expect(state).toBeTruthy();
+
+  const callback = await fetch(
+    `${origin}/oauth/gmail/callback?code=gmail-code&state=${encodeURIComponent(state!)}`,
+    { redirect: "manual" },
+  );
+  expect(callback.status).toBe(303);
+  const returnUrl = new URL(callback.headers.get("location")!);
+  return verifyGmailOAuthResult(
+    returnUrl.searchParams.get("result")!,
+    GMAIL_SERVICE_KEY,
+  );
+}
+
+function gmailMcpResponse(init: RequestInit | undefined): Response {
+  const request = JSON.parse(String(init?.body)) as {
+    id?: string | number;
+    method?: string;
+    params?: { name?: string };
+  };
+  if (request.method === "notifications/initialized") {
+    return new Response(null, { status: 202 });
+  }
+  const result = request.method === "initialize"
+    ? {
+        protocolVersion: "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "fake-gmail", version: "1" },
+      }
+    : request.method === "tools/list"
+      ? {
+          tools: [
+            {
+              name: "search_threads",
+              description: "Search Gmail threads",
+              inputSchema: {
+                type: "object",
+                properties: { query: { type: "string" }, pageSize: { type: "integer" } },
+                required: ["query"],
+              },
+              annotations: { readOnlyHint: true },
+            },
+            {
+              name: "get_thread",
+              description: "Get one Gmail thread",
+              inputSchema: {
+                type: "object",
+                properties: { threadId: { type: "string" } },
+                required: ["threadId"],
+              },
+              annotations: { readOnlyHint: true },
+            },
+            {
+              name: "create_draft",
+              description: "Create a draft",
+              inputSchema: { type: "object", properties: {} },
+              annotations: { readOnlyHint: false },
+            },
+          ],
+        }
+      : request.method === "tools/call" && request.params?.name === "search_threads"
+        ? {
+            content: [{
+              type: "text",
+              text: JSON.stringify({ threads: [{ id: "thread-1" }] }),
+            }],
+          }
+        : { isError: true, content: [{ type: "text", text: "unexpected test call" }] };
+  return Response.json({ jsonrpc: "2.0", id: request.id, result });
 }

@@ -941,7 +941,7 @@ export type ToolReceipt = z.infer<typeof ToolReceipt>;
 export const ConnectorTransport = z.enum(["stdio", "http"]);
 export type ConnectorTransport = z.infer<typeof ConnectorTransport>;
 
-export const ConnectorProvider = z.enum(["generic", "google_calendar"]);
+export const ConnectorProvider = z.enum(["generic", "google_calendar", "google_gmail"]);
 export type ConnectorProvider = z.infer<typeof ConnectorProvider>;
 
 export const ConnectorStatus = z.enum(["unverified", "ready", "unreachable", "disabled"]);

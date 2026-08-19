@@ -33,7 +33,33 @@ export const GoogleCalendarOAuthResult = z
   .strict();
 export type GoogleCalendarOAuthResult = z.infer<typeof GoogleCalendarOAuthResult>;
 
-type SignedPayload = GoogleCalendarOAuthRequest | GoogleCalendarOAuthResult;
+export const GoogleGmailOAuthRequest = z
+  .object({
+    kind: z.literal("google_gmail_oauth_request"),
+    accountId: z.string().uuid(),
+    returnUrl: z.string().url(),
+    nonce: z.string().uuid(),
+    ...EnvelopeTimes,
+  })
+  .strict();
+export type GoogleGmailOAuthRequest = z.infer<typeof GoogleGmailOAuthRequest>;
+
+export const GoogleGmailOAuthResult = z
+  .object({
+    kind: z.literal("google_gmail_oauth_result"),
+    accountId: z.string().uuid(),
+    connectionId: z.string().uuid(),
+    scopes: z.array(z.string()).max(32),
+    ...EnvelopeTimes,
+  })
+  .strict();
+export type GoogleGmailOAuthResult = z.infer<typeof GoogleGmailOAuthResult>;
+
+type SignedPayload =
+  | GoogleCalendarOAuthRequest
+  | GoogleCalendarOAuthResult
+  | GoogleGmailOAuthRequest
+  | GoogleGmailOAuthResult;
 
 export function signBrokerEnvelope(payload: SignedPayload, serviceKey: string): string {
   assertEnvelopeTimes(payload);
@@ -58,6 +84,22 @@ export function verifyOAuthResult(
   at: Date = new Date(),
 ): GoogleCalendarOAuthResult {
   return verifyBrokerEnvelope(envelope, serviceKey, GoogleCalendarOAuthResult, at);
+}
+
+export function verifyGmailOAuthRequest(
+  envelope: string,
+  serviceKey: string,
+  at: Date = new Date(),
+): GoogleGmailOAuthRequest {
+  return verifyBrokerEnvelope(envelope, serviceKey, GoogleGmailOAuthRequest, at);
+}
+
+export function verifyGmailOAuthResult(
+  envelope: string,
+  serviceKey: string,
+  at: Date = new Date(),
+): GoogleGmailOAuthResult {
+  return verifyBrokerEnvelope(envelope, serviceKey, GoogleGmailOAuthResult, at);
 }
 
 export function envelopeTimes(
@@ -128,7 +170,7 @@ function assertEnvelopeTimes(
 function normalizedServiceKey(serviceKey: string): Buffer {
   const normalized = serviceKey.trim();
   if (Buffer.byteLength(normalized, "utf8") < 32) {
-    throw new Error("The Google Calendar broker service key must be at least 32 bytes");
+    throw new Error("The Google broker service key must be at least 32 bytes");
   }
   return Buffer.from(normalized, "utf8");
 }

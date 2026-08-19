@@ -18,6 +18,7 @@ import {
 import { updateAmbientSetting } from "@/core/ambient";
 import { updateCalendarActionSetting } from "@/core/calendar-policy";
 import { syncCalendar } from "@/core/calendar-sync";
+import { syncEmail } from "@/core/email-sync";
 import {
   CAPABILITY_SLOTS,
   ConnectorPresetError,
@@ -25,11 +26,13 @@ import {
   configureConnectorPreset,
   createConnector,
   deleteGoogleCalendarConnector,
+  deleteGoogleGmailConnector,
   deleteConnector,
   getCapability,
   getConnector,
   getConnectorByPresetId,
   getGoogleCalendarConnector,
+  getGoogleGmailConnector,
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "@/core/connectors";
@@ -129,6 +132,7 @@ import {
   disconnectGoogleCalendarGrant,
   recordConnectionAction,
 } from "@/server/google-calendar/integration";
+import { disconnectGoogleGmailGrant } from "@/server/google-gmail/integration";
 
 /**
  * Curation actions.
@@ -890,11 +894,11 @@ export async function configureConnectorPresetAction(
   }
 
   const access = await getOwnerAccess();
-  if (access.state !== "local") return connectorSetupError("local_only");
+  if (access.state !== "local") return connectorSetupError("local_only", preset.label);
   const db = access.db;
   const existing = getConnectorByPresetId(db, presetId);
   if (expectedConnectorId === undefined && existing) {
-    return connectorSetupError("already_connected");
+    return connectorSetupError("already_connected", preset.label);
   }
   if (
     expectedConnectorId !== undefined &&
@@ -909,7 +913,7 @@ export async function configureConnectorPresetAction(
       tokenFailureCode: existing ? "scope_missing" : "adc_missing",
     }));
   } catch (error) {
-    return connectorSetupStateForError(error);
+    return connectorSetupStateForError(error, preset.label);
   }
 
   try {
@@ -994,6 +998,12 @@ export async function verifyConnectorAction(formData: FormData): Promise<void> {
     connector?.capabilities.some((capability) => capability.slot === "calendar.list_events")
   ) {
     await syncCalendar(db, { signal: AbortSignal.timeout(10_000) });
+  }
+  if (
+    connector?.provider === "google_gmail" ||
+    connector?.capabilities.some((capability) => capability.slot === "email.search_threads")
+  ) {
+    await syncEmail(db, { signal: AbortSignal.timeout(10_000) });
   }
   revalidatePath("/settings");
 }
@@ -1112,6 +1122,33 @@ export async function disconnectGoogleCalendarAction(): Promise<void> {
   revalidatePath("/today");
 }
 
+export async function disconnectGoogleGmailAction(): Promise<void> {
+  const access = await getOwnerAccess();
+  if (!access.canAccessPrivateData || access.state !== "authorized" || !access.account) {
+    redirect(
+      `/settings?connector_error=${encodeURIComponent(
+        "Sign in before disconnecting Gmail.",
+      )}#connections`,
+    );
+  }
+  const connector = getGoogleGmailConnector(access.db);
+  if (!connector?.provider_connection_id) return;
+  try {
+    await disconnectGoogleGmailGrant(
+      access.account.id,
+      connector.provider_connection_id,
+    );
+  } catch (error) {
+    redirect(
+      `/settings?connector_error=${encodeURIComponent(connectorErrorMessage(error))}#connections`,
+    );
+  }
+  recordConnectionAction(access.db, "Disconnect Gmail and revoke its read access.");
+  deleteGoogleGmailConnector(access.db, connector.id);
+  revalidatePath("/settings");
+  revalidatePath("/today");
+}
+
 /**
  * Confirm one exact external request, then let it happen.
  *
@@ -1195,10 +1232,14 @@ function connectorErrorMessage(error: unknown): string {
   return message.slice(0, 200);
 }
 
-function connectorSetupStateForError(error: unknown): ConnectorSetupState {
+function connectorSetupStateForError(
+  error: unknown,
+  serviceLabel = "Google Calendar",
+): ConnectorSetupState {
   if (error instanceof ConnectorError || error instanceof ConnectorPresetError) {
     return connectorSetupError(
       isConnectorSetupErrorCode(error.code) ? error.code : "invalid_request",
+      serviceLabel,
     );
   }
   return connectorSetupError("invalid_request");
@@ -1227,21 +1268,27 @@ function isConnectorSetupErrorCode(value: string): value is Exclude<
 
 function connectorSetupError(
   code: Exclude<ConnectorSetupCode, "idle" | "connected" | "updated">,
+  serviceLabel = "Google Calendar",
 ): ConnectorSetupState {
+  const gmail = serviceLabel === "Gmail";
   const messages: Record<typeof code, string> = {
-    local_only: "Guided Google Calendar setup is available only in local mode.",
+    local_only: gmail
+      ? "Guided Gmail setup is available only in local mode."
+      : "Guided Google Calendar setup is available only in local mode.",
     invalid_request: "That connection request was invalid. Refresh Settings and try again.",
     invalid_preset: "That connection preset is not available.",
-    invalid_permissions: "Select at least one Google Calendar permission.",
+    invalid_permissions: gmail
+      ? "Select at least one Gmail permission."
+      : "Select at least one Google Calendar permission.",
     gcloud_missing: "Install the Google Cloud CLI, then run the setup check again.",
     gcloud_unavailable: "The Google Cloud CLI did not answer safely. Try its commands in a terminal.",
-    project_missing: "Select an active Google Cloud project before connecting Calendar.",
-    adc_missing: "Create Application Default Credentials with the generated Calendar scopes.",
-    scope_missing: "Your Application Default Credentials need the newly selected Calendar scopes.",
+    project_missing: `Select an active Google Cloud project before connecting ${gmail ? "Gmail" : "Calendar"}.`,
+    adc_missing: `Create Application Default Credentials with the generated ${gmail ? "Gmail" : "Calendar"} scopes.`,
+    scope_missing: `Your Application Default Credentials need the newly selected ${gmail ? "Gmail" : "Calendar"} scopes.`,
     api_or_iam_missing: "Check that both APIs and the required IAM roles are enabled in the active project.",
-    server_unreachable: "Zeus could not reach Google's Calendar MCP server. No connection was saved.",
-    tool_contract_changed: "Google's Calendar tool contract changed, so Zeus left the permission disabled for review.",
-    already_connected: "Google Calendar is already connected. Refresh Settings to manage its permissions.",
+    server_unreachable: `Zeus could not reach Google's ${gmail ? "Gmail" : "Calendar"} MCP server. No connection was saved.`,
+    tool_contract_changed: `Google's ${gmail ? "Gmail" : "Calendar"} tool contract changed, so Zeus left the permission disabled for review.`,
+    already_connected: `${gmail ? "Gmail" : "Google Calendar"} is already connected. Refresh Settings to manage its permissions.`,
   };
   return { status: "error", code, message: messages[code] };
 }
