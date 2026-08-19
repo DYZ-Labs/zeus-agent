@@ -64,7 +64,7 @@ This file is the operating guide for coding agents working on Zeus.
 
 ## Purpose
 
-Zeus is a **Personal AI Agent**: an agentic system designed to understand a user's priorities, manage administrative work, coordinate across tools, remember preferences, and proactively help the user run their personal and professional life.
+Zeus is a **Personal AI Agent**: an agentic system designed to understand a user's priorities, manage administrative work, coordinate across tools, remember preferences, and help the user run their personal and professional life through explicit requests and authorized workflows.
 
 Zeus should evolve from a useful assistant into a trusted **personal operating layer**.
 
@@ -84,11 +84,12 @@ Build Zeus, an AI agent that can:
 
 - understand what matters to the user
 - maintain useful long-term context
-- identify tasks without waiting for explicit prompts
+- identify and persist tasks from authorized context
 - coordinate across the user's apps
 - prepare or execute actions
-- track unfinished work
-- follow up automatically
+- track unfinished work across conversations
+- surface unfinished work when the user asks
+- optionally surface unsolicited follow-through only when the user explicitly enables it
 - learn preferences over time
 - reduce administrative cognitive load
 - become increasingly useful without becoming intrusive
@@ -700,7 +701,7 @@ Zeus should:
 - prepare replies
 - detect unanswered messages
 - detect commitments
-- follow up when appropriate
+- prepare or perform follow-ups when the user requests or authorizes them
 - link email content with calendar and contacts
 
 Example output:
@@ -816,6 +817,9 @@ The system should close the loop.
 
 The daily brief should be extremely high signal.
 
+Generate it when the user asks or when the user has explicitly enabled delivery. Unsolicited
+delivery is not a baseline product requirement.
+
 Possible structure:
 
 ```text
@@ -845,11 +849,17 @@ Do not dump every available piece of information into the brief.
 
 ---
 
-# 18. Proactivity
+# 18. Optional Proactivity
 
-Proactivity is essential but dangerous.
+Proactivity is not a baseline product or MVP requirement. Zeus must remain useful through
+explicit requests, including requests to show priorities, commitments, or the next useful
+action.
 
-Zeus should proactively surface something when:
+Unsolicited follow-through may be offered as an opt-in capability. It must be independently
+controllable and must never be required for task persistence, user-initiated workflow
+completion, or verification.
+
+When the user enables it, the agent should proactively surface something only when:
 
 ```text
 expected value of interruption
@@ -915,6 +925,9 @@ Check for reply tomorrow afternoon.
 ```
 
 Zeus must not forget unfinished work because a conversation ended.
+
+When the user asks what remains open or what to do next, Zeus must retrieve and present this
+state. Persisting an unfinished task does not by itself authorize an unsolicited reminder.
 
 ---
 
@@ -1287,9 +1300,15 @@ Create a genuinely useful **Personal AI Agent for email + calendar**.
 - scheduling assistance
 - meeting preparation
 - task extraction
-- daily brief
+- persistent task and open-loop state
+- explicit priority and next-step retrieval
+- user-initiated workflow completion and verification
+- daily brief on request
 - approval-before-action system
 - action history
+
+Unsolicited follow-through, proactive suggestions, and background reminders are not MVP
+release criteria. If retained, they must be explicitly enabled by the user.
 
 Avoid building:
 
@@ -1320,10 +1339,12 @@ agent_actions_rejected
 draft_acceptance_rate
 successful_tool_execution_rate
 user_corrections
-proactive_suggestion_acceptance
 weekly_retention
 tasks_completed_without_manual_work
 ```
+
+For users who explicitly enable proactive behavior, additionally track
+`proactive_suggestion_acceptance`.
 
 Do not optimize primarily for:
 
@@ -1349,8 +1370,10 @@ user_correction_rate
 permission_rejection_rate
 duplicate_action_rate
 failed_action_rate
-false_proactive_alert_rate
 ```
+
+For users who explicitly enable proactive behavior, additionally track
+`false_proactive_alert_rate`.
 
 Reliability matters more than conversational impressiveness.
 
@@ -1613,7 +1636,7 @@ Add:
 - cross-app reasoning
 - tasks
 - meeting preparation
-- follow-ups
+- persistent follow-up state and explicit next-step retrieval
 - relationship memory
 - daily brief
 - approval workflows
@@ -1630,7 +1653,7 @@ Add:
 
 - standing permissions
 - automatic scheduling
-- proactive follow-ups
+- optional, explicitly enabled proactive follow-ups
 - recurring workflows
 - external service actions
 
@@ -1672,7 +1695,7 @@ Win by being:
 
 +
 
-**more proactive**
+**more effective at finishing authorized work**
 
 +
 
@@ -1708,5 +1731,3 @@ If not, question whether the feature belongs in the product.
 The goal is not to create the most impressive chatbot.
 
 The goal is to create an AI agent that users trust to **run the administrative layer of their lives**.
-
-
