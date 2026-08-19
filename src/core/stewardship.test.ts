@@ -24,6 +24,7 @@ import {
   evaluateOpportunity,
   followThroughMetrics,
   getRecommendationCycle,
+  getStewardshipSetting,
   listFollowThroughEvents,
   listOpportunityDeliveries,
   markOpportunityDelivered,
@@ -236,6 +237,9 @@ describe("follow-through selection", () => {
   it("does not recommend an item in the turn where the user closes or defers it", () => {
     const db = openTestDb();
     const message = source(db);
+    // Unrequested surfacing is off by default; this test is about which item wins once it
+    // is on, so the opt-in is the precondition rather than the subject.
+    setStewardshipMode(db, "balanced", message.id);
     createCommitment(db, {
       title: "Write the case study",
       dueAt: "2020-01-01",
@@ -613,10 +617,13 @@ describe("opportunity audit and delivery", () => {
       effect_kind: "web_read",
       requires_confirmation: false,
     });
+    // The account never opted into proactivity, and the trace says so — while the `today`
+    // trigger still produced a full cycle. That pairing is the contract the opt-in default
+    // rests on: `off` silences what Zeus volunteers, never what the user asks for.
     expect(JSON.parse(cycle.context_json)).toMatchObject({
       trigger: "today",
       timezone: "UTC",
-      stewardship_mode: "balanced",
+      stewardship_mode: "off",
       explicitly_requested: true,
     });
     expect(JSON.parse(cycle.candidate_scores_json)).toEqual([
@@ -825,6 +832,9 @@ describe("priority history and response context", () => {
     vi.stubEnv("ZEUS_EMBEDDINGS", "off");
     const db = openTestDb();
     const message = source(db, "Staying healthy matters; I need to book the dentist.");
+    // "dentist appointment" is an ordinary question, not an explicit ask for priorities, so
+    // a recommendation only reaches the context once the user opted into proactivity.
+    setStewardshipMode(db, "balanced", message.id);
     const goal = createGoal(db, {
       title: "Stay healthy",
       priority: "high",
@@ -857,6 +867,9 @@ describe("priority history and response context", () => {
       "user",
       "Maya started a pottery class, and I want to stay closer after missing her graduation.",
     );
+    // The reading-list question is unrelated to the commitment, so the overdue Maya nudge
+    // reaches the context only as volunteered follow-through — which is opt-in.
+    setStewardshipMode(db, "balanced", memory.id);
     applyExtraction(
       db,
       {
@@ -884,5 +897,92 @@ describe("priority history and response context", () => {
     expect(context.recommendation?.commitment_title).toContain("Maya");
     expect(context.text).toContain("pottery classes");
     expect(context.text).not.toContain("DATED EVIDENCE PASSAGES");
+  });
+});
+
+describe("proactivity is opt-in", () => {
+  const OPT_IN = MIGRATIONS.findIndex((migration) => migration.id === "031_proactivity_opt_in");
+
+  function storeBeforeOptIn(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    for (const migration of MIGRATIONS.slice(0, OPT_IN)) db.exec(migration.sql);
+    return db;
+  }
+
+  function applyOptIn(db: Database.Database): void {
+    const migration = MIGRATIONS[OPT_IN];
+    if (!migration) throw new Error("031_proactivity_opt_in is missing from MIGRATIONS");
+    db.exec(migration.sql);
+  }
+
+  function mode(db: Database.Database) {
+    return db
+      .prepare("SELECT mode, source_message_id FROM stewardship_setting WHERE id = 1")
+      .get();
+  }
+
+  it("starts a new account silent", () => {
+    const db = openTestDb();
+
+    expect(getStewardshipSetting(db).mode).toBe("off");
+  });
+
+  it("moves an inherited default to off and leaves a chosen mode alone", () => {
+    const inherited = storeBeforeOptIn();
+    // The pre-migration state every existing account is in: balanced, because that was the
+    // column default, with no user message behind it.
+    expect(mode(inherited)).toMatchObject({ mode: "balanced", source_message_id: null });
+
+    const chosen = storeBeforeOptIn();
+    const timestamp = "2029-01-01T00:00:00.000Z";
+    chosen
+      .prepare(
+        `INSERT INTO conversation (id, title, source, started_at, updated_at)
+         VALUES (1, 'Settings', 'web', ?, ?)`,
+      )
+      .run(timestamp, timestamp);
+    chosen
+      .prepare(
+        `INSERT INTO message (id, conversation_id, role, content, created_at)
+         VALUES (1, 1, 'user', 'Keep suggesting things.', ?)`,
+      )
+      .run(timestamp);
+    chosen.prepare("UPDATE stewardship_setting SET source_message_id = 1 WHERE id = 1").run();
+
+    applyOptIn(inherited);
+    applyOptIn(chosen);
+
+    expect(mode(inherited)).toMatchObject({ mode: "off" });
+    // Someone asked for this one. A migration that silences a stated preference is not a
+    // default change, it is an override.
+    expect(mode(chosen)).toMatchObject({ mode: "balanced", source_message_id: 1 });
+
+    inherited.close();
+    chosen.close();
+  });
+
+  it("opens no recommendation cycle on an ordinary turn, and one when asked", async () => {
+    vi.stubEnv("ZEUS_EMBEDDINGS", "off");
+    const db = openTestDb();
+    const message = source(db, "I need to book the dentist.");
+    createCommitment(db, {
+      title: "Book the dentist",
+      dueAt: "2020-01-01",
+      sourceMessageId: message.id,
+    });
+
+    const ordinary = await buildContext(db, "what is the weather like", { queryVector: null });
+    expect(ordinary.recommendation).toBeNull();
+    expect(ordinary.opportunityId).toBeNull();
+    // Not merely unrecommended: unconsidered. A cycle row is the record of a decision about
+    // whether to interrupt, and in mode `off` that decision was never Zeus's to take.
+    expect(db.prepare("SELECT count(*) AS rows FROM recommendation_cycle").get()).toMatchObject({
+      rows: 0,
+    });
+
+    const asked = await buildContext(db, "what should I do next?", { queryVector: null });
+    expect(asked.recommendation?.commitment_title).toBe("Book the dentist");
+    expect(asked.opportunityId).not.toBeNull();
   });
 });

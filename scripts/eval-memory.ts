@@ -15,6 +15,7 @@ import {
   createEvaluationContext,
   recommendNextAction,
   recordFollowThroughDecision,
+  setStewardshipMode,
 } from "../src/core/stewardship";
 
 process.env.ZEUS_EMBEDDINGS ??= "off";
@@ -70,6 +71,9 @@ const intent = appendMessage(
   "user",
   "I want to launch my portfolio, and I need to write the case study by Friday.",
 );
+// Proactivity is opt-in and off by default. The scenario below measures how well an
+// unprompted recommendation is chosen and ranked, which presupposes the user wants one.
+setStewardshipMode(db, "balanced", intent.id);
 const goal = applyExtraction(
   db,
   {
