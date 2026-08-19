@@ -18,6 +18,9 @@ import { z } from "zod";
 
 import { getCandidate, listCandidates, recordCandidateResolution, resolveCandidate } from "../core/candidates";
 import { buildEvaluationContextForTrigger } from "../core/ambient";
+import { briefIsEmpty, buildBrief, renderBriefBlock } from "../core/brief";
+import { buildScheduleContext } from "../core/calendar-context";
+import { calendarCapabilityState } from "../core/capabilities";
 import { remember } from "../core/chat";
 import { workPlanApprovalSentence } from "../core/confirmation-text";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
@@ -1495,6 +1498,47 @@ server.registerTool(
         ? `Recorded ${decision} for commitment ${commitment_id} (action source=message:${approval.sourceMessageId}). No external action was performed.`
         : `Commitment ${commitment_id} does not exist or is no longer actionable; nothing changed.`,
     );
+  },
+);
+
+server.registerTool(
+  "zeus_brief",
+  {
+    title: "The user's brief: today, what needs attention, and what is prepared",
+    description:
+      "One deterministic composition of what today holds and what is waiting: today's remaining schedule, noticed conflicts, overdue and due-soon commitments, the single best next action, and external requests or plans prepared but not sent. No model call and no ranking beyond the policy that already exists. Nothing under prepared has happened. Read-only.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true },
+  },
+  async () => {
+    const context = buildEvaluationContextForTrigger(db, "mcp");
+    // MCP is an explicit trigger, so the recommendation is reached even in mode `off` — the
+    // user asked. Evaluated here rather than inside `buildBrief` because the cycle and its
+    // delivery belong to the channel that renders it.
+    const cycle = evaluateOpportunity(db, context, "");
+    const recommendation = recommendationForOpportunity(db, cycle.id);
+    const brief = buildBrief(db, context, {
+      schedule: buildScheduleContext(db, context, calendarCapabilityState(db)),
+      recommendation,
+    });
+    if (briefIsEmpty(brief)) {
+      return text(
+        "Nothing today needs the user's attention: no events left, nothing overdue or due soon, nothing noticed, and nothing waiting to be sent.",
+      );
+    }
+    if (recommendation) {
+      recordMcpRecallAudit(db, "zeus_brief", "", [
+        {
+          kind: "commitment",
+          id: recommendation.commitment_id,
+          snapshot: { recommendation },
+        },
+      ]);
+      // Without this the surfaced event never fires, so the cooldown never starts and the
+      // same commitment is raised again on the next channel that asks.
+      markOpportunityDelivered(db, cycle.id, "mcp");
+    }
+    return text(renderBriefBlock(brief, context));
   },
 );
 
