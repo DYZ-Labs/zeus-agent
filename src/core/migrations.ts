@@ -2265,6 +2265,56 @@ CREATE TABLE inbox_context (
 );
 `;
 
+/**
+ * Two email detectors join the four calendar ones.
+ *
+ * Another CHECK that SQLite cannot widen in place, so another rebuild — the same shape as
+ * 030 and 032, with both partial indexes recreated after.
+ *
+ * Named for what they actually establish. The roadmap called the first `email_unanswered`,
+ * which the cache cannot support: deciding a thread is unanswered needs the recipients and
+ * the user's own address, and the standing block deliberately holds neither. What is
+ * checkable is that someone Zeus has been told about wrote, and the message is still
+ * unopened — so that is what the detector is called.
+ */
+const EMAIL_DETECTORS = `
+ALTER TABLE detected_signal RENAME TO detected_signal_email_legacy;
+CREATE TABLE detected_signal (
+  id                INTEGER PRIMARY KEY,
+  detector          TEXT NOT NULL
+                    CHECK (detector IN ('calendar_overlap','travel_gap',
+                                        'deadline_collision','commitment_unscheduled',
+                                        'email_unread_known_sender',
+                                        'email_commitment_adjacent')),
+  dedupe_key        TEXT NOT NULL UNIQUE,
+  subject_json      TEXT NOT NULL CHECK (json_valid(subject_json)),
+  commitment_id     INTEGER REFERENCES commitment(id) ON DELETE CASCADE,
+  severity          INTEGER NOT NULL CHECK (severity BETWEEN 0 AND 100),
+  why               TEXT NOT NULL,
+  suggested_action  TEXT NOT NULL,
+  effect_kind       TEXT NOT NULL
+                    CHECK (effect_kind IN ('memory_read','web_read','prepare_local',
+                                           'external_read','send','schedule','purchase',
+                                           'modify_external')),
+  occurs_at         TEXT,
+  detected_at       TEXT NOT NULL,
+  snoozed_until     TEXT,
+  last_surfaced_at  TEXT,
+  resolved_at       TEXT
+);
+INSERT INTO detected_signal
+  (id, detector, dedupe_key, subject_json, commitment_id, severity, why, suggested_action,
+   effect_kind, occurs_at, detected_at, snoozed_until, last_surfaced_at, resolved_at)
+SELECT id, detector, dedupe_key, subject_json, commitment_id, severity, why, suggested_action,
+       effect_kind, occurs_at, detected_at, snoozed_until, last_surfaced_at, resolved_at
+FROM detected_signal_email_legacy;
+DROP TABLE detected_signal_email_legacy;
+CREATE INDEX detected_signal_open_idx ON detected_signal(severity DESC, id)
+WHERE resolved_at IS NULL;
+CREATE INDEX detected_signal_commitment_idx ON detected_signal(commitment_id)
+WHERE commitment_id IS NOT NULL;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2308,4 +2358,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "033_email_capability_slots", sql: EMAIL_CAPABILITY_SLOTS },
   { id: "034_email_external_data", sql: EMAIL_EXTERNAL_DATA },
   { id: "035_inbox_turn_context", sql: INBOX_TURN_CONTEXT },
+  { id: "036_email_detectors", sql: EMAIL_DETECTORS },
 ];
