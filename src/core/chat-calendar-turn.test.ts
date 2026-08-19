@@ -98,7 +98,7 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
     confidence: "high",
     details_from: "user_message",
     title: null,
-    starts_at_local: "2026-08-17T19:30",
+    starts_at_local: `${new Date(Date.now() + 86_400_000).toISOString().slice(0, 10)}T19:30`,
     ends_at_local: null,
     location: null,
     target: { title_text: "dinner", starts_at_local: null, date_local: null },
