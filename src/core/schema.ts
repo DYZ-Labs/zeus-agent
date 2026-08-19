@@ -1366,6 +1366,8 @@ export const DetectorKind = z.enum([
   "travel_gap",
   "deadline_collision",
   "commitment_unscheduled",
+  "email_unread_known_sender",
+  "email_commitment_adjacent",
 ]);
 export type DetectorKind = z.infer<typeof DetectorKind>;
 

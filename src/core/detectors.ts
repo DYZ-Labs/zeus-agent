@@ -1,10 +1,14 @@
 import { cachedEvents } from "./calendar-sync";
+import { cachedThreads } from "./email-sync";
+import type { EmailThread } from "./email-sync";
+import { resolveEntityCandidates } from "./entities";
 import { overlappingPairs } from "./calendar-conflicts";
 import {
   clock,
   endOf,
   label,
   mentions,
+  contentWords,
   normalizedPlace,
   startOf,
 } from "./calendar-time";
@@ -40,6 +44,8 @@ const TRAVEL_GAP_MS = 30 * 60_000;
 /** How far ahead a deadline has to be before an unscheduled commitment is worth raising. */
 const UNSCHEDULED_HORIZON_MS = 7 * DAY_MS;
 const MAX_SIGNALS_PER_RUN = 50;
+/** How long an unopened message from someone known sits before it is worth raising. */
+const UNREAD_QUIET_MS = 2 * DAY_MS;
 
 export type { CachedEvent };
 
@@ -83,11 +89,15 @@ export function runDetectors(db: Db, options: { at?: Date } = {}): DetectionResu
     listGoals(db, { limit: 500 }).filter((goal) => goal.status === "active").map((goal) => goal.id),
   );
 
+  const threads = cachedThreads(db, at);
+
   const drafts = [
     ...detectCalendarOverlaps(events, timezone),
     ...detectTravelGaps(events),
     ...detectDeadlineCollisions(commitments, events, at, activeGoalIds),
     ...detectUnscheduledCommitments(commitments, events, at, activeGoalIds),
+    ...detectUnreadFromKnownSender(db, threads, at),
+    ...detectCommitmentAdjacentThreads(threads, commitments, activeGoalIds),
   ]
     .sort((left, right) => right.severity - left.severity)
     .slice(0, MAX_SIGNALS_PER_RUN);
@@ -295,6 +305,114 @@ function detectUnscheduledCommitments(
     });
   }
   return drafts;
+}
+
+/**
+ * Someone Zeus has been told about wrote, and the message is still unopened.
+ *
+ * Deliberately not the roadmap's `email_unanswered`. Deciding a thread is *unanswered* needs
+ * the recipients and the user's own address, and the standing inbox holds neither by design —
+ * subjects and senders only. Approximating it would mean a detector whose name claims more
+ * than it checked, on the most adversarial data Zeus ingests.
+ *
+ * The known-sender gate is what keeps this from being a second unread badge. An address that
+ * resolves to an entity is one the user told Zeus about; marketing lists do not. It also
+ * costs nothing extra, because the same lookup is what lets the sentence say a name.
+ */
+function detectUnreadFromKnownSender(
+  db: Db,
+  threads: readonly EmailThread[],
+  at: Date,
+): Draft[] {
+  const drafts: Draft[] = [];
+  for (const thread of threads) {
+    if (!thread.unread || thread.from === null) continue;
+    const quiet = thread.last_activity_at === null ? Number.NaN : Date.parse(thread.last_activity_at);
+    if (!Number.isFinite(quiet) || at.getTime() - quiet < UNREAD_QUIET_MS) continue;
+    const known = knownSender(db, thread.from);
+    if (!known) continue;
+    const days = Math.floor((at.getTime() - quiet) / DAY_MS);
+    drafts.push({
+      detector: "email_unread_known_sender",
+      dedupeKey: `email_unread_known_sender:${thread.id}`,
+      subject: { thread_id: thread.id, days_unread: days },
+      commitmentId: null,
+      severity: 50,
+      why:
+        `${known} wrote ${days} days ago about ${subjectPhrase(thread)} and it is still ` +
+        "unopened.",
+      suggestedAction: `Read what ${known} sent, or decide it can wait.`,
+      // Reading a thread is a read; nothing here proposes replying, and there is no slot
+      // that could.
+      effectKind: "external_read",
+      occursAt: thread.last_activity_at,
+    });
+  }
+  return drafts;
+}
+
+/**
+ * A thread that plainly concerns something the user already committed to.
+ *
+ * The overlap is content words shared between a subject line and a commitment title, the
+ * same rule `mentions` applies to calendar entries — so a thread Zeus links to a commitment
+ * and an event Zeus links to one are found the same way, and cannot disagree.
+ */
+function detectCommitmentAdjacentThreads(
+  threads: readonly EmailThread[],
+  commitments: readonly CommitmentView[],
+  activeGoalIds: ReadonlySet<number>,
+): Draft[] {
+  const drafts: Draft[] = [];
+  for (const commitment of eligible(commitments, activeGoalIds)) {
+    const words = contentWords(commitment.title);
+    if (words.size === 0) continue;
+    for (const thread of threads) {
+      if (thread.subject === null) continue;
+      const subjectWords = contentWords(thread.subject);
+      let shared = 0;
+      for (const word of words) if (subjectWords.has(word)) shared += 1;
+      if (shared < Math.min(2, words.size)) continue;
+      drafts.push({
+        detector: "email_commitment_adjacent",
+        dedupeKey: `email_commitment_adjacent:${commitment.id}:${thread.id}`,
+        subject: { commitment_id: commitment.id, thread_id: thread.id },
+        commitmentId: commitment.id,
+        severity: 45,
+        why:
+          `A thread about ${subjectPhrase(thread)} is in the inbox, and ` +
+          `“${commitment.title}” is still open.`,
+        suggestedAction: `Check whether that thread moves “${commitment.title}” forward.`,
+        effectKind: "external_read",
+        occursAt: thread.last_activity_at,
+      });
+    }
+  }
+  return drafts;
+}
+
+/**
+ * The entity a sender resolves to, or null when nobody is named unambiguously.
+ *
+ * Only a display name can resolve. `entity_alias` holds names the user's own memory
+ * established, and nothing populates it with addresses — the same limit meeting preparation
+ * runs into, and for the same reason: an attendee record and a From header are both external
+ * data, and external data is never memory evidence. So `Sarah Chen <sarah@example.com>`
+ * resolves and a bare `sarah@example.com` does not, rather than being guessed at from its
+ * local part.
+ */
+function knownSender(db: Db, from: string): string | null {
+  const display = /^\s*"?([^"<]+?)"?\s*<[^>]+>\s*$/u.exec(from)?.[1] ?? from;
+  if (display.includes("@")) return null;
+  const candidates = resolveEntityCandidates(db, display);
+  return candidates.length === 1 ? candidates[0]!.name : null;
+}
+
+/** A subject, guarded, or an honest stand-in when there is none. */
+function subjectPhrase(thread: EmailThread): string {
+  return thread.subject === null || thread.subject.trim().length === 0
+    ? "an untitled thread"
+    : `“${safeExternal(thread.subject.trim())}”`;
 }
 
 function eligible(

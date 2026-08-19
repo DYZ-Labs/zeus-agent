@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveTodayOpportunity, updateAmbientSetting } from "./ambient";
 import { mayBeCalendarRequest } from "./calendar-intent";
 import { cacheCalendarEvents } from "./calendar-sync";
+import { cacheEmailThreads } from "./email-sync";
+import { upsertEntity } from "./entities";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import { listOpenSignals, runDetectors } from "./detectors";
@@ -489,5 +491,128 @@ describe("handing a detected signal to chat", () => {
       "Start “Ship the report” earlier, or move its deadline. " +
         "Nothing outside this conversation changes without my explicit confirmation.",
     );
+  });
+});
+
+describe("what an inbox is worth noticing", () => {
+  const INBOX_NOW = new Date("2026-08-20T09:00:00.000Z");
+
+  function thread(id: string, subject: string, from: string, date: string, unread = true) {
+    return {
+      id,
+      messages: [{ subject, sender: from, date, labelIds: unread ? ["INBOX", "UNREAD"] : ["INBOX"] }],
+    };
+  }
+
+  function inbox(threads: unknown[]): void {
+    cacheEmailThreads(db, 1, { threads }, INBOX_NOW);
+  }
+
+  it("raises an unopened message from someone Zeus has been told about", () => {
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    inbox([
+      thread("t1", "The hiring deck", "Sarah Chen <sarah@example.com>", "2026-08-17T09:00:00.000Z"),
+    ]);
+
+    const signal = runDetectors(db, { at: INBOX_NOW }).created.find(
+      (entry) => entry.detector === "email_unread_known_sender",
+    );
+
+    expect(signal?.why).toContain("Sarah Chen wrote 3 days ago");
+    expect(signal?.why).toContain("“The hiring deck”");
+    // Reading is the only thing Zeus could do here; there is no email write slot at all.
+    expect(signal?.effect_kind).toBe("external_read");
+  });
+
+  it("stays quiet about a stranger, however loud the subject", () => {
+    // The known-sender gate is what stops this being a second unread badge. A marketing list
+    // is not in the entity graph, so it is not somebody the user told Zeus about.
+    inbox([
+      thread("t1", "FINAL NOTICE: your account", "deals@example.com", "2026-08-17T09:00:00.000Z"),
+    ]);
+
+    expect(
+      runDetectors(db, { at: INBOX_NOW }).created.filter(
+        (entry) => entry.detector === "email_unread_known_sender",
+      ),
+    ).toEqual([]);
+  });
+
+  it("does not resolve a sender known only by address", () => {
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    inbox([thread("t1", "The hiring deck", "sarah@example.com", "2026-08-17T09:00:00.000Z")]);
+
+    expect(
+      runDetectors(db, { at: INBOX_NOW }).created.filter(
+        (entry) => entry.detector === "email_unread_known_sender",
+      ),
+    ).toEqual([]);
+  });
+
+  it("waits before raising something that only just arrived, and ignores what was opened", () => {
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    inbox([
+      thread("fresh", "Just now", "Sarah Chen <s@example.com>", "2026-08-20T08:00:00.000Z"),
+      thread("read", "Already opened", "Sarah Chen <s@example.com>", "2026-08-16T09:00:00.000Z", false),
+    ]);
+
+    expect(
+      runDetectors(db, { at: INBOX_NOW }).created.filter(
+        (entry) => entry.detector === "email_unread_known_sender",
+      ),
+    ).toEqual([]);
+  });
+
+  it("links a thread to an open commitment it plainly concerns", () => {
+    createCommitment(db, {
+      title: "Send Sam the hiring deck",
+      sourceMessageId: userMessageId,
+    });
+    inbox([thread("t1", "Re: the hiring deck", "sam@example.com", "2026-08-19T09:00:00.000Z")]);
+
+    const signal = runDetectors(db, { at: INBOX_NOW }).created.find(
+      (entry) => entry.detector === "email_commitment_adjacent",
+    );
+
+    expect(signal?.why).toContain("“Send Sam the hiring deck” is still open");
+    expect(signal?.commitment_id).not.toBeNull();
+  });
+
+  it("does not link a thread that merely shares a common word", () => {
+    createCommitment(db, { title: "Send Sam the hiring deck", sourceMessageId: userMessageId });
+    inbox([thread("t1", "Lunch tomorrow?", "sam@example.com", "2026-08-19T09:00:00.000Z")]);
+
+    expect(
+      runDetectors(db, { at: INBOX_NOW }).created.filter(
+        (entry) => entry.detector === "email_commitment_adjacent",
+      ),
+    ).toEqual([]);
+  });
+
+  it("withholds an injection-shaped subject from the sentence it composes", () => {
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    inbox([thread("t1", HOSTILE, "Sarah Chen <s@example.com>", "2026-08-17T09:00:00.000Z")]);
+
+    const signal = runDetectors(db, { at: INBOX_NOW }).created.find(
+      (entry) => entry.detector === "email_unread_known_sender",
+    );
+
+    expect(signal?.why).toContain(WITHHELD);
+    expect(signal?.why).not.toContain("previous instructions");
+    expect(signalChatPrompt(signal!)).not.toContain("previous instructions");
+  });
+
+  it("stops raising a thread once it leaves the inbox", () => {
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    inbox([thread("t1", "The hiring deck", "Sarah Chen <s@example.com>", "2026-08-17T09:00:00.000Z")]);
+    runDetectors(db, { at: INBOX_NOW });
+    expect(listOpenSignals(db, { at: INBOX_NOW }).length).toBeGreaterThan(0);
+
+    // The user archived it. The next read is the only evidence Zeus will ever get.
+    inbox([]);
+    const { resolved } = runDetectors(db, { at: INBOX_NOW });
+
+    expect(resolved).toBeGreaterThan(0);
+    expect(listOpenSignals(db, { at: INBOX_NOW })).toEqual([]);
   });
 });
