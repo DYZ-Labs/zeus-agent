@@ -6,6 +6,7 @@ import {
   assertPresetConnectorConfiguration,
   availableCapability,
   availableEffectKinds,
+  calendarCapabilityForEffect,
   bindCapability,
   configureConnectorPreset,
   configureGoogleCalendarCapabilities,
@@ -28,12 +29,13 @@ import {
   toolSchemaHash,
   upsertGoogleCalendarConnector,
 } from "./connectors";
+import { calendarCapabilityState } from "./capabilities";
 import { GOOGLE_CALENDAR_MCP_URL } from "./connector-catalog";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import { MIGRATIONS } from "./migrations";
 import { bindAppOwner } from "./owner";
-import type { WorkPlanProposal } from "./schema";
+import type { CapabilitySlot, WorkPlanProposal } from "./schema";
 import {
   authorizeWorkPlan,
   createWorkPlan,
@@ -669,6 +671,62 @@ describe("capability binding is a deliberate, reviewable grant", () => {
     });
 
     expect(availableCapability(db, "calendar.create_event")).toBeNull();
+  });
+});
+
+describe("an email grant is not a calendar grant", () => {
+  /** A connector bound to one slot and fully enabled. */
+  function bound(slot: CapabilitySlot, remoteToolName: string, label: string): number {
+    const connector = stdioConnector({ label });
+    bindCapability(db, {
+      connectorId: connector.id,
+      slot,
+      remoteToolName,
+      inputSchema: { type: "object" },
+      sourceMessageId: userMessageId,
+    });
+    readyAndEnabled(connector.id);
+    const capability = getConnector(db, connector.id)?.capabilities[0];
+    if (!capability) throw new Error("capability missing");
+    setCapabilityEnabled(db, capability.id, true, userMessageId);
+    return connector.id;
+  }
+
+  it("will not answer a calendar read with a Gmail capability", () => {
+    // The trap this replaced: `availableCapabilityForEffect` resolved by effect kind, and
+    // `email.search_threads` is the first slot to share `external_read` with the calendar.
+    // With only Gmail connected, a generated plan's "read the calendar" step would have
+    // resolved to it — building calendar arguments from a Gmail schema, and opening a
+    // receipt citing a capability the call never used.
+    bound("email.search_threads", "search_threads", "Gmail");
+
+    expect(availableCapability(db, "email.search_threads")).not.toBeNull();
+    expect(calendarCapabilityForEffect(db, "external_read")).toBeNull();
+  });
+
+  it("resolves the calendar when the calendar is what is connected", () => {
+    bound("calendar.list_events", "list_events", "Calendar");
+
+    const resolved = calendarCapabilityForEffect(db, "external_read");
+    expect(resolved?.capability.slot).toBe("calendar.list_events");
+  });
+
+  it("picks the calendar even when both are connected", () => {
+    bound("email.search_threads", "search_threads", "Gmail");
+    bound("calendar.list_events", "list_events", "Calendar");
+
+    expect(calendarCapabilityForEffect(db, "external_read")?.capability.slot).toBe(
+      "calendar.list_events",
+    );
+  });
+
+  it("does not count a Gmail connector as a calendar for the capability block", () => {
+    // `calendarConnectorExists` and the capability block both asked "does this connector
+    // hold a known slot", which meant "is it a calendar" only while calendar was the only
+    // capability there was.
+    bound("email.search_threads", "search_threads", "Gmail");
+
+    expect(calendarCapabilityState(db).connected).toBe(false);
   });
 });
 

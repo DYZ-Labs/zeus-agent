@@ -1,7 +1,7 @@
 import { directExecutionAllowance } from "./calendar-policy";
 import { readCalendarCoverage } from "./calendar-sync";
 import {
-  CAPABILITY_SLOTS,
+  CALENDAR_CAPABILITY_SLOTS,
   availableCapability,
   connectorStatusLabel,
   listConnectors,
@@ -63,7 +63,7 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
     : listConnectors(db).find((connector) =>
         connector.provider === "google_calendar" ||
         connector.capabilities.some((capability) =>
-          (CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
+          (CALENDAR_CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
         ),
       ) ?? null;
   const connector = usable?.connector ?? bound;

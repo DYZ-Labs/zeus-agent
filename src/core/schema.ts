@@ -955,13 +955,26 @@ export const CapabilitySlot = z.enum([
   "calendar.list_events",
   "calendar.create_event",
   "calendar.update_event",
+  "email.search_threads",
+  "email.get_thread",
 ]);
 export type CapabilitySlot = z.infer<typeof CapabilitySlot>;
 
+/**
+ * Email arrives read-only, and there is no email write slot at all — not a disabled one, not
+ * one gated behind a policy. A capability Zeus cannot name is one it cannot be talked into,
+ * and email is the most adversarial text it will ever read.
+ *
+ * `email.search_threads` and `email.get_thread` are the first slots to share an effect kind
+ * with another slot. That makes effect kind an ambiguous way to choose a capability, which
+ * is why `availableCapabilityForEffect` no longer exists.
+ */
 export const CAPABILITY_SLOT_EFFECTS = {
   "calendar.list_events": "external_read",
   "calendar.create_event": "schedule",
   "calendar.update_event": "modify_external",
+  "email.search_threads": "external_read",
+  "email.get_thread": "external_read",
 } as const satisfies Record<CapabilitySlot, EffectKind>;
 
 export const Sha256Hex = z

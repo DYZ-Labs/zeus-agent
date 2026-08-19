@@ -880,3 +880,137 @@ describe("clear-window migration keeps every stored outcome", () => {
     db.close();
   });
 });
+
+// 033 widens the capability-slot CHECK for email, which again means swapping the table out.
+// `connector_capability` is the first rebuild target that write-path ledgers point at:
+// `proposed_effect` is ON DELETE RESTRICT and `tool_receipt` is ON DELETE SET NULL, so a
+// modern RENAME would repoint both at the legacy copy and the DROP would take a receipt's
+// provenance with it. Same bracketing as 023, asserted the same way.
+describe("email-slot migration rebuilds connector_capability in place", () => {
+  const emailSlotsIndex = MIGRATIONS.findIndex(
+    (migration) => migration.id === "033_email_capability_slots",
+  );
+  const upToThirtyTwo = MIGRATIONS.slice(0, emailSlotsIndex);
+
+  function storeAtThirtyTwo(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    migrate(db, upToThirtyTwo);
+    const hash = "b".repeat(64);
+    db.exec(`
+      INSERT INTO conversation (id, title, source, started_at, updated_at)
+      VALUES (1, 'Calendar', 'web', '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO message (id, conversation_id, role, content, created_at)
+      VALUES (1, 1, 'user', 'move my 3pm', '2026-08-19T00:00:00.000Z');
+      INSERT INTO connector
+        (id, label, transport, url, status, enabled, source_message_id, created_at, updated_at)
+      VALUES (1, 'Calendar', 'http', 'https://example.test/mcp', 'ready', 1, 1,
+              '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO connector_capability
+        (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+         enabled, source_message_id, created_at, updated_at)
+      VALUES (7, 1, 'calendar.update_event', 'update_event', 'modify_external', '{}', '${hash}',
+              1, 1, '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO work_plan
+        (id, objective, status, plan_hash, allowed_effects_json, completion_criteria_json,
+         max_steps, max_model_tool_calls, max_retries_per_step, max_duration_seconds,
+         source_message_id, origin, created_at, updated_at)
+      VALUES (1, 'move it', 'authorized', '${hash}', '["modify_external"]', '["done"]',
+              12, 20, 2, 900, 1, 'explicit_request', '2026-08-19T00:00:00.000Z',
+              '2026-08-19T00:00:00.000Z');
+      INSERT INTO work_step (id, work_plan_id, position, title, instruction, effect_kind, status)
+      VALUES (10, 1, 1, 'move', 'move the event', 'modify_external', 'pending');
+      INSERT INTO work_authorization
+        (id, work_plan_id, plan_hash, authorization_kind, allowed_effects_json,
+         max_model_tool_calls, max_retries_per_step, max_duration_seconds, expires_at,
+         source_message_id, created_at)
+      VALUES (1, 1, '${hash}', 'explicit_request', '["modify_external"]', 20, 2, 900,
+              '2099-01-01T00:00:00.000Z', 1, '2026-08-19T00:00:00.000Z');
+      INSERT INTO work_run
+        (id, work_plan_id, authorization_id, plan_hash, status, model_call_count,
+         tool_call_count, started_at, updated_at, deadline_at)
+      VALUES (1, 1, 1, '${hash}', 'running', 0, 0, '2026-08-19T00:00:00.000Z',
+              '2026-08-19T00:00:00.000Z', '2099-01-01T00:00:00.000Z');
+      INSERT INTO proposed_effect
+        (id, work_run_id, work_step_id, connector_capability_id, effect_kind, payload_json,
+         payload_hash, preview_text, status, idempotency_key, provider_request_key,
+         expires_at, created_at, updated_at)
+      VALUES (1, 1, 10, 7, 'modify_external', '{}', '${"c".repeat(64)}', 'Move it',
+              'pending_confirmation', 'idem-1', 'req-1', '2099-01-01T00:00:00.000Z',
+              '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO tool_receipt
+        (id, work_run_id, work_step_id, connector_capability_id, tool_name, effect_kind,
+         call_index, input_json, output_json, citations_json, status, idempotency_key,
+         started_at)
+      VALUES (1, 1, 10, 7, 'connector_call', 'modify_external', 1, '{}', '{}', '[]', 'completed',
+              'idem-r1', '2026-08-19T00:00:00.000Z');
+    `);
+    return db;
+  }
+
+  it("keeps the capability and both ledgers pointing at it across the swap", () => {
+    const db = storeAtThirtyTwo();
+
+    migrate(db, MIGRATIONS);
+
+    expect(db.pragma("foreign_key_check")).toEqual([]);
+    // Same row, same id — the id is what the two ledgers hold.
+    expect(db.prepare("SELECT slot FROM connector_capability WHERE id = 7").pluck().get())
+      .toBe("calendar.update_event");
+    expect(db.prepare("SELECT connector_capability_id FROM proposed_effect").pluck().all())
+      .toEqual([7]);
+    expect(db.prepare("SELECT connector_capability_id FROM tool_receipt").pluck().all())
+      .toEqual([7]);
+    // The references name the live table, not the copy that was dropped.
+    for (const table of ["proposed_effect", "tool_receipt"]) {
+      const sql = db
+        .prepare("SELECT sql FROM sqlite_master WHERE name = ?")
+        .pluck()
+        .get(table) as string;
+      expect(sql).toMatch(/REFERENCES connector_capability\s*\(/u);
+      expect(sql).not.toMatch(/email_legacy/u);
+    }
+    expect(
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'connector_capability_slot_idx'",
+        )
+        .pluck()
+        .get(),
+    ).toBe("connector_capability_slot_idx");
+    db.close();
+  });
+
+  it("still refuses to delete a capability a pending request depends on", () => {
+    // ON DELETE RESTRICT is the whole reason the reference has to survive: a grant cannot be
+    // deleted out from under a request the user has not answered yet.
+    const db = storeAtThirtyTwo();
+    migrate(db, MIGRATIONS);
+
+    expect(() => db.exec("DELETE FROM connector_capability WHERE id = 7")).toThrow(
+      /FOREIGN KEY/u,
+    );
+    db.close();
+  });
+
+  it("admits the email read slots, and no email write slot exists to admit", () => {
+    const db = storeAtThirtyTwo();
+    migrate(db, MIGRATIONS);
+
+    const insert = (slot: string, effect: string) =>
+      db.exec(
+        `INSERT INTO connector_capability
+           (connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+            enabled, source_message_id, created_at, updated_at)
+         VALUES (1, '${slot}', 'tool', '${effect}', '{}', '${"d".repeat(64)}', 0, 1,
+                 '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z')`,
+      );
+
+    expect(() => insert("email.search_threads", "external_read")).not.toThrow();
+    expect(() => insert("email.get_thread", "external_read")).not.toThrow();
+    // The pairing CHECK still binds each slot to exactly one effect kind.
+    expect(() => insert("email.get_thread", "send")).toThrow(/CHECK/u);
+    expect(() => insert("email.send_message", "send")).toThrow(/CHECK/u);
+    db.close();
+  });
+});
