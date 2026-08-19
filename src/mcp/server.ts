@@ -18,6 +18,14 @@ import { z } from "zod";
 
 import { getCandidate, listCandidates, recordCandidateResolution, resolveCandidate } from "../core/candidates";
 import { buildEvaluationContextForTrigger } from "../core/ambient";
+import { briefIsEmpty, buildBrief, renderBriefBlock } from "../core/brief";
+import { buildScheduleContext } from "../core/calendar-context";
+import { calendarCapabilityState } from "../core/capabilities";
+import {
+  buildMeetingPrep,
+  meetingPrepRequest,
+  renderMeetingPrepBlock,
+} from "../core/meeting-prep";
 import { remember } from "../core/chat";
 import { workPlanApprovalSentence } from "../core/confirmation-text";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
@@ -1495,6 +1503,91 @@ server.registerTool(
         ? `Recorded ${decision} for commitment ${commitment_id} (action source=message:${approval.sourceMessageId}). No external action was performed.`
         : `Commitment ${commitment_id} does not exist or is no longer actionable; nothing changed.`,
     );
+  },
+);
+
+server.registerTool(
+  "zeus_brief",
+  {
+    title: "The user's brief: today, what needs attention, and what is prepared",
+    description:
+      "One deterministic composition of what today holds and what is waiting: today's remaining schedule, noticed conflicts, overdue and due-soon commitments, the single best next action, and external requests or plans prepared but not sent. No model call and no ranking beyond the policy that already exists. Nothing under prepared has happened. Read-only.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true },
+  },
+  async () => {
+    const context = buildEvaluationContextForTrigger(db, "mcp");
+    // MCP is an explicit trigger, so the recommendation is reached even in mode `off` — the
+    // user asked. Evaluated here rather than inside `buildBrief` because the cycle and its
+    // delivery belong to the channel that renders it.
+    const cycle = evaluateOpportunity(db, context, "");
+    const recommendation = recommendationForOpportunity(db, cycle.id);
+    const brief = buildBrief(db, context, {
+      schedule: buildScheduleContext(db, context, calendarCapabilityState(db)),
+      recommendation,
+    });
+    if (briefIsEmpty(brief)) {
+      return text(
+        "Nothing today needs the user's attention: no events left, nothing overdue or due soon, nothing noticed, and nothing waiting to be sent.",
+      );
+    }
+    if (recommendation) {
+      recordMcpRecallAudit(db, "zeus_brief", "", [
+        {
+          kind: "commitment",
+          id: recommendation.commitment_id,
+          snapshot: { recommendation },
+        },
+      ]);
+      // Without this the surfaced event never fires, so the cooldown never starts and the
+      // same commitment is raised again on the next channel that asks.
+      markOpportunityDelivered(db, cycle.id, "mcp");
+    }
+    return text(renderBriefBlock(brief, context));
+  },
+);
+
+server.registerTool(
+  "zeus_meeting_prep",
+  {
+    title: "Prepare the user for an upcoming meeting",
+    description:
+      "Assemble what Zeus knows before a meeting: who is coming, which of them it has been told about, accepted facts and open commitments involving each, and anything it noticed about the meeting. Resolves the meeting deterministically from the calendar cache — no guessing which one, and no inferring anything about an attendee it cannot match. Read-only.",
+    inputSchema: {
+      meeting: z
+        .string()
+        .optional()
+        .describe(
+          "Which meeting, as the user would say it: a clock time like '11 AM', a word from its title, or nothing for the next one.",
+        ),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ meeting }) => {
+    const context = buildEvaluationContextForTrigger(db, "mcp");
+    // Parsed through the same predicate chat uses, so the two surfaces resolve "my 11 AM"
+    // identically. A bare argument is the target itself, hence the prefix.
+    const target = meetingPrepRequest(`prep me for ${meeting ?? "my next meeting"}`);
+    if (!target) return text("Zeus could not work out which meeting was meant.");
+    const result = buildMeetingPrep(db, context, target);
+    if (result.status === "prepared") {
+      const known = result.prep.attendees.filter((attendee) => attendee.entitySlug !== null);
+      if (known.length > 0) {
+        recordMcpRecallAudit(
+          db,
+          "zeus_meeting_prep",
+          meeting ?? "",
+          known.flatMap((attendee) =>
+            attendee.commitments.map((commitment) => ({
+              kind: "commitment" as const,
+              id: commitment.id,
+              snapshot: { commitment, attendee: attendee.entityName },
+            })),
+          ),
+        );
+      }
+    }
+    return text(renderMeetingPrepBlock(result, context));
   },
 );
 

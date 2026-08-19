@@ -38,8 +38,20 @@ export function label(event: CachedEvent): string {
   return event.title && event.title.trim().length > 0 ? `“${event.title.trim()}”` : "an event";
 }
 
-export function clock(timestamp: number): string {
-  return new Date(timestamp).toISOString().slice(11, 16);
+/**
+ * A clock time as the person reading it would say it.
+ *
+ * This was `toISOString().slice(11, 16)` — UTC, and on a 24-hour clock. Every signal that
+ * named a time named the wrong one for anyone outside UTC: a user in New York was told a
+ * meeting "runs until 16:00" while their own calendar showed 12:00 PM. Nothing flagged it,
+ * because the number was internally consistent and simply about somewhere else.
+ *
+ * The local helpers below already existed, for the schedule block; the detectors were
+ * written before them and never caught up. Routing through them is also what makes a signal
+ * and the schedule agree on how a time is written, which is this module's whole purpose.
+ */
+export function clock(timestamp: number, timezone: string): string {
+  return clockText(localMinutesOfDay(timestamp, timezone), true);
 }
 
 export function normalizedPlace(value: string): string {
