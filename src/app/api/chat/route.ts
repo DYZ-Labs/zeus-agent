@@ -3,6 +3,7 @@ import { z } from "zod";
 import { BUDGET_MESSAGES, checkModelBudget, logBudgetDenial } from "@/core/budget";
 import { streamTurn } from "@/core/chat";
 import { pendingConfirmationOffer } from "@/core/effects";
+import { pendingWorkPlanApprovalOffer } from "@/core/work-plans";
 import { createConversation, getConversation } from "@/core/conversations";
 import type { Db } from "@/core/db";
 import { errorSignature, logEvent } from "@/core/observability";
@@ -171,7 +172,8 @@ function privateChatResponse(
           // is emptied whenever the user sends anything else, so a change asked about three
           // messages ago still needs its line put back — and the reply is allowed to say it
           // is there only because this puts it there.
-          awaitingConfirmation: pendingConfirmationOffer(db),
+          awaitingConfirmation: pendingConfirmationOffer(db, { conversationId }),
+          awaitingWorkPlanApproval: pendingWorkPlanApprovalOffer(db, conversationId),
           extractionFailed: result.learned === null,
         });
 
@@ -209,6 +211,8 @@ function privateChatResponse(
                 : error instanceof Error
                   ? error.message
                   : "Something went wrong.",
+            awaitingConfirmation: pendingConfirmationOffer(db, { conversationId }),
+            awaitingWorkPlanApproval: pendingWorkPlanApprovalOffer(db, conversationId),
           });
         }
       } finally {

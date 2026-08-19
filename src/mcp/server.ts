@@ -19,6 +19,7 @@ import { z } from "zod";
 import { getCandidate, listCandidates, recordCandidateResolution, resolveCandidate } from "../core/candidates";
 import { buildEvaluationContextForTrigger } from "../core/ambient";
 import { remember } from "../core/chat";
+import { workPlanApprovalSentence } from "../core/confirmation-text";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
 import type { Db } from "../core/db";
 import { openDb } from "../core/db";
@@ -1096,7 +1097,7 @@ server.registerTool(
       "zeus_authorize_work_plan",
       mutationArgs,
       `Authorize work_plan:${plan_id}, exact plan hash ${plan_hash}, effects ${allowed_effects.join(", ")}, limits ${max_model_tool_calls} calls / ${max_retries_per_step} retries / ${max_duration_seconds}s, through ${expires_at}.`,
-      `I approve work_plan:${plan_id} with exact hash ${plan_hash}, allowed effects ${allowed_effects.join(", ")}, limits ${max_model_tool_calls} calls, ${max_retries_per_step} retries per step, ${max_duration_seconds} seconds, expiring ${expires_at}.`,
+      workPlanApprovalSentence(plan_hash),
       { kind: "work_plan", id: plan_id },
     );
     if (!approval) {

@@ -10,8 +10,13 @@ import {
   type ChatUpdatedDetail,
 } from "@/components/chat-events";
 import { type ChatReceipt } from "@/components/chat-receipt";
-import { confirmationSentence } from "@/core/confirmation-text";
+import {
+  confirmationSentence,
+  parseWorkPlanApproval,
+  workPlanApprovalAndRunSentence,
+} from "@/core/confirmation-text";
 import type { CalendarOutcome, FollowThroughRecommendation } from "@/core/schema";
+import type { WorkPlanApprovalOffer } from "@/core/work-plans";
 
 export type ChatHistoryTurn = {
   id: string;
@@ -44,6 +49,7 @@ export function Chat({
   initialTurns = [],
   initialConversationId,
   awaitingConfirmation,
+  awaitingWorkPlanApproval,
 }: {
   hasCredentials: boolean;
   canAccessPrivateData: boolean;
@@ -59,13 +65,23 @@ export function Chat({
    * could reach.
    */
   awaitingConfirmation?: { hash: string; count: number } | null;
+  /** The newest immutable plan in this conversation that has not been approved. */
+  awaitingWorkPlanApproval?: WorkPlanApprovalOffer | null;
 }) {
   const [turns, setTurns] = useState<Turn[]>(canAccessPrivateData ? initialTurns : []);
+  const [workProposal, setWorkProposal] = useState<WorkPlanApprovalOffer | null>(
+    awaitingWorkPlanApproval ?? null,
+  );
+  const [confirmationOffer, setConfirmationOffer] = useState(
+    awaitingConfirmation ?? null,
+  );
   const [input, setInput] = useState(
     initialPrompt ??
       (awaitingConfirmation
         ? confirmationSentence(awaitingConfirmation.hash, awaitingConfirmation.count)
-        : ""),
+        : awaitingWorkPlanApproval
+          ? workPlanApprovalAndRunSentence(awaitingWorkPlanApproval.hash)
+          : ""),
   );
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -80,6 +96,8 @@ export function Chat({
       activeRequest.current = null;
       conversationId.current = null;
       setTurns([]);
+      setWorkProposal(null);
+      setConfirmationOffer(null);
       setInput("");
       setStatus("idle");
       setError(null);
@@ -106,6 +124,16 @@ export function Chat({
   async function send() {
     const text = input.trim();
     if (!text || status === "streaming" || !hasCredentials || !canAccessPrivateData) return;
+    const planApproval = parseWorkPlanApproval(text);
+    if (
+      workProposal &&
+      planApproval?.run &&
+      planApproval.hash === workProposal.hash.toLowerCase()
+    ) {
+      // The proposal is no longer truthfully "not started" once its approval is in flight.
+      // A server error frame restores it only if it remains proposed.
+      setWorkProposal(null);
+    }
 
     const replyId = crypto.randomUUID();
     setTurns((prior) => [
@@ -215,8 +243,27 @@ export function Chat({
               | { hash: string; count: number }
               | null
               | undefined;
+            const planOffer = event.awaitingWorkPlanApproval as
+              | WorkPlanApprovalOffer
+              | null
+              | undefined;
+            setWorkProposal(planOffer ?? null);
+            setConfirmationOffer(offer ?? null);
             if (offer) offerConfirmation(offer.hash, offer.count);
+            else if (planOffer) offerWorkPlanApproval(planOffer.hash);
           } else if (event.type === "error") {
+            const offer = event.awaitingConfirmation as
+              | { hash: string; count: number }
+              | null
+              | undefined;
+            const planOffer = event.awaitingWorkPlanApproval as
+              | WorkPlanApprovalOffer
+              | null
+              | undefined;
+            setConfirmationOffer(offer ?? null);
+            setWorkProposal(planOffer ?? null);
+            if (offer) offerConfirmation(offer.hash, offer.count);
+            else if (planOffer) offerWorkPlanApproval(planOffer.hash);
             throw new Error(event.message as string);
           }
         }
@@ -246,6 +293,28 @@ export function Chat({
       resizeComposer(textareaRef.current);
       textareaRef.current.focus();
     });
+  }
+
+  function offerWorkPlanApproval(hash: string) {
+    setInput((current) => (
+      current.trim() ? current : workPlanApprovalAndRunSentence(hash)
+    ));
+    requestAnimationFrame(() => {
+      if (!textareaRef.current) return;
+      resizeComposer(textareaRef.current);
+      textareaRef.current.focus();
+    });
+  }
+
+  function prepareWorkPlanApproval(proposal: WorkPlanApprovalOffer) {
+    const sentence = workPlanApprovalAndRunSentence(proposal.hash);
+    if (input.trim() && input.trim() !== sentence) {
+      setError("Clear your draft before loading the exact plan approval.");
+      textareaRef.current?.focus();
+      return;
+    }
+    setError(null);
+    offerWorkPlanApproval(proposal.hash);
   }
 
   const hasVisibleTurns = canAccessPrivateData && turns.length > 0;
@@ -303,6 +372,14 @@ export function Chat({
                 ))}
               </ol>
 
+              {workProposal && !confirmationOffer && (
+                <WorkProposalCard
+                  proposal={workProposal}
+                  disabled={status !== "idle"}
+                  onPrepareApproval={prepareWorkPlanApproval}
+                />
+              )}
+
               {error && (
                 <p
                   role="alert"
@@ -325,6 +402,87 @@ export function Chat({
       )}
     </div>
   );
+}
+
+function WorkProposalCard({
+  proposal,
+  disabled,
+  onPrepareApproval,
+}: {
+  proposal: WorkPlanApprovalOffer;
+  disabled: boolean;
+  onPrepareApproval: (proposal: WorkPlanApprovalOffer) => void;
+}) {
+  return (
+    <section
+      aria-label="Proposed bounded work"
+      className="mb-2 rounded-xl border px-4 py-4"
+      style={{ background: "var(--shell-panel)", borderColor: "var(--shell-line-strong)" }}
+    >
+      <p className="text-[0.7rem] font-medium uppercase tracking-[0.08em]" style={{ color: "var(--shell-faint)" }}>
+        Proposed bounded work
+      </p>
+      <h2 className="mt-1 text-[0.92rem] font-medium">{proposal.objective}</h2>
+      <ol className="mt-3 space-y-2">
+        {proposal.steps.map((step) => (
+          <li key={step.position} className="flex gap-2 text-[0.78rem] leading-5">
+            <span className="font-mono text-[0.62rem]" style={{ color: "var(--shell-faint)" }}>
+              {step.position}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block">{step.title}</span>
+              <span className="block text-[0.72rem]" style={{ color: "var(--shell-muted)" }}>
+                {step.instruction}
+              </span>
+              <span className="font-mono text-[0.6rem]" style={{ color: "var(--shell-faint)" }}>
+                {step.effect.replace(/_/gu, " ")}
+                {step.dependsOn.length > 0 ? ` · after ${step.dependsOn.join(", ")}` : ""}
+              </span>
+            </span>
+          </li>
+        ))}
+      </ol>
+      <dl className="mt-3 space-y-1 text-[0.7rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        <div>
+          <dt className="inline">Allowed effects: </dt>
+          <dd className="inline">{proposal.allowedEffects.map(readableEffect).join(", ")}</dd>
+        </div>
+        <div>
+          <dt className="inline">Completion: </dt>
+          <dd className="inline">{proposal.completionCriteria.join("; ")}</dd>
+        </div>
+        <div>
+          <dt className="inline">Limits: </dt>
+          <dd className="inline">
+            {proposal.limits.modelToolCalls} model/tool calls · {proposal.limits.retriesPerStep}{" "}
+            retries per step · {proposal.limits.durationSeconds} seconds
+          </dd>
+        </div>
+      </dl>
+      <p className="mt-3 text-[0.74rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+        No work has started. Send the exact approval-and-run line to start this plan, or send
+        “no” or “cancel” to dismiss it.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onPrepareApproval(proposal)}
+          className="rounded-lg px-3 py-2 text-[0.72rem] font-medium disabled:opacity-50"
+          style={{ background: "var(--shell-accent)", color: "#000000" }}
+        >
+          Load exact approval
+        </button>
+        <span className="break-all font-mono text-[0.58rem]" style={{ color: "var(--shell-faint)" }}>
+          {proposal.hash}
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function readableEffect(effect: string): string {
+  return effect.replace(/_/gu, " ");
 }
 
 async function recordOpportunityDelivery(
@@ -445,12 +603,9 @@ function UserTurn({ text }: { text: string }) {
 /**
  * One reply, and nothing else.
  *
- * The calendar, work-plan and follow-through panels that used to sit here are gone. They were
- * deterministic where the prose is not, which is a real thing to give up — so what replaced
- * them is not trust in the model but a narrower job for it: the same stored `calendar_outcome`
- * that drove the panel is supplied to the model as data it must not contradict, kept for
- * audit, and replayed to later turns. The reply says it in sentences; the record still exists
- * and still governs.
+ * Calendar outcomes and follow-through stay in prose, constrained by their stored records.
+ * A proposed plan is the exception: its exact immutable scope is rendered beside the reply
+ * because the user must be able to inspect the thing the composer is asking them to approve.
  *
  * What a panel could do and a paragraph cannot is hand the user a button. That one case is
  * handled by putting the exact confirmation line in the composer, where the user sends it
