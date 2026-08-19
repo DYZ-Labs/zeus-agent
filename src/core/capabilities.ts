@@ -1,5 +1,6 @@
 import { directExecutionAllowance } from "./calendar-policy";
 import { readCalendarCoverage } from "./calendar-sync";
+import { readEmailCoverage } from "./email-sync";
 import {
   CALENDAR_CAPABILITY_SLOTS,
   availableCapability,
@@ -107,6 +108,57 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
     directExecution: allowance.reason !== "disabled",
     remainingToday: Math.max(0, allowance.limit - allowance.usedToday),
     lastReadAt: readCalendarCoverage(db)?.fetchedAt ?? null,
+  };
+}
+
+/**
+ * What Zeus can do with the user's mail, which in this increment is exactly one thing.
+ *
+ * Far smaller than its calendar counterpart, and that asymmetry is the point rather than an
+ * omission: email has no write slot, so there is no execution allowance to describe, no daily
+ * ceiling to spend, and no confirmation ladder to explain. A shape that left room for those
+ * would imply they exist.
+ */
+export type EmailCapabilityState = {
+  /** An inbox connector exists, whether or not it is currently usable. */
+  connected: boolean;
+  canRead: boolean;
+  connectorLabel: string | null;
+  unusableStatus: ConnectorStatus | null;
+  unusableReason: string | null;
+  lastReadAt: string | null;
+};
+
+export function emailCapabilityState(db: Db): EmailCapabilityState {
+  const read = availableCapability(db, "email.search_threads");
+  const bound = read
+    ? null
+    : listConnectors(db).find((connector) =>
+        connector.capabilities.some(
+          (capability) =>
+            capability.slot === "email.search_threads" ||
+            capability.slot === "email.get_thread",
+        ),
+      ) ?? null;
+  const connector = read?.connector ?? bound;
+  const unusableReason = read || !bound
+    ? null
+    : bound.last_error_code ?? (
+        bound.status === "ready"
+          ? bound.enabled === 0
+            ? "disabled"
+            : bound.missingEnvVarNames.length > 0
+              ? "missing_environment"
+              : "no_enabled_capability"
+          : bound.status
+      );
+  return {
+    connected: read !== null || bound !== null,
+    canRead: read !== null,
+    connectorLabel: connector?.label ?? null,
+    unusableStatus: read ? null : (bound?.status ?? null),
+    unusableReason,
+    lastReadAt: readEmailCoverage(db)?.fetchedAt ?? null,
   };
 }
 

@@ -1284,6 +1284,40 @@ export const ScheduleSnapshotEvent = z
   .strict();
 export type ScheduleSnapshotEvent = z.infer<typeof ScheduleSnapshotEvent>;
 
+export const InboxSnapshotThread = z
+  .object({
+    id: z.string(),
+    subject: z.string().nullable(),
+    from: z.string().nullable(),
+    lastActivityAt: z.string().nullable(),
+    unread: z.boolean(),
+  })
+  .strict();
+export type InboxSnapshotThread = z.infer<typeof InboxSnapshotThread>;
+
+/**
+ * The standing inbox a chat turn rendered for the model, kept with the turn.
+ *
+ * `schedule_context`'s twin, for the same answerability reason: the cache it was rendered
+ * from reconciles and expires, so without this row "why did Zeus say that?" about an inbox
+ * claim stops being answerable an hour after the claim.
+ *
+ * No snippet and no body, here or anywhere. Subjects and senders are stored post-guard, so a
+ * withheld line stays withheld in the record too.
+ */
+export const InboxSnapshot = z
+  .object({
+    state: z.enum(["current", "stale", "unread"]),
+    asOf: z.string().nullable(),
+    window: z.object({ from: z.string(), to: z.string() }).strict().nullable(),
+    threads: z.array(InboxSnapshotThread),
+    threadsShown: z.number().int().min(0),
+    threadsTotal: z.number().int().min(0),
+    withheld: z.boolean(),
+  })
+  .strict();
+export type InboxSnapshot = z.infer<typeof InboxSnapshot>;
+
 /**
  * The standing schedule context a chat turn rendered for the model, kept with the turn.
  *

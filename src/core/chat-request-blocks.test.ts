@@ -63,6 +63,7 @@ vi.mock("./calendar-intent", async (importOriginal) => ({
 
 const { streamTurn } = await import("./chat");
 const { cacheCalendarEvents } = await import("./calendar-sync");
+const { cacheEmailThreads } = await import("./email-sync");
 const { createConversation, appendMessage } = await import("./conversations");
 const { openTestDb } = await import("./db");
 const { upsertEntity } = await import("./entities");
@@ -219,5 +220,80 @@ describe("the meeting prep block on a chat turn", () => {
 
     expect(sentToModel).toContain('status="no_match"');
     expect(sentToModel).toContain("not a calendar that could not be read");
+  });
+});
+
+describe("the standing inbox block", () => {
+  /** A store with one connected inbox holding one thread. */
+  function withInbox(): Db {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    const source = appendMessage(db, conversation.id, "user", "hi", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    db.exec(`
+      INSERT INTO connector (id, label, transport, url, source_message_id, status, enabled,
+                             created_at, updated_at)
+      VALUES (1, 'Gmail', 'http', 'https://example.test/mcp', ${source.id}, 'ready', 1,
+              '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+      INSERT INTO connector_capability
+        (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+         enabled, source_message_id, created_at, updated_at)
+      VALUES (1, 1, 'email.search_threads', 'search_threads', 'external_read', '{}',
+              '${"e".repeat(64)}', 1, ${source.id}, '2026-08-19T00:00:00.000Z',
+              '2026-08-19T00:00:00.000Z');
+    `);
+    cacheEmailThreads(
+      db,
+      1,
+      {
+        threads: [
+          {
+            id: "t1",
+            messages: [
+              {
+                subject: "Q3 planning",
+                sender: "sarah@example.com",
+                date: "2026-08-19T08:00:00.000Z",
+                snippet: "body text that must not travel",
+              },
+            ],
+          },
+        ],
+      },
+      new Date("2026-08-19T09:00:00.000Z"),
+    );
+    return db;
+  }
+
+  it("rides along on every turn, not only when email is mentioned", async () => {
+    // Standing context, like the schedule: the point is that Zeus already knows, rather than
+    // that it looked because someone asked.
+    const sentToModel = await turn("how are you", withInbox());
+
+    expect(sentToModel).toContain("<inbox ");
+    expect(sentToModel).toContain("Q3 planning");
+    expect(sentToModel).toContain("sarah@example.com");
+  });
+
+  it("carries no message text, only what a subject line says", async () => {
+    const sentToModel = await turn("what is waiting for me", withInbox());
+
+    expect(sentToModel).not.toContain("body text that must not travel");
+    expect(sentToModel).toContain("never quote or summarize a body from this");
+  });
+
+  it("stays absent when no inbox is connected, so the prompt's biconditional holds", async () => {
+    const sentToModel = await turn("what is waiting for me", seeded());
+
+    expect(sentToModel).not.toContain("<inbox ");
+  });
+
+  it("renders after the schedule and before memory, as the prompt says it will", async () => {
+    const sentToModel = await turn("how are you", withInbox());
+
+    expect(sentToModel.indexOf("<capabilities")).toBeLessThan(sentToModel.indexOf("<inbox "));
+    expect(sentToModel.indexOf("<inbox ")).toBeLessThan(sentToModel.indexOf("<memory"));
   });
 });

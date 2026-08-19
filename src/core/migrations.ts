@@ -2240,6 +2240,31 @@ FROM external_read_window_email_legacy;
 DROP TABLE external_read_window_email_legacy;
 `;
 
+/**
+ * The standing inbox a turn rendered, kept beside the turn — `schedule_context`'s twin.
+ *
+ * Same reasoning, same shape, same cascade: assistant-context data over an external, expiring
+ * cache. Not memory, not evidence, never indexed, never exported, no path to extraction or
+ * retrieval, and it goes when its message does.
+ *
+ * A separate table rather than a `kind` column on `schedule_context`, because the two answer
+ * different questions and are rendered by different code. One row per assistant message per
+ * kind would be the same thing spelled more cleverly.
+ */
+const INBOX_TURN_CONTEXT = `
+CREATE TABLE inbox_context (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  state          TEXT NOT NULL CHECK (state IN ('current','stale','unread')),
+  as_of          TEXT,
+  window_from    TEXT,
+  window_to      TEXT,
+  threads_shown  INTEGER NOT NULL CHECK (threads_shown >= 0),
+  threads_total  INTEGER NOT NULL CHECK (threads_total >= 0),
+  snapshot_json  TEXT NOT NULL,
+  created_at     TEXT NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2282,4 +2307,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "032_calendar_unclassified_outcome", sql: CALENDAR_UNCLASSIFIED_OUTCOME },
   { id: "033_email_capability_slots", sql: EMAIL_CAPABILITY_SLOTS },
   { id: "034_email_external_data", sql: EMAIL_EXTERNAL_DATA },
+  { id: "035_inbox_turn_context", sql: INBOX_TURN_CONTEXT },
 ];
