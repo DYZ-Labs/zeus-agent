@@ -46,12 +46,34 @@ export const CHAT_COVERAGE_TTL_MS = 15 * 60_000;
  */
 export const CHAT_SYNC_TIMEOUT_MS = 6_000;
 
+/**
+ * One invited person, as the calendar reported them.
+ *
+ * Both fields are nullable because servers disagree about which they send: an entry with
+ * neither is not an attendee and is dropped at parse.
+ */
+export type CalendarAttendee = {
+  email: string | null;
+  name: string | null;
+};
+
+/** Beyond this, an event is an announcement rather than a meeting to prepare for. */
+const MAX_ATTENDEES = 25;
+
 export type CalendarEvent = {
   id: string;
   title: string | null;
   starts_at: string | null;
   ends_at: string | null;
   location: string | null;
+  /**
+   * Retained for meeting preparation, which cannot say who is coming without it.
+   *
+   * Null means the server said nothing about attendees; an empty array means it said there
+   * are none. Prep has to tell those apart — "nobody else is invited" and "this calendar
+   * does not report attendees" are different sentences.
+   */
+  attendees: CalendarAttendee[] | null;
 };
 
 export type CalendarWindow = { from: string; to: string };
@@ -416,9 +438,47 @@ export function parseCalendarEvents(value: unknown): CalendarEvent[] {
       starts_at: firstString(record, ["starts_at", "start", "startTime", "start_time"]),
       ends_at: firstString(record, ["ends_at", "end", "endTime", "end_time"]),
       location: firstString(record, ["location", "where"]),
+      attendees: parseAttendees(record),
     });
   }
   return events;
+}
+
+/**
+ * Who was invited, from whichever shape the server sent.
+ *
+ * Unlike an id or a start time, an unreadable attendee list does **not** fail the read. Those
+ * two are load-bearing — a missing id makes an event unaddressable, and a missing start makes
+ * a window unprovable — so the parse fails closed on them rather than let a malformed
+ * response look like an empty calendar. Attendees only feed meeting preparation. Losing them
+ * degrades a brief; refusing the whole read over them would lose the conflict gate a window
+ * it needs, which is the worse failure by far.
+ *
+ * Null and empty are kept distinct all the way through: a server that reports no attendee
+ * field is not a meeting with nobody in it.
+ */
+function parseAttendees(record: Record<string, unknown>): CalendarAttendee[] | null {
+  const raw = record.attendees ?? record.participants;
+  if (!Array.isArray(raw)) return null;
+  const attendees: CalendarAttendee[] = [];
+  for (const entry of raw.slice(0, MAX_ATTENDEES)) {
+    if (typeof entry === "string") {
+      const value = entry.trim();
+      if (!value) continue;
+      // A bare string is an address where it looks like one, and a name otherwise.
+      attendees.push(
+        value.includes("@") ? { email: value, name: null } : { email: null, name: value },
+      );
+      continue;
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const fields = entry as Record<string, unknown>;
+    const email = firstString(fields, ["email", "emailAddress", "address"]);
+    const name = firstString(fields, ["displayName", "name", "display_name"]);
+    if (email === null && name === null) continue;
+    attendees.push({ email, name });
+  }
+  return attendees;
 }
 
 /** Accepts both a plain string and the `{ dateTime }` / `{ date }` shape calendars use. */

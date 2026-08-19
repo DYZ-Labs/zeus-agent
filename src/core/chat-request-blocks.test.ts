@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Whether the brief actually reaches the model, and only when it was asked for.
+ * The blocks a turn attaches only because the user asked for them.
  *
- * `brief.test.ts` covers what the block says. This covers the wiring: a block composed
- * correctly and never attached is the same as no brief at all, and a block attached to every
- * turn is prompt growth nobody asked for.
+ * `brief.test.ts` and `meeting-prep.test.ts` cover what each block says. This covers the
+ * wiring they share: a block composed correctly and never attached is the same as no feature
+ * at all, and a block attached to every turn is prompt growth nobody asked for.
+ *
+ * The third case matters most. A request that was recognized, found nothing, and attached no
+ * block leaves the model to answer about the user's calendar out of memory — which is how
+ * "there is no dinner event to reschedule" came to be said about a calendar nothing in the
+ * turn had opened.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -57,8 +62,10 @@ vi.mock("./calendar-intent", async (importOriginal) => ({
 }));
 
 const { streamTurn } = await import("./chat");
+const { cacheCalendarEvents } = await import("./calendar-sync");
 const { createConversation, appendMessage } = await import("./conversations");
 const { openTestDb } = await import("./db");
+const { upsertEntity } = await import("./entities");
 const { createCommitment } = await import("./intentions");
 type Db = ReturnType<typeof openTestDb>;
 
@@ -158,5 +165,59 @@ describe("the brief block on a chat turn", () => {
 
     expect(sentToModel).toContain("<brief ");
     expect(sentToModel).toContain("Nothing today needs");
+  });
+});
+
+describe("the meeting prep block on a chat turn", () => {
+  /** A store with one upcoming meeting and one attendee Zeus has been told about. */
+  function withMeeting(): Db {
+    const db = seeded();
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    db.exec(`
+      INSERT INTO connector (id, label, transport, command, source_message_id, status, enabled,
+                             created_at, updated_at)
+      VALUES (1, 'Calendar', 'stdio', 'node', 1, 'ready', 1,
+              '2026-08-19T00:00:00.000Z', '2026-08-19T00:00:00.000Z');
+    `);
+    cacheCalendarEvents(
+      db,
+      1,
+      {
+        events: [
+          {
+            id: "evt-review",
+            title: "Product review",
+            starts_at: "2026-08-19T15:00:00Z",
+            ends_at: "2026-08-19T16:00:00Z",
+            attendees: [{ email: "sarah@example.com", displayName: "Sarah Chen" }],
+          },
+        ],
+      },
+      new Date("2026-08-19T09:00:00.000Z"),
+    );
+    return db;
+  }
+
+  it("reaches the model when the user asks to be prepared", async () => {
+    const sentToModel = await turn("prep me for my next meeting", withMeeting());
+
+    expect(sentToModel).toContain("<meeting_prep ");
+    expect(sentToModel).toContain('status="prepared"');
+    expect(sentToModel).toContain("Sarah Chen");
+  });
+
+  it("stays off an ordinary turn", async () => {
+    const sentToModel = await turn("what did I promise James", withMeeting());
+
+    expect(sentToModel).not.toContain("<meeting_prep ");
+  });
+
+  it("attaches a block even when nothing matched, rather than leaving the model to guess", async () => {
+    // A recognized request that found nothing and attached no block is how a reply about
+    // the user's calendar gets composed out of memory alone.
+    const sentToModel = await turn("prep me for my 4 AM", withMeeting());
+
+    expect(sentToModel).toContain('status="no_match"');
+    expect(sentToModel).toContain("not a calendar that could not be read");
   });
 });
