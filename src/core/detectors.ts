@@ -76,6 +76,7 @@ const SELECT_SIGNAL = `
  */
 export function runDetectors(db: Db, options: { at?: Date } = {}): DetectionResult {
   const at = options.at ?? new Date();
+  const timezone = storeTimezone(db);
   const events = cachedEvents(db, at);
   const commitments = listCommitments(db, { limit: 500 });
   const activeGoalIds = new Set(
@@ -83,7 +84,7 @@ export function runDetectors(db: Db, options: { at?: Date } = {}): DetectionResu
   );
 
   const drafts = [
-    ...detectCalendarOverlaps(events),
+    ...detectCalendarOverlaps(events, timezone),
     ...detectTravelGaps(events),
     ...detectDeadlineCollisions(commitments, events, at, activeGoalIds),
     ...detectUnscheduledCommitments(commitments, events, at, activeGoalIds),
@@ -142,6 +143,22 @@ function safeLabel(event: CachedEvent): string {
   return label({ ...event, title: event.title === null ? null : safeExternal(event.title) });
 }
 
+/**
+ * The timezone a signal's times should be written in.
+ *
+ * Read straight from the row rather than through `getAmbientSetting`, because `ambient.ts`
+ * calls `runDetectors` and importing it back would close a cycle. Knowing one column of a
+ * single seeded row in two places is a smaller cost than the alternative designs: taking the
+ * timezone as an option lets a caller omit it and silently get UTC again, which is the exact
+ * bug this replaced.
+ */
+function storeTimezone(db: Db): string {
+  const row = db
+    .prepare<[], { timezone: string }>("SELECT timezone FROM ambient_setting WHERE id = 1")
+    .get();
+  return row?.timezone ?? "UTC";
+}
+
 
 /**
  * Two events claiming the same minutes. The most checkable observation there is.
@@ -149,7 +166,10 @@ function safeLabel(event: CachedEvent): string {
  * The pairing itself comes from `overlappingPairs`, so a collision Zeus raises unprompted and
  * one it reports when asked in chat are found by the same rule. This adds only the wording.
  */
-function detectCalendarOverlaps(events: readonly CachedEvent[]): Draft[] {
+function detectCalendarOverlaps(
+  events: readonly CachedEvent[],
+  timezone: string,
+): Draft[] {
   return overlappingPairs(events).map(({ first, second }) => ({
     detector: "calendar_overlap" as const,
     dedupeKey: `calendar_overlap:${first.external_id}:${second.external_id}`,
@@ -157,8 +177,8 @@ function detectCalendarOverlaps(events: readonly CachedEvent[]): Draft[] {
     commitmentId: null,
     severity: 70,
     why:
-      `${safeLabel(first)} runs until ${clock(endOf(first))} and ${safeLabel(second)} starts at ` +
-      `${clock(startOf(second))}.`,
+      `${safeLabel(first)} runs until ${clock(endOf(first), timezone)} and ${safeLabel(second)} ` +
+      `starts at ${clock(startOf(second), timezone)}.`,
     suggestedAction: `Decide which of ${safeLabel(first)} and ${safeLabel(second)} to move.`,
     effectKind: "modify_external" as const,
     occursAt: second.starts_at,
