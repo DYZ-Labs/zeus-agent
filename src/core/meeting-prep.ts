@@ -1,6 +1,8 @@
 import { cachedEvents } from "./calendar-sync";
 import type { CalendarAttendee } from "./calendar-sync";
 import { contentWords, endOf, localMinutesOfDay, startOf } from "./calendar-time";
+import { cachedThreads } from "./email-sync";
+import type { EmailThread } from "./email-sync";
 import type { CachedEvent } from "./calendar-time";
 import type { Db } from "./db";
 import { listOpenSignals, signalSubject } from "./detectors";
@@ -31,6 +33,8 @@ import { guardExternalText } from "./untrusted-data";
 const MAX_ATTENDEES = 8;
 const MAX_FACTS_PER_ATTENDEE = 5;
 const MAX_COMMITMENTS_PER_ATTENDEE = 5;
+const MAX_THREADS_PER_ATTENDEE = 3;
+const MAX_THREADS_ABOUT_MEETING = 3;
 
 /** How far ahead "my next meeting" will reach before reporting there isn't one. */
 const NEXT_MEETING_HORIZON_MS = 7 * 86_400_000;
@@ -57,6 +61,8 @@ export type MeetingPrepAttendee = {
   ambiguous: boolean;
   facts: string[];
   commitments: { id: number; title: string; dueAt: string | null }[];
+  /** Recent threads from this person. Subjects only — Zeus never holds the messages. */
+  threads: { id: string; subject: string | null; lastActivityAt: string | null }[];
 };
 
 export type MeetingPrepSnapshot = {
@@ -72,6 +78,8 @@ export type MeetingPrepSnapshot = {
   /** Null when the calendar reported no attendee field at all, which is not the same as none. */
   attendeesReported: boolean;
   signals: DetectedSignal[];
+  /** Threads whose subject plainly concerns this meeting, whoever sent them. */
+  threads: { id: string; subject: string | null; lastActivityAt: string | null }[];
   withheld: boolean;
 };
 
@@ -169,9 +177,10 @@ export function buildMeetingPrep(
   const attendees = attendeesFor(db, event.external_id);
   const self = selfEntity(db);
   const commitments = listCommitments(db, { limit: 500 });
+  const threads = cachedThreads(db, at);
 
   const prepared = (attendees ?? [])
-    .map((attendee) => resolveAttendee(db, attendee, self, commitments, withheld))
+    .map((attendee) => resolveAttendee(db, attendee, self, commitments, threads, withheld))
     .filter((attendee): attendee is MeetingPrepAttendee => attendee !== null);
 
   return {
@@ -190,6 +199,7 @@ export function buildMeetingPrep(
       signals: listOpenSignals(db, { at }).filter((signal) =>
         eventIdsOf(signal).includes(event.external_id),
       ),
+      threads: threadsAbout(event.title, threads, withheld).slice(0, MAX_THREADS_ABOUT_MEETING),
       withheld: withheld.any,
     },
   };
@@ -224,6 +234,7 @@ function resolveAttendee(
   attendee: CalendarAttendee,
   self: Entity,
   commitments: readonly CommitmentView[],
+  threads: readonly EmailThread[],
   withheld: { any: boolean },
 ): MeetingPrepAttendee | null {
   const raw = attendee.name ?? attendee.email;
@@ -252,6 +263,12 @@ function resolveAttendee(
       entity === null
         ? []
         : commitmentsInvolving(db, entity, commitments).slice(0, MAX_COMMITMENTS_PER_ATTENDEE),
+    // Matched on the entity rather than the address, so this inherits the same limit as the
+    // fold above: a sender Zeus knows only by address stays unmatched rather than guessed at.
+    threads:
+      entity === null
+        ? []
+        : threadsFrom(db, entity, threads, withheld).slice(0, MAX_THREADS_PER_ATTENDEE),
   };
 }
 
@@ -282,6 +299,62 @@ function commitmentsInvolving(
       title: commitment.title,
       dueAt: commitment.due_at,
     }));
+}
+
+/**
+ * Recent threads this attendee sent.
+ *
+ * Subjects only, because that is all the cache holds — `email-sync.ts` drops snippets before
+ * storage and no body is ever fetched for a standing view. A meeting brief that quoted mail
+ * would be quoting something Zeus never had.
+ */
+function threadsFrom(
+  db: Db,
+  entity: Entity,
+  threads: readonly EmailThread[],
+  withheld: { any: boolean },
+): { id: string; subject: string | null; lastActivityAt: string | null }[] {
+  return threads
+    .filter((thread) => thread.from !== null && senderIs(db, thread.from, entity))
+    .map((thread) => threadLine(thread, withheld));
+}
+
+/** Threads whose subject plainly concerns the meeting itself, whoever sent them. */
+function threadsAbout(
+  title: string | null,
+  threads: readonly EmailThread[],
+  withheld: { any: boolean },
+): { id: string; subject: string | null; lastActivityAt: string | null }[] {
+  const words = contentWords(title ?? "");
+  if (words.size === 0) return [];
+  return threads
+    .filter((thread) => {
+      if (thread.subject === null) return false;
+      const subject = contentWords(thread.subject);
+      let shared = 0;
+      for (const word of words) if (subject.has(word)) shared += 1;
+      return shared >= Math.min(2, words.size);
+    })
+    .map((thread) => threadLine(thread, withheld));
+}
+
+/** Whether a From header names this entity. Display names resolve; bare addresses do not. */
+function senderIs(db: Db, from: string, entity: Entity): boolean {
+  const display = /^\s*"?([^"<]+?)"?\s*<[^>]+>\s*$/u.exec(from)?.[1] ?? from;
+  if (display.includes("@")) return false;
+  const candidates = resolveEntityCandidates(db, display);
+  return candidates.length === 1 && candidates[0]!.id === entity.id;
+}
+
+function threadLine(
+  thread: EmailThread,
+  withheld: { any: boolean },
+): { id: string; subject: string | null; lastActivityAt: string | null } {
+  return {
+    id: thread.id,
+    subject: thread.subject === null ? null : guardExternalText(thread.subject, withheld),
+    lastActivityAt: thread.last_activity_at,
+  };
 }
 
 function wholeWordMatch(haystack: string, needle: string): boolean {
@@ -348,6 +421,13 @@ export function renderMeetingPrepBlock(
     }
   }
 
+  if (prep.threads.length > 0) {
+    lines.push("In the inbox about this meeting — subject lines only, not their contents:");
+    for (const thread of prep.threads) {
+      lines.push(`${subjectOf(thread)}${dateSuffix(thread.lastActivityAt)}`);
+    }
+  }
+
   if (prep.signals.length > 0) {
     lines.push("Noticed about this meeting:");
     for (const signal of prep.signals) lines.push(signal.why);
@@ -406,10 +486,25 @@ function attendeeLines(attendee: MeetingPrepAttendee): string[] {
         `${commitment.dueAt === null ? "" : `, due ${commitment.dueAt.slice(0, 10)}`}.`,
     );
   }
-  if (attendee.facts.length === 0 && attendee.commitments.length === 0) {
+  for (const thread of attendee.threads) {
+    lines.push(`  recent thread: ${subjectOf(thread)}${dateSuffix(thread.lastActivityAt)}`);
+  }
+  if (
+    attendee.facts.length === 0 &&
+    attendee.commitments.length === 0 &&
+    attendee.threads.length === 0
+  ) {
     lines.push("  nothing recorded about them yet.");
   }
   return lines;
+}
+
+function subjectOf(thread: { subject: string | null }): string {
+  return thread.subject === null ? "an untitled thread" : `“${thread.subject}”`;
+}
+
+function dateSuffix(lastActivityAt: string | null): string {
+  return lastActivityAt === null ? "." : `, ${lastActivityAt.slice(0, 10)}.`;
 }
 
 function when(startsAt: string, endsAt: string | null, timezone: string): string {

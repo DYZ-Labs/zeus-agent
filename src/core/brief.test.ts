@@ -8,6 +8,8 @@ import {
   renderBriefBlock,
 } from "./brief";
 import { cacheCalendarEvents } from "./calendar-sync";
+import { cacheEmailThreads } from "./email-sync";
+import { upsertEntity } from "./entities";
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import { runDetectors } from "./detectors";
@@ -388,5 +390,93 @@ describe("third-party text in the brief", () => {
 
     expect(brief.withheld).toBe(true);
     expect(renderBriefBlock(brief, context())).toContain('external_text_withheld="true"');
+  });
+});
+
+describe("email reaches the brief without the brief changing", () => {
+  it("surfaces an email signal in the attention section, on a default account", () => {
+    // The claim `buildBrief` was written for: because it reads `listOpenSignals` directly
+    // rather than going through the opportunity pipeline, a detector added months later
+    // appears with no change here. Asserted rather than assumed — mode `off` is untouched,
+    // which is exactly where the pipeline would have returned nothing.
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    cacheEmailThreads(
+      db,
+      1,
+      {
+        threads: [
+          {
+            id: "t1",
+            messages: [
+              {
+                subject: "The hiring deck",
+                sender: "Sarah Chen <sarah@example.com>",
+                date: "2026-08-16T09:00:00.000Z",
+                labelIds: ["INBOX", "UNREAD"],
+              },
+            ],
+          },
+        ],
+      },
+      NOW,
+    );
+    runDetectors(db, { at: NOW });
+
+    const brief = buildBrief(db, context(), { schedule: null, recommendation: null });
+    const block = renderBriefBlock(brief, context());
+
+    expect(brief.signals.map((signal) => signal.detector)).toContain(
+      "email_unread_known_sender",
+    );
+    expect(block).toContain("NEEDS ATTENTION");
+    expect(block).toContain("Sarah Chen wrote");
+  });
+
+  it("shows an email signal and a calendar signal in one list, ranked together", () => {
+    // One attention section, not an inbox section beside a calendar section. Whether a
+    // conflict came from mail or from the diary is not how a person triages their morning.
+    upsertEntity(db, { kind: "person", name: "Sarah Chen" });
+    cacheCalendarEvents(
+      db,
+      1,
+      {
+        events: [
+          { id: "a", title: "Flight lands", starts_at: "2026-08-21T18:00:00Z", ends_at: "2026-08-21T18:40:00Z" },
+          { id: "b", title: "Dinner", starts_at: "2026-08-21T18:30:00Z", ends_at: "2026-08-21T20:00:00Z" },
+        ],
+      },
+      NOW,
+    );
+    cacheEmailThreads(
+      db,
+      1,
+      {
+        threads: [
+          {
+            id: "t1",
+            messages: [
+              {
+                subject: "The hiring deck",
+                sender: "Sarah Chen <sarah@example.com>",
+                date: "2026-08-16T09:00:00.000Z",
+                labelIds: ["INBOX", "UNREAD"],
+              },
+            ],
+          },
+        ],
+      },
+      NOW,
+    );
+    runDetectors(db, { at: NOW });
+
+    const brief = buildBrief(db, context(), { schedule: null, recommendation: null });
+
+    const kinds = brief.signals.map((signal) => signal.detector);
+    expect(kinds).toContain("calendar_overlap");
+    expect(kinds).toContain("email_unread_known_sender");
+    // Ranked by severity, so the collision outranks the unopened message.
+    expect(kinds.indexOf("calendar_overlap")).toBeLessThan(
+      kinds.indexOf("email_unread_known_sender"),
+    );
   });
 });
