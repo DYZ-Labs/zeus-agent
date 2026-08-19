@@ -12,7 +12,9 @@ vi.mock("@/server/auth/access", () => ({
 vi.mock("@/core/chat", () => ({ streamTurn: mocks.streamTurn }));
 
 import { openTestDb } from "@/core/db";
+import { appendMessage } from "@/core/conversations";
 import { bindAppOwner } from "@/core/owner";
+import { createWorkPlan } from "@/core/work-plans";
 import { POST } from "./route";
 
 /** A sentence of the kind a turn's own error can quote back. */
@@ -56,6 +58,35 @@ function loggedEvents(name: string): Array<Record<string, string | number>> {
     .filter((line) => line.startsWith("{"))
     .map((line) => JSON.parse(line) as Record<string, string | number>)
     .filter((event) => event.event === name);
+}
+
+function createPendingPlan(conversationId: number) {
+  const source = appendMessage(
+    db,
+    conversationId,
+    "user",
+    "Research the options and prepare a recommendation.",
+  );
+  return createWorkPlan(db, {
+    proposal: {
+      objective: "Research the options and prepare a recommendation",
+      steps: [{
+        title: "Recall context",
+        instruction: "Retrieve relevant accepted memory.",
+        effect_kind: "memory_read",
+        depends_on: [],
+      }],
+      allowed_effects: ["memory_read"],
+      completion_criteria: ["A local note is ready"],
+      limits: {
+        max_model_tool_calls: 2,
+        max_retries_per_step: 0,
+        max_duration_seconds: 120,
+      },
+    },
+    sourceMessageId: source.id,
+    origin: "surfaced_proposal",
+  });
 }
 
 describe("chat turn telemetry", () => {
@@ -133,5 +164,49 @@ describe("chat turn telemetry", () => {
     expect(
       stderr.mock.calls.map((call) => String(call[0])).join("\n"),
     ).not.toContain("jane@example.com");
+  });
+
+  it("returns the exact pending plan offer for the chat composer", async () => {
+    let planHash = "";
+    mocks.streamTurn.mockImplementation(
+      async (_turnDb: typeof db, options: { conversationId: number }) => {
+        const detail = createPendingPlan(options.conversationId);
+        planHash = detail.plan.plan_hash;
+        return {
+          message: { id: 7 },
+          context: { items: [] },
+          learned: null,
+          work: null,
+          workProposal: detail,
+          calendar: null,
+        };
+      },
+    );
+
+    const body = await (await turn("Research this and prepare a recommendation.")).text();
+
+    expect(body).toContain(
+      `"awaitingWorkPlanApproval":{"planId":1,"hash":"${planHash}","objective":"Research the options and prepare a recommendation"`,
+    );
+    expect(body).toContain('"allowedEffects":["memory_read"]');
+    expect(body).toContain('"completionCriteria":["A local note is ready"]');
+  });
+
+  it("returns the exact proposal scope even when the prose stream fails", async () => {
+    mocks.streamTurn.mockImplementation(
+      async (_turnDb: typeof db, options: { conversationId: number }) => {
+        createPendingPlan(options.conversationId);
+        throw new Error("The reply stream failed.");
+      },
+    );
+
+    const body = await (await turn("Research this and prepare a recommendation.")).text();
+
+    expect(body).toContain('"type":"error"');
+    expect(body).toContain(
+      '"objective":"Research the options and prepare a recommendation"',
+    );
+    expect(body).toContain('"steps":[{"position":1,"title":"Recall context"');
+    expect(body).toContain('"allowedEffects":["memory_read"]');
   });
 });

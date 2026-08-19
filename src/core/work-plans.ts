@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { availableCapabilityForEffect, isConnectorEffect } from "./connectors";
+import { parseWorkPlanApproval } from "./confirmation-text";
 import type { Db } from "./db";
 import { now } from "./db";
 import { logEvent } from "./observability";
@@ -49,6 +50,26 @@ export type WorkPlanOrigin = "explicit_request" | "surfaced_proposal";
 export type WorkAuthorizationKind = "explicit_request" | "user_approval";
 export type SafeToolName = "memory_recall" | "web_search" | "local_artifact";
 export type WorkPlanSourceLinkKind = "goal" | "commitment" | "project";
+
+export type WorkPlanApprovalOffer = {
+  planId: number;
+  hash: string;
+  objective: string;
+  steps: Array<{
+    position: number;
+    title: string;
+    instruction: string;
+    effect: EffectKind;
+    dependsOn: number[];
+  }>;
+  allowedEffects: EffectKind[];
+  completionCriteria: string[];
+  limits: {
+    modelToolCalls: number;
+    retriesPerStep: number;
+    durationSeconds: number;
+  };
+};
 
 export type CreateWorkPlanInput = {
   proposal: WorkPlanProposal;
@@ -456,6 +477,77 @@ export function listWorkPlans(
        ORDER BY updated_at DESC, id DESC LIMIT ?`,
     )
     .all(options.limit ?? 100);
+}
+
+/** The newest unapproved plan proposed from a message in this conversation. */
+export function pendingWorkPlanApproval(
+  db: Db,
+  conversationId: number,
+): WorkPlanDetail | null {
+  const row = db.prepare<
+    [number],
+    { id: number }
+  >(
+    `SELECT plan.id
+     FROM work_plan plan
+     JOIN message source ON source.id = plan.source_message_id
+     WHERE source.conversation_id = ? AND plan.status = 'proposed'
+     ORDER BY plan.updated_at DESC, plan.id DESC
+     LIMIT 1`,
+  ).get(conversationId);
+  return row ? getWorkPlan(db, row.id) : null;
+}
+
+/** The exact immutable scope the chat must show before it offers approval. */
+export function pendingWorkPlanApprovalOffer(
+  db: Db,
+  conversationId: number,
+): WorkPlanApprovalOffer | null {
+  const detail = pendingWorkPlanApproval(db, conversationId);
+  if (!detail) return null;
+  return {
+    planId: detail.plan.id,
+    hash: detail.plan.plan_hash,
+    objective: detail.plan.objective,
+    steps: detail.steps.map((step) => ({
+      position: step.position,
+      title: step.title,
+      instruction: step.instruction,
+      effect: step.effect_kind,
+      dependsOn: step.depends_on,
+    })),
+    allowedEffects: parseEffects(detail.plan.allowed_effects_json),
+    completionCriteria: parseStringArray(detail.plan.completion_criteria_json),
+    limits: {
+      modelToolCalls: detail.plan.max_model_tool_calls,
+      retriesPerStep: detail.plan.max_retries_per_step,
+      durationSeconds: detail.plan.max_duration_seconds,
+    },
+  };
+}
+
+/** The exact proposed plan named by an approval message in this conversation, if any. */
+export function workPlanForApprovalMessage(
+  db: Db,
+  conversationId: number,
+  content: string,
+  options: { mustRun?: boolean } = {},
+): WorkPlanDetail | null {
+  const approval = parseWorkPlanApproval(content);
+  if (!approval || (options.mustRun && !approval.run)) return null;
+  const rows = db.prepare<
+    [number],
+    { id: number; plan_hash: string }
+  >(
+    `SELECT plan.id, plan.plan_hash
+     FROM work_plan plan
+     JOIN message source ON source.id = plan.source_message_id
+     WHERE source.conversation_id = ? AND plan.status = 'proposed'
+     ORDER BY plan.updated_at DESC, plan.id DESC
+     LIMIT 100`,
+  ).all(conversationId);
+  const matches = rows.filter((row) => approval.hash === row.plan_hash.toLowerCase());
+  return matches.length === 1 ? getWorkPlan(db, matches[0]!.id) : null;
 }
 
 export function workSteps(db: Db, planId: number): WorkStepWithDependencies[] {
@@ -2591,12 +2683,13 @@ function assertExactApprovalMessage(db: Db, id: number, planHash: string): void 
   if (message?.role !== "user") {
     throw new Error("Work-plan approval must be a stored user message");
   }
-  const normalized = message.content.replace(/\s+/gu, " ").trim();
-  const rejects = /\b(?:do not|don['’]t|dont|never|reject|decline|cancel|revoke)\b/iu;
-  const approves = /\b(?:approve|authorize)\b/iu;
-  if (!normalized.includes(planHash) || !approves.test(normalized) || rejects.test(normalized)) {
+  if (!isExactApproval(message.content, planHash)) {
     throw new Error("User approval must explicitly approve the exact work-plan hash");
   }
+}
+
+function isExactApproval(content: string, planHash: string): boolean {
+  return parseWorkPlanApproval(content)?.hash === planHash.toLowerCase();
 }
 
 function sourceInstructionDigest(db: Db, id: number): string {
