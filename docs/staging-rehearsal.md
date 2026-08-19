@@ -1,6 +1,6 @@
 # Staging rehearsal
 
-The recovery procedures in [README.md](../README.md) were written by reading the code. Until
+The recovery procedures in [operations.md](operations.md) were written by reading the code. Until
 someone runs them, the recovery time is a guess and every step is a hypothesis. This is the
 script for turning them into measured facts.
 
@@ -117,8 +117,8 @@ likely to catch you at 3am.
 
 **This one is expected to fail.** The guard takes a `BEGIN IMMEDIATE` with a 250ms timeout, which
 detects a writer holding a write transaction *at that instant* — not a server that is running but
-idle between requests, which is the normal state of a deployment. The README says restore "refuses
-to proceed if a writer is still attached", which is stronger than what the check does.
+idle between requests, which is the normal state of a deployment. The operations doc says restore
+"refuses to proceed if a writer is still attached", which is stronger than what the check does.
 
 Rehearse it to find out how bad it is in practice, because the answer determines whether step C
 above is safe to hand to someone who has not read the code.
@@ -134,7 +134,7 @@ above is safe to hand to someone who has not read the code.
         the *preserved* inode, so writes after the restore go into a file nobody will read again.
 - [ ] If it proceeded, treat "stop the service first" as a hard manual precondition in every
       recovery procedure until the guard is replaced by an explicit lease, and say so in the
-      README rather than relying on a check that does not check.
+      operations doc rather than relying on a check that does not check.
 
 ## E. Rolling back past a migration
 
@@ -160,8 +160,8 @@ serving.
 - [ ] Record the elapsed time. This is your true RTO for a bad release, and it is almost
       certainly longer than anyone assumes.
 - [ ] Note every place the written procedure did not match reality — a missing flag, a step that
-      needed sudo, a path that differed, a `railway` subcommand that has changed. Fix the README
-      in the same sitting, while you still remember.
+      needed sudo, a path that differed, a `railway` subcommand that has changed. Fix the
+      operations doc in the same sitting, while you still remember.
 
 ## What you now know
 
@@ -175,7 +175,7 @@ Fill this in at the end. It is the whole output of the exercise.
 | Off-box copy verified at the far end? (A) | yes / no |
 | Monitor observed failing? (B) | yes / no |
 | Steps where the runbook was wrong | |
-| Fixes made to the README as a result | |
+| Fixes made to the operations doc as a result | |
 
 Two rules for what follows:
 
