@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { resolveTodayOpportunity } from "./ambient";
+import { resolveTodayOpportunity, updateAmbientSetting } from "./ambient";
 import { mayBeCalendarRequest } from "./calendar-intent";
 import { cacheCalendarEvents } from "./calendar-sync";
 import { appendMessage, createConversation } from "./conversations";
@@ -78,9 +78,23 @@ describe("what a detector notices", () => {
 
     const overlap = created.find((signal) => signal.detector === "calendar_overlap");
     expect(overlap).toBeDefined();
-    expect(overlap?.why).toContain("“Flight lands” runs until 18:40");
-    expect(overlap?.why).toContain("“Dinner with Sam” starts at 18:30");
+    expect(overlap?.why).toContain("“Flight lands” runs until 6:40 PM");
+    expect(overlap?.why).toContain("“Dinner with Sam” starts at 6:30 PM");
     expect(overlap?.effect_kind).toBe("modify_external");
+  });
+
+  it("states times in the user's timezone, not UTC", () => {
+    // The store is UTC by default, which is exactly why this went unnoticed: the number was
+    // internally consistent and simply about somewhere else.
+    updateAmbientSetting(db, { timezone: "America/New_York" });
+    cache([FLIGHT, DINNER]);
+
+    const { created } = runDetectors(db, { at: NOW });
+
+    const overlap = created.find((signal) => signal.detector === "calendar_overlap");
+    expect(overlap?.why).toContain("runs until 2:40 PM");
+    expect(overlap?.why).toContain("starts at 2:30 PM");
+    expect(overlap?.why).not.toContain("18:40");
   });
 
   it("claims only what it can see about travel, not that the user will be late", () => {
@@ -150,7 +164,7 @@ describe("what a detector notices", () => {
     expect(overlap?.suggested_action).not.toContain("previous instructions");
     // Only the hostile field is replaced. The user still learns what clashed with what.
     expect(overlap?.why).toContain("“Dinner with Sam”");
-    expect(overlap?.why).toContain("18:30");
+    expect(overlap?.why).toContain("6:30 PM");
   });
 
   it("withholds a hostile location as readily as a hostile title", () => {
