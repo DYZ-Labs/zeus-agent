@@ -903,33 +903,19 @@ Do not treat chat history as the database.
 
 ## Development
 
-Repository-specific setup instructions should be added once the implementation stack has been selected.
-
-A typical environment may require:
-
 ```bash
-git clone <repository-url>
-cd <repository>
-
-cp .env.example .env
-
 npm install
+cp .env.example .env.local   # add OPENAI_API_KEY
 npm run dev
 ```
 
-Potential environment variables:
+[docs/operations.md](docs/operations.md) is the operating guide: every environment
+variable, hosting and rollback, health and operational events, budgets, durability,
+snapshots and the restore runbook, MCP integration, and the command reference.
+`.env.example` documents each setting beside its default.
 
-```env
-DATABASE_URL=
-AUTH_SECRET=
-
-OPENAI_API_KEY=
-
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-
-ENCRYPTION_KEY=
-```
+`npm run check` — lint, typecheck, tests, trust evaluation, and build — is the required
+gate before any change lands.
 
 Never commit credentials or OAuth tokens.
 
