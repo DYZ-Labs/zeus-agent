@@ -12,7 +12,7 @@ The long-term goal is to build a trusted personal operating layer that can coord
 
 ## Overview
 
-Zeus aims to build an AI agent that understands the user's context, remembers relevant preferences, identifies work that needs attention, and helps execute it.
+Zeus aims to build an AI agent that understands the user's context, remembers relevant preferences, retrieves work that needs attention when asked, and helps execute it.
 
 Examples:
 
@@ -28,7 +28,7 @@ Zeus can:
 4. find suitable times
 5. prepare outreach
 6. send or schedule based on permissions
-7. track the task until completion
+7. persist the task's status through completion
 
 Another example:
 
@@ -125,9 +125,11 @@ Users should always control what the system can:
 - purchase
 - automate
 
-### Proactivity without noise
+### Opt-in proactivity without noise
 
-Zeus should proactively surface information only when the expected value of interrupting the user is greater than the cost of the interruption.
+Unsolicited follow-through is optional, explicitly enabled, and not an MVP requirement. When
+enabled, Zeus should proactively surface information only when the expected value of
+interrupting the user is greater than the cost of the interruption.
 
 ### Memory with purpose
 
@@ -145,7 +147,7 @@ The system should earn greater autonomy through reliable behavior.
 
 ## Core Experience
 
-A typical morning could look like:
+A user-requested morning brief could look like:
 
 ```text
 Good morning.
@@ -225,7 +227,7 @@ Zeus should be able to:
 - prepare responses
 - detect unanswered messages
 - identify commitments
-- follow up when appropriate
+- prepare or perform follow-ups when requested or authorized
 
 Example:
 
@@ -302,7 +304,7 @@ follow-ups
 preferences
 ```
 
-This allows Zeus to surface information such as:
+This allows Zeus to answer explicit questions with information such as:
 
 ```text
 You told Alex last Thursday that you'd send the hiring deck.
@@ -314,6 +316,9 @@ It has not been sent yet.
 ### Tasks
 
 Tasks should persist independently from chat sessions.
+
+When asked, Zeus should retrieve open tasks, priorities, and the next useful action. Task
+persistence does not by itself authorize an unsolicited reminder.
 
 Recommended states:
 
@@ -591,10 +596,16 @@ Required capabilities:
 - scheduling assistance
 - meeting preparation
 - task extraction
+- persistent task and open-loop state
+- explicit priority and next-step retrieval
+- user-initiated workflow completion and verification
 - preference memory
-- daily brief
+- daily brief on request
 - approval workflows
 - action history
+
+Unsolicited follow-through, proactive suggestions, and background reminders are not MVP
+release criteria. If retained, they must be explicitly enabled by the user.
 
 Avoid building broad consumer automation too early.
 
@@ -667,6 +678,10 @@ Suggested discussion:
 ### Follow-up tracking
 
 ```text
+User:
+"What did I promise James?"
+
+Agent:
 You promised to send James the product deck yesterday.
 
 I found the latest version in Drive and prepared the email.
@@ -701,7 +716,7 @@ Add:
 - cross-app reasoning
 - persistent tasks
 - meeting preparation
-- follow-ups
+- persistent follow-up state and explicit next-step retrieval
 - relationship memory
 - daily briefs
 - approval workflows
@@ -717,7 +732,7 @@ Goal:
 Add:
 
 - standing permissions
-- proactive workflows
+- optional, explicitly enabled proactive workflows
 - automatic scheduling
 - recurring actions
 - external service execution
@@ -760,11 +775,13 @@ minutes saved
 successful agent actions
 draft acceptance rate
 action approval rate
-proactive suggestion acceptance
 weekly retention
 tool execution success rate
 tasks completed without manual work
 ```
+
+For users who explicitly enable proactive behavior, additionally track proactive suggestion
+acceptance.
 
 Trust metrics:
 
@@ -774,9 +791,11 @@ undo rate
 user correction rate
 duplicate action rate
 permission rejection rate
-false proactive alert rate
 failed action rate
 ```
+
+For users who explicitly enable proactive behavior, additionally track the false proactive
+alert rate.
 
 Do not optimize primarily for:
 
@@ -990,7 +1009,7 @@ The winning product should become:
 
 +
 
-**more proactive**
+**more effective at finishing authorized work**
 
 +
 

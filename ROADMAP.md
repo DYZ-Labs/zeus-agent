@@ -9,6 +9,11 @@ This file records what is built, what is next, and why in that order. It is a pl
 promise; the reasoning matters more than the sequence, because the reasoning is what should
 survive when the sequence changes.
 
+Persistent open-loop state, explicit priority and next-step retrieval, and completion plus
+verification of user-initiated workflows are product requirements. Unsolicited
+follow-through is an optional, explicitly enabled capability; expanding or shipping it is
+not a phase gate.
+
 Invariants that constrain every phase live in [AGENTS.md](AGENTS.md). Nothing here
 overrides them.
 
@@ -132,6 +137,9 @@ Still in scope:
 Today an accepted `machine_effect` facet reaches exactly one place: follow-through
 recommendation ranking (`machineEffectFor`, `src/core/stewardship.ts`). It can boost,
 deprioritize, or block *what Zeus raises*. It cannot shape *what Zeus does*.
+
+That existing path may remain, but expanding proactive surfacing is not required by this
+phase.
 
 Extend accepted facets so they deterministically constrain plan shape and payload defaults
 — "never schedule me before 9am", "always leave 30 minutes after a flight" — as policy
