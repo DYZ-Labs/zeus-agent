@@ -10,6 +10,7 @@ import {
   classifyCalendarIntent,
   directCalendarReadRequest,
   isCalendarCapabilityQuestion,
+  isExplicitCalendarActionRequest,
   mayBeCalendarRequest,
   refusalIsSpoken,
   resolveCalendarRequest,
@@ -562,6 +563,25 @@ async function maybeExecuteBoundedWork(
     calendarHistory,
   );
 
+  // Recognition was unavailable on a message that plainly asked for a change. There is no
+  // intent to name, so the outcome names the gap itself and the reply says so — the one
+  // honest answer when Zeus cannot tell what it was asked for.
+  if (resolution?.status === "unclassified") {
+    // `needs_clarification`, not `unverifiable`: the prompt reads the latter as "I couldn't
+    // get a current read of your calendar", which would be a false account of what failed.
+    // What the turn owes is already what `needs_clarification` asks for — say what you
+    // couldn't work out, and ask for exactly that.
+    return {
+      work: null,
+      calendar: emptyOutcome(
+        "unclassified",
+        "needs_clarification",
+        "classification_unavailable",
+        null,
+      ),
+    };
+  }
+
   // A request Zeus recognized and declined to act on is reported, not swallowed. The
   // alternative is what shipped: the model saw no calendar data, no indication any had been
   // sought, and answered anyway.
@@ -827,7 +847,7 @@ async function resolveCalendarWork(
   ) {
     return null;
   }
-  const intent = await classifyCalendarIntent(db, {
+  const classification = await classifyCalendarIntent(db, {
     message: sourceMessage.content,
     priorTurns: priorTurns
       .filter((message) => message.role === "user" || message.role === "assistant")
@@ -838,10 +858,17 @@ async function resolveCalendarWork(
     context,
     sourceMessageId: sourceMessage.id,
   });
-  // A classifier that timed out recognized nothing, so there is nothing to report. This is
-  // the one silent path left, and it degrades exactly where the old regexes did.
-  if (!intent) return null;
-  return resolveCalendarRequest(sourceMessage.content, intent, context, {
+  if (classification.status === "unavailable") {
+    // A classifier that never answered recognized nothing — but for a message that plainly
+    // asked for a calendar change, saying nothing is indistinguishable from having heard it
+    // and done nothing. The narrower predicate is what keeps a loose prefilter hit ("coffee
+    // sometime?") from being answered as a calendar failure.
+    return isExplicitCalendarActionRequest(sourceMessage.content)
+      ? { status: "unclassified" }
+      : null;
+  }
+  if (!classification.intent) return null;
+  return resolveCalendarRequest(sourceMessage.content, classification.intent, context, {
     sourceMessageId: sourceMessage.id,
   });
 }

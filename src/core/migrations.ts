@@ -2074,6 +2074,32 @@ CREATE TABLE schedule_context (
 );
 `;
 
+/**
+ * A calendar turn where the intent was never established is a fifth thing that can happen.
+ *
+ * The five existing kinds all presume recognition succeeded — they name an action. When the
+ * classifier is unavailable there is no action to name, and filing the turn as a `read`
+ * (the closest fit, and what `refusalIntoKind` already stretches `none` into) would put a
+ * wrong answer into the only record a later turn can consult. Same rebuild as migration 030,
+ * for the same reason: SQLite cannot widen a CHECK in place.
+ */
+const CALENDAR_UNCLASSIFIED_OUTCOME = `
+ALTER TABLE calendar_outcome RENAME TO calendar_outcome_unclassified_legacy;
+CREATE TABLE calendar_outcome (
+  assistant_message_id INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+  kind                 TEXT NOT NULL
+                       CHECK (kind IN ('create','reschedule','cancel','clear','read','unclassified')),
+  status               TEXT NOT NULL,
+  outcome_json         TEXT NOT NULL,
+  created_at           TEXT NOT NULL
+);
+INSERT INTO calendar_outcome
+  (assistant_message_id, kind, status, outcome_json, created_at)
+SELECT assistant_message_id, kind, status, outcome_json, created_at
+FROM calendar_outcome_unclassified_legacy;
+DROP TABLE calendar_outcome_unclassified_legacy;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2108,4 +2134,9 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   { id: "029_schedule_turn_context", sql: SCHEDULE_TURN_CONTEXT },
   { id: "030_calendar_clear_outcome_kind", sql: CALENDAR_CLEAR_OUTCOME_KIND },
+  // Numbered 032 because 031 belongs to the proactivity opt-in, which lands first. A
+  // migration may only ever be appended: inserting one before an id a store has already
+  // applied fails `validateMigrationLedger`, which is the check that refuses a build that
+  // does not recognize the schema in front of it.
+  { id: "032_calendar_unclassified_outcome", sql: CALENDAR_UNCLASSIFIED_OUTCOME },
 ];
