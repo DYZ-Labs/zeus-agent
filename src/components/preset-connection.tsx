@@ -37,6 +37,7 @@ export function PresetConnection({
   icon,
   defaultSlots,
   hostedStartHref = null,
+  unavailableNote = null,
   connector,
   localMode,
   available,
@@ -45,6 +46,15 @@ export function PresetConnection({
   icon: ReactNode;
   defaultSlots: CapabilitySlot[];
   hostedStartHref?: string | null;
+  /**
+   * Why this connection cannot be made, when it cannot.
+   *
+   * "Unavailable right now" is what this said before, which is true and useless: it reads as
+   * a transient outage, so the only sensible response is to wait, and waiting never helps.
+   * Every reason here is a standing configuration fact, and each has something the person
+   * can actually do about it.
+   */
+  unavailableNote?: string | null;
   connector: ConnectorView | null;
   localMode: boolean;
   available: boolean;
@@ -154,7 +164,7 @@ export function PresetConnection({
           className="border-t px-4 py-3 text-xs leading-5"
           style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
         >
-          {preset.label} connections are unavailable right now.
+          {unavailableNote ?? `${preset.label} connections are unavailable right now.`}
         </p>
       ) : null}
     </article>

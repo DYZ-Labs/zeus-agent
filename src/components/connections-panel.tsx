@@ -17,6 +17,8 @@ export function ConnectionsPanel({
   localMode,
   googleCalendarAvailable,
   googleGmailAvailable,
+  calendarNote,
+  gmailNote,
   hostedAccount,
 }: {
   connectors: ConnectorView[];
@@ -24,6 +26,16 @@ export function ConnectionsPanel({
   localMode: boolean;
   googleCalendarAvailable: boolean;
   googleGmailAvailable: boolean;
+  /**
+   * Why each connection cannot be made, when it cannot.
+   *
+   * Passed in rather than derived from the booleans beside them, because the booleans have
+   * already thrown the answer away. `unconfigured` and `misconfigured` are different problems
+   * with different fixes, and collapsing both into "unavailable" is what leaves someone
+   * looking at a disabled button with nothing to act on.
+   */
+  calendarNote: string | null;
+  gmailNote: string | null;
   hostedAccount: boolean;
 }) {
   const googleCalendar = localMode
@@ -58,6 +70,7 @@ export function ConnectionsPanel({
         connector={googleCalendar}
         localMode={localMode}
         available={localMode || (hostedAccount && googleCalendarAvailable)}
+        unavailableNote={calendarNote}
       />
 
       <PresetConnection
@@ -68,6 +81,7 @@ export function ConnectionsPanel({
         connector={gmail}
         localMode={localMode}
         available={localMode || (hostedAccount && googleGmailAvailable)}
+        unavailableNote={gmailNote}
       />
     </section>
   );

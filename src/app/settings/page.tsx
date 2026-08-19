@@ -79,6 +79,18 @@ export default async function SettingsPage({
             localMode={access.state === "local"}
             googleCalendarAvailable={googleCalendarConfiguration.state === "ready"}
             googleGmailAvailable={googleGmailConfiguration.state === "ready"}
+            calendarNote={connectionNote(
+              "Google Calendar",
+              googleCalendarConfiguration,
+              access.state === "local",
+              "GOOGLE_CALENDAR_BROKER_URL and GOOGLE_CALENDAR_BROKER_SERVICE_KEY",
+            )}
+            gmailNote={connectionNote(
+              "Gmail",
+              googleGmailConfiguration,
+              access.state === "local",
+              "GOOGLE_GMAIL_BROKER_URL and GOOGLE_GMAIL_BROKER_SERVICE_KEY",
+            )}
             hostedAccount={access.state === "authorized"}
           />
         ) : (
@@ -512,3 +524,32 @@ const MODE_OPTIONS: readonly {
   { mode: "balanced", label: "Balanced", description: "Relevant, due, waiting, or forgotten items." },
   { mode: "proactive", label: "Proactive", description: "Earlier notice with a shorter cooldown." },
 ];
+
+/**
+ * Why a first-party Google connection cannot be made.
+ *
+ * Both configuration readers already distinguish three states, and one of them carries a
+ * written diagnosis — then the page reduced all three to `state === "ready"` and the reason
+ * was gone. A person with no broker configured and a person with a malformed service key saw
+ * the same sentence, which named neither problem and suggested waiting.
+ *
+ * Null in local mode, where these connections use credentials on this machine instead of a
+ * broker and there is nothing missing to report.
+ */
+function connectionNote(
+  label: string,
+  configuration: { state: "unconfigured" | "misconfigured" | "ready"; message?: string },
+  localMode: boolean,
+  variableNames: string,
+): string | null {
+  if (localMode || configuration.state === "ready") return null;
+  if (configuration.state === "misconfigured") {
+    return configuration.message ?? `${label} is configured, but not correctly.`;
+  }
+  return (
+    `Zeus is running with accounts, so it reaches ${label} through its broker rather than ` +
+    `through credentials on this machine — and the broker is not configured. Set ` +
+    `${variableNames} on this service and deploy the broker, or run Zeus as a single local ` +
+    `account instead.`
+  );
+}

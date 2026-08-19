@@ -123,3 +123,41 @@ describe("Gmail is a second connection, not a second component", () => {
     expect(html).toContain(">Connect</a>");
   });
 })
+
+describe("a connection that cannot be made says why", () => {
+  it("relays the reason it was given instead of a bare 'unavailable'", () => {
+    // The failure this replaces: someone with no broker configured and someone with a
+    // malformed service key saw the same sentence, which named neither problem and implied
+    // the only sensible response was to wait.
+    const html = renderToStaticMarkup(
+      createElement(PresetConnection, {
+        preset: GMAIL_PRESET,
+        icon: createElement(MailIcon),
+        defaultSlots: ["email.search_threads"],
+        connector: null,
+        localMode: false,
+        available: false,
+        unavailableNote:
+          "Zeus is running with accounts, so it reaches Gmail through its broker — and the broker is not configured.",
+      }),
+    );
+
+    expect(html).toContain("the broker is not configured");
+    expect(html).not.toContain("unavailable right now");
+  });
+
+  it("still says something when no reason was supplied", () => {
+    const html = renderToStaticMarkup(
+      createElement(PresetConnection, {
+        preset: GMAIL_PRESET,
+        icon: createElement(MailIcon),
+        defaultSlots: ["email.search_threads"],
+        connector: null,
+        localMode: false,
+        available: false,
+      }),
+    );
+
+    expect(html).toContain("Gmail connections are unavailable right now.");
+  });
+})
