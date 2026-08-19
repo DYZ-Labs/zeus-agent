@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { GOOGLE_CALENDAR_PRESET } from "./connector-catalog";
 
 const presetMocks = vi.hoisted(() => ({
   execFile: vi.fn(),
@@ -53,7 +54,7 @@ import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import {
   callCapability,
-  googleCalendarAdcHeaders,
+  googleAdcHeaders,
 } from "./mcp-client";
 
 let db: Db;
@@ -104,7 +105,7 @@ describe("the Google preset transport", () => {
   it("uses execFile without a shell and passes only the safe environment", async () => {
     process.env.ZEUS_TEST_UNRELATED_SECRET = "must-not-leak";
 
-    await googleCalendarAdcHeaders(["calendar.list_events"]);
+    await googleAdcHeaders(GOOGLE_CALENDAR_PRESET, ["calendar.list_events"]);
 
     expect(presetMocks.execFile).toHaveBeenCalledTimes(2);
     const [file, args, options] = presetMocks.execFile.mock.calls[1]!;

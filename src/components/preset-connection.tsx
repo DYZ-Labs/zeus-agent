@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useActionState, useEffect } from "react";
+import { useActionState, useEffect, type ReactNode } from "react";
 
 import {
   configureConnectorPresetAction,
@@ -9,7 +9,7 @@ import {
   removeConnectorAction,
   type ConnectorSetupState,
 } from "@/app/actions";
-import { GOOGLE_CALENDAR_PRESET_ID } from "@/core/connector-catalog";
+import type { ConnectorPreset } from "@/core/connector-catalog";
 import type { ConnectorView } from "@/core/connectors";
 import type { CapabilitySlot } from "@/core/schema";
 
@@ -19,11 +19,32 @@ const INITIAL_STATE: ConnectorSetupState = {
   message: "",
 };
 
-export function GoogleCalendarConnection({
+/**
+ * One connected service, rendered from its catalog preset.
+ *
+ * Was Calendar-shaped throughout — label, icon, preset id, and default slot all literals —
+ * which is workable for one connection and a copy-paste invitation for the second. The
+ * preset carries the identity now; what stays as props is the part presets genuinely differ
+ * on: an icon, and whether there is a hosted path at all.
+ *
+ * `hostedStartHref` is null for a preset that only exists locally. Gmail is one: its scopes
+ * are restricted, so a hosted multi-account deployment would need app verification and an
+ * annual security assessment before anyone else could consent. Calendar reaches its broker
+ * instead.
+ */
+export function PresetConnection({
+  preset,
+  icon,
+  defaultSlots,
+  hostedStartHref = null,
   connector,
   localMode,
   available,
 }: {
+  preset: ConnectorPreset;
+  icon: ReactNode;
+  defaultSlots: CapabilitySlot[];
+  hostedStartHref?: string | null;
   connector: ConnectorView | null;
   localMode: boolean;
   available: boolean;
@@ -39,7 +60,7 @@ export function GoogleCalendarConnection({
     .filter((capability) => capability.enabled === 1)
     .map((capability) => capability.slot) ?? [];
   const localSlots: CapabilitySlot[] =
-    grantedSlots.length > 0 ? grantedSlots : ["calendar.list_events"];
+    grantedSlots.length > 0 ? grantedSlots : defaultSlots;
 
   useEffect(() => {
     if (state.status === "success") router.refresh();
@@ -60,11 +81,11 @@ export function GoogleCalendarConnection({
             color: "var(--shell-muted)",
           }}
         >
-          <CalendarIcon />
+          {icon}
         </span>
 
         <div className="min-w-0 flex-1">
-          <h2 className="truncate text-sm font-medium leading-5">Google Calendar</h2>
+          <h2 className="truncate text-sm font-medium leading-5">{preset.label}</h2>
           <p
             role="status"
             className="mt-0.5 flex items-center gap-1.5 text-xs leading-4"
@@ -92,16 +113,16 @@ export function GoogleCalendarConnection({
           )
         ) : localMode ? (
           <form action={formAction}>
-            <input type="hidden" name="presetId" value={GOOGLE_CALENDAR_PRESET_ID} />
+            <input type="hidden" name="presetId" value={preset.id} />
             {connector ? <input type="hidden" name="connectorId" value={connector.id} /> : null}
             {localSlots.map((slot) => (
               <input key={slot} type="hidden" name="slots" value={slot} />
             ))}
             <ConnectButton disabled={pending || !available} pending={pending} />
           </form>
-        ) : available ? (
+        ) : available && hostedStartHref ? (
           <a
-            href="/api/integrations/google-calendar/start?permission=read"
+            href={hostedStartHref}
             className="shrink-0 rounded-lg px-3.5 py-2 text-sm font-medium"
             style={{ background: "var(--shell-accent)", color: "#000000" }}
           >
@@ -127,7 +148,7 @@ export function GoogleCalendarConnection({
           className="border-t px-4 py-3 text-xs leading-5"
           style={{ borderColor: "var(--shell-line)", color: "var(--shell-muted)" }}
         >
-          Google Calendar connections are unavailable right now.
+          {preset.label} connections are unavailable right now.
         </p>
       ) : null}
     </article>
@@ -159,7 +180,7 @@ function SecondaryButton({ label }: { label: string }) {
   );
 }
 
-function CalendarIcon() {
+export function CalendarIcon() {
   return (
     <svg
       viewBox="0 0 24 24"
@@ -171,6 +192,21 @@ function CalendarIcon() {
       <rect x="3.5" y="5" width="17" height="15" rx="2.5" />
       <path d="M8 3.5v3M16 3.5v3M3.5 9h17" strokeLinecap="round" />
       <path d="M8 13h.01M12 13h.01M16 13h.01M8 16.5h.01M12 16.5h.01" strokeLinecap="round" strokeWidth="2.2" />
+    </svg>
+  );
+}
+
+export function MailIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+    >
+      <rect x="3" y="5.5" width="18" height="13" rx="2.5" />
+      <path d="M3.6 7.2 12 13l8.4-5.8" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }

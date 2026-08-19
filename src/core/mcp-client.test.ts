@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { GOOGLE_CALENDAR_PRESET } from "./connector-catalog";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,7 @@ import { type Db, openTestDb } from "./db";
 import {
   ConnectorError,
   callCapability,
-  googleCalendarAdcHeaders,
+  googleAdcHeaders,
   restoreConnectorReachability,
   revalidateCapabilitySchemas,
   verifyConnector,
@@ -295,7 +296,7 @@ describe("reaching a connected service", () => {
 describe("Google Application Default Credentials", () => {
   it("requests only the fixed project and minimum-scope token commands", async () => {
     const calls: string[][] = [];
-    const headers = await googleCalendarAdcHeaders(["calendar.list_events"], {
+    const headers = await googleAdcHeaders(GOOGLE_CALENDAR_PRESET, ["calendar.list_events"], {
       environment: {},
       commandRunner: async (args) => {
         calls.push([...args]);
@@ -323,7 +324,7 @@ describe("Google Application Default Credentials", () => {
 
   it("returns an allowlisted failure without echoing command output", async () => {
     let call = 0;
-    const failure = googleCalendarAdcHeaders(["calendar.create_event"], {
+    const failure = googleAdcHeaders(GOOGLE_CALENDAR_PRESET, ["calendar.create_event"], {
       environment: {},
       tokenFailureCode: "scope_missing",
       commandRunner: async () => {
@@ -340,7 +341,7 @@ describe("Google Application Default Credentials", () => {
   it("refuses process-wide ADC outside local mode before running gcloud", async () => {
     let called = false;
     await expect(
-      googleCalendarAdcHeaders(["calendar.list_events"], {
+      googleAdcHeaders(GOOGLE_CALENDAR_PRESET, ["calendar.list_events"], {
         environment: { NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co" },
         commandRunner: async () => {
           called = true;
