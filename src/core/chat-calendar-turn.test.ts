@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CalendarIntent } from "./calendar-intent";
 
@@ -71,6 +71,7 @@ vi.mock("./mcp-client", async (importOriginal) => ({
 
 import { cacheCalendarEvents } from "./calendar-sync";
 import { streamTurn } from "./chat";
+import { workPlanApprovalAndRunSentence } from "./confirmation-text";
 import { batchPayloadHash, confirmationSentence, listPendingEffects } from "./effects";
 import {
   availableCapability,
@@ -85,6 +86,11 @@ import {
 import { appendMessage, createConversation } from "./conversations";
 import { type Db, openTestDb } from "./db";
 import type { CapabilitySlot } from "./schema";
+import {
+  activeWorkAuthorization,
+  listWorkPlans,
+  listWorkRuns,
+} from "./work-plans";
 
 function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
   return {
@@ -104,9 +110,15 @@ function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
 }
 
 beforeEach(() => {
+  // Calendar plausibility is intentionally relative to now. Keep the fixture's August 17-20
+  // window stable so the production past-date veto does not turn these into calendar tests
+  // that begin failing as wall-clock time advances.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-08-18T00:00:00.000Z"));
   vi.clearAllMocks();
   mocks.buildContext.mockResolvedValue({
     hits: [],
+    items: [],
     plan: {},
     queryVector: null,
     recommendation: null,
@@ -120,6 +132,10 @@ beforeEach(() => {
     text: JSON.stringify({ events: [] }),
     isError: false,
   });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 function connectCalendar(db: Db, slots: readonly CapabilitySlot[]): void {
@@ -323,14 +339,18 @@ describe("a recognized calendar request is never silent", () => {
     expect(sentToModel).not.toContain("<calendar_result");
   });
 
-  it("still runs a research plan when the message was never a calendar request", async () => {
+  it("still considers a work proposal when the message was never a calendar request", async () => {
     // "by Friday" is enough for the prefilter, so an ordinary bounded-work request reaches
     // the classifier and comes back as `none`. Returning there would quietly drop the work.
     mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
 
     await turn("Research the backup options by Friday and draft a recommendation.");
 
-    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledWith(
+      expect.anything(),
+      "Research the backup options by Friday and draft a recommendation.",
+      expect.objectContaining({ allowNoPlan: true }),
+    );
   });
 
   it("stores the outcome so a reload still shows what happened", async () => {
@@ -350,6 +370,137 @@ describe("a recognized calendar request is never silent", () => {
       )
       .get(result.message.id);
     expect(stored?.status).toBe("needs_clarification");
+  });
+});
+
+describe("bounded work requires an exact plan approval", () => {
+  const proposal = {
+    objective: "Research the backup options and prepare a recommendation",
+    steps: [
+      {
+        title: "Recall relevant context",
+        instruction: "Retrieve accepted memory relevant to the decision.",
+        effect_kind: "memory_read" as const,
+        depends_on: [],
+      },
+    ],
+    allowed_effects: ["memory_read" as const],
+    completion_criteria: ["A source-backed local note is ready for review"],
+    limits: {
+      max_model_tool_calls: 2,
+      max_retries_per_step: 0,
+      max_duration_seconds: 120,
+    },
+  };
+
+  it("proposes first, then runs only after the stored user message approves the exact hash", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.generateWorkPlanProposal.mockResolvedValueOnce({ proposal });
+
+    const offered = await nextTurn(
+      db,
+      conversation.id,
+      "Research the backup options and prepare a recommendation.",
+    );
+
+    expect(offered.result.work).toBeNull();
+    expect(offered.result.workProposal?.plan).toMatchObject({
+      status: "proposed",
+      origin: "surfaced_proposal",
+    });
+    const plan = listWorkPlans(db, { includeClosed: true })[0]!;
+    expect(activeWorkAuthorization(db, plan.id)).toBeNull();
+    expect(listWorkRuns(db, plan.id)).toEqual([]);
+    expect(offered.sentToModel).toContain('<work_proposal plan_id="1" status="proposed">');
+    expect(offered.sentToModel).toContain('"no_work_has_started":true');
+    expect(offered.sentToModel).not.toContain(plan.plan_hash);
+
+    const approved = await nextTurn(
+      db,
+      conversation.id,
+      workPlanApprovalAndRunSentence(plan.plan_hash),
+    );
+
+    expect(approved.result.work?.run).toMatchObject({ status: "completed" });
+    expect(approved.result.workProposal).toBeNull();
+    expect(activeWorkAuthorization(db, plan.id)).toMatchObject({
+      authorization_kind: "user_approval",
+    });
+    expect(listWorkRuns(db, plan.id)).toHaveLength(1);
+    expect(approved.sentToModel).toContain('<work_result plan_id="1"');
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+  });
+
+  it("does not authorize the wrong hash or replay a settled approval", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.generateWorkPlanProposal.mockResolvedValueOnce({ proposal });
+    await nextTurn(db, conversation.id, "Research the options and prepare a recommendation.");
+    const plan = listWorkPlans(db, { includeClosed: true })[0]!;
+
+    const wrongHash = `${plan.plan_hash.slice(0, -1)}${plan.plan_hash.endsWith("0") ? "1" : "0"}`;
+    const rejected = await nextTurn(
+      db,
+      conversation.id,
+      workPlanApprovalAndRunSentence(wrongHash),
+    );
+    expect(rejected.result.work).toBeNull();
+    expect(rejected.result.workProposal?.plan.id).toBe(plan.id);
+    expect(activeWorkAuthorization(db, plan.id)).toBeNull();
+    expect(listWorkRuns(db, plan.id)).toEqual([]);
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+
+    const approval = workPlanApprovalAndRunSentence(plan.plan_hash);
+    await nextTurn(db, conversation.id, approval);
+    await nextTurn(db, conversation.id, approval);
+
+    expect(listWorkRuns(db, plan.id)).toHaveLength(1);
+    expect(listWorkPlans(db, { includeClosed: true })).toHaveLength(1);
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+  });
+
+  it("cancels the pending proposal when the user refuses it", async () => {
+    const db = openTestDb();
+    const conversation = createConversation(db);
+    mocks.generateWorkPlanProposal.mockResolvedValueOnce({ proposal });
+    await nextTurn(db, conversation.id, "Research the options and prepare a recommendation.");
+
+    const declined = await nextTurn(db, conversation.id, "no thanks");
+
+    expect(declined.result.work).toBeNull();
+    expect(declined.result.workProposal).toBeNull();
+    expect(listWorkPlans(db, { includeClosed: true })[0]?.status).toBe("cancelled");
+    expect(mocks.generateWorkPlanProposal).toHaveBeenCalledOnce();
+  });
+
+  it("rejects connector effects from the generic planner before storing a plan", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events", "calendar.create_event"]);
+    const conversation = createConversation(db);
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.generateWorkPlanProposal.mockResolvedValueOnce({
+      proposal: {
+        ...proposal,
+        steps: [{
+          title: "Create event",
+          instruction: "Put the event on the calendar.",
+          effect_kind: "schedule" as const,
+          depends_on: [],
+        }],
+        allowed_effects: ["schedule" as const],
+      },
+    });
+
+    const result = await nextTurn(
+      db,
+      conversation.id,
+      "Find a time for lunch and put it on my calendar.",
+    );
+
+    expect(result.result.work).toBeNull();
+    expect(result.result.workProposal).toBeNull();
+    expect(listWorkPlans(db, { includeClosed: true })).toEqual([]);
   });
 });
 
@@ -609,6 +760,28 @@ describe("clearing a window", () => {
       "evt-gym",
       "evt-review",
     ]);
+  });
+
+  it("cannot confirm another conversation's prepared calendar change", async () => {
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
+    calendarHolding(THURSDAY);
+    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    const sourceConversation = createConversation(db);
+    await nextTurn(db, sourceConversation.id, "clear my Thursday afternoon");
+    const hash = batchPayloadHash(listPendingEffects(db))!;
+    const otherConversation = createConversation(db);
+    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+
+    await nextTurn(db, otherConversation.id, confirmationSentence(hash, 2));
+
+    expect(listPendingEffects(db)).toHaveLength(2);
+    expect(
+      mocks.callCapability.mock.calls.filter((call) => call[1] === "calendar.update_event"),
+    ).toEqual([]);
+
+    await nextTurn(db, sourceConversation.id, confirmationSentence(hash, 2));
+    expect(listPendingEffects(db)).toEqual([]);
   });
 
   it("changes nothing when the window is already empty, and does not pretend otherwise", async () => {

@@ -3,6 +3,7 @@ import { calendarOutcomesIn } from "@/core/calendar-outcome";
 import { getConversation, messagesIn } from "@/core/conversations";
 import { pendingConfirmationOffer } from "@/core/effects";
 import { hasCredentials } from "@/core/openai";
+import { pendingWorkPlanApprovalOffer } from "@/core/work-plans";
 import { getOwnerAccess } from "@/server/auth/access";
 import { redirect } from "next/navigation";
 
@@ -46,6 +47,9 @@ export default async function ChatPage({
         calendar: storedOutcomes?.get(message.id) ?? null,
       }))
     : [];
+  const pendingPlan = conversation && db
+    ? pendingWorkPlanApprovalOffer(db, conversation.id)
+    : null;
 
   return (
     <Chat
@@ -56,7 +60,10 @@ export default async function ChatPage({
       initialPrompt={prompt}
       initialTurns={initialTurns}
       initialConversationId={conversation?.id}
-      awaitingConfirmation={db ? pendingConfirmationOffer(db) : null}
+      awaitingConfirmation={db && conversation
+        ? pendingConfirmationOffer(db, { conversationId: conversation.id })
+        : null}
+      awaitingWorkPlanApproval={pendingPlan}
     />
   );
 }

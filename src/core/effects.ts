@@ -197,16 +197,34 @@ export function getProposedEffect(db: Db, id: number): ProposedEffectView | null
   return row ? view(db, row) : null;
 }
 
-export function listPendingEffects(db: Db, options: { at?: Date } = {}): ProposedEffectView[] {
+export function listPendingEffects(
+  db: Db,
+  options: { at?: Date; conversationId?: number } = {},
+): ProposedEffectView[] {
   const at = (options.at ?? new Date()).toISOString();
-  return db
-    .prepare<[string], ProposedEffect>(
-      `${SELECT_EFFECT}
-       WHERE status = 'pending_confirmation' AND expires_at > ?
-       ORDER BY id`,
-    )
-    .all(at)
-    .map((row) => view(db, row));
+  const rows = options.conversationId === undefined
+    ? db
+      .prepare<[string], ProposedEffect>(
+        `${SELECT_EFFECT}
+         WHERE status = 'pending_confirmation' AND expires_at > ?
+         ORDER BY id`,
+      )
+      .all(at)
+    : db
+      .prepare<[string, number], ProposedEffect>(
+        `${SELECT_EFFECT}
+         WHERE status = 'pending_confirmation' AND expires_at > ?
+           AND work_run_id IN (
+             SELECT run.id
+             FROM work_run run
+             JOIN work_plan plan ON plan.id = run.work_plan_id
+             JOIN message source ON source.id = plan.source_message_id
+             WHERE source.conversation_id = ?
+           )
+         ORDER BY id`,
+      )
+      .all(at, options.conversationId);
+  return rows.map((row) => view(db, row));
 }
 
 /** Requests that actually happened, most recent first — the "what did Zeus do?" list. */
@@ -298,7 +316,7 @@ export function batchPayloadHash(effects: readonly { payload_hash: string }[]): 
  */
 export function pendingConfirmationOffer(
   db: Db,
-  options: { at?: Date } = {},
+  options: { at?: Date; conversationId?: number } = {},
 ): { hash: string; count: number } | null {
   const pending = listPendingEffects(db, options);
   if (pending.length === 0) return null;
@@ -319,7 +337,7 @@ export function pendingConfirmationOffer(
 export function pendingEffectsForConfirmation(
   db: Db,
   content: string,
-  options: { at?: Date } = {},
+  options: { at?: Date; conversationId?: number } = {},
 ): { effects: ProposedEffectView[]; hash: string } | null {
   const pending = listPendingEffects(db, options);
   if (pending.length === 0) return null;

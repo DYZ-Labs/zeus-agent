@@ -869,6 +869,38 @@ describe("confirming a prepared set", () => {
     expect(pendingEffectsForConfirmation(db, "yes please go ahead")).toBeNull();
   });
 
+  it("does not match a confirmation from another conversation", async () => {
+    await grantCalendar();
+    const effect = propose();
+    const otherConversation = createConversation(db, {
+      title: "Unrelated work",
+      source: "web",
+    });
+    const content = confirmationSentence(effect.payload_hash);
+
+    expect(listPendingEffects(db, { conversationId }).map((entry) => entry.id)).toEqual([
+      effect.id,
+    ]);
+    expect(listPendingEffects(db, { conversationId: otherConversation.id })).toEqual([]);
+    expect(pendingConfirmationOffer(db, { conversationId })).toEqual({
+      hash: effect.payload_hash,
+      count: 1,
+    });
+    expect(pendingConfirmationOffer(db, { conversationId: otherConversation.id })).toBeNull();
+    expect(
+      pendingEffectsForConfirmation(db, content, { conversationId })?.effects.map(
+        (entry) => entry.id,
+      ),
+    ).toEqual([effect.id]);
+    expect(
+      pendingEffectsForConfirmation(db, content, {
+        conversationId: otherConversation.id,
+      }),
+    ).toBeNull();
+    // Today and MCP intentionally retain their unscoped, cross-conversation view.
+    expect(pendingEffectsForConfirmation(db, content)?.effects[0]?.id).toBe(effect.id);
+  });
+
   /**
    * The composer is emptied every time the user sends anything else, so the offer has to be
    * answerable on any turn — not only on the one that asked. A reply saying "the line is in

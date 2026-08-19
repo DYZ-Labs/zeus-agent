@@ -8,7 +8,6 @@ import {
 import { BUDGET_MESSAGES, checkModelBudget, logBudgetDenial } from "@/core/budget";
 import { generateWorkPlanProposal } from "@/core/work-execution";
 import {
-  authorizeWorkPlan,
   createWorkPlan,
   listWorkPlans,
 } from "@/core/work-plans";
@@ -40,7 +39,8 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: "Expected a bounded work objective." }, { status: 400 });
   }
 
-  // Planning is itself a model call, and an authorized plan licenses many more.
+  // Planning is itself a model call. Creating the proposal spends only that call; running
+  // the plan remains behind the separate exact-authorization route.
   const budget = checkModelBudget(access.db);
   if (!budget.allowed) {
     logBudgetDenial("/api/work-plans", budget);
@@ -67,18 +67,8 @@ export async function POST(request: Request): Promise<Response> {
       origin: "explicit_request",
       generationProvenance: generated.provenance,
     });
-    const authorization = authorizeWorkPlan(access.db, detail.plan.id, {
-      planHash: detail.plan.plan_hash,
-      authorizationKind: "explicit_request",
-      allowedEffects: proposal.allowed_effects,
-      maxModelToolCalls: detail.plan.max_model_tool_calls,
-      maxRetriesPerStep: detail.plan.max_retries_per_step,
-      maxDurationSeconds: detail.plan.max_duration_seconds,
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      sourceMessageId: source.id,
-    });
     return Response.json(
-      { ...detail, authorization, status: "authorized" },
+      { ...detail, status: "proposed" },
       { status: 201 },
     );
   } catch (error) {

@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 import { EffectKind } from "@/core/schema";
+import { workPlanApprovalSentence } from "@/core/confirmation-text";
 import type {
   WorkArtifact,
   WorkPlan,
@@ -80,7 +81,7 @@ export function WorkPlansPanel({
           maxRetriesPerStep: item.plan.max_retries_per_step,
           maxDurationSeconds: item.plan.max_duration_seconds,
           expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-          userInstruction: `I approve bounded work plan ${item.plan.plan_hash}.`,
+          userInstruction: workPlanApprovalSentence(item.plan.plan_hash),
         }),
       });
       router.refresh();

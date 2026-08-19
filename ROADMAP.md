@@ -111,16 +111,17 @@ intent, no model stands between the request and the bytes, and the whole write p
 testable offline. And once a write reads the calendar first, the prior state is sitting in
 the read cache, so the receipt can say what an event was before Zeus changed it.
 
-`isExplicitBoundedWorkRequest` survives, and it is still the right target for this phase.
-Replace it with an explicit **propose → approve → execute** loop in chat: Zeus offers a
-plan, the user approves the plan hash, the run proceeds under the gates that already exist.
-The regex disappears because approval becomes visible rather than inferred. Note the
-asymmetry with the calendar path: a research plan has no equivalent of a conflict check, so
-there approval has to stay explicit rather than be replaced by verification.
+**The non-calendar front door has landed.** `isExplicitBoundedWorkRequest` is gone. Chat now
+creates an immutable proposal, renders its exact steps, effects, completion criteria, and
+limits, and waits for a separate approval-and-run message naming that plan's hash. A stale,
+wrong, quoted, or replayed approval starts nothing, and generic plans cannot claim connector
+effects that belong behind the code-owned Calendar gates. Proposals persist across sessions
+until the user approves or declines them. The asymmetry remains deliberate: a research plan
+has no equivalent of a conflict check, so its approval stays explicit rather than being
+replaced by verification.
 
-Also in scope:
+Still in scope:
 
-- Plans that span sessions rather than one request.
 - The trip scenario end to end: compare options, build an itinerary, hold the slots, alert
   to conflicts.
 
