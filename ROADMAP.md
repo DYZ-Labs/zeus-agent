@@ -1,207 +1,304 @@
 # Roadmap
 
-Zeus's purpose is to help one person make meaningful progress on what they genuinely care
-about — understanding their preferences, planning the steps, and taking useful actions on
-their behalf, with their permission and oversight. The test case is a trip: compare
-options, build an itinerary, check the calendar, draft the booking, flag the conflict.
+Zeus's purpose is defined in [README.md](README.md): a personal AI agent for busy
+professionals that understands what matters, remembers what matters, and handles what does
+not require their attention. The MVP is an agent for **email + calendar** — triage,
+summaries, drafting, scheduling, meeting preparation, a daily brief on request, persistent
+open-loop state, approval-before-action, and verification — with proactivity strictly
+opt-in.
 
-This file records what is built, what is next, and why in that order. It is a plan, not a
-promise; the reasoning matters more than the sequence, because the reasoning is what should
-survive when the sequence changes.
+This file supersedes the previous roadmap (git history retains it), written after its
+Phase 1 shipped calendar end to end and the product goals were rewritten. Its principle
+survives unchanged: this is a plan, not a promise, and the reasoning matters more than the
+sequence, because the reasoning is what should survive when the sequence changes.
 
-Persistent open-loop state, explicit priority and next-step retrieval, and completion plus
-verification of user-initiated workflows are product requirements. Unsolicited
-follow-through is an optional, explicitly enabled capability; expanding or shipping it is
-not a phase gate.
-
-Invariants that constrain every phase live in [AGENTS.md](AGENTS.md). Nothing here
+Invariants that constrain every increment live in [AGENTS.md](AGENTS.md). Nothing here
 overrides them.
 
 ---
 
-## Phase 1 — See and act, with confirmation · **shipped**
+## Invariants carried forward
 
-Landed in [#18](https://github.com/DYZ-Labs/zeus-agent/pull/18).
+Lessons the calendar work paid for. Later increments assume them rather than rediscover
+them.
 
-Zeus is an MCP client. It can read a connected calendar, notice conflicts in it
-deterministically, and prepare changes to it — and it cannot change anything without a
-message from the user naming the exact payload hash.
-
-What that phase established, which everything after it depends on:
-
-- **Two gates.** Authorizing a plan approves a scope; confirming approves a payload. A
-  write step materializes the exact request and pauses rather than calling out.
-- **No third-party credentials.** Connectors store commands, arguments, URLs, and the
-  *names* of environment variables. There is nowhere to put a value.
-- **Capability slots.** A slot fixes its effect kind, so reviewing the granted slots is
-  enough to understand everything a connector may do. Remote schema drift withdraws the
-  grant.
-- **`external_read` is its own effect kind.** The effect kind is the unit of
-  authorization, so web research cannot reach a calendar.
-- **Detectors.** Four deterministic rules, no model call, delivered through the existing
-  opportunity pipeline so every interruption gate applies unchanged.
-- **External data is never evidence.** Calendar text can inform a plan and can never
-  become memory.
-- **`connector_call` vs `effect_proposal`.** The receipt log answers "did anything happen
-  out there?" as a query rather than an interpretation.
-
----
-
-## Phase 2 — Standing grants and `send`
-
-**Why now.** Confirming every action forever is not stewardship; it moves the work rather
-than doing it. But a standing grant should be built from evidence of what the user actually
-confirms repeatedly, and Phase 1 is what produces that evidence. Building this first would
-have meant guessing.
-
-**Standing grants.** A `standing_effect_grant` bound to a capability, a narrow predicate, an
-expiry, and a maximum number of uses. Revocable at any time. Every use still writes a
-receipt and still appears in the Today control readout — a grant removes the interruption,
-never the record. The fail-safe direction is expiry: a grant nobody renews simply stops.
-
-Design constraints worth stating before anyone writes code:
-
-- A grant is not a mode. It names one capability and one narrow predicate — "accept invites
-  from my team", not "manage my calendar".
-- A grant may never be inferred. It is proposed, reviewed, and accepted explicitly, the same
-  way a `machine_effect` facet is.
-- Reaching the use limit or the expiry returns to per-action confirmation silently. Zeus
-  does not ask to renew at the moment it wants permission.
-
-**`send`.** Email or messaging behind a recipient allowlist, drafted then confirmed. This is
-a harder bar than `schedule` for one reason: **a sent message cannot be taken back.** Zeus
-offers no undo for a calendar change either, but a calendar change can be reversed by asking
-— a new request through the same gates — and a sent message cannot be. That asymmetry is
-with *asking*, and it should shape the UI rather than be papered over: the confirmation for
-a send has to read differently from the confirmation for a hold.
-
-**Open question.** Whether standing grants should apply to `send` at all in this phase, or
-only to `schedule` and `modify_external` until there is a year of evidence. The
-conservative answer is probably right.
-
-**Amended.** A mode shipped before narrow grants did, at the user's explicit direction, and
-it is scoped to calendar create, reschedule, and cancel. That contradicts the design
-constraint two paragraphs above — "a grant is not a mode" — so it is worth being exact about
-what made it defensible, because the reasoning does not transfer.
-
-It was not the grant machinery. It was the conflict gate. The mode only ever covers an
-action Zeus verified against a calendar it had just read: a collision, a stale or
-unreadable calendar, or a target matching more than one event all still stop and ask, and a
-daily ceiling bounds how wrong a misclassification can go before it stops on its own. The
-check replaced the interruption; nothing replaced the record.
-
-That argument is unavailable for `send`. There is no equivalent of "is this slot free" for a
-message, and no equivalent of cancelling the event afterwards. The narrow-predicate
-`standing_effect_grant` remains the right shape there. A mode is a ceiling-and-check design;
-a grant is a scope design. They are not substitutes, and this one should not be read as a
-precedent for the other.
+- **Two gates.** Authorizing a plan approves a scope (a hash over exact steps, effects,
+  and limits). Confirming approves a payload (a hash over the exact request). Neither
+  substitutes for the other.
+- **Connector rows never hold credential values.** Commands, URLs, and the *names* of
+  environment variables only. First-party OAuth tokens live in the isolated broker
+  service, encrypted, never in an account database.
+- **External data is never memory evidence.** Calendar and email content can inform a
+  plan, a brief, or a signal — and can never become a fact, a facet, or a candidate.
+- **No undo.** It was built, shipped, and removed: a partial reversal offered as "Undo" is
+  a promise the code cannot keep. Reversal is a new request, in the user's words, through
+  the same gates. Do not rebuild it for any capability.
+- **A grant is not a mode.** The calendar direct-execution mode is defensible only because
+  a deterministic conflict gate verifies every action against a freshly read calendar and
+  a daily ceiling bounds a misclassification. That argument does not transfer to
+  capabilities without an equivalent check.
+- **Steps that span a confirmation need explicit settlement.** A resumed run re-enters a
+  paused write step; without a settled-effect check it re-proposes forever.
+- **Models lowball their own limits.** Any generated artifact with self-declared ceilings
+  needs a raise-and-refuse pass at creation.
+- **Tests with generous limits hide real failures.** Every capability is exercised against
+  a real server and a real model before it is called done.
+- **`purchase` stays refused unconditionally.** Undoing that requires a stronger reason
+  than the enum having the value.
 
 ---
 
-## Phase 3 — Real multi-step workflows
+## Where the codebase stands
 
-**Why after Phase 2.** Broad autonomy is only safe once the gate and the receipts exist,
-and they now do.
+Shipped and tested: the memory system (facts, entities, facets, passages, review
+candidates — with confidence, provenance, supersession, and erasure that reaches
+backups); calendar read/create/reschedule/cancel/clear through an isolated OAuth broker
+with a twice-run deterministic conflict gate; the two-gate work-plan and effect machinery
+with append-only, trigger-enforced ledgers and receipts; multi-account isolation with one
+SQLite store per account; snapshots, replication, restore, and export; Zeus as an MCP
+server for external clients.
 
-**The calendar half landed early.** The three calendar regexes are gone, replaced by a
-recall-safe keyword skip, a low-effort structured classifier, and a deterministic veto that
-can only ever downgrade what the classifier proposed. What that fixed was not the plan loop
-but the front door: "I need to get dinner with Sam on the calendar" produced a sentence
-rather than an event, because the regex required a leading create verb. Recognition turned
-out to be the model's job and permission code's — the same split as `extract` →
-`applyExtraction`.
+All of it is shaped around a single capability domain. Against the MVP list in README.md:
 
-Two things fell out of doing it. Once the payload is built deterministically from a resolved
-intent, no model stands between the request and the bytes, and the whole write path became
-testable offline. And once a write reads the calendar first, the prior state is sitting in
-the read cache, so the receipt can say what an event was before Zeus changed it.
-
-**The non-calendar front door has landed.** `isExplicitBoundedWorkRequest` is gone. Chat now
-creates an immutable proposal, renders its exact steps, effects, completion criteria, and
-limits, and waits for a separate approval-and-run message naming that plan's hash. A stale,
-wrong, quoted, or replayed approval starts nothing, and generic plans cannot claim connector
-effects that belong behind the code-owned Calendar gates. Proposals persist across sessions
-until the user approves or declines them. The asymmetry remains deliberate: a research plan
-has no equivalent of a conflict check, so its approval stays explicit rather than being
-replaced by verification.
-
-Still in scope:
-
-- The trip scenario end to end: compare options, build an itinerary, hold the slots, alert
-  to conflicts.
+| MVP requirement | State |
+|---|---|
+| Authentication, calendar, scheduling, availability | Shipped |
+| Preference memory, task extraction, open-loop persistence | Shipped |
+| Priority and next-step retrieval on request | Shipped (`src/core/stewardship.ts`) |
+| Approval workflows | Shipped, strong (hash-bound, ledgered) |
+| Gmail; inbox triage; email summarization; email drafting | Absent — no email code exists |
+| Daily brief on request | Absent — ingredients exist, no composition |
+| Meeting preparation | Absent — ingredients exist, no assembly |
+| Verification of writes | Absent — all checks are pre-flight; nothing reads back |
+| Action history | Partial — per-effect receipt pages, no aggregate view |
+| Contacts | Absent as an integration (internal entity graph exists) |
+| Opt-in proactivity | Misaligned — in-chat follow-through defaults on |
 
 ---
 
-## Phase 4 — Preferences that steer action
+## Increment 1 — Email read foundation, the brief, meeting prep
 
-Today an accepted `machine_effect` facet reaches exactly one place: follow-through
-recommendation ranking (`machineEffectFor`, `src/core/stewardship.ts`). It can boost,
-deprioritize, or block *what Zeus raises*. It cannot shape *what Zeus does*.
+**Why now.** Every remaining MVP absence traces to the same root: Zeus cannot see email.
+Triage, thread summaries, the brief's needs-attention section, and half of meeting prep
+all begin with reading the inbox. Read-only first, because reads need no per-use
+confirmation (connecting the service is the consent), because email is the most
+adversarial text Zeus will ever ingest and the guarding should be proven before any email
+write exists, and because Gmail's write scopes raise the OAuth verification stakes.
 
-That existing path may remain, but expanding proactive surfacing is not required by this
-phase.
+### Alignment first
 
-Extend accepted facets so they deterministically constrain plan shape and payload defaults
-— "never schedule me before 9am", "always leave 30 minutes after a flight" — as policy
-rather than as prompt text a model may or may not honour.
+Small, independent changes that land before the capability, each its own PR:
 
-Separately: promote repeated confirmed patterns into **proposed** standing grants, reusing
-the `behavioral_policy_suggestion` machinery. Note the deliberate obstacle — that machinery
-today may only ever *reduce* interruptions (`allowed_interruption_change` is `none` or
-`suppress_only`, enforced by a CHECK). Widening it so a suggestion can propose *more*
-autonomy is a real decision with a real risk, and it should be made explicitly rather than
-discovered as a side effect of implementing this phase.
+- **Proactivity becomes opt-in.** A migration moves `stewardship_setting.mode` from
+  `balanced` to `off` where no user message chose the mode; `buildContext`
+  (`src/core/context.ts`) stops evaluating an opportunity on every ordinary turn. Safe
+  because explicit triggers already bypass `off` — `/today`, MCP, and explicit chat
+  phrases keep answering "what should I do next" — so the MVP's explicit-retrieval
+  contract is untouched. Matches README "Opt-in proactivity" and AGENTS.md §18.
+- **The injection surface gets its tests.** `src/core/untrusted-data.ts` currently has no
+  direct coverage. Unit tests for the classifier and guard, plus scenario tests proving an
+  injection-titled calendar event renders withheld end to end. These land *before* the
+  first Gmail connect.
+- **Operations documentation returns.** The pre-rewrite README's operational sections
+  (hosting, configuration, health, budgets, durability, recovery, commands) are restored
+  as `docs/operations.md` (`git show '531e527~1:README.md'`), the dangling references in
+  `docs/staging-rehearsal.md` are repointed, and README gains a one-line pointer.
+- **Classifier timeout becomes honest.** A strongly action-shaped calendar request whose
+  intent classification times out gets a spoken "couldn't work that out just now" outcome
+  instead of the current silent fallthrough (`src/core/chat.ts`).
+- **`update_event` becomes idempotent.** Read-before-write in the broker
+  (`src/calendar-broker/google.ts`): when the target already holds the requested state,
+  return it without patching — the analogue of `create_event`'s derived event id.
+
+### Gmail, local-first
+
+Google ships an official Gmail MCP server (`https://gmailmcp.googleapis.com/mcp/v1`,
+Developer Preview at the time of writing — re-verify tools and status at implementation).
+Its read tools (`search_threads`, `get_thread`) cover this increment, and it exposes **no
+send tool** — drafts are its only write, which happens to match Zeus's reversibility
+ladder exactly.
+
+`gmail.readonly` is a Google *restricted* scope. A hosted multi-account deployment would
+need app verification plus an annual CASA assessment before external users could consent.
+A local single-account connection through the user's own OAuth client needs neither — the
+exact Application Default Credentials pattern the calendar preset already uses
+(`src/core/connector-catalog.ts`). So: **local preset now; broker-served hosted Gmail
+deferred to Increment 2's go/no-go.** One caveat to document in the connect UI: an OAuth
+client left in "Testing" status expires refresh tokens after seven days — publish it or
+mark it Internal.
+
+### The shape of the change
+
+- **Slots.** `email.search_threads` and `email.get_thread`, both effect kind
+  `external_read`, added to `CapabilitySlot` and `CAPABILITY_SLOT_EFFECTS`
+  (`src/core/schema.ts`) and to the mirrored SQL CHECKs — a `connector_capability`
+  rebuild, following the established rename→recreate→copy→drop precedents (migrations
+  023, 026, 030). `external_signal` and `external_read_window` admit kind `email_thread`;
+  a new `inbox_context` table is `schedule_context`'s twin, for the same answerability
+  reason.
+- **A trap to disarm in the same change.** `availableCapabilityForEffect`
+  (`src/core/connectors.ts`) resolves capabilities by effect kind by iterating slots; the
+  moment an email slot carries `external_read`, a generated plan's "read the calendar"
+  could silently resolve to Gmail. The call sites in `src/core/work-execution.ts` and
+  `src/core/work-plans.ts` get pinned to `calendar.list_events`; email reads run through
+  their own deterministic paths, never through generated plan steps. Slot-addressed steps
+  arrive in Increment 2 with the code-owned email plan builders.
+- **Sync and context, on the calendar template.** `email-sync.ts` mirrors
+  `calendar-sync.ts`: schema-driven fail-closed argument building, parse-then-cache in one
+  transaction with window reconciliation and a read-window proof (a failed read must never
+  look like an empty inbox), a 15-minute chat-facing TTL, and thread bodies that are
+  fetched on request and never cached. `email-context.ts` renders a standing `<inbox>`
+  block — **subjects and senders only, no snippets**; snippets and bodies are the
+  highest-injection, highest-token text for the least standing value — and a `<thread>`
+  block for on-request summaries. Everything third-party passes `guardExternalText`.
+- **Chat wiring.** Turn start refreshes calendar and inbox caches in parallel under one
+  deadline. Thread requests ("summarize the email from Sarah") parse deterministically
+  against the cache — no model classifier in v1; ambiguity lists candidates rather than
+  guessing. Summarization is a context block plus the one streaming call, **not** a work
+  plan: a read needs no approval hop.
+- **Detectors.** `email_unanswered` (inbound, direct-to-user, quiet past a threshold) and
+  `email_commitment_adjacent` (a cached thread overlapping an open commitment) join the
+  four deterministic detectors in `src/core/detectors.ts`, feeding the existing signal
+  pipeline with reconciliation — a replied thread stops being raised. Their `why` text is
+  guarded at composition.
+- **The brief.** `brief.ts` composes deterministically, with no model call: today's
+  schedule, needs-attention (email signals, overdue and due-soon commitments, open
+  calendar signals), the top recommendation (an explicit trigger, so it works in mode
+  `off`), and prepared items (pending effects, plans awaiting approval). Rendered as a
+  `<brief>` block on trigger phrases in chat, on `/today`, and as a `zeus_brief` MCP
+  tool. "What needs my attention" *is* the brief's attention section — one composition,
+  two render depths, so triage and the brief can never disagree.
+- **Meeting prep.** The calendar cache starts retaining attendee emails (today's parse
+  drops them). `meeting-prep.ts` resolves an event deterministically ("prep me for my 11
+  AM"; next meeting by default), folds attendees to entities via aliases, and assembles
+  per-attendee facts, open commitments, related cached threads (subjects only), and open
+  signals into a `<meeting_prep>` block and a `zeus_meeting_prep` MCP tool.
+
+### Done means
+
+The AGENTS.md §37 matrix per workflow (happy path, permission, missing context,
+conflicting data, tool failure, duplicate execution, injection, timezone), plus the
+real-account recipe: connect via ADC; ask for the inbox; send yourself an email titled
+with an injection payload and watch it render withheld; kill the network and watch the
+inbox degrade honestly; `npm run check` green. Email rows exist only in `external_signal`
+and `inbox_context`, with no path into facts, candidates, or extraction — and no write
+slot exists, so no email write is possible at all in this increment.
 
 ---
 
-## Phase 5 — `purchase`
+## Increment 2 — Drafts, then `send`
 
-Deliberately last, and possibly never.
+**Why after read.** Standing on a proven read path, drafting is low-risk: drafts are
+`work_artifact` rows, local and reversible, produced by a code-owned plan builder with a
+strict intent schema. `send` is the step change.
 
-Money is irreversible in a way a calendar is not, and it has its own threat model. Today
-`purchase` is refused unconditionally: no slot produces it, `assertAuthorizableEffects`
-rejects it by name, and the storage layer will not record a receipt for it. Undoing that
-should require a stronger reason than "the enum has the value".
+A sent message cannot be taken back. A calendar change can be reversed by asking; a sent
+email cannot, and that asymmetry should shape the UI rather than be papered over: the
+confirmation for a send has to read differently from the confirmation for a hold.
+
+- New slot `email.send_message` → effect kind `send`, reachable only from code-owned
+  builders — never from a generated plan.
+- **Exact-confirmation only.** No standing-policy path, no mode: there is no equivalent of
+  "is this slot free" for a message, so the calendar mode's ceiling-and-check reasoning
+  does not transfer. A recipient allowlist is enforced deterministically at payload build
+  and re-checked at execution.
+- **Served by the broker, not the official server** (which has no send tool): the calendar
+  broker generalizes into a Google broker — a Gmail API client, per-service grants
+  replacing the calendar-only single-grant shape in `src/calendar-broker/store.ts`, and
+  provider-side idempotency by deriving the RFC 5322 Message-ID from the request key, the
+  send analogue of the derived event id.
+- Settlement generalizes: `settlePendingConfirmation` currently restores reachability for
+  `calendar.list_events` by name; the slot derives from the pending effect's capability.
+- **Hosted Gmail is this increment's explicit go/no-go**: restricted-scope verification
+  and CASA are a funded decision, not a side effect.
 
 ---
 
-## Carried forward from Phase 1
+## Increment 3 — Verification, and the action ledger made visible
 
-Things the live verification taught that later phases should assume rather than rediscover.
+The README's verification principle — a write is not done until the resulting state is
+read back — is currently unimplemented; every check is pre-flight. After
+`executeConfirmedEffect` succeeds, a bounded read-back through the matching read slot
+(calendar: re-read the window and match the event; send: locate the Message-ID) records a
+`verified` or `verification_failed` event in the effect ledger. Receipts and chat wording
+distinguish executed-and-verified from executed-unconfirmed; an unverified write is
+reported honestly, never retried blindly.
 
-**A model will lowball its own limits.** It proposed three steps and budgeted three calls
-when the steps need six, producing a plan that died on its last step — the one that would
-have asked the user to confirm. Generation now raises a lowballed ceiling and creation
-refuses a plan that cannot cover its own steps. Any future generated artifact with
-self-declared limits needs the same treatment.
+Alongside it, the aggregate action history the MVP asks for: an `/actions` page over
+executed, failed, and declined effects — the data already exists in the ledgers; only the
+view is missing.
 
-**Payload validation is shallow.** It checks required fields and rejects invented ones, but
-it is not a JSON Schema validator — that would be a new dependency for a check the remote
-service performs authoritatively anyway. A `send` capability with a complex schema may
-change that calculation. Revisit in Phase 2, not before.
+---
 
-**Undo was built, shipped, and then removed. Do not rebuild it.** The machinery worked: a
-created event could be cancelled because the service returns an id, and an update was
-reversible as a side effect of reading the calendar first, with `prior_state_json` holding
-what the cache knew before anything changed.
+## Increment 4 — One thread of work: tasks and relationships
 
-What it could never be was honest about its own limits. The reversal restored only the
-fields Zeus itself set, and only from the five the cache holds — attendees, description,
-recurrence, reminders, and conferencing were never read and were never restored, and
-un-cancelling does not recall the notices already sent. A partial undo offered as a button
-labelled "Undo" is a promise the code cannot keep, and it earned a card under every completed
-change to hold it.
+Today "Sarah needs a response → drafted → sent → done" is split across three unjoined
+ledgers: commitments (user-stated), detected signals (noticed), work plans (executable).
+This increment widens `commitment.status` toward the nine states the product docs name
+(a CHECK rebuild with a conservative mapping for existing rows), persists last and next
+action on the commitment, and links commitments to the work plans and signals that
+advance them.
 
-Reversing a change is now a request the user makes, in their own words, through the same
-gates as the change itself. That is slower and it is truthful, and it costs nothing to build.
-`prior_state_json` survives for the reason that always justified it: the receipt can say what
-an event was before Zeus touched it. Assume no undo for any future capability, and do not
-add one back for `send`.
+Relationship intelligence rides the same change: the entity page grows rollups — open
+commitments with that person, recent episodes, last interaction — and "what did I promise
+James" becomes a first-class retrieval path rather than a lucky search hit.
 
-**Steps that span a confirmation need explicit settlement.** A resumed run re-enters a
-paused write step, and without a settled-effect check it re-proposes forever. Any future
-effect kind that pauses must answer "what does resume do?" before it ships.
+---
 
-**Tests with generous limits hide real failures.** Every bug above survived a passing suite
-and died on first contact with a real MCP server and a real model. New capabilities should
-be exercised against a real server before they are called done.
+## Increment 5 — Standing grants and the autonomy surface
+
+The prior roadmap's design, unchanged in substance: a `standing_effect_grant` names one
+capability and one narrow structured predicate, with an expiry and a maximum number of
+uses, revocable at any time, proposed and accepted explicitly — never inferred, and
+**never for `send`**. Every use writes a ledger event citing the accepting user message; a
+grant removes the interruption, never the record. Expiry and exhaustion fall back to
+per-action confirmation silently.
+
+Settings grows an autonomy section that shows, in one place, the calendar mode, standing
+grants, and (from Increment 3) verification outcomes — the visible, editable, revocable
+surface the product docs require. Widening `behavioral_policy_suggestion` beyond
+reduce-only interruption changes remains an explicit decision with its own review; the
+CHECK constraint exists precisely so that widening cannot happen as a side effect.
+
+---
+
+## Increment 6 — Contacts and Drive
+
+Google Contacts arrives as a read slot whose output becomes **entity candidates through
+the existing review pipeline** — a contact record is external data, so the user's
+acceptance, not the record, is the evidence. Drive arrives as a read slot serving meeting
+prep ("relevant documents") and draft attachments. Both wait until the email loop proves
+the multi-service patterns.
+
+---
+
+## Evals, throughout
+
+Starting during Increment 1, a scenario eval joins `eval:memory` in `npm run check`:
+deterministic fixtures per AGENTS.md §36 — scheduling (right person, hours, timezone, no
+unconfirmed write), triage (right ranking, no send), prompt injection (summarized, no
+tool call, no memory write), memory supersession. The real-account recipes become a
+repeatable smoke checklist in the operations doc, run before any connector capability is
+called done. Retrieval-quality queries ("what did I promise X") join once Increment 4
+lands.
+
+---
+
+## Risks
+
+- **Gmail restricted scopes.** Local ADC with the user's own client avoids verification
+  entirely; the seven-day testing-status expiry is documented at connect; hosted CASA is
+  deferred to Increment 2's explicit gate.
+- **Preview-status endpoint drift.** The official Gmail MCP server may change contracts;
+  schema-hash drift detection already withdraws a capability safely, and argument
+  builders fail closed on schemas they do not understand.
+- **Prompt growth.** `<inbox>`, `<brief>`, and `<meeting_prep>` land on an already
+  monolithic system prompt. Caps hold the line (eight threads, subjects only, brief
+  sections bounded; the brief replaces detail blocks rather than stacking on them), token
+  deltas are measured, and restructuring the prompt is scheduled as its own change rather
+  than smuggled into a capability.
+- **Injection surface.** Email is adversarial by default. The standing block carries
+  subjects and senders only; bodies appear only on request, guarded and bounded; the
+  injection tests precede the first real connect; and the worst case in Increment 1 is a
+  withheld line — never a tool call and never a memory write, because email has no write
+  slot and external data is never evidence.
