@@ -865,6 +865,7 @@ describe("external data stays outside memory", () => {
         starts_at: "2026-08-20T18:40:00Z",
         ends_at: null,
         location: null,
+        attendees: null,
       },
       {
         id: "evt-b",
@@ -872,11 +873,67 @@ describe("external data stays outside memory", () => {
         starts_at: "2026-08-20T18:30:00Z",
         ends_at: null,
         location: "Lisbon",
+        attendees: null,
       },
     ]);
     expect(() => parseCalendarEvents({ events: [{ summary: "no id" }] })).toThrow(
       /without an id/u,
     );
+  });
+
+  it("keeps who was invited, in whichever shape the server sent them", () => {
+    const [structured, bare] = parseCalendarEvents({
+      events: [
+        {
+          id: "evt-a",
+          summary: "Review",
+          start: "2026-08-20T18:00:00Z",
+          attendees: [
+            { email: "sarah@example.com", displayName: "Sarah Chen", responseStatus: "accepted" },
+            { email: "kev@example.com" },
+            { displayName: "Room 4" },
+            { responseStatus: "declined" },
+          ],
+        },
+        {
+          id: "evt-b",
+          summary: "Sync",
+          start: "2026-08-20T19:00:00Z",
+          participants: ["alex@example.com", "Jordan", "  "],
+        },
+      ],
+    });
+
+    // `responseStatus` is not a field Zeus uses, and an entry carrying only that is not an
+    // attendee at all.
+    expect(structured?.attendees).toEqual([
+      { email: "sarah@example.com", name: "Sarah Chen" },
+      { email: "kev@example.com", name: null },
+      { email: null, name: "Room 4" },
+    ]);
+    // A bare string is an address where it looks like one, a name otherwise.
+    expect(bare?.attendees).toEqual([
+      { email: "alex@example.com", name: null },
+      { email: null, name: "Jordan" },
+    ]);
+  });
+
+  it("does not fail a whole read over an attendee list it cannot understand", () => {
+    // An id or a start time is load-bearing — one makes an event unaddressable, the other
+    // makes a window unprovable — so the parse fails closed on those. Attendees only feed
+    // meeting preparation, and refusing the read would cost the conflict gate a window it
+    // needs. Null and empty stay distinct: a server that reports no attendees is not a
+    // meeting with nobody in it.
+    const [unreadable, none] = parseCalendarEvents({
+      events: [
+        { id: "evt-a", summary: "Review", start: "2026-08-20T18:00:00Z", attendees: "everyone" },
+        { id: "evt-b", summary: "Solo", start: "2026-08-20T19:00:00Z", attendees: [] },
+      ],
+    });
+
+    expect(unreadable?.attendees).toBeNull();
+    expect(unreadable?.title).toBe("Review");
+    expect(none?.attendees).toEqual([]);
   });
 
   it("never lets a cached external signal become evidence", async () => {

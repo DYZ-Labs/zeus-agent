@@ -21,6 +21,11 @@ import { buildEvaluationContextForTrigger } from "../core/ambient";
 import { briefIsEmpty, buildBrief, renderBriefBlock } from "../core/brief";
 import { buildScheduleContext } from "../core/calendar-context";
 import { calendarCapabilityState } from "../core/capabilities";
+import {
+  buildMeetingPrep,
+  meetingPrepRequest,
+  renderMeetingPrepBlock,
+} from "../core/meeting-prep";
 import { remember } from "../core/chat";
 import { workPlanApprovalSentence } from "../core/confirmation-text";
 import { appendMessage, createConversation, getMessage, listConversations } from "../core/conversations";
@@ -1539,6 +1544,50 @@ server.registerTool(
       markOpportunityDelivered(db, cycle.id, "mcp");
     }
     return text(renderBriefBlock(brief, context));
+  },
+);
+
+server.registerTool(
+  "zeus_meeting_prep",
+  {
+    title: "Prepare the user for an upcoming meeting",
+    description:
+      "Assemble what Zeus knows before a meeting: who is coming, which of them it has been told about, accepted facts and open commitments involving each, and anything it noticed about the meeting. Resolves the meeting deterministically from the calendar cache — no guessing which one, and no inferring anything about an attendee it cannot match. Read-only.",
+    inputSchema: {
+      meeting: z
+        .string()
+        .optional()
+        .describe(
+          "Which meeting, as the user would say it: a clock time like '11 AM', a word from its title, or nothing for the next one.",
+        ),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ meeting }) => {
+    const context = buildEvaluationContextForTrigger(db, "mcp");
+    // Parsed through the same predicate chat uses, so the two surfaces resolve "my 11 AM"
+    // identically. A bare argument is the target itself, hence the prefix.
+    const target = meetingPrepRequest(`prep me for ${meeting ?? "my next meeting"}`);
+    if (!target) return text("Zeus could not work out which meeting was meant.");
+    const result = buildMeetingPrep(db, context, target);
+    if (result.status === "prepared") {
+      const known = result.prep.attendees.filter((attendee) => attendee.entitySlug !== null);
+      if (known.length > 0) {
+        recordMcpRecallAudit(
+          db,
+          "zeus_meeting_prep",
+          meeting ?? "",
+          known.flatMap((attendee) =>
+            attendee.commitments.map((commitment) => ({
+              kind: "commitment" as const,
+              id: commitment.id,
+              snapshot: { commitment, attendee: attendee.entityName },
+            })),
+          ),
+        );
+      }
+    }
+    return text(renderMeetingPrepBlock(result, context));
   },
 );
 
