@@ -30,7 +30,7 @@ import {
 } from "./calendar-sync";
 import { startOf } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
-import { availableCapabilityForEffect, getConnector } from "./connectors";
+import { calendarCapabilityForEffect, getConnector } from "./connectors";
 import type { BoundCapability } from "./connectors";
 import { buildContext, intentFieldProvenance } from "./context";
 import type { Db } from "./db";
@@ -382,7 +382,7 @@ async function executeSafeStep(
   input: SafeStepExecutionInput,
 ): Promise<SafeStepExecutionResult> {
   const effect = input.step.effect_kind;
-  if (!SAFE_EFFECTS.has(effect) && !availableCapabilityForEffect(db, effect)) {
+  if (!SAFE_EFFECTS.has(effect) && !calendarCapabilityForEffect(db, effect)) {
     return {
       pause: {
         code: "effect_not_available",
@@ -566,7 +566,7 @@ async function executeExternalRead(
   db: Db,
   input: SafeStepExecutionInput,
 ): Promise<SafeStepExecutionResult> {
-  const available = availableCapabilityForEffect(db, "external_read");
+  const available = calendarCapabilityForEffect(db, "external_read");
   if (!available) {
     return {
       pause: { code: "effect_not_available", message: "No connected calendar to read" },
@@ -764,7 +764,7 @@ async function prepareExternalRequest(
   const settled = settledEffectForStep(db, input);
   if (settled) return settled;
 
-  const available = availableCapabilityForEffect(db, input.step.effect_kind);
+  const available = calendarCapabilityForEffect(db, input.step.effect_kind);
   if (!available) {
     return {
       pause: {

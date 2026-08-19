@@ -52,6 +52,23 @@ export const CAPABILITY_SLOTS = [
   "calendar.list_events",
   "calendar.create_event",
   "calendar.update_event",
+  "email.search_threads",
+  "email.get_thread",
+] as const satisfies readonly CapabilitySlot[];
+
+/**
+ * The slots that mean "this connector is a calendar".
+ *
+ * Two callers used membership in `CAPABILITY_SLOTS` to ask that question, which was the same
+ * question only while calendar was the sole capability. `satisfies` does not enforce
+ * exhaustiveness, so nothing would have failed when email joined the list — a Gmail-only
+ * connector would simply have started answering yes, and the capability block would have
+ * told the user a calendar was connected.
+ */
+export const CALENDAR_CAPABILITY_SLOTS = [
+  "calendar.list_events",
+  "calendar.create_event",
+  "calendar.update_event",
 ] as const satisfies readonly CapabilitySlot[];
 
 export const GOOGLE_CALENDAR_BROKER_SERVICE_KEY =
@@ -847,16 +864,25 @@ export function availableEffectKinds(db: Db): EffectKind[] {
 }
 
 /**
- * The capability that would serve a step of this effect kind, if any.
+ * The **calendar** capability that would serve a step of this effect kind, if any.
  *
- * The work engine reasons in effect kinds because that is what an authorization names;
- * this is the one place that turns an authorized effect back into a concrete grant.
+ * This replaces `availableCapabilityForEffect`, which resolved across every slot. That was
+ * unambiguous only while `calendar.list_events` was the sole `external_read` slot: the
+ * moment email joined it, declaration order in `CAPABILITY_SLOTS` silently became policy,
+ * and a generated plan's "read the calendar" step could have resolved to Gmail — building
+ * calendar arguments from a Gmail schema, and opening a receipt citing a capability the call
+ * never used.
+ *
+ * Narrowed rather than parameterized because every caller is a calendar path. Email reads
+ * run through their own deterministic code and never through a generated plan step, so there
+ * is no second caller to generalize for, and an effect-kind resolver left in place is a
+ * loaded gun for whoever adds the next slot.
  */
-export function availableCapabilityForEffect(
+export function calendarCapabilityForEffect(
   db: Db,
   effect: EffectKind,
 ): BoundCapability | null {
-  for (const slot of CAPABILITY_SLOTS) {
+  for (const slot of CALENDAR_CAPABILITY_SLOTS) {
     if (CAPABILITY_SLOT_EFFECTS[slot] !== effect) continue;
     const available = availableCapability(db, slot);
     if (available) return available;

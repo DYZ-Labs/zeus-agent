@@ -2131,6 +2131,58 @@ FROM calendar_outcome_unclassified_legacy;
 DROP TABLE calendar_outcome_unclassified_legacy;
 `;
 
+/**
+ * Email arrives as two read slots, so the slot CHECK and its slot↔effect pairing widen.
+ *
+ * The first rebuild of a table other tables point at. `proposed_effect.connector_capability_id`
+ * is ON DELETE RESTRICT and `tool_receipt.connector_capability_id` is ON DELETE SET NULL, so
+ * with SQLite's post-3.25 defaults the RENAME would repoint both clauses at the legacy copy
+ * and the DROP would then take the referencing rows — a receipt ledger quietly losing its
+ * provenance. `migrate` already brackets every migration in `legacy_alter_table = ON` with
+ * foreign keys suspended, and runs `foreign_key_check` before COMMIT, precisely so a rebuild
+ * like this one is safe. Copying `id` explicitly is what keeps those references valid.
+ *
+ * `effect_kind` does not change: it already admits `external_read`, which is all either
+ * email slot needs. There is no email write slot to add, and that is deliberate.
+ */
+const EMAIL_CAPABILITY_SLOTS = `
+ALTER TABLE connector_capability RENAME TO connector_capability_email_legacy;
+CREATE TABLE connector_capability (
+  id                 INTEGER PRIMARY KEY,
+  connector_id       INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  slot               TEXT NOT NULL
+                     CHECK (slot IN ('calendar.list_events','calendar.create_event',
+                                     'calendar.update_event','email.search_threads',
+                                     'email.get_thread')),
+  remote_tool_name   TEXT NOT NULL,
+  effect_kind        TEXT NOT NULL
+                     CHECK (effect_kind IN ('external_read','schedule','modify_external')),
+  input_schema_json  TEXT NOT NULL CHECK (json_valid(input_schema_json)),
+  schema_hash        TEXT NOT NULL
+                     CHECK (length(schema_hash) = 64 AND schema_hash NOT GLOB '*[^0-9a-f]*'),
+  enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  UNIQUE (connector_id, slot),
+  CHECK (
+    (slot = 'calendar.list_events' AND effect_kind = 'external_read')
+    OR (slot = 'calendar.create_event' AND effect_kind = 'schedule')
+    OR (slot = 'calendar.update_event' AND effect_kind = 'modify_external')
+    OR (slot = 'email.search_threads' AND effect_kind = 'external_read')
+    OR (slot = 'email.get_thread' AND effect_kind = 'external_read')
+  )
+);
+INSERT INTO connector_capability
+  (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+   enabled, source_message_id, created_at, updated_at)
+SELECT id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+       enabled, source_message_id, created_at, updated_at
+FROM connector_capability_email_legacy;
+DROP TABLE connector_capability_email_legacy;
+CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2171,4 +2223,5 @@ export const MIGRATIONS: readonly Migration[] = [
   // applied fails `validateMigrationLedger`, which is the check that refuses a build that
   // does not recognize the schema in front of it.
   { id: "032_calendar_unclassified_outcome", sql: CALENDAR_UNCLASSIFIED_OUTCOME },
+  { id: "033_email_capability_slots", sql: EMAIL_CAPABILITY_SLOTS },
 ];

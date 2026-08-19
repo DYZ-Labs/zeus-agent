@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { availableCapabilityForEffect, isConnectorEffect } from "./connectors";
+import { calendarCapabilityForEffect, isConnectorEffect } from "./connectors";
 import { parseWorkPlanApproval } from "./confirmation-text";
 import type { Db } from "./db";
 import { now } from "./db";
@@ -1173,7 +1173,7 @@ async function executeRun(
     // than failing it: reconnecting the service is a repair the user can make.
     let connectorCapabilityId: number | null = null;
     if (isConnectorEffect(step.effect_kind)) {
-      const available = availableCapabilityForEffect(db, step.effect_kind);
+      const available = calendarCapabilityForEffect(db, step.effect_kind);
       if (!available) {
         pauseStepAndRun(
           db,
@@ -2610,7 +2610,7 @@ function assertAuthorizableEffects(db: Db, effects: readonly EffectKind[]): void
     if (effect === "purchase") {
       throw new Error("Zeus cannot be authorized to spend money");
     }
-    if (!isConnectorEffect(effect) || !availableCapabilityForEffect(db, effect)) {
+    if (!isConnectorEffect(effect) || !calendarCapabilityForEffect(db, effect)) {
       throw new Error(
         `Effect ${effect} is unavailable without a connected service that provides it`,
       );

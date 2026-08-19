@@ -2,7 +2,7 @@ import type { CalendarCoverage } from "./calendar-conflicts";
 import { endOf } from "./calendar-time";
 import type { CachedEvent } from "./calendar-time";
 import {
-  CAPABILITY_SLOTS,
+  CALENDAR_CAPABILITY_SLOTS,
   availableCapability,
   connectorAwaitingReachability,
   listConnectors,
@@ -191,7 +191,7 @@ function calendarConnectorExists(db: Db): boolean {
     (connector) =>
       connector.provider === "google_calendar" ||
       connector.capabilities.some((capability) =>
-        (CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
+        (CALENDAR_CAPABILITY_SLOTS as readonly string[]).includes(capability.slot),
       ),
   );
 }
