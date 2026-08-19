@@ -2183,6 +2183,63 @@ DROP TABLE connector_capability_email_legacy;
 CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
 `;
 
+/**
+ * The two external-data tables learn a second kind.
+ *
+ * Both CHECKs admitted exactly `'calendar_event'`, which was true while calendar was the only
+ * thing Zeus could read. Widened rather than replaced: a thread and an event are the same
+ * kind of thing to these tables — somebody else's text, cached with an expiry, unreachable
+ * from every evidence table — and giving email its own pair would mean two copies of the
+ * reconcile-and-prove logic that must not disagree.
+ *
+ * `starts_at` carries a thread's last activity. The column is calendar-named because
+ * calendar came first, and reusing it is deliberate: it is what
+ * `external_signal_window_idx (kind, starts_at)` indexes, and the window reconciliation is
+ * the same query for both kinds. `ends_at` and `location` stay null for a thread.
+ */
+const EMAIL_EXTERNAL_DATA = `
+ALTER TABLE external_signal RENAME TO external_signal_email_legacy;
+CREATE TABLE external_signal (
+  id            INTEGER PRIMARY KEY,
+  connector_id  INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('calendar_event','email_thread')),
+  external_id   TEXT NOT NULL,
+  starts_at     TEXT,
+  ends_at       TEXT,
+  location      TEXT,
+  payload_json  TEXT NOT NULL CHECK (json_valid(payload_json)),
+  fetched_at    TEXT NOT NULL,
+  expires_at    TEXT NOT NULL,
+  UNIQUE (connector_id, kind, external_id)
+);
+INSERT INTO external_signal
+  (id, connector_id, kind, external_id, starts_at, ends_at, location, payload_json,
+   fetched_at, expires_at)
+SELECT id, connector_id, kind, external_id, starts_at, ends_at, location, payload_json,
+       fetched_at, expires_at
+FROM external_signal_email_legacy;
+DROP TABLE external_signal_email_legacy;
+CREATE INDEX external_signal_window_idx ON external_signal(kind, starts_at);
+CREATE INDEX external_signal_expiry_idx ON external_signal(expires_at);
+
+ALTER TABLE external_read_window RENAME TO external_read_window_email_legacy;
+CREATE TABLE external_read_window (
+  id            INTEGER PRIMARY KEY,
+  connector_id  INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('calendar_event','email_thread')),
+  window_from   TEXT NOT NULL,
+  window_to     TEXT NOT NULL,
+  event_count   INTEGER NOT NULL CHECK (event_count >= 0),
+  fetched_at    TEXT NOT NULL,
+  UNIQUE (connector_id, kind)
+);
+INSERT INTO external_read_window
+  (id, connector_id, kind, window_from, window_to, event_count, fetched_at)
+SELECT id, connector_id, kind, window_from, window_to, event_count, fetched_at
+FROM external_read_window_email_legacy;
+DROP TABLE external_read_window_email_legacy;
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2224,4 +2281,5 @@ export const MIGRATIONS: readonly Migration[] = [
   // does not recognize the schema in front of it.
   { id: "032_calendar_unclassified_outcome", sql: CALENDAR_UNCLASSIFIED_OUTCOME },
   { id: "033_email_capability_slots", sql: EMAIL_CAPABILITY_SLOTS },
+  { id: "034_email_external_data", sql: EMAIL_EXTERNAL_DATA },
 ];
