@@ -36,7 +36,11 @@ export function inspectUntrustedWorkData(value: string): UntrustedWorkDataIssue 
     return "sensitive_data";
   }
   if (
-    /(?:ignore|disregard|override|forget)\s+(?:all\s+)?(?:previous|prior|system|developer)\s+(?:instructions?|messages?|rules?)/iu.test(value) ||
+    // The qualifier repeats: "prior developer messages" and "previous system rules" are the
+    // same instruction as "prior messages", and a single-qualifier pattern reads them as
+    // ordinary text. Each repetition must consume a literal plus whitespace, so widening it
+    // costs nothing in matching behavior beyond the phrasings it was already meant to catch.
+    /(?:ignore|disregard|override|forget)\s+(?:all\s+)?(?:(?:previous|prior|system|developer)\s+)+(?:instructions?|messages?|rules?)/iu.test(value) ||
     /(?:reveal|print|exfiltrate|send)\s+(?:the\s+)?(?:system prompt|developer message|api key|password|secret)/iu.test(value) ||
     /<\/?(?:system|developer|tool)>/iu.test(value) ||
     /\bsystem\s+(?:update|directive|notice)\s*:\s*[^\n]{0,200}\b(?:search|private context|hidden context|memory|verbatim)\b/iu.test(value) ||
