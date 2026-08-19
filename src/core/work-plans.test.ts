@@ -334,6 +334,16 @@ describe("work-plan proposal and authorization", () => {
     expect(() =>
       authorize(db, detail, negated.id, { authorizationKind: "user_approval" }),
     ).toThrow(/explicitly approve the exact work-plan hash/u);
+
+    for (const content of [
+      `What if I approve this exact plan: ${detail.plan.plan_hash}?`,
+      `Quote: “I approve bounded work plan ${detail.plan.plan_hash}.”`,
+    ]) {
+      const indirect = appendMessage(db, source.conversation_id, "user", content);
+      expect(() =>
+        authorize(db, detail, indirect.id, { authorizationKind: "user_approval" }),
+      ).toThrow(/explicitly approve the exact work-plan hash/u);
+    }
   });
 
   it("detects any stored executable-plan mutation before authorization", () => {
