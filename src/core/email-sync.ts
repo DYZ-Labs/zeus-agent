@@ -1,6 +1,10 @@
-import { availableCapability } from "./connectors";
+import {
+  availableCapability,
+  connectorAwaitingReachability,
+  listConnectors,
+} from "./connectors";
 import type { Db } from "./db";
-import { callCapability } from "./mcp-client";
+import { callCapability, restoreConnectorReachability } from "./mcp-client";
 import { errorSignature, logEvent } from "./observability";
 
 /**
@@ -110,6 +114,64 @@ export async function syncEmail(
     });
     return null;
   }
+}
+
+export type EmailCacheFreshness =
+  | "fresh"
+  | "synced"
+  | "restored_and_synced"
+  | "sync_failed"
+  | "unavailable"
+  | "no_connector";
+
+/**
+ * Make the inbox cache fresh enough for a chat turn to answer from, if it can.
+ *
+ * The calendar twin's contract, kept exactly: costs nothing when there is nothing to do,
+ * revives an unreachable connector at most once per TTL window, and **never throws**. A
+ * failure here degrades the turn to the last-known inbox with an honest as-of time; it must
+ * not replace the reply with an error. The turn awaits this alongside the calendar refresh
+ * under one deadline, and `Promise.all` rejects on the first rejection — so "never throws"
+ * is load-bearing for the calendar too, not just for this.
+ */
+export async function ensureFreshEmailCache(
+  db: Db,
+  options: { at?: Date; signal?: AbortSignal } = {},
+): Promise<EmailCacheFreshness> {
+  const at = options.at ?? new Date();
+  const coverage = readEmailCoverage(db);
+  if (coverage && at.getTime() - Date.parse(coverage.fetchedAt) <= CHAT_COVERAGE_TTL_MS) {
+    return "fresh";
+  }
+  let restored = false;
+  if (!availableCapability(db, "email.search_threads")) {
+    const awaiting = connectorAwaitingReachability(db, "email.search_threads");
+    if (!awaiting) return emailConnectorExists(db) ? "unavailable" : "no_connector";
+    if (at.getTime() - Date.parse(awaiting.updated_at) <= CHAT_COVERAGE_TTL_MS) {
+      return "unavailable";
+    }
+    restored = await restoreConnectorReachability(db, "email.search_threads", {
+      signal: options.signal,
+    });
+    if (!restored) return "unavailable";
+  }
+  const deadline = AbortSignal.timeout(CHAT_SYNC_TIMEOUT_MS);
+  const synced = await syncEmail(db, {
+    at,
+    signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
+  });
+  if (!synced) return "sync_failed";
+  return restored ? "restored_and_synced" : "synced";
+}
+
+/** Whether any inbox connector exists at all, usable or not. Mirrors the capability block. */
+function emailConnectorExists(db: Db): boolean {
+  return listConnectors(db).some((connector) =>
+    connector.capabilities.some(
+      (capability) =>
+        capability.slot === "email.search_threads" || capability.slot === "email.get_thread",
+    ),
+  );
 }
 
 /**
