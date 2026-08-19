@@ -6,8 +6,10 @@ import {
   cacheEmailThreads,
   cachedThreads,
   emailWindow,
+  getThreadArguments,
   lastKnownThreads,
   parseEmailThreads,
+  parseThreadMessages,
   provenWindow,
   readEmailCoverage,
   searchThreadArguments,
@@ -264,3 +266,50 @@ describe("the cache reflects the inbox, not the union of every read", () => {
     expect(lastKnownThreads(db).map((t) => t.id)).toEqual(["a"]);
   });
 });
+
+describe("reading one thread, on request", () => {
+  const SCHEMA_THREAD = JSON.stringify({
+    type: "object",
+    properties: { threadId: { type: "string" }, messageFormat: { type: "string" } },
+  });
+
+  it("pins how much comes back rather than accepting a default", () => {
+    // The server's default is FULL_CONTENT, which is what this call wants — but a default is
+    // not a decision, and this is the one parameter in Zeus that governs whether message
+    // bodies cross the wire.
+    expect(getThreadArguments(SCHEMA_THREAD, "t1")).toEqual({
+      threadId: "t1",
+      messageFormat: "FULL_CONTENT",
+    });
+  });
+
+  it("refuses to read at all when it can no longer choose how much it gets", () => {
+    const noFormat = JSON.stringify({ type: "object", properties: { threadId: {} } });
+    const noId = JSON.stringify({ type: "object", properties: { messageFormat: {} } });
+
+    expect(() => getThreadArguments(noFormat, "t1")).toThrow(/how much it returns/u);
+    expect(() => getThreadArguments(noId, "t1")).toThrow(/no thread identifier/u);
+    expect(() => getThreadArguments("{oops", "t1")).toThrow(/invalid input schema/u);
+  });
+
+  it("keeps the newest messages and bounds each body", () => {
+    const long = "x".repeat(5_000);
+    const messages = parseThreadMessages({
+      messages: Array.from({ length: 9 }, (_, index) => ({
+        subject: `Message ${index}`,
+        sender: "sarah@example.com",
+        date: `2026-08-1${index}T09:00:00.000Z`,
+        plaintextBody: index === 8 ? long : `body ${index}`,
+      })),
+    });
+
+    expect(messages).toHaveLength(6);
+    expect(messages.at(-1)?.subject).toBe("Message 8");
+    expect(messages.at(-1)?.body?.length).toBeLessThan(long.length);
+    expect(messages.at(-1)?.body?.endsWith("…")).toBe(true);
+  });
+
+  it("fails the read rather than reporting an unreadable answer as an empty thread", () => {
+    expect(() => parseThreadMessages({ not_messages: [] })).toThrow(/did not contain a message list/u);
+  });
+})

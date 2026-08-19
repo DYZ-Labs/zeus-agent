@@ -223,6 +223,133 @@ export function searchThreadArguments(
   return args;
 }
 
+/** The most messages a fetched thread will render, oldest first, newest kept. */
+const MAX_THREAD_MESSAGES = 6;
+
+/** Per-message body budget. A long thread is a summary problem, not a context problem. */
+const MAX_BODY_CHARS = 2_000;
+
+export type ThreadMessage = {
+  subject: string | null;
+  from: string | null;
+  sentAt: string | null;
+  body: string | null;
+};
+
+/**
+ * Build the arguments for one on-request thread read.
+ *
+ * `messageFormat` is **pinned**, and this is the one call in Zeus that deliberately asks for
+ * message bodies. The server's default happens to be `FULL_CONTENT`, which is what this wants
+ * — but relying on that would mean the most consequential parameter in the system was the one
+ * nobody chose. A contract that stops offering the field is a contract Zeus can no longer
+ * control the verbosity of, so it fails closed rather than sending the request blind.
+ */
+export function getThreadArguments(
+  inputSchemaJson: string,
+  threadId: string,
+): Record<string, unknown> {
+  let schema: unknown;
+  try {
+    schema = JSON.parse(inputSchemaJson) as unknown;
+  } catch {
+    throw new Error("Email thread tool has an invalid input schema");
+  }
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error("Email thread tool has an invalid input schema");
+  }
+  const properties = (schema as Record<string, unknown>).properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    throw new Error("Email thread tool has no reviewable input fields");
+  }
+  const fields = properties as Record<string, unknown>;
+  const idField = ["threadId", "thread_id", "id"].find((name) => Object.hasOwn(fields, name));
+  if (!idField) throw new Error("Email thread tool takes no thread identifier");
+  if (!Object.hasOwn(fields, "messageFormat")) {
+    throw new Error("Email thread tool no longer lets Zeus choose how much it returns");
+  }
+  return { [idField]: threadId, messageFormat: "FULL_CONTENT" };
+}
+
+/**
+ * Read one thread, on request.
+ *
+ * The only path in Zeus that holds a message body, and it holds it for exactly one turn:
+ * what comes back is rendered and discarded. Nothing here writes to `external_signal`, and
+ * there is no table a body could reach — a cached body would be somebody else's text sitting
+ * in a store, retrievable long after the moment that justified reading it.
+ *
+ * Returns null when no inbox is connected or the read fails, which the caller renders as an
+ * honest "could not open it" rather than as an empty thread.
+ */
+export async function fetchThread(
+  db: Db,
+  threadId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<ThreadMessage[] | null> {
+  const available = availableCapability(db, "email.get_thread");
+  if (!available) return null;
+  try {
+    const args = getThreadArguments(available.capability.input_schema_json, threadId);
+    const deadline = AbortSignal.timeout(CHAT_SYNC_TIMEOUT_MS);
+    const result = await callCapability(db, "email.get_thread", args, {
+      signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
+      capabilityId: available.capability.id,
+    });
+    if (result.isError) throw new Error("email_thread_tool_reported_error");
+    const messages = parseThreadMessages(result.value);
+    logEvent({
+      event: "email_thread_read",
+      outcome: "ok",
+      connector_id: available.connector.id,
+      count: messages.length,
+    });
+    return messages;
+  } catch (error) {
+    logEvent({
+      event: "email_thread_read",
+      outcome: "error",
+      connector_id: available.connector.id,
+      ...errorSignature(error),
+    });
+    return null;
+  }
+}
+
+/** The messages of one thread, newest last, bodies bounded. */
+export function parseThreadMessages(value: unknown): ThreadMessage[] {
+  const record =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  const list = Array.isArray(value)
+    ? value
+    : record && Array.isArray(record.messages)
+      ? (record.messages as unknown[])
+      : record && Array.isArray((record.thread as Record<string, unknown> | undefined)?.messages)
+        ? ((record.thread as Record<string, unknown>).messages as unknown[])
+        : null;
+  if (list === null) throw new Error("Thread response did not contain a message list");
+
+  const usable = list.filter(
+    (entry): entry is Record<string, unknown> =>
+      entry !== null && typeof entry === "object" && !Array.isArray(entry),
+  );
+  return usable.slice(-MAX_THREAD_MESSAGES).map((message) => ({
+    subject: firstString(message, ["subject", "title"]),
+    from: firstString(message, ["sender", "from", "fromAddress"]),
+    sentAt: firstString(message, ["date", "internalDate", "receivedAt"]),
+    body: bodyOf(message),
+  }));
+}
+
+/** Plain text where the server offers it. HTML is not un-marked-up here, it is skipped. */
+function bodyOf(message: Record<string, unknown>): string | null {
+  const plain = firstString(message, ["plaintextBody", "plainTextBody", "body", "text"]);
+  if (plain === null) return null;
+  return plain.length > MAX_BODY_CHARS ? `${plain.slice(0, MAX_BODY_CHARS)}…` : plain;
+}
+
 /**
  * Parse a response into the fields Zeus keeps, failing closed on anything unreadable.
  *
