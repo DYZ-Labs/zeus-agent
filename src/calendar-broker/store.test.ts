@@ -82,3 +82,33 @@ describe("encrypted Google Calendar grants", () => {
     expect(upgraded.scopes).toEqual(["scope:read", "scope:write"]);
   });
 });
+
+describe("encrypted Gmail grants", () => {
+  it("stores one separately encrypted grant per Zeus account", () => {
+    const accountId = randomUUID();
+    const otherAccountId = randomUUID();
+    const grant = store.upsertGmailGrant({
+      accountId,
+      refreshToken: "gmail-refresh-token-secret",
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
+    const raw = store.db.prepare("SELECT * FROM gmail_grant").get() as Record<string, unknown>;
+
+    expect(JSON.stringify(raw)).not.toContain("gmail-refresh-token-secret");
+    expect(store.getGmailGrant(grant.id, accountId)?.refreshToken).toBe(
+      "gmail-refresh-token-secret",
+    );
+    expect(store.getGmailGrant(grant.id, otherAccountId)).toBeNull();
+  });
+
+  it("consumes Gmail OAuth state exactly once", () => {
+    const at = new Date("2026-08-20T10:00:00.000Z");
+    const state = store.createGmailOAuthState({
+      accountId: randomUUID(),
+      returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
+    }, at);
+
+    expect(store.consumeGmailOAuthState(state, at)?.returnUrl).toContain("google-gmail");
+    expect(store.consumeGmailOAuthState(state, at)).toBeNull();
+  });
+});

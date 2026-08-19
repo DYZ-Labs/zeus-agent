@@ -26,6 +26,7 @@ import {
   connectorAwaitingReachability,
   connectorEnvironment,
   GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
+  GOOGLE_GMAIL_BROKER_SERVICE_KEY,
   getCapability,
   getConnector,
   recordConnectorVerification,
@@ -113,9 +114,12 @@ export async function probeConnectorPreset(
   if (!localConnectorPresetsAllowed(options.environment)) {
     throw new ConnectorError(
       "local_only",
-      "Guided Google Calendar connections are available only in local mode.",
+      `Guided ${preset.label} connections are available only in local mode.`,
     );
   }
+  const googleProduct = preset.label.startsWith("Google ")
+    ? preset.label.slice("Google ".length)
+    : preset.label;
   const uniqueSlots = [...new Set(slots)];
   if (uniqueSlots.length === 0 || uniqueSlots.some((slot) => !presetCapability(preset, slot))) {
     throw new ConnectorError(
@@ -145,7 +149,7 @@ export async function probeConnectorPreset(
       status === 401 || status === 403 ? "api_or_iam_missing" : "server_unreachable",
       status === 401 || status === 403
         ? "Google rejected this setup. Check the enabled APIs, project, and IAM roles."
-        : "Zeus could not reach Google's Calendar MCP server.",
+        : `Zeus could not reach Google's ${googleProduct} MCP server.`,
     );
   }
 }
@@ -163,6 +167,9 @@ export async function googleAdcHeaders(
     );
   }
   let scopes: string[];
+  const googleProduct = preset.label.startsWith("Google ")
+    ? preset.label.slice("Google ".length)
+    : preset.label;
   try {
     scopes = connectorPresetScopes(preset, slots);
   } catch {
@@ -178,6 +185,7 @@ export async function googleAdcHeaders(
       runner,
       ["config", "get-value", "project", "--quiet"],
       "project_missing",
+      googleProduct,
     )
   ).stdout.trim();
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u.test(project)) {
@@ -198,13 +206,14 @@ export async function googleAdcHeaders(
         `--scopes=${scopes.join(",")}`,
       ],
       tokenFailureCode,
+      googleProduct,
     )
   ).stdout.trim();
   if (token.length < 20 || token.length > MAX_GCLOUD_OUTPUT_BYTES || /\s/u.test(token)) {
     throw new ConnectorError(
       tokenFailureCode,
       tokenFailureCode === "scope_missing"
-        ? `Application Default Credentials do not include the selected ${preset.label} scopes.`
+          ? `Application Default Credentials do not include the selected ${googleProduct} scopes.`
         : "Application Default Credentials are missing or invalid.",
     );
   }
@@ -400,7 +409,11 @@ export async function callCapability(
     // The broker names its own failures, and only two of them mean the authorization is
     // gone. `refresh_unavailable` is Google declining to mint a token this minute; recording
     // it as a reconnection would tell the user to redo consent over a transient outage.
-    if (result.isError === true && bound.connector.provider === "google_calendar") {
+    if (
+      result.isError === true &&
+      (bound.connector.provider === "google_calendar" ||
+        bound.connector.provider === "google_gmail")
+    ) {
       const remote = /^([a-z_]{1,64}):/u.exec(text)?.[1] ?? null;
       if (remote === "reconnect_required" || remote === "refresh_revoked") {
         recordConnectorVerification(db, bound.connector.id, {
@@ -578,8 +591,8 @@ async function transportFor(
   return new StreamableHTTPClientTransport(new URL(connector.url), {
     requestInit: {
       headers:
-        connector.provider === "google_calendar"
-          ? googleCalendarBrokerHeaders(db, requestKey)
+        connector.provider === "google_calendar" || connector.provider === "google_gmail"
+          ? googleProviderBrokerHeaders(db, connector.provider, requestKey)
           : bearerHeaders(connector),
     },
   });
@@ -659,6 +672,7 @@ async function safeGoogleCloudCommand(
   runner: GoogleCloudCommandRunner,
   args: readonly string[],
   failureCode: "project_missing" | "adc_missing" | "scope_missing",
+  serviceLabel: string,
 ): Promise<GoogleCloudCommandResult> {
   try {
     const result = await runner(args);
@@ -675,9 +689,9 @@ async function safeGoogleCloudCommand(
     throw new ConnectorError(
       failureCode,
       failureCode === "project_missing"
-        ? "Set an active Google Cloud project before connecting Calendar."
+        ? `Set an active Google Cloud project before connecting ${serviceLabel}.`
         : failureCode === "scope_missing"
-          ? "Application Default Credentials do not include the selected Calendar scopes."
+          ? `Application Default Credentials do not include the selected ${serviceLabel} scopes.`
           : "Application Default Credentials are missing or invalid.",
     );
   }
@@ -721,22 +735,27 @@ function numericErrorStatus(error: unknown, depth = 0): number | null {
   return numericErrorStatus(record.cause, depth + 1);
 }
 
-function googleCalendarBrokerHeaders(
+function googleProviderBrokerHeaders(
   db: Db,
+  provider: "google_calendar" | "google_gmail",
   requestKey: string | undefined,
 ): Record<string, string> {
-  const serviceKey = process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY]?.trim();
+  const serviceKeyName = provider === "google_calendar"
+    ? GOOGLE_CALENDAR_BROKER_SERVICE_KEY
+    : GOOGLE_GMAIL_BROKER_SERVICE_KEY;
+  const label = provider === "google_calendar" ? "Google Calendar" : "Gmail";
+  const serviceKey = process.env[serviceKeyName]?.trim();
   const owner = getAppOwner(db);
   if (!serviceKey) {
     throw new ConnectorError(
       "missing_environment",
-      "The Google Calendar broker service key is not configured.",
+      `The ${label} broker service key is not configured.`,
     );
   }
   if (!owner) {
     throw new ConnectorError(
       "account_unbound",
-      "Google Calendar requires a verified hosted account.",
+      `${label} requires a verified hosted account.`,
     );
   }
   return {

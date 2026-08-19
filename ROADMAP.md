@@ -110,7 +110,7 @@ Small, independent changes that land before the capability, each its own PR:
   (`src/calendar-broker/google.ts`): when the target already holds the requested state,
   return it without patching — the analogue of `create_event`'s derived event id.
 
-### Gmail, local-first
+### Gmail, read-only first
 
 Google ships an official Gmail MCP server (`https://gmailmcp.googleapis.com/mcp/v1`,
 Developer Preview at the time of writing — re-verify tools and status at implementation).
@@ -118,14 +118,14 @@ Its read tools (`search_threads`, `get_thread`) cover this increment, and it exp
 send tool** — drafts are its only write, which happens to match Zeus's reversibility
 ladder exactly.
 
-`gmail.readonly` is a Google *restricted* scope. A hosted multi-account deployment would
-need app verification plus an annual CASA assessment before external users could consent.
-A local single-account connection through the user's own OAuth client needs neither — the
-exact Application Default Credentials pattern the calendar preset already uses
-(`src/core/connector-catalog.ts`). So: **local preset now; broker-served hosted Gmail
-deferred to Increment 2's go/no-go.** One caveat to document in the connect UI: an OAuth
-client left in "Testing" status expires refresh tokens after seven days — publish it or
-mark it Internal.
+`gmail.readonly` is a Google *restricted* scope. Local single-account connections use the
+user's own OAuth client through the Application Default Credentials pattern already used by
+Calendar (`src/core/connector-catalog.ts`). Hosted accounts use an independently keyed,
+per-user broker grant and a separate Gmail OAuth client; the broker exposes only
+`search_threads` and `get_thread` even though Google's preview server advertises write tools.
+External production users still require Google app verification plus a recurring security
+assessment. An OAuth client left in "Testing" status also expires refresh tokens after seven
+days — publish it or mark it Internal.
 
 ### The shape of the change
 
@@ -178,7 +178,8 @@ mark it Internal.
 
 The AGENTS.md §37 matrix per workflow (happy path, permission, missing context,
 conflicting data, tool failure, duplicate execution, injection, timezone), plus the
-real-account recipe: connect via ADC; ask for the inbox; send yourself an email titled
+real-account recipes: connect locally via ADC and through the hosted per-user broker; ask
+for the inbox; send yourself an email titled
 with an injection payload and watch it render withheld; kill the network and watch the
 inbox degrade honestly; `npm run check` green. Email rows exist only in `external_signal`
 and `inbox_context`, with no path into facts, candidates, or extraction — and no write
@@ -202,15 +203,14 @@ confirmation for a send has to read differently from the confirmation for a hold
   "is this slot free" for a message, so the calendar mode's ceiling-and-check reasoning
   does not transfer. A recipient allowlist is enforced deterministically at payload build
   and re-checked at execution.
-- **Served by the broker, not the official server** (which has no send tool): the calendar
-  broker generalizes into a Google broker — a Gmail API client, per-service grants
-  replacing the calendar-only single-grant shape in `src/calendar-broker/store.ts`, and
+- **Served by the broker, not the official server** (which has no send tool): extend the
+  existing read-only Gmail broker path with a Gmail API client, and add
   provider-side idempotency by deriving the RFC 5322 Message-ID from the request key, the
   send analogue of the derived event id.
 - Settlement generalizes: `settlePendingConfirmation` currently restores reachability for
   `calendar.list_events` by name; the slot derives from the pending effect's capability.
-- **Hosted Gmail is this increment's explicit go/no-go**: restricted-scope verification
-  and CASA are a funded decision, not a side effect.
+- **Public hosted Gmail remains an operational go/no-go**: the isolated OAuth path exists,
+  while restricted-scope verification and CASA remain a funded launch decision.
 
 ---
 
@@ -286,9 +286,10 @@ lands.
 
 ## Risks
 
-- **Gmail restricted scopes.** Local ADC with the user's own client avoids verification
-  entirely; the seven-day testing-status expiry is documented at connect; hosted CASA is
-  deferred to Increment 2's explicit gate.
+- **Gmail restricted scopes.** Local ADC with the user's own client avoids verification.
+  Hosted test users can use the isolated broker flow, but public external access still
+  depends on Google verification and recurring CASA; testing-status tokens expire after
+  seven days.
 - **Preview-status endpoint drift.** The official Gmail MCP server may change contracts;
   schema-hash drift detection already withdraws a capability safely, and argument
   builders fail closed on schemas they do not understand.

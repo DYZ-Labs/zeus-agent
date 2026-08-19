@@ -7,6 +7,13 @@ import { z } from "zod";
 
 import { calendarBrokerConfiguration, type CalendarBrokerConfiguration } from "./config";
 import {
+  createGoogleGmailMcpServer,
+  exchangeGmailCode,
+  GMAIL_READ_SCOPE,
+  gmailAuthorizationUrl,
+  revokeGmailGrant,
+} from "./gmail";
+import {
   CALENDAR_READ_SCOPE,
   CALENDAR_WRITE_SCOPE,
   exchangeGoogleCode,
@@ -18,6 +25,7 @@ import { createGoogleCalendarMcpServer } from "./mcp";
 import {
   envelopeTimes,
   signBrokerEnvelope,
+  verifyGmailOAuthRequest,
   verifyOAuthRequest,
 } from "./protocol";
 import { CalendarBrokerStore } from "./store";
@@ -38,6 +46,13 @@ export function createCalendarBrokerServer(
     redirectUri: configuration.googleRedirectUri,
   };
   const api = new GoogleCalendarApi(oauthConfiguration, fetcher);
+  const gmailOAuthConfiguration = configuration.gmail
+    ? {
+        clientId: configuration.gmail.clientId,
+        clientSecret: configuration.gmail.clientSecret,
+        redirectUri: configuration.gmail.redirectUri,
+      }
+    : null;
 
   return createServer(async (request, response) => {
     try {
@@ -61,6 +76,29 @@ export function createCalendarBrokerServer(
             state,
             permission: oauthRequest.permission,
           }),
+        );
+      }
+      if (request.method === "GET" && url.pathname === "/oauth/gmail/start") {
+        if (!configuration.gmail || !gmailOAuthConfiguration) {
+          return text(response, 503, "Gmail connections are not configured");
+        }
+        const envelope = url.searchParams.get("request") ?? "";
+        const oauthRequest = verifyGmailOAuthRequest(
+          envelope,
+          configuration.gmail.serviceKey,
+        );
+        assertReturnUrl(
+          oauthRequest.returnUrl,
+          configuration.zeusAppUrl,
+          "/api/integrations/google-gmail/callback",
+        );
+        const state = store.createGmailOAuthState({
+          accountId: oauthRequest.accountId,
+          returnUrl: oauthRequest.returnUrl,
+        });
+        return redirect(
+          response,
+          gmailAuthorizationUrl({ configuration: gmailOAuthConfiguration, state }),
         );
       }
       if (request.method === "GET" && url.pathname === "/oauth/google/callback") {
@@ -104,6 +142,49 @@ export function createCalendarBrokerServer(
           );
         }
       }
+      if (request.method === "GET" && url.pathname === "/oauth/gmail/callback") {
+        if (!configuration.gmail || !gmailOAuthConfiguration) {
+          return text(response, 503, "Gmail connections are not configured");
+        }
+        const state = store.consumeGmailOAuthState(url.searchParams.get("state") ?? "");
+        if (!state) return text(response, 400, "This Gmail connection attempt expired.");
+        if (url.searchParams.get("error")) {
+          return redirectWithError(response, state.returnUrl, "Gmail access was not granted.");
+        }
+        const code = url.searchParams.get("code");
+        if (!code) return redirectWithError(response, state.returnUrl, "Google returned no authorization code.");
+        try {
+          const token = await exchangeGmailCode(code, gmailOAuthConfiguration, fetcher);
+          if (!token.scopes.includes(GMAIL_READ_SCOPE)) {
+            return redirectWithError(
+              response,
+              state.returnUrl,
+              "Google did not grant read-only Gmail access.",
+            );
+          }
+          const grant = store.upsertGmailGrant({
+            accountId: state.accountId,
+            refreshToken: token.refreshToken,
+            scopes: token.scopes,
+          });
+          const result = signBrokerEnvelope({
+            kind: "google_gmail_oauth_result",
+            accountId: state.accountId,
+            connectionId: grant.id,
+            scopes: grant.scopes,
+            ...envelopeTimes(new Date(), 5 * 60),
+          }, configuration.gmail.serviceKey);
+          const returnUrl = new URL(state.returnUrl);
+          returnUrl.searchParams.set("result", result);
+          return redirect(response, returnUrl);
+        } catch {
+          return redirectWithError(
+            response,
+            state.returnUrl,
+            "Gmail could not be connected. Start a new attempt.",
+          );
+        }
+      }
       if (request.method === "POST" && url.pathname === "/connections/disconnect") {
         if (!authorized(request, configuration.serviceKey)) return text(response, 401, "Unauthorized");
         const parsed = DisconnectBody.safeParse(await readJson(request));
@@ -113,6 +194,50 @@ export function createCalendarBrokerServer(
         await revokeGoogleGrant(grant.refreshToken, fetcher);
         store.deleteGrant(grant.id, grant.accountId);
         return empty(response, 204);
+      }
+      if (request.method === "POST" && url.pathname === "/connections/gmail/disconnect") {
+        if (!configuration.gmail || !authorized(request, configuration.gmail.serviceKey)) {
+          return text(response, 401, "Unauthorized");
+        }
+        const parsed = DisconnectBody.safeParse(await readJson(request));
+        if (!parsed.success) return text(response, 400, "Invalid disconnect request");
+        const grant = store.getGmailGrant(parsed.data.connectionId, parsed.data.accountId);
+        if (!grant) return empty(response, 204);
+        await revokeGmailGrant(grant.refreshToken, fetcher);
+        store.deleteGmailGrant(grant.id, grant.accountId);
+        return empty(response, 204);
+      }
+
+      const gmailMcpMatch = /^\/gmail\/mcp\/([0-9a-f-]{36})$/iu.exec(url.pathname);
+      if (gmailMcpMatch) {
+        if (request.method !== "POST") return text(response, 405, "Method not allowed");
+        if (!configuration.gmail || !gmailOAuthConfiguration ||
+            !authorized(request, configuration.gmail.serviceKey)) {
+          return text(response, 401, "Unauthorized");
+        }
+        const accountId = request.headers["x-zeus-account-id"];
+        const connectionId = gmailMcpMatch[1];
+        if (typeof accountId !== "string" || !connectionId) return text(response, 401, "Unauthorized");
+        const grant = store.getGmailGrant(connectionId, accountId);
+        if (!grant) return text(response, 404, "Connection unavailable");
+        const body = await readJson(request);
+        const proxy = createGoogleGmailMcpServer({
+          grant,
+          store,
+          oauth: gmailOAuthConfiguration,
+          remoteMcpUrl: configuration.gmail.remoteMcpUrl,
+          fetcher,
+        });
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        try {
+          await proxy.server.connect(transport);
+          await transport.handleRequest(request, response, body);
+        } finally {
+          await transport.close().catch(() => undefined);
+          await proxy.server.close().catch(() => undefined);
+          await proxy.close();
+        }
+        return;
       }
 
       const mcpMatch = /^\/mcp\/([0-9a-f-]{36})$/iu.exec(url.pathname);
@@ -152,11 +277,15 @@ export function createCalendarBrokerServer(
   });
 }
 
-function assertReturnUrl(returnUrl: string, zeusAppUrl: string): void {
+function assertReturnUrl(
+  returnUrl: string,
+  zeusAppUrl: string,
+  pathname = "/api/integrations/google-calendar/callback",
+): void {
   const url = new URL(returnUrl);
   if (
     url.origin !== zeusAppUrl ||
-    url.pathname !== "/api/integrations/google-calendar/callback" ||
+    url.pathname !== pathname ||
     url.username ||
     url.password ||
     url.hash ||

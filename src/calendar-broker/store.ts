@@ -42,6 +42,27 @@ CREATE TABLE IF NOT EXISTS calendar_grant (
   updated_at                TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS calendar_grant_status_idx ON calendar_grant(status, id);
+
+CREATE TABLE IF NOT EXISTS gmail_oauth_state (
+  state_hash   TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL,
+  return_url   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gmail_oauth_state_expiry_idx ON gmail_oauth_state(expires_at);
+
+CREATE TABLE IF NOT EXISTS gmail_grant (
+  id                        TEXT PRIMARY KEY,
+  account_id                TEXT NOT NULL UNIQUE,
+  refresh_token_ciphertext  TEXT NOT NULL,
+  scopes_json               TEXT NOT NULL CHECK (json_valid(scopes_json)),
+  status                    TEXT NOT NULL DEFAULT 'active'
+                            CHECK (status IN ('active','reconnect_required')),
+  connected_at              TEXT NOT NULL,
+  updated_at                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gmail_grant_status_idx ON gmail_grant(status, id);
 `;
 
 export type OAuthState = {
@@ -52,6 +73,20 @@ export type OAuthState = {
 };
 
 export type CalendarGrant = {
+  id: string;
+  accountId: string;
+  refreshToken: string;
+  scopes: string[];
+  status: "active" | "reconnect_required";
+};
+
+export type GmailOAuthState = {
+  accountId: string;
+  returnUrl: string;
+  expiresAt: string;
+};
+
+export type GmailGrant = {
   id: string;
   accountId: string;
   refreshToken: string;
@@ -86,6 +121,9 @@ export class CalendarBrokerStore {
     this.db.exec(MIGRATION);
     this.db.prepare(
       "INSERT OR IGNORE INTO broker_migration (id, applied_at) VALUES ('001_init', ?)",
+    ).run(new Date().toISOString());
+    this.db.prepare(
+      "INSERT OR IGNORE INTO broker_migration (id, applied_at) VALUES ('002_gmail', ?)",
     ).run(new Date().toISOString());
     if (path !== ":memory:") {
       for (const suffix of ["", "-wal", "-shm"]) {
@@ -149,6 +187,44 @@ export class CalendarBrokerStore {
     }).immediate();
   }
 
+  createGmailOAuthState(
+    input: Omit<GmailOAuthState, "expiresAt">,
+    at: Date = new Date(),
+  ): string {
+    const state = randomBytes(32).toString("base64url");
+    const createdAt = at.toISOString();
+    const expiresAt = new Date(at.getTime() + OAUTH_STATE_TTL_MS).toISOString();
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM gmail_oauth_state WHERE expires_at <= ?").run(createdAt);
+      this.db.prepare(
+        `INSERT INTO gmail_oauth_state
+           (state_hash, account_id, return_url, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(stateHash(state), input.accountId, input.returnUrl, expiresAt, createdAt);
+    })();
+    return state;
+  }
+
+  consumeGmailOAuthState(state: string, at: Date = new Date()): GmailOAuthState | null {
+    return this.db.transaction((): GmailOAuthState | null => {
+      const row = this.db.prepare<
+        [string],
+        { account_id: string; return_url: string; expires_at: string }
+      >(
+        `SELECT account_id, return_url, expires_at
+         FROM gmail_oauth_state WHERE state_hash = ?`,
+      ).get(stateHash(state));
+      if (!row) return null;
+      this.db.prepare("DELETE FROM gmail_oauth_state WHERE state_hash = ?").run(stateHash(state));
+      if (row.expires_at <= at.toISOString()) return null;
+      return {
+        accountId: row.account_id,
+        returnUrl: row.return_url,
+        expiresAt: row.expires_at,
+      };
+    }).immediate();
+  }
+
   upsertGrant(input: {
     accountId: string;
     refreshToken: string | null;
@@ -203,6 +279,62 @@ export class CalendarBrokerStore {
     ).run(id, accountId).changes > 0;
   }
 
+  upsertGmailGrant(input: {
+    accountId: string;
+    refreshToken: string | null;
+    scopes: readonly string[];
+    at?: Date;
+  }): GmailGrant {
+    const at = input.at ?? new Date();
+    return this.db.transaction((): GmailGrant => {
+      const existing = this.gmailGrantRowForAccount(input.accountId);
+      const id = existing?.id ?? randomUUID();
+      const refreshToken = input.refreshToken ??
+        (existing
+          ? this.decrypt(existing.refresh_token_ciphertext, id, input.accountId, "gmail")
+          : null);
+      if (!refreshToken) {
+        throw new Error("Google did not return a Gmail refresh token; reconnect with consent");
+      }
+      const scopes = [...new Set(input.scopes)].sort();
+      const ciphertext = this.encrypt(refreshToken, id, input.accountId, "gmail");
+      const timestamp = at.toISOString();
+      this.db.prepare(
+        `INSERT INTO gmail_grant
+           (id, account_id, refresh_token_ciphertext, scopes_json, status,
+            connected_at, updated_at)
+         VALUES (?, ?, ?, ?, 'active', ?, ?)
+         ON CONFLICT(account_id) DO UPDATE SET
+           refresh_token_ciphertext = excluded.refresh_token_ciphertext,
+           scopes_json = excluded.scopes_json,
+           status = 'active',
+           updated_at = excluded.updated_at`,
+      ).run(id, input.accountId, ciphertext, JSON.stringify(scopes), timestamp, timestamp);
+      return this.requireGmailGrant(id, input.accountId);
+    }).immediate();
+  }
+
+  getGmailGrant(id: string, accountId: string): GmailGrant | null {
+    const row = this.db.prepare<[string, string], GrantRow>(
+      `SELECT id, account_id, refresh_token_ciphertext, scopes_json, status
+       FROM gmail_grant WHERE id = ? AND account_id = ?`,
+    ).get(id, accountId);
+    return row ? this.gmailGrant(row) : null;
+  }
+
+  markGmailReconnectRequired(id: string, accountId: string): void {
+    this.db.prepare(
+      `UPDATE gmail_grant SET status = 'reconnect_required', updated_at = ?
+       WHERE id = ? AND account_id = ?`,
+    ).run(new Date().toISOString(), id, accountId);
+  }
+
+  deleteGmailGrant(id: string, accountId: string): boolean {
+    return this.db.prepare(
+      "DELETE FROM gmail_grant WHERE id = ? AND account_id = ?",
+    ).run(id, accountId).changes > 0;
+  }
+
   close(): void {
     this.db.close();
     this.encryptionKey.fill(0);
@@ -214,10 +346,23 @@ export class CalendarBrokerStore {
     return grant;
   }
 
+  private requireGmailGrant(id: string, accountId: string): GmailGrant {
+    const grant = this.getGmailGrant(id, accountId);
+    if (!grant) throw new Error("Gmail grant vanished after write");
+    return grant;
+  }
+
   private grantRowForAccount(accountId: string): GrantRow | null {
     return this.db.prepare<[string], GrantRow>(
       `SELECT id, account_id, refresh_token_ciphertext, scopes_json, status
        FROM calendar_grant WHERE account_id = ?`,
+    ).get(accountId) ?? null;
+  }
+
+  private gmailGrantRowForAccount(accountId: string): GrantRow | null {
+    return this.db.prepare<[string], GrantRow>(
+      `SELECT id, account_id, refresh_token_ciphertext, scopes_json, status
+       FROM gmail_grant WHERE account_id = ?`,
     ).get(accountId) ?? null;
   }
 
@@ -236,16 +381,42 @@ export class CalendarBrokerStore {
     };
   }
 
-  private encrypt(value: string, grantId: string, accountId: string): string {
+  private gmailGrant(row: GrantRow): GmailGrant {
+    const parsedScopes = z.array(z.string()).max(32).parse(JSON.parse(row.scopes_json) as unknown);
+    return {
+      id: row.id,
+      accountId: row.account_id,
+      refreshToken: this.decrypt(
+        row.refresh_token_ciphertext,
+        row.id,
+        row.account_id,
+        "gmail",
+      ),
+      scopes: parsedScopes,
+      status: row.status,
+    };
+  }
+
+  private encrypt(
+    value: string,
+    grantId: string,
+    accountId: string,
+    provider: "calendar" | "gmail" = "calendar",
+  ): string {
     const iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", this.encryptionKey, iv);
-    cipher.setAAD(Buffer.from(`${grantId}:${accountId}`, "utf8"));
+    cipher.setAAD(Buffer.from(grantAad(provider, grantId, accountId), "utf8"));
     const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
     const tag = cipher.getAuthTag();
     return `v1.${iv.toString("base64url")}.${encrypted.toString("base64url")}.${tag.toString("base64url")}`;
   }
 
-  private decrypt(value: string, grantId: string, accountId: string): string {
+  private decrypt(
+    value: string,
+    grantId: string,
+    accountId: string,
+    provider: "calendar" | "gmail" = "calendar",
+  ): string {
     const [version, ivValue, encryptedValue, tagValue] = Ciphertext.parse(value).split(".");
     if (version !== "v1" || !ivValue || !encryptedValue || !tagValue) {
       throw new Error("Invalid encrypted Google Calendar token");
@@ -255,7 +426,7 @@ export class CalendarBrokerStore {
       this.encryptionKey,
       Buffer.from(ivValue, "base64url"),
     );
-    decipher.setAAD(Buffer.from(`${grantId}:${accountId}`, "utf8"));
+    decipher.setAAD(Buffer.from(grantAad(provider, grantId, accountId), "utf8"));
     decipher.setAuthTag(Buffer.from(tagValue, "base64url"));
     return Buffer.concat([
       decipher.update(Buffer.from(encryptedValue, "base64url")),
@@ -266,4 +437,16 @@ export class CalendarBrokerStore {
 
 function stateHash(state: string): string {
   return createHash("sha256").update(state).digest("hex");
+}
+
+function grantAad(
+  provider: "calendar" | "gmail",
+  grantId: string,
+  accountId: string,
+): string {
+  // Keep Calendar's original AAD byte-for-byte so grants encrypted before Gmail support
+  // remain readable. Gmail gets its own domain separator to prevent cross-table swapping.
+  return provider === "calendar"
+    ? `${grantId}:${accountId}`
+    : `gmail:${grantId}:${accountId}`;
 }

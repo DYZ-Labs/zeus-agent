@@ -282,6 +282,25 @@ describe("guided connector actions", () => {
     expect(listConversations(db)).toEqual([]);
   });
 
+  it("reports local Gmail setup failures as Gmail failures", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    actionMocks.probeConnectorPreset.mockRejectedValue(
+      new ConnectorError("adc_missing", "provider detail"),
+    );
+    const form = setupForm(["email.search_threads", "email.get_thread"]);
+    form.set("presetId", "gmail-official");
+
+    const state = await configureConnectorPresetAction(idleConnectorState(), form);
+
+    expect(state).toEqual({
+      status: "error",
+      code: "adc_missing",
+      message: "Create Application Default Credentials with the generated Gmail scopes.",
+    });
+    expect(getConnectorByPresetId(db, "gmail-official")).toBeNull();
+  });
+
   it("updates the full selected permission set with one additional source", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);

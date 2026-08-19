@@ -28,6 +28,13 @@ export type CalendarBrokerConfiguration = {
   googleClientId: string;
   googleClientSecret: string;
   googleRedirectUri: string;
+  gmail?: {
+    serviceKey: string;
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
+    remoteMcpUrl: string;
+  };
 };
 
 export function calendarBrokerConfiguration(
@@ -53,12 +60,47 @@ export function calendarBrokerConfiguration(
 
   const serviceKey = environment.GOOGLE_CALENDAR_BROKER_SERVICE_KEY?.trim() ?? "";
   assertServiceKey(serviceKey);
+  const googleClientId = z.string().trim().min(1).parse(
+    environment.GOOGLE_OAUTH_CLIENT_ID,
+  );
   const zeusAppUrl = ExactOrigin.parse(environment.ZEUS_APP_URL?.trim() ?? "").replace(/\/$/u, "");
   const googleRedirectUri = HttpsUrl.parse(
     environment.GOOGLE_OAUTH_REDIRECT_URI?.trim() ?? "",
   );
   if (new URL(googleRedirectUri).pathname !== "/oauth/google/callback") {
     throw new Error("GOOGLE_OAUTH_REDIRECT_URI must end at /oauth/google/callback");
+  }
+
+  const gmailValues = [
+    environment.GOOGLE_GMAIL_BROKER_SERVICE_KEY,
+    environment.GOOGLE_GMAIL_OAUTH_CLIENT_ID,
+    environment.GOOGLE_GMAIL_OAUTH_CLIENT_SECRET,
+    environment.GOOGLE_GMAIL_OAUTH_REDIRECT_URI,
+  ].map((value) => value?.trim() ?? "");
+  let gmail: CalendarBrokerConfiguration["gmail"];
+  if (gmailValues.some(Boolean)) {
+    const gmailServiceKey = gmailValues[0] ?? "";
+    const gmailClientId = gmailValues[1] ?? "";
+    const gmailClientSecret = gmailValues[2] ?? "";
+    const gmailRedirectValue = gmailValues[3] ?? "";
+    assertServiceKey(gmailServiceKey);
+    if (gmailServiceKey === serviceKey) {
+      throw new Error("Gmail and Calendar broker service keys must be different");
+    }
+    if (gmailClientId === googleClientId) {
+      throw new Error("Gmail and Calendar OAuth clients must be different");
+    }
+    const gmailRedirectUri = HttpsUrl.parse(gmailRedirectValue);
+    if (new URL(gmailRedirectUri).pathname !== "/oauth/gmail/callback") {
+      throw new Error("GOOGLE_GMAIL_OAUTH_REDIRECT_URI must end at /oauth/gmail/callback");
+    }
+    gmail = {
+      serviceKey: gmailServiceKey,
+      clientId: z.string().trim().min(1).parse(gmailClientId),
+      clientSecret: z.string().trim().min(1).parse(gmailClientSecret),
+      redirectUri: gmailRedirectUri,
+      remoteMcpUrl: "https://gmailmcp.googleapis.com/mcp/v1",
+    };
   }
 
   return {
@@ -68,8 +110,9 @@ export function calendarBrokerConfiguration(
     encryptionKey,
     serviceKey,
     zeusAppUrl,
-    googleClientId: z.string().trim().min(1).parse(environment.GOOGLE_OAUTH_CLIENT_ID),
+    googleClientId,
     googleClientSecret: z.string().trim().min(1).parse(environment.GOOGLE_OAUTH_CLIENT_SECRET),
     googleRedirectUri,
+    ...(gmail ? { gmail } : {}),
   };
 }

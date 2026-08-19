@@ -10,17 +10,22 @@ import {
   bindCapability,
   configureConnectorPreset,
   configureGoogleCalendarCapabilities,
+  configureGoogleGmailCapabilities,
   connectorAwaitingReachability,
   connectorEnvironment,
   createConnector,
   deleteConnector,
   deleteGoogleCalendarConnector,
+  deleteGoogleGmailConnector,
   GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
   GOOGLE_CALENDAR_READ_SCOPE,
   GOOGLE_CALENDAR_WRITE_SCOPE,
+  GOOGLE_GMAIL_BROKER_SERVICE_KEY,
+  GOOGLE_GMAIL_READ_SCOPE,
   getConnector,
   getConnectorByPresetId,
   getGoogleCalendarConnector,
+  getGoogleGmailConnector,
   listConnectors,
   recordConnectorVerification,
   restoreConnectorAfterReachability,
@@ -28,11 +33,12 @@ import {
   setConnectorEnabled,
   toolSchemaHash,
   upsertGoogleCalendarConnector,
+  upsertGoogleGmailConnector,
 } from "./connectors";
 import { calendarCapabilityState } from "./capabilities";
 import { GOOGLE_CALENDAR_MCP_URL } from "./connector-catalog";
 import { appendMessage, createConversation } from "./conversations";
-import { type Db, openTestDb } from "./db";
+import { type Db, migrate, openTestDb } from "./db";
 import { MIGRATIONS } from "./migrations";
 import { bindAppOwner } from "./owner";
 import type { CapabilitySlot, WorkPlanProposal } from "./schema";
@@ -101,9 +107,14 @@ describe("connectors hold configuration, never credentials", () => {
   });
 
   it("reserves the broker service key from user-configured connectors", () => {
-    expect(() =>
-      stdioConnector({ envVarNames: [GOOGLE_CALENDAR_BROKER_SERVICE_KEY] }),
-    ).toThrow(/reserved for a system-managed provider/u);
+    for (const name of [
+      GOOGLE_CALENDAR_BROKER_SERVICE_KEY,
+      GOOGLE_GMAIL_BROKER_SERVICE_KEY,
+    ]) {
+      expect(() => stdioConnector({ envVarNames: [name] })).toThrow(
+        /reserved for a system-managed provider/u,
+      );
+    }
   });
 
   it("lets a connector borrow the environment only where it belongs to the user", () => {
@@ -609,6 +620,101 @@ describe("the first-party Google Calendar provider", () => {
       delete process.env.NEXT_PUBLIC_SUPABASE_URL;
       delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
     }
+  });
+});
+
+describe("the first-party Gmail provider", () => {
+  it("widens the provider check without losing existing connectors or capabilities", () => {
+    const migrationIndex = MIGRATIONS.findIndex(
+      (migration) => migration.id === "037_google_gmail_provider",
+    );
+    const legacy = new Database(":memory:");
+    legacy.pragma("foreign_keys = ON");
+    migrate(legacy, MIGRATIONS.slice(0, migrationIndex));
+    const conversation = createConversation(legacy, { title: "Legacy", source: "web" });
+    const source = appendMessage(legacy, conversation.id, "user", "Connect a service", {
+      origin: "user_action",
+      recallState: "blocked",
+    });
+    const connector = createConnector(legacy, {
+      label: "Legacy notes",
+      transport: "http",
+      url: "https://notes.example.test/mcp",
+      sourceMessageId: source.id,
+    });
+    recordConnectorVerification(legacy, connector.id, {
+      status: "ready",
+      tools: [tool("search", true)],
+    });
+    bindCapability(legacy, {
+      connectorId: connector.id,
+      slot: "email.search_threads",
+      remoteToolName: "search",
+      inputSchema: {},
+      sourceMessageId: source.id,
+    });
+
+    migrate(legacy, MIGRATIONS);
+
+    expect(getConnector(legacy, connector.id)).toMatchObject({ provider: "generic" });
+    expect(getConnector(legacy, connector.id)?.capabilities).toHaveLength(1);
+    expect(legacy.pragma("foreign_key_check")).toEqual([]);
+    legacy.close();
+  });
+
+  it("stores only an opaque account-bound grant and enables the two read slots", () => {
+    process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = "g".repeat(40);
+    try {
+      bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
+      const connectionId = randomUUID();
+      const connector = upsertGoogleGmailConnector(db, {
+        connectionId,
+        mcpUrl: `https://mail.zeusagent.dev/gmail/mcp/${connectionId}`,
+        sourceMessageId: userMessageId,
+      });
+      const tools = [tool("search_threads", true), tool("get_thread", true)];
+      recordConnectorVerification(db, connector.id, { status: "ready", tools });
+      const configured = configureGoogleGmailCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_GMAIL_READ_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+
+      expect(configured).toMatchObject({
+        provider: "google_gmail",
+        provider_connection_id: connectionId,
+        envVarNames: [],
+      });
+      expect(configured.capabilities.map((entry) => entry.slot).sort()).toEqual([
+        "email.get_thread",
+        "email.search_threads",
+      ]);
+      expect(JSON.stringify(
+        db.prepare("SELECT * FROM connector WHERE id = ?").get(connector.id),
+      )).not.toContain("g".repeat(40));
+    } finally {
+      delete process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("cannot be rebound or removed through generic connector actions", () => {
+    const connector = upsertGoogleGmailConnector(db, {
+      connectionId: randomUUID(),
+      mcpUrl: "https://mail.zeusagent.dev/gmail/mcp/connection",
+      sourceMessageId: userMessageId,
+    });
+
+    expect(() => bindCapability(db, {
+      connectorId: connector.id,
+      slot: "email.search_threads",
+      remoteToolName: "create_draft",
+      inputSchema: {},
+      sourceMessageId: userMessageId,
+    })).toThrow(/verified OAuth grant/u);
+    expect(deleteConnector(db, connector.id)).toBe(false);
+    expect(getGoogleGmailConnector(db)?.id).toBe(connector.id);
+    expect(deleteGoogleGmailConnector(db, connector.id)).toBe(true);
   });
 });
 

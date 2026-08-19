@@ -27,6 +27,7 @@ import {
 } from "@/core/stewardship";
 import { getOwnerAccess, type OwnerAccess } from "@/server/auth/access";
 import { getGoogleCalendarIntegrationConfiguration } from "@/server/google-calendar/config";
+import { getGoogleGmailIntegrationConfiguration } from "@/server/google-gmail/config";
 
 export const dynamic = "force-dynamic";
 
@@ -39,6 +40,7 @@ export default async function SettingsPage({
   const resolvedSearchParams = await searchParams;
   const connectorError = resolvedSearchParams.connector_error;
   const googleCalendarConfiguration = getGoogleCalendarIntegrationConfiguration();
+  const googleGmailConfiguration = getGoogleGmailIntegrationConfiguration();
   const privateSettings = access.canAccessPrivateData
     ? {
         setting: getStewardshipSetting(access.db),
@@ -76,6 +78,7 @@ export default async function SettingsPage({
             errorMessage={typeof connectorError === "string" ? connectorError : null}
             localMode={access.state === "local"}
             googleCalendarAvailable={googleCalendarConfiguration.state === "ready"}
+            googleGmailAvailable={googleGmailConfiguration.state === "ready"}
             hostedAccount={access.state === "authorized"}
           />
         ) : (

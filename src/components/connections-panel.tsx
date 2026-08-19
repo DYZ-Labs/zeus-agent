@@ -16,19 +16,22 @@ export function ConnectionsPanel({
   errorMessage,
   localMode,
   googleCalendarAvailable,
+  googleGmailAvailable,
   hostedAccount,
 }: {
   connectors: ConnectorView[];
   errorMessage: string | null;
   localMode: boolean;
   googleCalendarAvailable: boolean;
+  googleGmailAvailable: boolean;
   hostedAccount: boolean;
 }) {
   const googleCalendar = localMode
     ? connectors.find((connector) => connector.preset_id === GOOGLE_CALENDAR_PRESET_ID) ?? null
     : connectors.find((connector) => connector.provider === "google_calendar") ?? null;
-  const gmail =
-    connectors.find((connector) => connector.preset_id === GMAIL_PRESET_ID) ?? null;
+  const gmail = localMode
+    ? connectors.find((connector) => connector.preset_id === GMAIL_PRESET_ID) ?? null
+    : connectors.find((connector) => connector.provider === "google_gmail") ?? null;
 
   return (
     <section className="px-5 py-5 sm:px-6 sm:py-6">
@@ -57,19 +60,14 @@ export function ConnectionsPanel({
         available={localMode || (hostedAccount && googleCalendarAvailable)}
       />
 
-      {/*
-        Gmail is local-only: `gmail.readonly` is a Google restricted scope, so a hosted
-        multi-account deployment would need app verification and an annual security
-        assessment before anyone but the operator could consent. No hosted path, and
-        `available` follows local mode alone.
-      */}
       <PresetConnection
         preset={GMAIL_PRESET}
         icon={<MailIcon />}
         defaultSlots={["email.search_threads", "email.get_thread"]}
+        hostedStartHref="/api/integrations/google-gmail/start"
         connector={gmail}
         localMode={localMode}
-        available={localMode}
+        available={localMode || (hostedAccount && googleGmailAvailable)}
       />
     </section>
   );
