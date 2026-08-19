@@ -151,7 +151,8 @@ export async function probeConnectorPreset(
 }
 
 /** Resolve the two non-secret Google headers without retaining either beyond the caller. */
-export async function googleCalendarAdcHeaders(
+export async function googleAdcHeaders(
+  preset: ConnectorPreset,
   slots: readonly CapabilitySlot[],
   options: Omit<PresetClientOptions, "signal"> = {},
 ): Promise<Record<string, string>> {
@@ -161,13 +162,14 @@ export async function googleCalendarAdcHeaders(
       "Process-wide Google credentials are disabled outside local mode.",
     );
   }
-  const preset = getConnectorPreset("google-calendar-official");
-  if (!preset) throw new ConnectorError("invalid_preset", "Google Calendar is unavailable.");
   let scopes: string[];
   try {
     scopes = connectorPresetScopes(preset, slots);
   } catch {
-    throw new ConnectorError("invalid_permissions", "Those Calendar permissions are invalid.");
+    throw new ConnectorError(
+      "invalid_permissions",
+      `Those ${preset.label} permissions are invalid.`,
+    );
   }
 
   const runner = options.commandRunner ?? runGoogleCloudCommand;
@@ -181,7 +183,7 @@ export async function googleCalendarAdcHeaders(
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/u.test(project)) {
     throw new ConnectorError(
       "project_missing",
-      "Set an active Google Cloud project before connecting Calendar.",
+      `Set an active Google Cloud project before connecting ${preset.label}.`,
     );
   }
 
@@ -202,7 +204,7 @@ export async function googleCalendarAdcHeaders(
     throw new ConnectorError(
       tokenFailureCode,
       tokenFailureCode === "scope_missing"
-        ? "Application Default Credentials do not include the selected Calendar scopes."
+        ? `Application Default Credentials do not include the selected ${preset.label} scopes.`
         : "Application Default Credentials are missing or invalid.",
     );
   }
@@ -239,9 +241,15 @@ export async function verifyConnector(
   }
 
   try {
-    const slots = connector.capabilities.length > 0
+    // Slots decide which ADC scopes a preset handshake asks for. A connector with nothing
+    // bound yet has none, so fall back to what its own preset can fill — Calendar's slots
+    // for Calendar, Gmail's for Gmail. The literal `calendar.list_events` that used to sit
+    // here would have made a Gmail handshake request Calendar scopes and no Gmail scope at
+    // all.
+    const preset = connector.preset_id ? getConnectorPreset(connector.preset_id) : null;
+    const slots: readonly CapabilitySlot[] = connector.capabilities.length > 0
       ? connector.capabilities.map((capability) => capability.slot)
-      : (["calendar.list_events"] as const);
+      : preset?.capabilities.map((capability) => capability.slot) ?? [];
     const tools = await withClient(
       db,
       connector,
@@ -374,7 +382,7 @@ export async function callCapability(
             disableDriftedCapability(db, bound, live ? "schema_changed" : "tool_missing");
             throw new ConnectorError(
               "tool_contract_changed",
-              "Google changed the reviewed Calendar tool contract. Zeus disabled this permission before dispatch.",
+              `Google changed the reviewed ${preset.label} tool contract. Zeus disabled this permission before dispatch.`,
             );
           }
         }
@@ -585,7 +593,7 @@ async function presetTransport(
   if (preset.authentication !== "google_adc") {
     throw new ConnectorError("invalid_preset", "That preset authentication is unsupported.");
   }
-  const headers = await googleCalendarAdcHeaders(slots, options);
+  const headers = await googleAdcHeaders(preset, slots, options);
   return new StreamableHTTPClientTransport(new URL(preset.url), {
     requestInit: { headers },
   });

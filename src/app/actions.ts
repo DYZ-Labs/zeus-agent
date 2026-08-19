@@ -33,7 +33,7 @@ import {
   setCapabilityEnabled,
   setConnectorEnabled,
 } from "@/core/connectors";
-import { GOOGLE_CALENDAR_PRESET_ID } from "@/core/connector-catalog";
+import { getConnectorPreset, presetCapability } from "@/core/connector-catalog";
 import { getSignal } from "@/core/detectors";
 import {
   confirmEffect,
@@ -873,13 +873,20 @@ export async function configureConnectorPresetAction(
   const selectedSlots = [...new Set(rawSlots)] as (typeof CAPABILITY_SLOTS)[number][];
   const expectedIdText = String(formData.get("connectorId") ?? "").trim();
   const expectedConnectorId = expectedIdText ? Number(expectedIdText) : undefined;
-  if (
-    presetId !== GOOGLE_CALENDAR_PRESET_ID ||
-    (expectedConnectorId !== undefined && !Number.isInteger(expectedConnectorId))
-  ) {
-    return connectorSetupError(
-      presetId === GOOGLE_CALENDAR_PRESET_ID ? "invalid_request" : "invalid_preset",
-    );
+  // The browser submits a preset id and slot names; everything else — endpoint, remote tool
+  // names, scopes — is resolved again from the trusted catalog. Presets are looked up rather
+  // than compared against one literal, so adding Gmail did not mean adding a second branch
+  // here that could drift from the first.
+  const preset = getConnectorPreset(presetId);
+  if (!preset) return connectorSetupError("invalid_preset");
+  if (expectedConnectorId !== undefined && !Number.isInteger(expectedConnectorId)) {
+    return connectorSetupError("invalid_request");
+  }
+  // A slot this preset cannot fill is not a permission it can be granted, whatever the form
+  // said. `connectorPresetScopes` would throw on it later; refusing here keeps the failure a
+  // form error rather than an exception.
+  if (selectedSlots.some((slot) => !presetCapability(preset, slot))) {
+    return connectorSetupError("invalid_permissions");
   }
 
   const access = await getOwnerAccess();
@@ -911,8 +918,8 @@ export async function configureConnectorPresetAction(
       const source = curationMessage(
         db,
         existing
-          ? `Set Google Calendar permissions to: ${decision}.`
-          : `Connect Google Calendar with permissions: ${decision}.`,
+          ? `Set ${preset.label} permissions to: ${decision}.`
+          : `Connect ${preset.label} with permissions: ${decision}.`,
       );
       configureConnectorPreset(db, {
         presetId,
@@ -932,8 +939,8 @@ export async function configureConnectorPresetAction(
     status: "success",
     code: existing ? "updated" : "connected",
     message: existing
-      ? "Google Calendar permissions were updated."
-      : "Google Calendar is connected.",
+      ? `${preset.label} permissions were updated.`
+      : `${preset.label} is connected.`,
   };
 }
 

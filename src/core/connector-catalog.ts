@@ -72,7 +72,54 @@ export const GOOGLE_CALENDAR_PRESET = {
   ],
 } as const satisfies ConnectorPreset;
 
-export const CONNECTOR_PRESETS = [GOOGLE_CALENDAR_PRESET] as const;
+export const GMAIL_PRESET_ID = "gmail-official";
+
+export const GMAIL_MCP_URL = "https://gmailmcp.googleapis.com/mcp/v1";
+
+export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+
+/**
+ * Gmail, read-only.
+ *
+ * `gmail.readonly` alone, verified against the live server on 2026-08-20: Google's setup
+ * guide says to add `gmail.compose` as well, but that is a basic-setup instruction and not a
+ * handshake requirement — a readonly-only token connects and lists tools. Declaring the
+ * narrower scope is the whole point, so it is worth stating that it was tested rather than
+ * assumed.
+ *
+ * Two read capabilities and no write, deliberately. The server itself offers twenty-one
+ * tools, including trashing threads and marking spam — ten more than its documentation lists,
+ * and every one of them reachable in the tool list a readonly token gets back. None of that
+ * matters here only because a preset capability is bound by Zeus's own catalog: a tool this
+ * file does not name cannot be called, whatever the server advertises.
+ */
+export const GMAIL_PRESET = {
+  id: GMAIL_PRESET_ID,
+  label: "Gmail",
+  description:
+    "Read your inbox through Google's official MCP server. Read-only: Zeus cannot send, draft, label, or delete anything.",
+  badge: "Developer Preview",
+  transport: "http",
+  url: GMAIL_MCP_URL,
+  documentationUrl: "https://developers.google.com/workspace/gmail/api/reference/mcp",
+  setupUrl: "https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server",
+  localOnly: true,
+  authentication: "google_adc",
+  capabilities: [
+    {
+      slot: "email.search_threads",
+      remoteToolName: "search_threads",
+      scopes: [GMAIL_READ_SCOPE],
+    },
+    {
+      slot: "email.get_thread",
+      remoteToolName: "get_thread",
+      scopes: [GMAIL_READ_SCOPE],
+    },
+  ],
+} as const satisfies ConnectorPreset;
+
+export const CONNECTOR_PRESETS = [GOOGLE_CALENDAR_PRESET, GMAIL_PRESET] as const;
 
 export function getConnectorPreset(id: string): ConnectorPreset | null {
   return CONNECTOR_PRESETS.find((preset) => preset.id === id) ?? null;
@@ -99,10 +146,11 @@ export function connectorPresetScopes(
   return [...scopes];
 }
 
-export function googleCalendarAdcLoginCommand(
+export function googleAdcLoginCommand(
+  preset: ConnectorPreset,
   slots: readonly CapabilitySlot[],
 ): string {
-  const scopes = connectorPresetScopes(GOOGLE_CALENDAR_PRESET, slots);
+  const scopes = connectorPresetScopes(preset, slots);
   return (
     "gcloud auth application-default login " +
     "--client-id-file=/path/to/client_secret.json " +
