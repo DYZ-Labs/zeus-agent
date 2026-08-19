@@ -2074,6 +2074,37 @@ CREATE TABLE schedule_context (
 );
 `;
 
+/**
+ * Proactivity becomes opt-in, in the schema rather than in a prompt.
+ *
+ * Migration 013 widened the mode to include `off` but left the default at `balanced`, so
+ * every account ever created has volunteered follow-through in ordinary chat without anyone
+ * choosing it. The product documents say the opposite. SQLite cannot alter a DEFAULT in
+ * place, so the table is rebuilt on the same rename→create→copy→drop path 013 itself used.
+ *
+ * The update moves only rows nobody chose. `source_message_id` is exactly that evidence: it
+ * is the user message that set the mode, and `setStewardshipMode` records it on every
+ * deliberate change. A row with one is a decision and is left alone — including a decision
+ * to be `balanced`.
+ */
+const PROACTIVITY_OPT_IN = `
+ALTER TABLE stewardship_setting RENAME TO stewardship_setting_default_legacy;
+CREATE TABLE stewardship_setting (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  mode               TEXT NOT NULL DEFAULT 'off'
+                     CHECK (mode IN ('off','quiet','balanced','proactive')),
+  source_message_id  INTEGER REFERENCES message(id) ON DELETE SET NULL,
+  updated_at         TEXT NOT NULL
+);
+INSERT INTO stewardship_setting (id, mode, source_message_id, updated_at)
+SELECT id, mode, source_message_id, updated_at FROM stewardship_setting_default_legacy;
+DROP TABLE stewardship_setting_default_legacy;
+
+UPDATE stewardship_setting
+SET mode = 'off', updated_at = ${NOW}
+WHERE source_message_id IS NULL AND mode = 'balanced';
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2108,4 +2139,5 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   { id: "029_schedule_turn_context", sql: SCHEDULE_TURN_CONTEXT },
   { id: "030_calendar_clear_outcome_kind", sql: CALENDAR_CLEAR_OUTCOME_KIND },
+  { id: "031_proactivity_opt_in", sql: PROACTIVITY_OPT_IN },
 ];
