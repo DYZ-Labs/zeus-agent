@@ -208,6 +208,21 @@ export class GoogleCalendarApi {
     if (Object.keys(patch).length === 0) {
       throw new GoogleCalendarError("empty_update", "A calendar update needs a changed field");
     }
+    // Read before write. `createEvent` survives a replay because the derived id makes the
+    // second attempt a conflict Google itself catches; an update has no such handle, so it
+    // asks what the event already says. This matters beyond wasted calls: Google notifies
+    // attendees on every update, so a re-sent confirmation is visible to other people.
+    //
+    // It can only ever remove a redundant write. A read that fails, a body that will not
+    // parse, or a field that cannot be compared with confidence all fall through to the
+    // PATCH — the same behavior as before this existed.
+    let current: z.infer<typeof GoogleEvent> | null = null;
+    try {
+      current = GoogleEvent.parse(await this.authorizedJson(grant, url, { method: "GET" }));
+    } catch {
+      current = null;
+    }
+    if (current && patchAlreadyHolds(patch, current)) return eventResult(current);
     const body = await this.authorizedJson(grant, url, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -300,6 +315,59 @@ function eventBody(input: CalendarEventInput): Record<string, unknown> {
       ? {}
       : { attendees: input.attendees.map((email) => ({ email })) }),
   };
+}
+
+/**
+ * Does the event already say everything this patch would say?
+ *
+ * Every field must be one that can be compared *and* already match. An unrecognized field
+ * answers no, so adding one to `updateEvent` without teaching this function about it makes
+ * updates redundant rather than wrong — the safe direction to fail, since a needless PATCH
+ * costs a notification and a skipped one loses a change the user asked for.
+ */
+function patchAlreadyHolds(
+  patch: Record<string, unknown>,
+  current: z.infer<typeof GoogleEvent>,
+): boolean {
+  return Object.entries(patch).every(([field, value]) => {
+    switch (field) {
+      case "summary":
+      case "description":
+      case "location":
+      case "status": {
+        const held = (current as Record<string, unknown>)[field];
+        return typeof held === "string" && held === value;
+      }
+      case "start":
+      case "end":
+        return timeAlreadyHolds(value, (current as Record<string, unknown>)[field]);
+      default:
+        // `attendees` lands here on purpose. Google returns an unordered list of objects it
+        // has annotated with response status and self flags, and matching that against a
+        // list of addresses means guessing at which differences are real.
+        return false;
+    }
+  });
+}
+
+function timeAlreadyHolds(requested: unknown, held: unknown): boolean {
+  if (!isRecord(requested) || !isRecord(held)) return false;
+  // An all-day date is already canonical, so it compares as written. A mismatch of kind —
+  // an all-day request against a timed event, or the reverse — is a real change.
+  if (typeof requested.date === "string") return held.date === requested.date;
+  if (typeof requested.dateTime !== "string" || typeof held.dateTime !== "string") return false;
+  // Google echoes an offset-bearing dateTime whatever form the request used, so the same
+  // instant is routinely a different string. Compare instants, not spellings.
+  const wanted = Date.parse(requested.dateTime);
+  const holding = Date.parse(held.dateTime);
+  if (!Number.isFinite(wanted) || !Number.isFinite(holding) || wanted !== holding) return false;
+  // Same instant under a different zone label is still a change to the event, so a request
+  // that named a zone has to find that zone already set.
+  return typeof requested.timeZone !== "string" || held.timeZone === requested.timeZone;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function eventTime(value: string, timeZone?: string): Record<string, string> {
