@@ -1187,7 +1187,13 @@ export type CalendarOutcomeChange = z.infer<typeof CalendarOutcomeChange>;
 
 export const CalendarOutcome = z
   .object({
-    kind: z.enum(["create", "reschedule", "cancel", "clear", "read"]),
+    /**
+     * `unclassified` is the kind for a request whose intent was never established — the
+     * classifier was unavailable. Every other kind presumes recognition succeeded, so
+     * filing one of those would misreport what happened to the only record a later turn
+     * can read.
+     */
+    kind: z.enum(["create", "reschedule", "cancel", "clear", "read", "unclassified"]),
     status: z.enum([
       "done",
       "awaiting_confirmation",
