@@ -38,7 +38,7 @@ import {
   responseSelectionsForResponse,
 } from "./response-context";
 import type { ExtractedFact, Extraction } from "./schema";
-import { recommendNextAction } from "./stewardship";
+import { recommendNextAction, setStewardshipMode } from "./stewardship";
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -255,6 +255,9 @@ describe("goals, commitments, and nudges", () => {
     const db = openTestDb();
     const conversation = createConversation(db);
     const source = appendMessage(db, conversation.id, "user", "I need to send the deck.");
+    // Ranking and cooldown are what this test is about, and neither runs unless the user
+    // opted into unsolicited surfacing. The `today` trigger below is explicit either way.
+    setStewardshipMode(db, "balanced", source.id);
     const commitment = createCommitment(db, {
       title: "Send the launch deck",
       dueAt: "2020-01-01",

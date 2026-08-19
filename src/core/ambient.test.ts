@@ -40,6 +40,7 @@ import {
   listFollowThroughEvents,
   listOpportunityDeliveries,
   markOpportunityDelivered,
+  setStewardshipMode,
 } from "./stewardship";
 
 afterEach(() => {
@@ -51,8 +52,16 @@ function source(db: ReturnType<typeof openTestDb>) {
   return appendMessage(db, conversation.id, "user", "I need to prepare the launch brief.");
 }
 
+/**
+ * Something worth delivering, in an account that agreed to be interrupted about it.
+ *
+ * Proactivity is opt-in and defaults to `off`, so a due commitment on its own produces no
+ * ambient delivery at all. Every test below is about how a delivery is claimed, budgeted, or
+ * released — questions that only arise once the user has opted in.
+ */
 function dueCommitment(db: ReturnType<typeof openTestDb>) {
   const message = source(db);
+  setStewardshipMode(db, "balanced", message.id);
   return createCommitment(db, {
     title: "Prepare the launch brief",
     dueAt: "2029-12-01T09:00:00.000Z",
