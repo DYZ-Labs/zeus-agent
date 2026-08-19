@@ -1,8 +1,8 @@
-# Zeus - Personal AI Chief of Staff
+# Zeus
 
-A personal AI agent designed to help busy professionals manage the administrative layer of their lives.
+A personal AI agent designed to help professionals manage the administrative layer of their lives.
 
-Instead of acting like a chatbot that waits for prompts, the system is designed to:
+Zeus is designed to:
 
 **Observe → Understand → Prioritize → Recommend → Act → Verify → Remember**
 
@@ -12,11 +12,7 @@ The long-term goal is to build a trusted personal operating layer that can coord
 
 ## Overview
 
-Most AI assistants are reactive.
-
-You ask a question, they give you an answer.
-
-Zeus aims to build something different: an AI agent that understands the user's context, remembers relevant preferences, identifies work that needs attention, and helps execute it.
+Zeus aims to build an AI agent that understands the user's context, remembers relevant preferences, identifies work that needs attention, and helps execute it.
 
 Examples:
 
@@ -24,7 +20,7 @@ Examples:
 "Find time for lunch with Sarah next week."
 ```
 
-The agent can:
+Zeus can:
 
 1. identify Sarah
 2. inspect the user's calendar
@@ -40,7 +36,7 @@ Another example:
 "I'm flying to Tokyo next month."
 ```
 
-The agent could eventually coordinate:
+Zeus could eventually coordinate:
 
 - calendar conflicts
 - flights
@@ -62,7 +58,7 @@ The objective is to **get work done**.
 
 Build Zeus, an AI agent that becomes more useful the longer someone uses it.
 
-Over time, the system should understand:
+Over time, Zeus should understand:
 
 - who matters to the user
 - how the user communicates
@@ -74,7 +70,7 @@ Over time, the system should understand:
 - what decisions they commonly make
 - which actions it is authorized to perform
 
-The product should eventually feel closer to a highly capable human Chief of Staff than a traditional chatbot.
+Zeus should eventually feel closer to a highly capable Personal AI Agent than a traditional chatbot.
 
 ---
 
@@ -188,14 +184,14 @@ At a high level:
                     └──────────┬──────────┘
                                │
                     ┌──────────▼──────────┐
-                    │   Agent Orchestrator │
+                    │  Agent Orchestrator │
                     └──────────┬──────────┘
                                │
            ┌───────────────────┼───────────────────┐
            │                   │                   │
     ┌──────▼──────┐     ┌──────▼──────┐     ┌─────▼─────┐
-    │   Memory    │     │ Task/Planner │     │  Policy   │
-    │   System    │     │    State     │     │ & Access  │
+    │   Memory    │     │ Task/Planner│     │  Policy   │
+    │   System    │     │    State    │     │ & Access  │
     └──────┬──────┘     └──────┬──────┘     └─────┬─────┘
            │                   │                   │
            └───────────────────┼───────────────────┘
@@ -220,7 +216,7 @@ Avoid unnecessary multi-agent complexity.
 
 ### Email
 
-The email agent should be able to:
+Zeus should be able to:
 
 - triage messages
 - summarize threads
@@ -245,7 +241,7 @@ Example:
 
 ### Calendar
 
-The calendar agent should understand:
+Zeus should understand:
 
 - availability
 - work hours
@@ -262,7 +258,7 @@ Example:
 "Find 30 minutes with John next week."
 ```
 
-The agent should inspect the user's calendar rather than asking them when they are free.
+Zeus should inspect the user's calendar rather than asking them when they are free.
 
 ---
 
@@ -290,7 +286,7 @@ After a meeting, it can capture:
 
 ### Relationship Intelligence
 
-The system should maintain useful context around people.
+Zeus should maintain useful context around people.
 
 Examples:
 
@@ -306,7 +302,7 @@ follow-ups
 preferences
 ```
 
-This allows the agent to surface information such as:
+This allows Zeus to surface information such as:
 
 ```text
 You told Alex last Thursday that you'd send the hiring deck.
@@ -402,11 +398,11 @@ Explicit new preferences should supersede older ones.
 
 ## Autonomy Model
 
-The product uses progressive autonomy.
+Zeus uses progressive autonomy.
 
 ### Level 1 — Read
 
-The agent may access authorized information.
+Zeus may access authorized information.
 
 Examples:
 
@@ -416,7 +412,7 @@ Examples:
 
 ### Level 2 — Suggest
 
-The agent recommends an action.
+Zeus recommends an action.
 
 ```text
 Your 3 PM meeting conflicts with your flight.
@@ -425,7 +421,7 @@ I recommend moving it to Thursday at 4 PM.
 
 ### Level 3 — Prepare
 
-The agent prepares an action but waits for approval.
+Zeus prepares an action but waits for approval.
 
 Examples:
 
@@ -451,7 +447,7 @@ Automatically schedule internal meetings when:
 
 ### Level 5 — Autonomous Domain
 
-The agent manages a specific domain with limited supervision.
+Zeus manages a specific domain with limited supervision.
 
 Example:
 
@@ -579,7 +575,7 @@ Do not add integrations unless they unlock meaningful workflows.
 
 The first release should focus on:
 
-# AI Chief of Staff for Email + Calendar
+# Personal AI Agent for Email + Calendar
 
 Required capabilities:
 
