@@ -190,6 +190,9 @@ describe("signals enter through the existing gates, or not at all", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
+    // Proactivity is opt-in and off by default. These are the gates a signal passes on the
+    // way to an interruption, so the mode that permits interrupting is a precondition.
+    setStewardshipMode(db, "balanced", userMessageId);
   });
 
   it("surfaces an imminent conflict through the ordinary opportunity pipeline", () => {

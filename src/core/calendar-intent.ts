@@ -105,6 +105,42 @@ export const CalendarIntent = z
   .strict();
 export type CalendarIntent = z.infer<typeof CalendarIntent>;
 
+// The vocabulary the two recognizers below share. At module scope because they must stay
+// the same words: the narrow one is defined as a subset of the loose one, and that only
+// holds while there is one copy of each pattern.
+const SUBJECT =
+  /\b(?:calendar|schedule|scheduling|meeting|appointment|event|invite|booking|book|reschedule|rebook|standup|stand-up|call|lunch|dinner|breakfast|coffee|class|workout|gym|session|catch[- ]?up|sync|one[- ]?on[- ]?one|1:1|deadline|reminder|agenda)\b/iu;
+const ACTION =
+  /\b(?:add|create|put|set\s+up|pencil|slot|block|hold|move|shift|push|bump|change|cancel|kill|drop|clear|delete|remove|free|busy|availab|make\s+time|find\s+time)\b/iu;
+const TEMPORAL =
+  /\b(?:today|tonight|tomorrow|tmr|yesterday|next\s+\w+|this\s+\w+|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}\s*(?:am|pm)|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|morning|afternoon|evening|noon|midday)\b/iu;
+// "block 2-3", "hold 10–11": a bare hour range is a time to a person and nothing to the
+// patterns above.
+const HOUR_RANGE = /\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b/iu;
+// "out at 1030", "by 7", "from 9.30": a clock time written without a colon or a meridiem.
+// People type these constantly and `TEMPORAL` sees none of them, which is how "so can i go
+// out at 1030" reached nothing at all — in a conversation that was entirely about the
+// user's calendar. Anchored to a preposition so it cannot fire on every stray number.
+const BARE_CLOCK =
+  /\b(?:at|from|until|til|till|by|before|after|around|about)\s+\d{1,2}(?:[.:]?[0-5]\d)?\b/iu;
+// "in 30 mins", "in an hour": an offset from now is how people ask whether they are free
+// soon, and it names no clock time at all.
+const RELATIVE_OFFSET = /\bin\s+(?:a|an|\d{1,3})\s*(?:min(?:ute)?s?|hours?|hrs?)\b/iu;
+// Verbs that are about appointments and very little else. "cancel the design review"
+// carries no time and no calendar noun, so pairing a verb with a time would skip it —
+// and the thing named is exactly the thing the user wants gone.
+const SCHEDULING_VERB =
+  /\b(?:reschedule|rebook|postpone|unbook|cancel|call\s+off|double[- ]?book|free\s+up|push\s+back)\b/iu;
+
+function carriesTime(normalized: string): boolean {
+  return (
+    TEMPORAL.test(normalized) ||
+    HOUR_RANGE.test(normalized) ||
+    BARE_CLOCK.test(normalized) ||
+    RELATIVE_OFFSET.test(normalized)
+  );
+}
+
 /**
  * A cheap skip, deliberately over-inclusive.
  *
@@ -113,7 +149,7 @@ export type CalendarIntent = z.infer<typeof CalendarIntent>;
  * bug. So it only asks "could this conceivably be about a calendar?" and errs toward yes.
  *
  * `afterCalendarTurn` says a calendar request already happened in this conversation. A
- * follow-up to one carries almost none of the nouns below — "and after that?", "move it
+ * follow-up to one carries almost none of the nouns above — "and after that?", "move it
  * later", "the second one", "did that go through?" — so a conversation already about the
  * calendar lowers the bar to any short message. The classifier sees the earlier user messages
  * and can tell an actual follow-up from a change of subject; the veto behind it is unchanged.
@@ -127,24 +163,6 @@ export function mayBeCalendarRequest(
 ): boolean {
   const normalized = input.replace(/\s+/gu, " ").trim();
   if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
-  const subject =
-    /\b(?:calendar|schedule|scheduling|meeting|appointment|event|invite|booking|book|reschedule|rebook|standup|stand-up|call|lunch|dinner|breakfast|coffee|class|workout|gym|session|catch[- ]?up|sync|one[- ]?on[- ]?one|1:1|deadline|reminder|agenda)\b/iu;
-  const action =
-    /\b(?:add|create|put|set\s+up|pencil|slot|block|hold|move|shift|push|bump|change|cancel|kill|drop|clear|delete|remove|free|busy|availab|make\s+time|find\s+time)\b/iu;
-  const temporal =
-    /\b(?:today|tonight|tomorrow|tmr|yesterday|next\s+\w+|this\s+\w+|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2}\s*(?:am|pm)|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|morning|afternoon|evening|noon|midday)\b/iu;
-  // "block 2-3", "hold 10–11": a bare hour range is a time to a person and nothing to the
-  // patterns above.
-  const hourRange = /\b\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}\b/iu;
-  // "out at 1030", "by 7", "from 9.30": a clock time written without a colon or a meridiem.
-  // People type these constantly and `temporal` sees none of them, which is how "so can i go
-  // out at 1030" reached nothing at all — in a conversation that was entirely about the
-  // user's calendar. Anchored to a preposition so it cannot fire on every stray number.
-  const bareClock =
-    /\b(?:at|from|until|til|till|by|before|after|around|about)\s+\d{1,2}(?:[.:]?[0-5]\d)?\b/iu;
-  // "in 30 mins", "in an hour": an offset from now is how people ask whether they are free
-  // soon, and it names no clock time at all.
-  const relativeOffset = /\bin\s+(?:a|an|\d{1,3})\s*(?:min(?:ute)?s?|hours?|hrs?)\b/iu;
   // A short reply that is mostly a time is almost always answering a question about one —
   // "yes, 1pm works", "make it Thursday", "the 3pm one". Requiring an action verb here is
   // what made Zeus ignore someone accepting a slot it had just offered them, which is the
@@ -152,16 +170,6 @@ export function mayBeCalendarRequest(
   // user messages and can tell the difference; a needless call costs one low-effort model
   // request, and the veto and conflict gate still stand behind it.
   const shortReply = normalized.length <= 80;
-  // Verbs that are about appointments and very little else. "cancel the design review"
-  // carries no time and no calendar noun, so pairing a verb with a time would skip it —
-  // and the thing named is exactly the thing the user wants gone.
-  const schedulingVerb =
-    /\b(?:reschedule|rebook|postpone|unbook|cancel|call\s+off|double[- ]?book|free\s+up|push\s+back)\b/iu;
-  const carriesTime =
-    temporal.test(normalized) ||
-    hourRange.test(normalized) ||
-    bareClock.test(normalized) ||
-    relativeOffset.test(normalized);
   // A bare acceptance carries no time and no calendar word — that is exactly what makes it an
   // acceptance. So it is judged against the reply it answers rather than on its own: "ok do
   // it" is a calendar request when, and only when, the thing being accepted was one. Without
@@ -172,12 +180,34 @@ export function mayBeCalendarRequest(
     typeof options.previousAssistantText === "string" &&
     mayBeCalendarRequest(options.previousAssistantText);
   return (
-    subject.test(normalized) ||
-    schedulingVerb.test(normalized) ||
-    (action.test(normalized) && carriesTime) ||
-    (shortReply && carriesTime) ||
+    SUBJECT.test(normalized) ||
+    SCHEDULING_VERB.test(normalized) ||
+    (ACTION.test(normalized) && carriesTime(normalized)) ||
+    (shortReply && carriesTime(normalized)) ||
     accepting ||
     (shortReply && options.afterCalendarTurn === true)
+  );
+}
+
+/**
+ * The subset of the above that plainly asks for a calendar change.
+ *
+ * `mayBeCalendarRequest` is deliberately over-inclusive: it lets through a bare "and after
+ * that?", a mention of dinner, a short reply carrying a time. That is right for deciding
+ * whether to spend a classifier call, and wrong for deciding whether a *failed* classifier
+ * call is worth telling the user about — "let's grab coffee sometime" does not deserve a
+ * reply about a calendar change nobody asked for.
+ *
+ * So this asks the narrower question: did the user name an action and something to do it
+ * to? Only those messages are told when recognition was unavailable, because only for those
+ * does silence hide something they were waiting on.
+ */
+export function isExplicitCalendarActionRequest(input: string): boolean {
+  const normalized = input.replace(/\s+/gu, " ").trim();
+  if (normalized.length === 0 || normalized.length > MAX_INPUT_CHARS) return false;
+  if (SCHEDULING_VERB.test(normalized)) return true;
+  return (
+    ACTION.test(normalized) && (SUBJECT.test(normalized) || carriesTime(normalized))
   );
 }
 
@@ -291,6 +321,20 @@ export function containsCalendarRefusalSignal(input: string): boolean {
   );
 }
 
+/**
+ * What the classifier came back with — including the case where it did not come back.
+ *
+ * These were one value before, both spelled `null`, and the caller could not tell "this is
+ * not about a calendar" from "the model call failed". So a timed-out classification on a
+ * plain request to move a meeting became an ordinary chat turn, and the user was told
+ * nothing at all about the thing they had asked for.
+ */
+export type CalendarClassification =
+  /** The model answered. A null intent is an answer: no calendar action was asked for. */
+  | { status: "classified"; intent: CalendarIntent | null }
+  /** The call timed out, errored, or came back unusable. Nothing was recognized. */
+  | { status: "unavailable" };
+
 export async function classifyCalendarIntent(
   db: Db,
   input: {
@@ -312,7 +356,7 @@ export async function classifyCalendarIntent(
     sourceMessageId?: number | null;
   },
   options: { signal?: AbortSignal } = {},
-): Promise<CalendarIntent | null> {
+): Promise<CalendarClassification> {
   const deadline = AbortSignal.timeout(INTENT_TIMEOUT_MS);
   const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
   const clip = (text: string) =>
@@ -368,17 +412,18 @@ export async function classifyCalendarIntent(
       message_id: input.sourceMessageId ?? null,
       ...(parsed ? { mode: parsed.intent, confidence: parsed.confidence } : {}),
     });
-    return parsed;
+    return { status: "classified", intent: parsed };
   } catch (error) {
-    // Degrading here lands exactly where the old regexes landed for an unrecognized
-    // phrasing: an ordinary chat turn. It can never be worse than the behavior it replaced.
+    // Reported as unavailable rather than as "no calendar action", so the caller can decide
+    // whether the user is owed a word about it. The old regexes degraded silently here and
+    // this is the one place that inherited the habit.
     logEvent({
       event: "calendar_intent_classified",
       outcome: "degraded",
       message_id: input.sourceMessageId ?? null,
       ...errorSignature(error),
     });
-    return null;
+    return { status: "unavailable" };
   }
 }
 
@@ -438,7 +483,15 @@ export type CalendarResolution =
       reason: CalendarRefusalReason;
       /** What the model thought was being asked, so a spoken refusal can name the action. */
       intent: CalendarIntent["intent"];
-    };
+    }
+  /**
+   * Recognition itself was unavailable, so there is no intent to refuse or act on.
+   *
+   * Distinct from a refusal: a refusal knows what was asked and declines it, and this knows
+   * nothing. The user is told so rather than left with a reply that reads as though their
+   * request was heard and ignored.
+   */
+  | { status: "unclassified" };
 
 /**
  * Turn a proposed intent into an action Zeus may actually take — or into nothing.

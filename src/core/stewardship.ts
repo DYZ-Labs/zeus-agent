@@ -132,7 +132,15 @@ function contextForOptions(options: RecommendationOptions): EvaluationContext {
   });
 }
 
-function isExplicitTrigger(
+/**
+ * Did the user ask for follow-through, or is Zeus about to volunteer it?
+ *
+ * Exported because mode `off` is now the default, and a caller that wants to skip the
+ * evaluation entirely has to answer the same question this module answers internally.
+ * Two copies of the rule would drift, and the drift would be silent in the direction that
+ * matters: an ordinary turn quietly regaining the interruption.
+ */
+export function isExplicitTrigger(
   trigger: TriggerKind,
   query: string,
 ): boolean {

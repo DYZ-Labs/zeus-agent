@@ -114,6 +114,103 @@ describe("Google OAuth and Calendar API", () => {
     expect(String(fetcher.mock.calls[3]?.[0])).toContain(createBody.id);
   });
 
+  it("does not re-send an update the event already holds", async () => {
+    // A replayed confirmation used to PATCH again, and Google notifies attendees on every
+    // update — so the duplicate was not merely wasted, it reached other people's inboxes.
+    const settled = {
+      id: "event-1",
+      summary: "Planning",
+      // Google echoes an offset-bearing dateTime whatever form the request used. Same
+      // instant, different string: a spelling comparison would patch every time.
+      start: { dateTime: "2026-08-15T12:00:00+02:00" },
+      end: { dateTime: "2026-08-15T13:00:00+02:00" },
+    };
+    const fetcher = googleFetch([
+      Response.json({ access_token: "access" }),
+      Response.json(settled),
+    ]);
+    const api = new GoogleCalendarApi(OAUTH, fetcher);
+
+    await expect(
+      api.updateEvent(grant([CALENDAR_WRITE_SCOPE]), {
+        event_id: "event-1",
+        start: "2026-08-15T10:00:00Z",
+        end: "2026-08-15T11:00:00Z",
+      }),
+    ).resolves.toMatchObject({ id: "event-1", title: "Planning" });
+
+    // One token call and one GET. No PATCH at all.
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.every((call) => call[1]?.method !== "PATCH")).toBe(true);
+  });
+
+  it("still sends an update that changes something, and one it cannot compare", async () => {
+    const settled = {
+      id: "event-1",
+      summary: "Planning",
+      start: { dateTime: "2026-08-15T10:00:00Z" },
+      end: { dateTime: "2026-08-15T11:00:00Z" },
+    };
+    const moved = new GoogleCalendarApi(
+      OAUTH,
+      googleFetch([
+        Response.json({ access_token: "access" }),
+        Response.json(settled),
+        Response.json({ access_token: "access" }),
+        Response.json({ ...settled, start: { dateTime: "2026-08-15T14:00:00Z" } }),
+      ]),
+    );
+    await expect(
+      moved.updateEvent(grant([CALENDAR_WRITE_SCOPE]), {
+        event_id: "event-1",
+        start: "2026-08-15T14:00:00Z",
+      }),
+    ).resolves.toMatchObject({ starts_at: "2026-08-15T14:00:00Z" });
+
+    // Attendees come back as objects Google has annotated, so "already holds" cannot be
+    // decided without guessing. It patches instead — the direction that loses nothing.
+    const invited = vi.fn<typeof fetch>();
+    invited.mockResolvedValueOnce(Response.json({ access_token: "access" }));
+    invited.mockResolvedValueOnce(
+      Response.json({ ...settled, attendees: [{ email: "sam@example.com", responseStatus: "accepted" }] }),
+    );
+    invited.mockResolvedValueOnce(Response.json({ access_token: "access" }));
+    invited.mockResolvedValueOnce(Response.json(settled));
+    const api = new GoogleCalendarApi(OAUTH, invited);
+
+    await api.updateEvent(grant([CALENDAR_WRITE_SCOPE]), {
+      event_id: "event-1",
+      attendees: ["sam@example.com"],
+    });
+
+    expect(invited.mock.calls.some((call) => call[1]?.method === "PATCH")).toBe(true);
+  });
+
+  it("updates as it always did when the event cannot be read first", async () => {
+    // The check exists to remove a redundant write, never to block a real one. A read that
+    // fails says nothing about the event, so the update proceeds.
+    const fetcher = googleFetch([
+      Response.json({ access_token: "access" }),
+      Response.json({ error: "backend_error" }, { status: 500 }),
+      Response.json({ access_token: "access" }),
+      Response.json({
+        id: "event-1",
+        summary: "Planning",
+        start: { dateTime: "2026-08-15T14:00:00Z" },
+        end: { dateTime: "2026-08-15T15:00:00Z" },
+      }),
+    ]);
+    const api = new GoogleCalendarApi(OAUTH, fetcher);
+
+    await expect(
+      api.updateEvent(grant([CALENDAR_WRITE_SCOPE]), {
+        event_id: "event-1",
+        start: "2026-08-15T14:00:00Z",
+      }),
+    ).resolves.toMatchObject({ starts_at: "2026-08-15T14:00:00Z" });
+    expect(fetcher.mock.calls.some((call) => call[1]?.method === "PATCH")).toBe(true);
+  });
+
   it("refuses writes when the user granted read-only access", async () => {
     const api = new GoogleCalendarApi(OAUTH, vi.fn<typeof fetch>());
     await expect(api.createEvent(

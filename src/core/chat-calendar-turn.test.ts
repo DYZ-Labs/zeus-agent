@@ -92,6 +92,17 @@ import {
   listWorkRuns,
 } from "./work-plans";
 
+/**
+ * The classifier answered.
+ *
+ * A `null` intent is an answer — the model looked and found no calendar action. It is not
+ * the same as `{ status: "unavailable" }`, which is the model never answering at all, and
+ * keeping the two apart in the fixtures is the point of the distinction under test.
+ */
+function classified(value: CalendarIntent | null) {
+  return { status: "classified" as const, intent: value };
+}
+
 function intent(overrides: Partial<CalendarIntent> = {}): CalendarIntent {
   return {
     intent: "reschedule",
@@ -224,7 +235,7 @@ async function nextTurn(db: Db, conversationId: number, input: string) {
 
 describe("resolving what a short reply is agreeing to", () => {
   it("shows the classifier its own earlier reply, labelled as its own", async () => {
-    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent()));
     const db = openTestDb();
     const conversation = createConversation(db);
     appendMessage(db, conversation.id, "user", "what should i do");
@@ -252,9 +263,9 @@ describe("a recognized calendar request is never silent", () => {
   it("reads a connected calendar on the first turn of every new conversation", async () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
-    // A classifier timeout or malformed response returns null. A direct read must not need
-    // conversational history—or a second attempt—to reach an already granted capability.
-    mocks.classifyCalendarIntent.mockResolvedValue(null);
+    // The classifier recognizes nothing here, and is never asked to: a direct read must not
+    // need conversational history—or a second attempt—to reach an already granted capability.
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(null));
 
     const first = await turn("What is on my calendar tomorrow?", db);
     const second = await turn("Show me my calendar for tomorrow.", db);
@@ -279,7 +290,7 @@ describe("a recognized calendar request is never silent", () => {
   });
 
   it("says nothing is connected instead of letting the model guess", async () => {
-    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent()));
 
     const { result, sentToModel } = await turn("move dinner to 7:30pm");
 
@@ -297,7 +308,7 @@ describe("a recognized calendar request is never silent", () => {
   it("reports a read-only connection instead of discarding the turn", async () => {
     // A read-only grant used to make `assertAuthorizableEffects` throw, which the planning
     // catch swallowed — so the user was told nothing and the model was told nothing.
-    mocks.classifyCalendarIntent.mockResolvedValue(intent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent()));
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
 
@@ -311,7 +322,7 @@ describe("a recognized calendar request is never silent", () => {
   });
 
   it("asks rather than inventing a reason when the classifier was unsure", async () => {
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ confidence: "low" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ confidence: "low" })));
 
     const { result, sentToModel } = await turn("move dinner to 7:30pm");
 
@@ -329,7 +340,7 @@ describe("a recognized calendar request is never silent", () => {
     ["someone else's", { is_about_another_person: true }],
     ["not a calendar request", { intent: "none" as const }],
   ])("stays quiet when the user did not ask (%s)", async (_label, overrides) => {
-    mocks.classifyCalendarIntent.mockResolvedValue(intent(overrides));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent(overrides)));
 
     const { result, sentToModel } = await turn("dinner with Priya was great tonight");
 
@@ -342,7 +353,7 @@ describe("a recognized calendar request is never silent", () => {
   it("still considers a work proposal when the message was never a calendar request", async () => {
     // "by Friday" is enough for the prefilter, so an ordinary bounded-work request reaches
     // the classifier and comes back as `none`. Returning there would quietly drop the work.
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     await turn("Research the backup options by Friday and draft a recommendation.");
 
@@ -354,7 +365,7 @@ describe("a recognized calendar request is never silent", () => {
   });
 
   it("stores the outcome so a reload still shows what happened", async () => {
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ confidence: "low" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ confidence: "low" })));
     const db = openTestDb();
     const conversation = createConversation(db);
 
@@ -370,6 +381,51 @@ describe("a recognized calendar request is never silent", () => {
       )
       .get(result.message.id);
     expect(stored?.status).toBe("needs_clarification");
+  });
+
+  it("says so when it could not work out what was asked, rather than nothing", async () => {
+    // The classifier never answered. Silence here is indistinguishable to the user from
+    // Zeus hearing the request and ignoring it, which is what this replaces.
+    mocks.classifyCalendarIntent.mockResolvedValue({ status: "unavailable" });
+    const db = openTestDb();
+    connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
+    const conversation = createConversation(db);
+
+    const result = await streamTurn(db, {
+      conversationId: conversation.id,
+      input: "move dinner to 7:30pm tomorrow",
+      timezone: "UTC",
+    });
+
+    expect(result.calendar).toMatchObject({
+      kind: "unclassified",
+      status: "needs_clarification",
+      reason: "classification_unavailable",
+    });
+    // Nothing was attempted against the calendar beyond the standing cache refresh every
+    // turn does: there was never an intent to act on.
+    expect(
+      mocks.callCapability.mock.calls.every((call) => call[1] === "calendar.list_events"),
+    ).toBe(true);
+    // And it survives the turn, so a reload and a later "did that go through?" both see it.
+    const stored = db
+      .prepare<[number], { kind: string; status: string }>(
+        "SELECT kind, status FROM calendar_outcome WHERE assistant_message_id = ?",
+      )
+      .get(result.message.id);
+    expect(stored).toMatchObject({ kind: "unclassified", status: "needs_clarification" });
+  });
+
+  it("stays quiet when the message only brushed the prefilter", async () => {
+    // The prefilter lets "coffee" through on the chance it is a request. When recognition
+    // then fails, reporting a calendar failure would invent a request the user never made —
+    // so only a message that plainly named an action and a target is told.
+    mocks.classifyCalendarIntent.mockResolvedValue({ status: "unavailable" });
+
+    const { result, sentToModel } = await turn("we should grab coffee sometime");
+
+    expect(result.calendar).toBeNull();
+    expect(sentToModel).not.toContain("<calendar_result");
   });
 });
 
@@ -478,7 +534,7 @@ describe("bounded work requires an exact plan approval", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.create_event"]);
     const conversation = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
     mocks.generateWorkPlanProposal.mockResolvedValueOnce({
       proposal: {
         ...proposal,
@@ -534,7 +590,7 @@ describe("a connection that stopped answering is not a connection the user lost"
       restoreConnectorAfterReachability(db, prior);
       return true;
     });
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "read" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "read" })));
 
     const { result } = await turn("what's on my calendar today?", db);
 
@@ -549,7 +605,7 @@ describe("a connection that stopped answering is not a connection the user lost"
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
     stopAnswering(db, "call_failed");
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "read" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "read" })));
 
     const { result, sentToModel } = await turn("what's on my calendar today?", db);
 
@@ -567,7 +623,7 @@ describe("a connection that stopped answering is not a connection the user lost"
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
     stopAnswering(db, "reconnect_required");
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "read" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "read" })));
 
     const { result, sentToModel } = await turn("what's on my calendar today?", db);
 
@@ -593,13 +649,15 @@ describe("what Zeus did survives the turn that did it", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.create_event"]);
     mocks.classifyCalendarIntent.mockResolvedValue(
-      intent({
-        intent: "create",
-        title: "Lunch with Sam",
-        starts_at_local: "2026-08-19T13:00",
-        ends_at_local: "2026-08-19T14:00",
-        target: null,
-      }),
+      classified(
+        intent({
+          intent: "create",
+          title: "Lunch with Sam",
+          starts_at_local: "2026-08-19T13:00",
+          ends_at_local: "2026-08-19T14:00",
+          target: null,
+        }),
+      ),
     );
     const conversation = createConversation(db);
 
@@ -608,7 +666,7 @@ describe("what Zeus did survives the turn that did it", () => {
 
     // An ordinary sentence, nowhere near the calendar: the turn reads nothing, and used to
     // leave the model with no evidence a calendar had ever been opened.
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
     const after = await nextTurn(db, conversation.id, "thanks, that is all sorted then");
 
     expect(after.result.calendar).toBeNull();
@@ -621,7 +679,7 @@ describe("what Zeus did survives the turn that did it", () => {
   it("says nothing about a conversation that never touched the calendar", async () => {
     const db = openTestDb();
     const conversation = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     const { sentToModel } = await nextTurn(db, conversation.id, "how are you today");
 
@@ -631,12 +689,12 @@ describe("what Zeus did survives the turn that did it", () => {
   it("does not carry one conversation's actions into another", async () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
-    mocks.classifyCalendarIntent.mockResolvedValue(null);
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(null));
     const first = createConversation(db);
     await nextTurn(db, first.id, "What is on my calendar tomorrow?");
 
     const second = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
     const { sentToModel } = await nextTurn(db, second.id, "how are you today");
 
     expect(sentToModel).not.toContain("<calendar_history>");
@@ -649,7 +707,7 @@ describe("what Zeus did survives the turn that did it", () => {
   it("classifies a short follow-up once the conversation is already about the calendar", async () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
-    mocks.classifyCalendarIntent.mockResolvedValue(null);
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(null));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "What is on my calendar tomorrow?");
     expect(mocks.classifyCalendarIntent).not.toHaveBeenCalled();
@@ -715,7 +773,7 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
 
     const { result, sentToModel } = await nextTurn(
@@ -743,7 +801,7 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "clear my Thursday afternoon");
     const hash = batchPayloadHash(listPendingEffects(db))!;
@@ -766,12 +824,12 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const sourceConversation = createConversation(db);
     await nextTurn(db, sourceConversation.id, "clear my Thursday afternoon");
     const hash = batchPayloadHash(listPendingEffects(db))!;
     const otherConversation = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     await nextTurn(db, otherConversation.id, confirmationSentence(hash, 2));
 
@@ -788,7 +846,7 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding([]);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
 
     const { result } = await nextTurn(db, conversation.id, "clear my Thursday afternoon");
@@ -812,7 +870,7 @@ describe("clearing a window", () => {
         ends_at: new Date(Date.parse("2026-08-20T12:06:00.000Z") + index * 60_000).toISOString(),
       })),
     );
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
 
     const { result } = await nextTurn(db, conversation.id, "clear my Thursday afternoon");
@@ -835,7 +893,7 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "clear my Thursday afternoon");
     const [first, second] = listPendingEffects(db);
@@ -862,12 +920,12 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "clear my Thursday afternoon");
     const [first] = listPendingEffects(db);
     await nextTurn(db, conversation.id, confirmationSentence(first!.payload_hash));
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     const { result } = await nextTurn(db, conversation.id, "no, leave the rest");
 
@@ -880,10 +938,10 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "clear my Thursday afternoon");
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     // "cancel that" is a refusal; "cancel that meeting on Friday" is the opposite of one, and
     // reading only the opening words could not tell them apart.
@@ -896,7 +954,7 @@ describe("clearing a window", () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events", "calendar.update_event"]);
     calendarHolding(THURSDAY);
-    mocks.classifyCalendarIntent.mockResolvedValue(clearIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(clearIntent()));
     const conversation = createConversation(db);
     await nextTurn(db, conversation.id, "clear my Thursday afternoon");
 
@@ -948,7 +1006,7 @@ describe("confirming a change without a button", () => {
 
   async function collide(db: Db, conversationId: number) {
     calendarHolding(OCCUPIED);
-    mocks.classifyCalendarIntent.mockResolvedValue(createIntent());
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(createIntent()));
     return nextTurn(db, conversationId, "put lunch with Sam at 1pm tomorrow");
   }
 
@@ -1025,7 +1083,7 @@ describe("confirming a change without a button", () => {
       (entry) => entry.slot === "calendar.create_event",
     )!;
     setCapabilityEnabled(db, capability.id, false, 1);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     const { result } = await nextTurn(
       db,
@@ -1045,7 +1103,7 @@ describe("confirming a change without a button", () => {
     connectCalendar(db, ["calendar.list_events", "calendar.create_event"]);
     const conversation = createConversation(db);
     await collide(db, conversation.id);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     await nextTurn(db, conversation.id, "yes go ahead");
 
@@ -1067,7 +1125,7 @@ describe("confirming a change without a button", () => {
     mocks.finalResponse.mockResolvedValueOnce({
       output_text: confirmationSentence(hash),
     });
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     await nextTurn(db, conversation.id, "what were you going to do again?");
 
@@ -1097,13 +1155,15 @@ describe("what a refusal can and cannot stop", () => {
       },
     ]);
     mocks.classifyCalendarIntent.mockResolvedValue(
-      intent({
-        intent: "create",
-        title: "Lunch with Sam",
-        starts_at_local: "2026-08-19T13:00",
-        ends_at_local: "2026-08-19T14:00",
-        target: null,
-      }),
+      classified(
+        intent({
+          intent: "create",
+          title: "Lunch with Sam",
+          starts_at_local: "2026-08-19T13:00",
+          ends_at_local: "2026-08-19T14:00",
+          target: null,
+        }),
+      ),
     );
     return nextTurn(db, conversationId, "put lunch with Sam at 1pm tomorrow");
   }
@@ -1116,7 +1176,7 @@ describe("what a refusal can and cannot stop", () => {
     expect(listPendingEffects(db)).toHaveLength(1);
 
     const elsewhere = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
     await nextTurn(db, elsewhere.id, "no");
 
     // The user answered a question nobody asked them here.
@@ -1128,7 +1188,7 @@ describe("what a refusal can and cannot stop", () => {
     connectCalendar(db, ["calendar.list_events", "calendar.create_event"]);
     const conversation = createConversation(db);
     await pendingIn(db, conversation.id);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     const { result } = await nextTurn(db, conversation.id, "no");
 
@@ -1139,7 +1199,7 @@ describe("what a refusal can and cannot stop", () => {
   it("does nothing when there was no question to refuse", async () => {
     const db = openTestDb();
     const conversation = createConversation(db);
-    mocks.classifyCalendarIntent.mockResolvedValue(intent({ intent: "none" }));
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(intent({ intent: "none" })));
 
     const { result } = await nextTurn(db, conversation.id, "no");
 
@@ -1257,7 +1317,7 @@ describe("every turn already knows the schedule", () => {
   it("does not read twice when the turn already ran a calendar read plan", async () => {
     const db = openTestDb();
     connectCalendar(db, ["calendar.list_events"]);
-    mocks.classifyCalendarIntent.mockResolvedValue(null);
+    mocks.classifyCalendarIntent.mockResolvedValue(classified(null));
 
     const { result, sentToModel } = await turn("What is on my calendar tomorrow?", db);
 

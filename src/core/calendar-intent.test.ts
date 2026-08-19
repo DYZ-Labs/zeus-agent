@@ -4,6 +4,7 @@ import {
   containsCalendarRefusalSignal,
   directCalendarReadRequest,
   isCalendarCapabilityQuestion,
+  isExplicitCalendarActionRequest,
   localToUtc,
   mayBeCalendarRequest,
   refusalIsSpoken,
@@ -582,5 +583,31 @@ describe("following up on a calendar turn", () => {
   it("does not widen to an essay, which is a change of subject rather than a follow-up", () => {
     const long = "I have been thinking about the pitch deck all week and ".repeat(3);
     expect(mayBeCalendarRequest(long, { afterCalendarTurn: true })).toBe(false);
+  });
+});
+
+describe("which messages are owed an answer when recognition fails", () => {
+  it("recognizes a message that named an action and something to do it to", () => {
+    expect(isExplicitCalendarActionRequest("move dinner to 7:30pm tomorrow")).toBe(true);
+    expect(isExplicitCalendarActionRequest("cancel the design review")).toBe(true);
+    expect(isExplicitCalendarActionRequest("add lunch with Sam at 1pm")).toBe(true);
+    expect(isExplicitCalendarActionRequest("clear my Thursday afternoon")).toBe(true);
+    expect(isExplicitCalendarActionRequest("reschedule that")).toBe(true);
+  });
+
+  it("leaves the loose prefilter hits alone", () => {
+    // Every one of these passes `mayBeCalendarRequest`, which is correct — each is worth a
+    // classifier call. None of them asked for a change, so none is owed a report when that
+    // call fails; saying "I couldn't work out what to do with your calendar" would invent a
+    // request the user never made.
+    for (const message of [
+      "we should grab coffee sometime",
+      "dinner with Priya was great tonight",
+      "and after that?",
+      "my standup is the worst part of the week",
+    ]) {
+      expect(mayBeCalendarRequest(message, { afterCalendarTurn: true })).toBe(true);
+      expect(isExplicitCalendarActionRequest(message)).toBe(false);
+    }
   });
 });
