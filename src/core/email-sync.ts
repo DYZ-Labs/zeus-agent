@@ -37,11 +37,12 @@ import type { EmailReadFailure, InboxReadFailure } from "./schema";
  * outside what was proven and is left alone, exactly as the calendar leaves events outside
  * its window alone.
  *
- * **Snippets are dropped at parse.** No view returns subject and sender without one:
- * `THREAD_VIEW_MINIMAL` includes the snippet and `THREAD_VIEW_METADATA_ONLY` omits the
- * subject. So the snippet arrives and is discarded before anything is stored — weaker than
- * never fetching it, and worth saying plainly rather than implying the standing block's
- * "subjects and senders only" is enforced at the wire.
+ * **Snippets never arrive.** They used to: Google's Gmail MCP returned one with every thread,
+ * because no view of theirs gives a subject and a sender without it, so the snippet reached
+ * this file and was discarded at parse. The broker composes the window itself now, out of
+ * `threads.get` metadata, and simply does not ask for the snippet — so the standing block's
+ * "subjects and senders only" is enforced at the wire rather than just downstream of it. The
+ * parser still refuses to read one, which is where that promise is kept if a payload changes.
  */
 
 /** How far back a sync reaches. Gmail expresses this inside the query, in whole days. */
@@ -513,8 +514,8 @@ export function parseEmailThreads(value: unknown): {
     const newest = newestMessage(thread);
     threads.push({
       id,
-      // The snippet is deliberately absent. It arrives on the wire because no view omits it
-      // while keeping the subject, and it stops here.
+      // No snippet is read, whatever a payload happens to carry. The broker no longer sends
+      // one, and this is the line that keeps that true if some future one does.
       subject: firstString(newest, ["subject", "title"]),
       from: firstString(newest, ["sender", "from", "fromAddress"]),
       last_activity_at: firstString(newest, ["date", "internalDate", "receivedAt"]),

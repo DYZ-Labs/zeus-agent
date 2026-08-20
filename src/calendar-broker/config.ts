@@ -33,7 +33,6 @@ export type CalendarBrokerConfiguration = {
     clientId: string;
     clientSecret: string;
     redirectUri: string;
-    remoteMcpUrl: string;
   };
 };
 
@@ -99,7 +98,6 @@ export function calendarBrokerConfiguration(
       clientId: z.string().trim().min(1).parse(gmailClientId),
       clientSecret: z.string().trim().min(1).parse(gmailClientSecret),
       redirectUri: gmailRedirectUri,
-      remoteMcpUrl: "https://gmailmcp.googleapis.com/mcp/v1",
     };
   }
 

@@ -221,21 +221,19 @@ export function createCalendarBrokerServer(
         const grant = store.getGmailGrant(connectionId, accountId);
         if (!grant) return text(response, 404, "Connection unavailable");
         const body = await readJson(request);
-        const proxy = createGoogleGmailMcpServer({
+        const gmailServer = createGoogleGmailMcpServer({
           grant,
           store,
           oauth: gmailOAuthConfiguration,
-          remoteMcpUrl: configuration.gmail.remoteMcpUrl,
           fetcher,
         });
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         try {
-          await proxy.server.connect(transport);
+          await gmailServer.connect(transport);
           await transport.handleRequest(request, response, body);
         } finally {
           await transport.close().catch(() => undefined);
-          await proxy.server.close().catch(() => undefined);
-          await proxy.close();
+          await gmailServer.close().catch(() => undefined);
         }
         return;
       }

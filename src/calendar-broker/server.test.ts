@@ -15,6 +15,12 @@ import {
 import { appendMessage, createConversation } from "../core/conversations";
 import { openTestDb } from "../core/db";
 import { callCapability, verifyConnector } from "../core/mcp-client";
+import {
+  cachedThreads,
+  fetchThread,
+  readEmailCoverage,
+  syncEmail,
+} from "../core/email-sync";
 import { bindAppOwner } from "../core/owner";
 import type { CalendarBrokerConfiguration } from "./config";
 import { GMAIL_READ_SCOPE } from "./gmail";
@@ -37,14 +43,11 @@ let accountId: string;
 let fetcher: ReturnType<typeof vi.fn<typeof fetch>>;
 /** Set by a test to make Google refuse the tool call rather than answer it. */
 let gmailCallRefusal: { status: number; body: unknown } | null = null;
-/** Set by a test to make Google answer the tool call with a refusal of its own. */
-let gmailToolResult: unknown = null;
 
 beforeEach(async () => {
   store = new CalendarBrokerStore(":memory:", randomBytes(32));
   accountId = randomUUID();
   gmailCallRefusal = null;
-  gmailToolResult = null;
   fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     if (url === "https://oauth2.googleapis.com/token") {
@@ -66,9 +69,9 @@ beforeEach(async () => {
           })
         : Response.json({ access_token: "calendar-access" });
     }
-    if (url === "https://gmail.example.test/mcp") {
+    if (url.startsWith("https://gmail.googleapis.com/gmail/v1/users/me")) {
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer gmail-access");
-      return gmailMcpResponse(init);
+      return gmailApiResponse(new URL(url));
     }
     if (url.includes("/calendar/v3/calendars/primary/events")) {
       if (init?.method === "POST") {
@@ -101,7 +104,6 @@ beforeEach(async () => {
       clientId: "gmail-client-id",
       clientSecret: "gmail-client-secret",
       redirectUri: "https://calendar-dev.zeusagent.dev/oauth/gmail/callback",
-      remoteMcpUrl: "https://gmail.example.test/mcp",
     },
   };
   server = createCalendarBrokerServer(configuration, store, fetcher);
@@ -251,12 +253,14 @@ describe("the multi-user Gmail broker", () => {
     });
     expect(searched.isError).not.toBe(true);
     expect(JSON.stringify(searched.content)).toContain("thread-1");
+    // Read-only is structural now rather than filtered: there is no write tool to refuse,
+    // because the broker only ever issues two GETs.
     const blocked = await client.callTool({
       name: "create_draft",
       arguments: { to: "attacker@example.test", body: "must not leave" },
     });
     expect(blocked.isError).toBe(true);
-    expect(JSON.stringify(blocked.content)).toContain("read-only tools only");
+    expect(JSON.stringify(blocked.content)).toContain("create_draft");
     await client.close();
 
     const wrongAccount = await fetch(`${origin}/gmail/mcp/${result.connectionId}`, {
@@ -318,45 +322,6 @@ describe("the multi-user Gmail broker", () => {
     expect(store.getGmailGrant(result.connectionId, accountId)?.status).toBe("active");
   });
 
-  it("tags a refusal Google returned as a result, not as a transport error", async () => {
-    // The other half, and the one that would otherwise still arrive unnamed: Google's MCP
-    // server answering with an ordinary `isError` tool result. Nothing throws, so none of the
-    // transport naming runs, and the text used to be forwarded untagged — leaving Zeus able
-    // to report only that something went wrong.
-    const result = await connectGmail();
-    gmailToolResult = {
-      isError: true,
-      content: [{
-        type: "text",
-        text: "Request had insufficient authentication scopes. ACCESS_TOKEN_SCOPE_INSUFFICIENT",
-      }],
-    };
-
-    const client = new Client({ name: "test-zeus", version: "0.0.1" });
-    await client.connect(new StreamableHTTPClientTransport(
-      new URL(`${origin}/gmail/mcp/${result.connectionId}`),
-      {
-        requestInit: {
-          headers: {
-            Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
-            "X-Zeus-Account-Id": accountId,
-          },
-        },
-      },
-    ));
-    const searched = await client.callTool({
-      name: "search_threads",
-      arguments: { query: "in:inbox newer_than:7d", pageSize: 50 },
-    });
-    await client.close();
-
-    expect(searched.isError).toBe(true);
-    const text = JSON.stringify(searched.content);
-    expect(text).toContain("gmail_tool_refused_access_token_scope_insufficient");
-    // Google's sentence stays in the broker's own log; only the token crosses to Zeus.
-    expect(text).not.toContain("insufficient authentication scopes");
-  });
-
   it("serves the locked Gmail provider transport in hosted Zeus", async () => {
     process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = GMAIL_SERVICE_KEY;
     const result = await connectGmail();
@@ -380,12 +345,33 @@ describe("the multi-user Gmail broker", () => {
       sourceMessageId: source.id,
     });
 
-    const searched = await callCapability(db, "email.search_threads", {
-      query: "in:inbox newer_than:7d",
-      pageSize: 50,
-    });
-    expect(searched.isError).toBe(false);
-    expect(searched.value).toMatchObject({ threads: [{ id: "thread-1" }] });
+    // The whole path Zeus actually walks, not a stand-in for it: build the arguments from
+    // the schema the broker advertised, dispatch, and parse the reply with the same reader a
+    // chat turn uses. The transport under this changed; what it has to produce did not.
+    const read = await syncEmail(db);
+    expect(read).toMatchObject({ ok: true });
+    expect(cachedThreads(db, new Date())).toEqual([
+      {
+        id: "thread-1",
+        subject: "Q3 planning",
+        from: "sarah@example.com",
+        last_activity_at: new Date(1787202038000).toISOString(),
+        unread: true,
+      },
+    ]);
+    // Proof of the read, which is the row whose absence produced "the Gmail read failed".
+    expect(readEmailCoverage(db)?.threadCount).toBe(1);
+
+    // The on-request thread read, and the one call in Zeus that holds a body.
+    const messages = await fetchThread(db, "thread-1");
+    expect(messages).toEqual([
+      {
+        subject: "Q3 planning",
+        from: "sarah@example.com",
+        sentAt: new Date(1787202038000).toISOString(),
+        body: "the body text",
+      },
+    ]);
     db.close();
   });
 });
@@ -456,65 +442,52 @@ async function connectGmail() {
   );
 }
 
-function gmailMcpResponse(init: RequestInit | undefined): Response {
-  const request = JSON.parse(String(init?.body)) as {
-    id?: string | number;
-    method?: string;
-    params?: { name?: string };
-  };
-  if (request.method === "notifications/initialized") {
-    return new Response(null, { status: 202 });
-  }
-  if (request.method === "tools/call" && gmailCallRefusal) {
+/**
+ * The Gmail REST API, as much of it as the broker uses: `threads.list` for a window and
+ * `threads.get` for one thread's metadata or full content.
+ */
+function gmailApiResponse(url: URL): Response {
+  if (gmailCallRefusal) {
     return Response.json(gmailCallRefusal.body, { status: gmailCallRefusal.status });
   }
-  if (request.method === "tools/call" && gmailToolResult) {
-    return Response.json({ jsonrpc: "2.0", id: request.id, result: gmailToolResult });
+  if (url.pathname.endsWith("/users/me/threads")) {
+    return Response.json({
+      threads: [{ id: "thread-1", snippet: "…" }],
+      resultSizeEstimate: 1,
+    });
   }
-  const result = request.method === "initialize"
-    ? {
-        protocolVersion: "2025-06-18",
-        capabilities: { tools: {} },
-        serverInfo: { name: "fake-gmail", version: "1" },
-      }
-    : request.method === "tools/list"
-      ? {
-          tools: [
-            {
-              name: "search_threads",
-              description: "Search Gmail threads",
-              inputSchema: {
-                type: "object",
-                properties: { query: { type: "string" }, pageSize: { type: "integer" } },
-                required: ["query"],
-              },
-              annotations: { readOnlyHint: true },
-            },
-            {
-              name: "get_thread",
-              description: "Get one Gmail thread",
-              inputSchema: {
-                type: "object",
-                properties: { threadId: { type: "string" } },
-                required: ["threadId"],
-              },
-              annotations: { readOnlyHint: true },
-            },
-            {
-              name: "create_draft",
-              description: "Create a draft",
-              inputSchema: { type: "object", properties: {} },
-              annotations: { readOnlyHint: false },
-            },
+  const full = url.searchParams.get("format") === "full";
+  return Response.json({
+    id: "thread-1",
+    messages: [
+      {
+        id: "message-1",
+        threadId: "thread-1",
+        labelIds: ["INBOX", "UNREAD"],
+        internalDate: "1787202038000",
+        payload: {
+          mimeType: full ? "multipart/alternative" : "text/plain",
+          headers: [
+            { name: "Date", value: "Wed, 19 Aug 2026 08:00:00 +0000" },
+            { name: "From", value: "sarah@example.com" },
+            { name: "Subject", value: "Q3 planning" },
           ],
-        }
-      : request.method === "tools/call" && request.params?.name === "search_threads"
-        ? {
-            content: [{
-              type: "text",
-              text: JSON.stringify({ threads: [{ id: "thread-1" }] }),
-            }],
-          }
-        : { isError: true, content: [{ type: "text", text: "unexpected test call" }] };
-  return Response.json({ jsonrpc: "2.0", id: request.id, result });
+          ...(full
+            ? {
+                parts: [
+                  {
+                    mimeType: "text/html",
+                    body: { data: Buffer.from("<p>ignored</p>").toString("base64url") },
+                  },
+                  {
+                    mimeType: "text/plain",
+                    body: { data: Buffer.from("the body text").toString("base64url") },
+                  },
+                ],
+              }
+            : {}),
+        },
+      },
+    ],
+  });
 }
