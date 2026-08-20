@@ -960,18 +960,30 @@ export const CapabilitySlot = z.enum([
   "email.create_draft",
   "email.trash_thread",
   "email.untrash_thread",
+  "email.send_message",
 ]);
 export type CapabilitySlot = z.infer<typeof CapabilitySlot>;
 
 /**
- * Email can now draft and can now bin, and still cannot send.
+ * Email reads, drafts, bins, restores — and now sends.
  *
- * The read slots came first on purpose, and the three write slots that join them are the ones
- * whose worst case a user can undo: a draft waits unsent in their own Drafts, and a trashed
- * thread waits thirty days in their own Trash — with a slot to bring it back out again. There is no `email.send_message`, and that is
- * the point of naming slots at all — a capability Zeus cannot name is one it cannot be talked
- * into, however adversarial the mail it is reading. Permanent deletion is out of reach for a
- * second, independent reason: it needs an OAuth scope the broker never asks for.
+ * `email.send_message` is the only slot in Zeus whose effect nothing can undo. A draft waits
+ * unsent, a trashed thread waits thirty days, a calendar change is reversed by asking; a sent
+ * message is gone. So it carries the most standing between it and a call — and none of that
+ * protection lives here, because a slot only names a capability. What guards it:
+ *
+ * - it is reachable only from a code-owned plan builder, never a generated one, because
+ *   `isSafeSurfacedProposal` admits nothing outside `SAFE_EFFECT_KINDS`;
+ * - `send` has no standing-policy path and cannot acquire one: the calendar's mode is
+ *   defensible because a deterministic gate re-reads the calendar first, and there is no
+ *   equivalent question to ask about a message;
+ * - the recipient is checked against an allowlist when the payload is built, and again in
+ *   `executeConfirmedEffect` immediately before the bytes leave;
+ * - and it needs the same exact-payload confirmation as everything else.
+ *
+ * Permanent deletion stays out of reach for a different kind of reason, and the difference is
+ * worth keeping straight: it needs an OAuth scope the broker never asks for. Sending is held
+ * back by decisions this codebase makes; deleting is held back by a token that cannot do it.
  *
  * The email slots are also why effect kind is an ambiguous way to choose a capability —
  * `modify_external` now means either `calendar.update_event` or `email.trash_thread` — which
@@ -986,6 +998,7 @@ export const CAPABILITY_SLOT_EFFECTS = {
   "email.create_draft": "modify_external",
   "email.trash_thread": "modify_external",
   "email.untrash_thread": "modify_external",
+  "email.send_message": "send",
 } as const satisfies Record<CapabilitySlot, EffectKind>;
 
 export const Sha256Hex = z
@@ -1028,7 +1041,7 @@ export const ConnectorCapability = z
     connector_id: z.number().int(),
     slot: CapabilitySlot,
     remote_tool_name: z.string(),
-    effect_kind: z.enum(["external_read", "schedule", "modify_external"]),
+    effect_kind: z.enum(["external_read", "schedule", "modify_external", "send"]),
     input_schema_json: z.string(),
     schema_hash: Sha256Hex,
     enabled: z.number().int().min(0).max(1),

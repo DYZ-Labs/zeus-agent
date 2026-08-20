@@ -126,6 +126,7 @@ export type EmailCapabilityState = {
   canDraft: boolean;
   canTrash: boolean;
   canUntrash: boolean;
+  canSend: boolean;
   connectorLabel: string | null;
   unusableStatus: ConnectorStatus | null;
   unusableReason: string | null;
@@ -145,6 +146,7 @@ export function emailCapabilityState(db: Db): EmailCapabilityState {
   const canDraft = availableCapability(db, "email.create_draft") !== null;
   const canTrash = availableCapability(db, "email.trash_thread") !== null;
   const canUntrash = availableCapability(db, "email.untrash_thread") !== null;
+  const canSend = availableCapability(db, "email.send_message") !== null;
   // A connector that exists and cannot be called is a different answer from no connector at
   // all. `provider === "google_gmail"` covers the hosted row before any slot is bound, which
   // is the calendar's rule for `google_calendar` and the one this used to skip.
@@ -176,6 +178,7 @@ export function emailCapabilityState(db: Db): EmailCapabilityState {
     canDraft,
     canTrash,
     canUntrash,
+    canSend,
     connectorLabel: connector?.label ?? null,
     unusableStatus: read ? null : (bound?.status ?? null),
     unusableReason,
@@ -358,6 +361,7 @@ function emailLines(state: EmailCapabilityState): string[] {
     ...(state.canDraft ? ["save a draft in the user's Gmail Drafts"] : []),
     ...(state.canTrash ? ["move a whole thread to the user's Gmail Trash"] : []),
     ...(state.canUntrash ? ["take a thread it moved to Trash back out again"] : []),
+    ...(state.canSend ? ["send a message"] : []),
   ];
   return [
     `Inbox: ${name} is connected for reading. Zeus can see recent subjects and senders in ` +
@@ -368,9 +372,14 @@ function emailLines(state: EmailCapabilityState): string[] {
         "could do any of that; reconnecting Gmail in Settings, under Connections, grants " +
         "it in one step."
       : `Zeus can ${series(writes)}, each after the user confirms that exact request. Zeus ` +
-        "cannot send email, and cannot delete anything permanently. A saved draft is unsent " +
-        "and waiting in Gmail; a trashed thread is in Gmail's Trash and can be put back. " +
-        "Never describe either as done unless the work result says it was completed.",
+        "cannot delete anything permanently. A saved draft is unsent and waiting in Gmail; a " +
+        "trashed thread is in Gmail's Trash and can be put back. Never describe any of them " +
+        "as done unless the work result says it was completed." +
+        (state.canSend
+          ? " Sending is the one thing here that cannot be undone: say so when it comes up, " +
+            "never offer to unsend or recall a message, and never treat a request to draft " +
+            "as a request to send."
+          : ""),
     state.lastReadAt === null
       ? "Zeus has never successfully read this inbox."
       : "Zeus has read this inbox; the inbox block in this message is from that read and " +

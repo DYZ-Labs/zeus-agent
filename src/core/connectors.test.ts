@@ -578,6 +578,7 @@ describe("the first-party Google Calendar provider", () => {
         tool("create_draft", false),
         tool("trash_thread", false),
         tool("untrash_thread", false),
+        tool("send_message", false),
       ];
       recordConnectorVerification(db, connector.id, { status: "ready", tools });
 
@@ -593,6 +594,7 @@ describe("the first-party Google Calendar provider", () => {
           "email.create_draft",
           "email.get_thread",
           "email.search_threads",
+          "email.send_message",
           "email.trash_thread",
           "email.untrash_thread",
         ]);

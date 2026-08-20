@@ -8,17 +8,18 @@ import type { CalendarBrokerStore, GmailGrant } from "./store";
 export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 
 /**
- * The narrowest scope that can draft and can trash.
+ * The one scope for everything Zeus does with a mailbox: read, draft, trash, untrash, send.
  *
- * There is no draft-only Gmail scope: `gmail.compose` and `gmail.modify` both confer the
- * ability to send, and `threads.trash` needs `gmail.modify` regardless. So the honest
- * statement is the two-part one, and it is worth writing down where the constant lives —
- * **permanent deletion is prevented by scope, and sending is prevented by code.**
+ * It stops exactly one thing, and that is worth writing down where the constant lives.
+ * `messages.delete` and `threads.delete` accept only `https://mail.google.com/`, which this
+ * broker never requests — so permanent deletion is not something a bug here could reach, and
+ * the worst a mistake can do to somebody's mail is put it in their own Trash.
  *
- * By scope: `messages.delete` and `threads.delete` require `https://mail.google.com/`, which
- * this broker never requests, so bypassing Trash is not something any bug here could reach.
- * By code: Zeus has no `send` capability slot to name, `CapabilitySlot` cannot express one,
- * and the only requests this file can make are the five registered below.
+ * Everything else this scope permits, Zeus permits too, including sending. That is not an
+ * accident of Google's scope design: there is no narrower option — `gmail.compose` confers
+ * sending as well — but it is also no longer being worked around. What holds a send back is
+ * a code-owned plan, no standing policy, a recipient allowlist checked twice, and one exact
+ * confirmation. See `CAPABILITY_SLOT_EFFECTS` in `schema.ts`.
  */
 export const GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
@@ -296,6 +297,44 @@ export function createGoogleGmailMcpServer(input: {
   );
 
   server.registerTool(
+    "send_message",
+    {
+      title: "Send a Gmail message",
+      description:
+        "Send one message from the connected user's mailbox. This cannot be undone: there " +
+        "is no recall, no edit, and no unsend.",
+      inputSchema: {
+        to: z.array(EmailAddress).min(1).max(MAX_RECIPIENTS),
+        subject: HeaderText.optional(),
+        body: z.string().min(1).max(MAX_DRAFT_BODY_CHARS),
+        threadId: z.string().trim().min(1).max(1_024).optional(),
+      },
+      // Not destructive in the sense of overwriting anything — irreversible, which is the
+      // property a person reading a tool list needs warned about, and the closest one this
+      // vocabulary has.
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ to, subject, body, threadId }) => {
+      // The rule that matters more here than anywhere else in this file. A retry without a
+      // durable key is a second message in somebody's inbox, and there is no taking it back.
+      if (!input.requestKey) return failure("A durable Zeus request key is required");
+      try {
+        return success(
+          await sendMessage(await accessToken(), fetcher, {
+            to,
+            subject,
+            body,
+            threadId,
+            requestKey: input.requestKey,
+          }),
+        );
+      } catch (error) {
+        return gmailToolFailure(input, error, "send");
+      }
+    },
+  );
+
+  server.registerTool(
     "trash_thread",
     {
       title: "Move a Gmail thread to Trash",
@@ -505,6 +544,77 @@ async function createDraft(
     message: { raw, ...(draft.threadId ? { threadId: draft.threadId } : {}) },
   });
   return { ...draftSummary(created), message_id: messageId, created: true };
+}
+
+/**
+ * Send one message, or report the one this request already sent.
+ *
+ * The duplicate check is the same shape as the draft's and carries far more weight: a second
+ * draft is a nuisance the user deletes, and a second message is a second message. So the
+ * lookup runs over sent mail before anything leaves, and — unlike the draft path — a lookup
+ * that *fails* is not waved through. Not knowing whether this already sent is precisely the
+ * state in which sending again is the wrong move.
+ */
+async function sendMessage(
+  token: string,
+  fetcher: typeof fetch,
+  message: {
+    to: string[];
+    subject?: string;
+    body: string;
+    threadId?: string;
+    requestKey: string;
+  },
+): Promise<Record<string, unknown>> {
+  const messageId = derivedMessageId(message.requestKey, await accountDomain(token, fetcher));
+  const already = await sentCarrying(token, fetcher, messageId);
+  if (already) return { ...already, message_id: messageId, sent: false };
+
+  const reply = message.threadId
+    ? await replyHeaders(token, fetcher, message.threadId)
+    : null;
+  const raw = Buffer.from(
+    mimeMessage({
+      ...message,
+      subject: message.subject ?? reply?.subject ?? "",
+      messageId,
+      reply,
+    }),
+    "utf8",
+  ).toString("base64url");
+  const sent = await gmailPost(token, fetcher, "/messages/send", {
+    raw,
+    ...(message.threadId ? { threadId: message.threadId } : {}),
+  });
+  return {
+    id: stringField(sent, "id"),
+    thread_id: stringField(sent, "threadId"),
+    message_id: messageId,
+    sent: true,
+  };
+}
+
+/**
+ * Has this exact request already been sent?
+ *
+ * Throws rather than returning null when Gmail will not answer. The draft path swallows the
+ * same failure because the cost of guessing wrong there is one extra draft; here it is a
+ * duplicate nobody can recall, so an unanswerable question fails the send instead.
+ */
+async function sentCarrying(
+  token: string,
+  fetcher: typeof fetch,
+  messageId: string,
+): Promise<Record<string, unknown> | null> {
+  const found = await gmailGet(token, fetcher, "/messages", {
+    q: `rfc822msgid:${messageId.replace(/^<|>$/gu, "")}`,
+    includeSpamTrash: "true",
+    maxResults: "1",
+  });
+  const first = asArray(found.messages)[0];
+  if (first === undefined) return null;
+  const record = asRecord(first);
+  return { id: stringField(record, "id"), thread_id: stringField(record, "threadId") };
 }
 
 /**
@@ -887,7 +997,7 @@ function refusalCode(base: string, message: string): string {
  * The operation is named because a failed draft reported as `gmail_read_failed` is an
  * operator reading the wrong incident.
  */
-type GmailOperation = "read" | "draft" | "trash" | "untrash";
+type GmailOperation = "read" | "draft" | "trash" | "untrash" | "send";
 
 function reportGmailFailure(
   operation: GmailOperation,

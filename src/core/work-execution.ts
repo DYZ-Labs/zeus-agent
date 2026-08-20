@@ -36,8 +36,11 @@ import { buildContext, intentFieldProvenance } from "./context";
 import {
   buildEmailPayload,
   emailPreviewFor,
+  isEmailSendRequest,
   isThreadMoveRequest,
   parseEmailRequest,
+  sendCheckFor,
+  sendRecipientsAllowed,
 } from "./email-actions";
 import { emailMoveTarget } from "./email-context";
 import type { EmailRequest } from "./email-actions";
@@ -889,12 +892,12 @@ async function executeEmailWrite(
   available: BoundCapability,
   request: EmailRequest,
 ): Promise<SafeStepExecutionResult> {
-  const threadId = request.kind === "draft_new" ? null : request.threadId;
-  const thread = request.kind === "draft_new"
+  const threadId = "threadId" in request ? request.threadId : null;
+  const thread = threadId === null
     ? null
     : isThreadMoveRequest(request)
       ? emailMoveTarget(db, request)
-      : cachedThreads(db, new Date()).find((entry) => entry.id === request.threadId) ?? null;
+      : cachedThreads(db, new Date()).find((entry) => entry.id === threadId) ?? null;
   if (threadId !== null && !thread) {
     return {
       output: { prepared: false, reason: "thread_no_longer_cached" },
@@ -921,6 +924,19 @@ async function executeEmailWrite(
     return { pause: { code: "payload_invalid", message: mismatch }, toolCalls: 0 };
   }
 
+  // Stored with the payload it approves, so the check that runs immediately before the bytes
+  // leave is reading the decision this step made — not asking a moved cache to make it again.
+  const sendCheck = isEmailSendRequest(request) ? sendCheckFor(request, new Date()) : null;
+  if (sendCheck && !sendRecipientsAllowed(sendCheck, payload)) {
+    return {
+      pause: {
+        code: "recipient_not_allowed",
+        message: "That recipient did not come from a source Zeus is allowed to send to",
+      },
+      toolCalls: 0,
+    };
+  }
+
   const effect = proposeEffect(db, {
     workRunId: input.run.id,
     workStepId: input.step.id,
@@ -932,6 +948,7 @@ async function executeEmailWrite(
     priorState: thread
       ? { thread_id: thread.id, subject: thread.subject, from: thread.from }
       : null,
+    conflictCheck: sendCheck,
   });
 
   return {
@@ -943,7 +960,9 @@ async function executeEmailWrite(
         ? "Moving a thread to Trash needs your confirmation"
         : request.kind === "untrash"
           ? "Restoring a thread from Trash needs your confirmation"
-          : "Saving this draft needs your confirmation",
+          : isEmailSendRequest(request)
+            ? "Sending this needs your confirmation, and it cannot be undone afterwards"
+            : "Saving this draft needs your confirmation",
       requiresReauthorization: false,
     },
   };

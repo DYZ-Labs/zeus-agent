@@ -729,8 +729,8 @@ GOOGLE_GMAIL_BROKER_SERVICE_KEY=<the same Gmail broker service key>
 
 The Gmail OAuth consent screen declares exactly one scope:
 `https://www.googleapis.com/auth/gmail.modify`. Connecting Gmail is a single consent and
-grants everything Zeus can do with a mailbox — read, draft, trash, untrash. There is no
-second permission to come back for, and no read-only tier to choose.
+grants everything Zeus can do with a mailbox — read, draft, trash, untrash, send. There is
+no second permission to come back for, and no read-only tier to choose.
 
 It is a Google *restricted* scope, the same tier `gmail.readonly` was: test users can connect
 while the app is in testing, but a public external app needs Google's OAuth verification and
@@ -740,13 +740,29 @@ recurring security assessment.
 "Zeus cannot delete your mail permanently": `messages.delete` and `threads.delete` accept no
 other scope, so no bug in Zeus or the broker can reach them.
 
-**Sending is prevented by code, not by scope.** There is no draft-only Gmail scope —
-`gmail.modify` and `gmail.compose` both permit `messages.send` — so what stops a send is that
-Zeus has no `send` capability slot to name, the database CHECK rejects one, and the broker
-registers five tools of which none sends. The residual risk worth stating plainly: a
-compromised broker holding a `gmail.modify` refresh token could send. That is the price of
-Google offering no narrower scope, and it is why the Gmail broker keeps its own project, its
-own OAuth client, and its own service key.
+**Sending is the one thing Zeus does that cannot be undone**, and it is guarded by four
+independent things rather than by the absence of a capability:
+
+1. `email.send_message` is reachable only from a code-owned plan builder. A model-generated
+   proposal may name nothing outside `SAFE_EFFECT_KINDS` (`memory_read`, `web_read`,
+   `prepare_local`), and `isSafeSurfacedProposal` rejects the plan before a row exists.
+2. There is no standing-policy path for `send`, and it cannot acquire one. The calendar's
+   direct-execution mode is defensible because a deterministic gate re-reads the calendar
+   first; there is no equivalent question to ask about a message.
+3. The recipient must come from one of two sources — the sender of a thread in the user's own
+   inbox, or an address typed into the message that asked for the send. That allowlist is
+   recorded beside the payload and re-checked in `executeConfirmedEffect` immediately before
+   the bytes leave. A name is never a source: Zeus has no contacts to resolve one against.
+4. One exact-payload confirmation, hash-bound, like every other write.
+
+The broker adds provider-side idempotency: the RFC 5322 `Message-ID` is derived from Zeus's
+durable request key and sent mail is searched for it before anything goes. Unlike the draft
+path, a lookup that *fails* aborts the send — not knowing whether a message already went is
+precisely the state in which sending again is wrong.
+
+The residual risk worth stating plainly: a compromised broker holding a `gmail.modify` refresh
+token could send. That is the price of Google offering no narrower scope, and it is why the
+Gmail broker keeps its own project, its own OAuth client, and its own service key.
 
 Inboxes connected before Zeus could write still hold a `gmail.readonly` refresh token. They
 keep reading, bind only the two read slots, and say so in `<capabilities>`; reconnecting

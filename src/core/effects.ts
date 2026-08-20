@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { confirmationSentence } from "./confirmation-text";
+import { sendRecipientsAllowed } from "./email-actions";
 import { availableCapability, getCapability, getConnector } from "./connectors";
 import type { ConnectorView } from "./connectors";
 import type { Db } from "./db";
@@ -451,7 +452,7 @@ export function authorizeEffectByPolicy(
     if (effect.payload_hash !== payloadHashToAuthorize) {
       throw new Error("That authorization does not match this exact external request");
     }
-    assertStoredCalendarCheckIsClear(effect);
+    assertStoredCalendarCheckIsClear(db, effect);
     const message = db
       .prepare<[number], { role: string }>("SELECT role FROM message WHERE id = ?")
       .get(input.requestMessageId);
@@ -483,7 +484,25 @@ export function authorizeEffectByPolicy(
   })();
 }
 
-function assertStoredCalendarCheckIsClear(effect: ProposedEffect): void {
+/** The allowlist recorded beside the payload, or null if this effect never had one. */
+function storedSendCheck(effect: ProposedEffect): unknown {
+  if (!effect.conflict_check_json) return null;
+  try {
+    return JSON.parse(effect.conflict_check_json);
+  } catch {
+    return null;
+  }
+}
+
+function assertStoredCalendarCheckIsClear(db: Db, effect: ProposedEffect): void {
+  // Pinned by slot, not by effect kind. `modify_external` used to mean "a calendar change"
+  // and now also means "bin a mail thread", so the kind alone stopped being an answer to the
+  // question this asks. Email has no standing-policy path and is not getting one here by
+  // having grown an effect kind the calendar already used.
+  const capability = getCapability(db, effect.connector_capability_id);
+  if (!capability || !capability.slot.startsWith("calendar.")) {
+    throw new Error("Standing policy can authorize only a calendar request");
+  }
   if (effect.effect_kind !== "schedule" && effect.effect_kind !== "modify_external") {
     throw new Error("Standing policy can authorize only a calendar request");
   }
@@ -576,6 +595,13 @@ export async function executeConfirmedEffect(
   const payload = JSON.parse(effect.payload_json) as Record<string, unknown>;
   if (payloadHash(capability.slot, capability.remote_tool_name, payload) !== effect.payload_hash) {
     return fail(db, id, "payload_changed_since_confirmation");
+  }
+  // The last gate before bytes leave, and only the irreversible effect pays for it. The hash
+  // above already proves the payload is the confirmed one; this proves the confirmed one was
+  // addressed to somebody the user themselves named. Two questions, one of which the store
+  // could in principle answer wrongly, asked in the one place where being wrong is permanent.
+  if (effect.effect_kind === "send" && !sendRecipientsAllowed(storedSendCheck(effect), payload)) {
+    return fail(db, id, "recipient_not_allowed");
   }
 
   const receiptId = beginConnectorCallReceipt(db, effect, capability.id, payload);

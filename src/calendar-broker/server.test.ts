@@ -257,6 +257,7 @@ describe("connecting Gmail", () => {
       "create_draft",
       "get_thread",
       "search_threads",
+      "send_message",
       "trash_thread",
       "untrash_thread",
     ]);
@@ -293,6 +294,7 @@ describe("the multi-user Gmail broker", () => {
       "create_draft",
       "get_thread",
       "search_threads",
+      "send_message",
       "trash_thread",
       "untrash_thread",
     ]);

@@ -58,6 +58,7 @@ export const CAPABILITY_SLOTS = [
   "email.create_draft",
   "email.trash_thread",
   "email.untrash_thread",
+  "email.send_message",
 ] as const satisfies readonly CapabilitySlot[];
 
 /**
@@ -84,9 +85,8 @@ export const GOOGLE_CALENDAR_WRITE_SCOPE =
 export const GOOGLE_GMAIL_BROKER_SERVICE_KEY = "GOOGLE_GMAIL_BROKER_SERVICE_KEY";
 export const GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 /**
- * The one scope that can draft and can trash. It reads too, so a write grant asks for it
- * alone. See `calendar-broker/gmail.ts` for why there is no narrower option and what that
- * does and does not imply.
+ * The one scope for everything Zeus does with a mailbox. See `calendar-broker/gmail.ts` for
+ * what it permits, what it does not, and what holds a send back.
  */
 export const GOOGLE_GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
@@ -824,6 +824,7 @@ export function configureGoogleGmailCapabilities(
       ["email.create_draft", "create_draft"],
       ["email.trash_thread", "trash_thread"],
       ["email.untrash_thread", "untrash_thread"],
+      ["email.send_message", "send_message"],
     );
   }
   return configureGoogleProviderCapabilities(db, input, {

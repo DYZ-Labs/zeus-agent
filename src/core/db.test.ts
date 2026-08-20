@@ -39,6 +39,7 @@ import {
 } from "./db";
 import { MIGRATIONS, type Migration } from "./migrations";
 import { CAPABILITY_SLOT_EFFECTS, CapabilitySlot } from "./schema";
+import { SAFE_EFFECT_KINDS } from "./work-plans";
 import { ACCOUNTS_DIRECTORY } from "./stores";
 
 const FIRST: Migration = {
@@ -994,7 +995,7 @@ describe("email-slot migration rebuilds connector_capability in place", () => {
     db.close();
   });
 
-  it("admits the email draft and trash slots, and still has no send slot to admit", () => {
+  it("pairs every email slot with exactly one effect kind, send included", () => {
     const db = storeAtThirtyTwo();
     migrate(db, MIGRATIONS);
 
@@ -1012,23 +1013,35 @@ describe("email-slot migration rebuilds connector_capability in place", () => {
     expect(() => insert("email.create_draft", "modify_external")).not.toThrow();
     expect(() => insert("email.trash_thread", "modify_external")).not.toThrow();
     expect(() => insert("email.untrash_thread", "modify_external")).not.toThrow();
-    // The pairing CHECK still binds each slot to exactly one effect kind.
-    expect(() => insert("email.get_thread", "send")).toThrow(/CHECK/u);
+    expect(() => insert("email.send_message", "send")).not.toThrow();
+
+    // This table used to refuse `send` outright, and a test here said so. It no longer does,
+    // because the user asked for sending — so what survives is the narrower claim, and it is
+    // the one that was doing the real work all along: exactly one slot may send, and it may
+    // do nothing else.
     expect(() => insert("email.create_draft", "send")).toThrow(/CHECK/u);
-    expect(() => insert("email.create_draft", "external_read")).toThrow(/CHECK/u);
-    expect(() => insert("email.trash_thread", "external_read")).toThrow(/CHECK/u);
+    expect(() => insert("email.trash_thread", "send")).toThrow(/CHECK/u);
     expect(() => insert("email.untrash_thread", "send")).toThrow(/CHECK/u);
-    // The one that matters most, and the reason this test outlived the increment that wrote
-    // it: email can draft and can bin, and there is still no row shape that says it can send.
-    expect(() => insert("email.send_message", "send")).toThrow(/CHECK/u);
+    expect(() => insert("calendar.update_event", "send")).toThrow(/CHECK/u);
+    expect(() => insert("email.send_message", "modify_external")).toThrow(/CHECK/u);
+    expect(() => insert("email.send_message", "external_read")).toThrow(/CHECK/u);
     db.close();
   });
 
-  it("names no capability slot that can send", () => {
-    // Stated against the type rather than the table, so a slot added without a migration
-    // still trips it. `send` remains in `EffectKind` because the enum is the vocabulary of
-    // authorization, not a list of things Zeus can do.
-    expect(CapabilitySlot.options.filter((slot) => /send/u.test(slot))).toEqual([]);
-    expect(Object.values(CAPABILITY_SLOT_EFFECTS)).not.toContain("send");
+  it("keeps sending out of reach of any plan a model writes", () => {
+    // The database stopped being the thing that prevents a send, so this is where the
+    // replacement guarantee is stated. `SAFE_EFFECT_KINDS` is the entire vocabulary a
+    // generated proposal may use — `isSafeSurfacedProposal` rejects anything else before a
+    // plan row exists — so `send` being absent from it is what keeps sending reachable only
+    // from a builder written in this repository.
+    expect(SAFE_EFFECT_KINDS as readonly string[]).not.toContain("send");
+    expect(SAFE_EFFECT_KINDS as readonly string[]).not.toContain("modify_external");
+
+    // And exactly one slot carries it, so reviewing the bound slots is still enough to know
+    // what a connector may do.
+    const senders = CapabilitySlot.options.filter(
+      (slot) => CAPABILITY_SLOT_EFFECTS[slot] === "send",
+    );
+    expect(senders).toEqual(["email.send_message"]);
   });
 });

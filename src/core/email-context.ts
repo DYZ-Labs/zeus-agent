@@ -10,8 +10,8 @@ import {
 import type { EmailThread, ThreadMessage } from "./email-sync";
 import {
   addressInMessage,
-  draftReplyRequest,
   emailWriteVerb,
+  replyRequest,
   trashRequest,
   untrashRequest,
 } from "./email-actions";
@@ -381,7 +381,7 @@ export function matchThread(
 
   const words = contentWords(
     query.replace(
-      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|draft|compose|write|reply|replies|respond|answer|delete|trash|bin|junk|throw away|get rid of|untrash|undelete|restore|recover|undo|put|bring|take|pull|back|out of|e-?mails?|messages?|threads?|note|inbox|say|says|said|about|from|the|my|to)\b/giu,
+      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|draft|compose|write|reply|replies|respond|answer|delete|trash|bin|junk|throw away|get rid of|untrash|undelete|restore|recover|undo|put|bring|take|pull|back|out of|send|sends|sending|sent|e-?mails?|messages?|threads?|note|inbox|say|says|said|about|from|the|my|to)\b/giu,
       " ",
     ),
   );
@@ -595,16 +595,18 @@ export function resolveEmailWriteRequest(
     return { status: "request", request: trashRequest(target.thread), thread: target.thread };
   }
 
+  const intent = verb === "send" ? "send" : "draft";
+
   // An address the user typed is the only recipient Zeus can use that did not come out of
   // somebody else's mailbox. There is no contacts integration to turn a name into one, and
   // guessing from a cached sender that merely looks like "Sarah" is how mail reaches the
-  // wrong Sarah.
+  // wrong Sarah — an embarrassment for a draft, and unrecoverable for a send.
   const typed = addressInMessage(content);
   if (typed) {
     return {
       status: "request",
       request: {
-        kind: "draft_new",
+        kind: intent === "send" ? "send_new" : "draft_new",
         to: typed,
         subject: null,
         instruction: content.trim().slice(0, 800),
@@ -618,12 +620,14 @@ export function resolveEmailWriteRequest(
   if (target.status !== "resolved") {
     return {
       status: "refused",
-      reason:
-        "Zeus has no address to draft to. Name the address, or point at an email in the " +
-        "inbox to reply to.",
+      reason: intent === "send"
+        ? "Zeus has no address to send to. Name the address, or point at an email in the " +
+          "inbox to reply to — it will not guess a recipient for something it cannot recall."
+        : "Zeus has no address to draft to. Name the address, or point at an email in the " +
+          "inbox to reply to.",
     };
   }
-  const request = draftReplyRequest(target.thread, content);
+  const request = replyRequest(target.thread, content, intent);
   if (!request) {
     return {
       status: "refused",
