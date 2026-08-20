@@ -5,9 +5,11 @@ import { PageHeader } from "@/components/page-header";
 import { OpportunityDeliveryReceipt } from "@/components/opportunity-delivery-receipt";
 import { PendingEffectsPanel } from "@/components/pending-effects-panel";
 import { Plans } from "@/components/plans";
+import { Reflection } from "@/components/reflection";
 import { WorkPlansPanel, type WorkPlanPanelItem } from "@/components/work-plans-panel";
 import { buildEvaluationContextForTrigger, resolveTodayOpportunity } from "@/core/ambient";
 import { expireStaleEffects, listExecutedEffects, listPendingEffects } from "@/core/effects";
+import { listFacets, type UnderstandingFacetView } from "@/core/facets";
 import { hasCredentials } from "@/core/openai";
 import type { FollowThroughRecommendation } from "@/core/schema";
 import {
@@ -40,6 +42,7 @@ export default async function TodayPage({
   const cycle = resolveTodayOpportunity(db, todayContext) ?? evaluateOpportunity(db, todayContext);
   const recommendation = recommendationForOpportunity(db, cycle.id);
   const signalAlert = signalAlertForOpportunity(db, cycle.id);
+  const currentFacets = listFacets(db, { limit: 500 });
   const workItems: WorkPlanPanelItem[] = listWorkPlans(db, { includeClosed: true, limit: 30 })
     .map((plan) => {
       const detail = getWorkPlan(db, plan.id);
@@ -106,8 +109,34 @@ export default async function TodayPage({
 
         <Plans db={db} showCompleted={params.show === "completed"} />
         <WorkPlansPanel items={workItems} canExecute={hasCredentials()} />
+
+        <OpenQuestion currentFacets={currentFacets} />
       </div>
     </div>
+  );
+}
+
+/**
+ * One question about how the user works, kept behind a disclosure.
+ *
+ * Zeus never appends profile questions to a normal chat, and Today shows one thing at a
+ * time, so this stays closed until the user opens it.
+ */
+function OpenQuestion({ currentFacets }: { currentFacets: readonly UnderstandingFacetView[] }) {
+  return (
+    <section className="mt-10 max-w-[54rem]">
+      <details>
+        <summary className="cursor-pointer text-[0.84rem]" style={{ color: "var(--shell-muted)" }}>
+          Open questions — answer one, and Zeus understands you a little better
+        </summary>
+        <p className="mt-3 max-w-[68ch] text-[0.8rem] leading-5" style={{ color: "var(--shell-muted)" }}>
+          Zeus does not append profile questions to normal chats. This reflection begins only
+          because you opened it, and your answer is stored as an ordinary user-authored source
+          message.
+        </p>
+        <Reflection currentFacets={currentFacets} />
+      </details>
+    </section>
   );
 }
 
