@@ -106,6 +106,7 @@ describe("encrypted Gmail grants", () => {
     const state = store.createGmailOAuthState({
       accountId: randomUUID(),
       returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
+      permission: "read",
     }, at);
 
     expect(store.consumeGmailOAuthState(state, at)?.returnUrl).toContain("google-gmail");

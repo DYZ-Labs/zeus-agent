@@ -2375,6 +2375,60 @@ CREATE INDEX detected_signal_commitment_idx ON detected_signal(commitment_id)
 WHERE commitment_id IS NOT NULL;
 `;
 
+/**
+ * The two email write slots, admitted the only way a CHECK can be widened.
+ *
+ * Same rename-recreate-copy-drop as 033, and for the same reason: `proposed_effect` and
+ * `tool_receipt` both reference `connector_capability(id)`, so copying `id` explicitly is
+ * what keeps a receipt written last week still pointing at the capability that earned it.
+ *
+ * `effect_kind`'s own CHECK is untouched — `modify_external` was already admitted. What
+ * changes is the pairing CHECK, and what stays absent from it is any slot paired with
+ * `send`. That absence is the constraint `db.test.ts` asserts against, and it is load-bearing
+ * rather than incidental: Zeus can draft and can bin, and the database will not store a
+ * capability row saying it can send.
+ */
+const EMAIL_WRITE_CAPABILITY_SLOTS = `
+ALTER TABLE connector_capability RENAME TO connector_capability_email_write_legacy;
+CREATE TABLE connector_capability (
+  id                 INTEGER PRIMARY KEY,
+  connector_id       INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  slot               TEXT NOT NULL
+                     CHECK (slot IN ('calendar.list_events','calendar.create_event',
+                                     'calendar.update_event','email.search_threads',
+                                     'email.get_thread','email.create_draft',
+                                     'email.trash_thread')),
+  remote_tool_name   TEXT NOT NULL,
+  effect_kind        TEXT NOT NULL
+                     CHECK (effect_kind IN ('external_read','schedule','modify_external')),
+  input_schema_json  TEXT NOT NULL CHECK (json_valid(input_schema_json)),
+  schema_hash        TEXT NOT NULL
+                     CHECK (length(schema_hash) = 64 AND schema_hash NOT GLOB '*[^0-9a-f]*'),
+  enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  UNIQUE (connector_id, slot),
+  CHECK (
+    (slot = 'calendar.list_events' AND effect_kind = 'external_read')
+    OR (slot = 'calendar.create_event' AND effect_kind = 'schedule')
+    OR (slot = 'calendar.update_event' AND effect_kind = 'modify_external')
+    OR (slot = 'email.search_threads' AND effect_kind = 'external_read')
+    OR (slot = 'email.get_thread' AND effect_kind = 'external_read')
+    OR (slot = 'email.create_draft' AND effect_kind = 'modify_external')
+    OR (slot = 'email.trash_thread' AND effect_kind = 'modify_external')
+  )
+);
+INSERT INTO connector_capability
+  (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+   enabled, source_message_id, created_at, updated_at)
+SELECT id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+       enabled, source_message_id, created_at, updated_at
+FROM connector_capability_email_write_legacy;
+DROP TABLE connector_capability_email_write_legacy;
+CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2420,4 +2474,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "035_inbox_turn_context", sql: INBOX_TURN_CONTEXT },
   { id: "036_email_detectors", sql: EMAIL_DETECTORS },
   { id: "037_google_gmail_provider", sql: GOOGLE_GMAIL_PROVIDER },
+  { id: "038_email_write_capability_slots", sql: EMAIL_WRITE_CAPABILITY_SLOTS },
 ];

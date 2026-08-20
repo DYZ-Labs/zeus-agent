@@ -12,9 +12,12 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
   if (!access.canAccessPrivateData || access.state !== "authorized" || !access.account) {
     return settingsError(request, access.message ?? "Sign in before connecting Gmail.");
   }
+  const permission = request.nextUrl.searchParams.get("permission") === "write"
+    ? "write"
+    : "read";
   try {
     const response = NextResponse.redirect(
-      googleGmailAuthorizationUrl(access.account.id),
+      googleGmailAuthorizationUrl(access.account.id, permission),
       303,
     );
     response.headers.set("Cache-Control", "private, no-store");

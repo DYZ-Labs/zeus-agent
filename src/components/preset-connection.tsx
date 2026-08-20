@@ -43,6 +43,7 @@ export function PresetConnection({
   icon,
   defaultSlots,
   hostedStartHref = null,
+  upgrade = null,
   recheckLabel = null,
   connector,
   localMode,
@@ -52,6 +53,14 @@ export function PresetConnection({
   icon: ReactNode;
   defaultSlots: CapabilitySlot[];
   hostedStartHref?: string | null;
+  /**
+   * Where a connected account goes to widen its grant.
+   *
+   * Without this a scope can only be widened by hand-editing a URL: a connected hosted
+   * connector otherwise renders "Disconnect" and nothing else, so a capability that needs a
+   * second consent ships unreachable.
+   */
+  upgrade?: { href: string; label: string; slot: CapabilitySlot } | null;
   recheckLabel?: string | null;
   connector: ConnectorView | null;
   localMode: boolean;
@@ -110,6 +119,15 @@ export function PresetConnection({
 
         {connected && connector ? (
           <div className="flex shrink-0 items-center gap-2">
+            {upgrade && !localMode && !grantedSlots.includes(upgrade.slot) ? (
+              <a
+                href={upgrade.href}
+                className="shrink-0 rounded-lg px-3 py-2 text-sm font-medium"
+                style={{ background: "var(--shell-accent)", color: "#000000" }}
+              >
+                {upgrade.label}
+              </a>
+            ) : null}
             {recheckLabel ? (
               <form action={verifyConnectorAction}>
                 <input type="hidden" name="id" value={connector.id} />

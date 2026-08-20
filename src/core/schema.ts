@@ -957,17 +957,24 @@ export const CapabilitySlot = z.enum([
   "calendar.update_event",
   "email.search_threads",
   "email.get_thread",
+  "email.create_draft",
+  "email.trash_thread",
 ]);
 export type CapabilitySlot = z.infer<typeof CapabilitySlot>;
 
 /**
- * Email arrives read-only, and there is no email write slot at all — not a disabled one, not
- * one gated behind a policy. A capability Zeus cannot name is one it cannot be talked into,
- * and email is the most adversarial text it will ever read.
+ * Email can now draft and can now bin, and still cannot send.
  *
- * `email.search_threads` and `email.get_thread` are the first slots to share an effect kind
- * with another slot. That makes effect kind an ambiguous way to choose a capability, which
- * is why `availableCapabilityForEffect` no longer exists.
+ * The read slots came first on purpose, and the two write slots that join them are the two
+ * whose worst case a user can undo: a draft waits unsent in their own Drafts, and a trashed
+ * thread waits thirty days in their own Trash. There is no `email.send_message`, and that is
+ * the point of naming slots at all — a capability Zeus cannot name is one it cannot be talked
+ * into, however adversarial the mail it is reading. Permanent deletion is out of reach for a
+ * second, independent reason: it needs an OAuth scope the broker never asks for.
+ *
+ * The email slots are also why effect kind is an ambiguous way to choose a capability —
+ * `modify_external` now means either `calendar.update_event` or `email.trash_thread` — which
+ * is why `availableCapabilityForEffect` no longer exists and callers resolve by slot.
  */
 export const CAPABILITY_SLOT_EFFECTS = {
   "calendar.list_events": "external_read",
@@ -975,6 +982,8 @@ export const CAPABILITY_SLOT_EFFECTS = {
   "calendar.update_event": "modify_external",
   "email.search_threads": "external_read",
   "email.get_thread": "external_read",
+  "email.create_draft": "modify_external",
+  "email.trash_thread": "modify_external",
 } as const satisfies Record<CapabilitySlot, EffectKind>;
 
 export const Sha256Hex = z

@@ -22,6 +22,7 @@ import {
   GOOGLE_CALENDAR_WRITE_SCOPE,
   GOOGLE_GMAIL_BROKER_SERVICE_KEY,
   GOOGLE_GMAIL_READ_SCOPE,
+  GOOGLE_GMAIL_WRITE_SCOPE,
   getConnector,
   getConnectorByPresetId,
   getGoogleCalendarConnector,
@@ -558,6 +559,78 @@ describe("the first-party Google Calendar provider", () => {
       expect(listToolReceipts(db, run.id)[0]?.connector_capability_id).toBe(readCapability.id);
     } finally {
       delete process.env[GOOGLE_CALENDAR_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("binds the write slots only for a grant that actually carries the write scope", () => {
+    process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = "g".repeat(40);
+    try {
+      bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
+      const connectionId = randomUUID();
+      const connector = upsertGoogleGmailConnector(db, {
+        connectionId,
+        mcpUrl: `https://mail.zeusagent.dev/gmail/mcp/${connectionId}`,
+        sourceMessageId: userMessageId,
+      });
+      const tools = [
+        tool("search_threads", true),
+        tool("get_thread", true),
+        tool("create_draft", false),
+        tool("trash_thread", false),
+      ];
+      recordConnectorVerification(db, connector.id, { status: "ready", tools });
+
+      // `gmail.modify` reads as well as writes, so it satisfies the read requirement alone.
+      const wide = configureGoogleGmailCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_GMAIL_WRITE_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+      expect(wide.capabilities.filter((entry) => entry.enabled === 1).map((entry) => entry.slot).sort())
+        .toEqual([
+          "email.create_draft",
+          "email.get_thread",
+          "email.search_threads",
+          "email.trash_thread",
+        ]);
+
+      // Narrowing the grant narrows what Zeus can do, in the same store, without deleting
+      // the rows a receipt may already cite.
+      const narrowed = configureGoogleGmailCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: [GOOGLE_GMAIL_READ_SCOPE],
+        sourceMessageId: userMessageId,
+      });
+      expect(narrowed.capabilities.filter((entry) => entry.enabled === 1).map((entry) => entry.slot).sort())
+        .toEqual(["email.get_thread", "email.search_threads"]);
+    } finally {
+      delete process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY];
+    }
+  });
+
+  it("refuses a grant that carries neither Gmail scope", () => {
+    process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = "g".repeat(40);
+    try {
+      bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
+      const connectionId = randomUUID();
+      const connector = upsertGoogleGmailConnector(db, {
+        connectionId,
+        mcpUrl: `https://mail.zeusagent.dev/gmail/mcp/${connectionId}`,
+        sourceMessageId: userMessageId,
+      });
+      const tools = [tool("search_threads", true), tool("get_thread", true)];
+      recordConnectorVerification(db, connector.id, { status: "ready", tools });
+
+      expect(() => configureGoogleGmailCapabilities(db, {
+        connectorId: connector.id,
+        tools,
+        scopes: ["https://www.googleapis.com/auth/userinfo.email"],
+        sourceMessageId: userMessageId,
+      })).toThrow(/Read-only Gmail access/u);
+    } finally {
+      delete process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY];
     }
   });
 
