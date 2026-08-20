@@ -44,7 +44,6 @@ describe("Google Calendar broker envelopes", () => {
       kind: "google_gmail_oauth_request" as const,
       accountId,
       returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
-      permission: "read" as const,
       nonce: randomUUID(),
       ...envelopeTimes(AT),
     };

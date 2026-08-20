@@ -9,7 +9,6 @@ import { calendarBrokerConfiguration, type CalendarBrokerConfiguration } from ".
 import {
   createGoogleGmailMcpServer,
   exchangeGmailCode,
-  GMAIL_READ_SCOPE,
   GMAIL_WRITE_SCOPE,
   gmailAuthorizationUrl,
   revokeGmailGrant,
@@ -96,15 +95,10 @@ export function createCalendarBrokerServer(
         const state = store.createGmailOAuthState({
           accountId: oauthRequest.accountId,
           returnUrl: oauthRequest.returnUrl,
-          permission: oauthRequest.permission,
         });
         return redirect(
           response,
-          gmailAuthorizationUrl({
-            configuration: gmailOAuthConfiguration,
-            state,
-            permission: oauthRequest.permission,
-          }),
+          gmailAuthorizationUrl({ configuration: gmailOAuthConfiguration, state }),
         );
       }
       if (request.method === "GET" && url.pathname === "/oauth/google/callback") {
@@ -161,17 +155,13 @@ export function createCalendarBrokerServer(
         if (!code) return redirectWithError(response, state.returnUrl, "Google returned no authorization code.");
         try {
           const token = await exchangeGmailCode(code, gmailOAuthConfiguration, fetcher);
-          // The scope the consent actually asked for. `gmail.modify` also reads, so a write
-          // grant satisfies both and a read grant satisfies only the read.
-          const requiredGmailScope =
-            state.permission === "write" ? GMAIL_WRITE_SCOPE : GMAIL_READ_SCOPE;
-          if (!token.scopes.includes(requiredGmailScope)) {
+          // One scope, and the connection is not recorded without it. A partial grant that
+          // reads but cannot draft would bind capabilities the first use would refuse.
+          if (!token.scopes.includes(GMAIL_WRITE_SCOPE)) {
             return redirectWithError(
               response,
               state.returnUrl,
-              state.permission === "write"
-                ? "Google did not grant Gmail drafting access."
-                : "Google did not grant read-only Gmail access.",
+              "Google did not grant Zeus access to this mailbox.",
             );
           }
           const grant = store.upsertGmailGrant({

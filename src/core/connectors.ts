@@ -57,6 +57,8 @@ export const CAPABILITY_SLOTS = [
   "email.get_thread",
   "email.create_draft",
   "email.trash_thread",
+  "email.untrash_thread",
+  "email.send_message",
 ] as const satisfies readonly CapabilitySlot[];
 
 /**
@@ -83,9 +85,8 @@ export const GOOGLE_CALENDAR_WRITE_SCOPE =
 export const GOOGLE_GMAIL_BROKER_SERVICE_KEY = "GOOGLE_GMAIL_BROKER_SERVICE_KEY";
 export const GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 /**
- * The one scope that can draft and can trash. It reads too, so a write grant asks for it
- * alone. See `calendar-broker/gmail.ts` for why there is no narrower option and what that
- * does and does not imply.
+ * The one scope for everything Zeus does with a mailbox. See `calendar-broker/gmail.ts` for
+ * what it permits, what it does not, and what holds a send back.
  */
 export const GOOGLE_GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
@@ -815,13 +816,15 @@ export function configureGoogleGmailCapabilities(
     ["email.search_threads", "search_threads"],
     ["email.get_thread", "get_thread"],
   ];
-  // An inbox connected before drafting existed holds a readonly refresh token, so it binds
-  // the two read slots and nothing else. It keeps working; it simply cannot draft until the
-  // user widens the grant, which is a question Settings asks and this code never assumes.
+  // Connecting Gmail asks for everything at once, so a fresh connection always lands here
+  // with all five slots. The read-only branch is not a permission tier — it is what an inbox
+  // connected before Zeus could write still binds, so it keeps reading until it reconnects.
   if (canWrite) {
     desired.push(
       ["email.create_draft", "create_draft"],
       ["email.trash_thread", "trash_thread"],
+      ["email.untrash_thread", "untrash_thread"],
+      ["email.send_message", "send_message"],
     );
   }
   return configureGoogleProviderCapabilities(db, input, {

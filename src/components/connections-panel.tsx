@@ -65,11 +65,6 @@ export function ConnectionsPanel({
         icon={<MailIcon />}
         defaultSlots={["email.search_threads", "email.get_thread"]}
         hostedStartHref="/api/integrations/google-gmail/start"
-        upgrade={{
-          href: "/api/integrations/google-gmail/start?permission=write",
-          label: "Enable drafting",
-          slot: "email.create_draft",
-        }}
         recheckLabel="Check inbox"
         connector={gmail}
         localMode={localMode}

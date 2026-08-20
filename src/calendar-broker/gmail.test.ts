@@ -2,11 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
-import {
-  GMAIL_READ_SCOPE,
-  GMAIL_WRITE_SCOPE,
-  createGoogleGmailMcpServer,
-} from "./gmail";
+import { GMAIL_READ_SCOPE, GMAIL_WRITE_SCOPE, createGoogleGmailMcpServer } from "./gmail";
 import type { CalendarBrokerStore, GmailGrant } from "./store";
 
 const GRANT: GmailGrant = {
@@ -109,7 +105,7 @@ describe("what the broker offers", () => {
     await close();
   });
 
-  it("offers drafting and trashing to a write grant, and never sending", async () => {
+  it("offers a write grant everything, and warns on the one that cannot be undone", async () => {
     const { fetcher } = fakeGmail();
     const { client, close } = await connect(fetcher);
     const tools = (await client.listTools()).tools;
@@ -117,9 +113,12 @@ describe("what the broker offers", () => {
       "create_draft",
       "get_thread",
       "search_threads",
+      "send_message",
       "trash_thread",
+      "untrash_thread",
     ]);
-    expect(tools.find((tool) => /send/u.test(tool.name))).toBeUndefined();
+    expect(tools.find((tool) => tool.name === "send_message")?.annotations?.destructiveHint)
+      .toBe(true);
     expect(tools.find((tool) => tool.name === "trash_thread")?.annotations?.destructiveHint)
       .toBe(true);
     expect(tools.find((tool) => tool.name === "create_draft")?.annotations?.destructiveHint)
@@ -228,6 +227,94 @@ describe("saving a draft", () => {
   });
 });
 
+describe("sending", () => {
+  it("sends the message and reports the id Gmail gave it", async () => {
+    const { calls, fetcher } = fakeGmail({
+      "/messages/send": { id: "m-sent", threadId: "18f0a" },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "send_message",
+      arguments: {
+        to: ["sarah@acme.example"],
+        body: "Tuesday is out for me.",
+        threadId: "18f0a",
+      },
+    });
+    const post = calls.find((call) => call.url.endsWith("/messages/send"));
+    const raw = (post?.body as { raw: string }).raw;
+    const message = Buffer.from(raw, "base64url").toString("utf8");
+    expect(message).toContain("To: sarah@acme.example");
+    expect(message).toContain("In-Reply-To: <parent@acme.example>");
+    expect(String((result.content as { text: string }[])[0]?.text)).toContain('"sent":true');
+    await close();
+  });
+
+  it("does not send twice for one request key", async () => {
+    const { calls, fetcher } = fakeGmail({
+      "/messages?": { messages: [{ id: "m-sent", threadId: "18f0a" }] },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "send_message",
+      arguments: { to: ["sarah@acme.example"], subject: "s", body: "b" },
+    });
+    expect(calls.filter((call) => call.url.endsWith("/messages/send"))).toHaveLength(0);
+    expect(String((result.content as { text: string }[])[0]?.text)).toContain('"sent":false');
+    await close();
+  });
+
+  it("refuses to send when it cannot find out whether it already did", async () => {
+    // The draft path waves this failure through, because the cost there is a spare draft.
+    // Here the cost is a duplicate nobody can recall, so not knowing fails the send.
+    const fetcher = (async (input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return Response.json({ access_token: "at" });
+      }
+      if (url.includes("/profile")) return Response.json({ emailAddress: "me@acme.example" });
+      if (url.includes("/messages?")) return Response.json({ error: "nope" }, { status: 500 });
+      if (init?.method === "POST") throw new Error("must not send");
+      return Response.json({});
+    }) as unknown as typeof fetch;
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "send_message",
+      arguments: { to: ["sarah@acme.example"], subject: "s", body: "b" },
+    });
+    expect(result.isError).toBe(true);
+    await close();
+  });
+
+  it("will not send without a durable request key", async () => {
+    const { calls, fetcher } = fakeGmail();
+    const { client, close } = await connect(fetcher, { requestKey: null });
+    const result = await client.callTool({
+      name: "send_message",
+      arguments: { to: ["sarah@acme.example"], subject: "s", body: "b" },
+    });
+    expect(result.isError).toBe(true);
+    expect(calls.filter((call) => call.url.endsWith("/messages/send"))).toHaveLength(0);
+    await close();
+  });
+
+  it("cannot be talked into an extra recipient by a header", async () => {
+    const { calls, fetcher } = fakeGmail();
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "send_message",
+      arguments: {
+        to: ["sarah@acme.example"],
+        subject: "Hello\r\nBcc: attacker@evil.example",
+        body: "hi",
+      },
+    });
+    expect(result.isError).toBe(true);
+    expect(calls.filter((call) => call.url.endsWith("/messages/send"))).toHaveLength(0);
+    await close();
+  });
+});
+
 describe("moving a thread to Trash", () => {
   it("trashes the whole thread and reads the outcome back off the answer", async () => {
     const { calls, fetcher } = fakeGmail();
@@ -256,6 +343,37 @@ describe("moving a thread to Trash", () => {
       arguments: { threadId: "18f0a" },
     });
     expect(String((result.content as { text: string }[])[0]?.text)).toContain('"trashed":false');
+    await close();
+  });
+
+  it("takes a thread back out again, and says it is no longer trashed", async () => {
+    const { calls, fetcher } = fakeGmail({
+      "/untrash": { id: "18f0a", messages: [{ labelIds: ["INBOX"] }, { labelIds: ["INBOX"] }] },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "untrash_thread",
+      arguments: { threadId: "18f0a" },
+    });
+    expect(calls.some((call) => call.url.endsWith("/threads/18f0a/untrash"))).toBe(true);
+    expect(JSON.parse(String((result.content as { text: string }[])[0]?.text))).toEqual({
+      id: "18f0a",
+      trashed: false,
+      message_count: 2,
+    });
+    await close();
+  });
+
+  it("does not claim a restore worked while the thread is still in Trash", async () => {
+    const { fetcher } = fakeGmail({
+      "/untrash": { id: "18f0a", messages: [{ labelIds: ["TRASH"] }] },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "untrash_thread",
+      arguments: { threadId: "18f0a" },
+    });
+    expect(String((result.content as { text: string }[])[0]?.text)).toContain('"trashed":true');
     await close();
   });
 

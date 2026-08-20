@@ -65,7 +65,7 @@ import { type Db, openTestDb } from "./db";
 import { confirmationSentence, listExecutedEffects, listPendingEffects } from "./effects";
 import { cacheEmailThreads } from "./email-sync";
 import type { CapabilitySlot } from "./schema";
-import { listWorkPlans, listWorkRuns } from "./work-plans";
+import { createWorkPlan, listWorkPlans, listWorkRuns } from "./work-plans";
 
 const NOW = new Date("2026-08-20T10:00:00.000Z");
 
@@ -82,7 +82,7 @@ const DRAFT_SCHEMA = {
   required: ["to", "body"],
 };
 
-const TRASH_SCHEMA = {
+const THREAD_SCHEMA = {
   type: "object",
   properties: { threadId: { type: "string" } },
   required: ["threadId"],
@@ -139,10 +139,10 @@ function connectGmail(
       slot,
       remoteToolName: slot.split(".")[1] ?? slot,
       inputSchema:
-        slot === "email.create_draft"
+        slot === "email.create_draft" || slot === "email.send_message"
           ? DRAFT_SCHEMA
-          : slot === "email.trash_thread"
-            ? TRASH_SCHEMA
+          : slot === "email.trash_thread" || slot === "email.untrash_thread"
+            ? THREAD_SCHEMA
             : { type: "object", properties: { query: { type: "string" } } },
       sourceMessageId,
     });
@@ -307,6 +307,112 @@ describe("drafting a reply", () => {
   });
 });
 
+describe("sending", () => {
+  it("prepares one send, addressed from the thread, and dispatches only on confirmation", async () => {
+    const db = openTestDb();
+    connectGmail(db, ["email.search_threads", "email.send_message"]);
+    const conversation = createConversation(db);
+
+    await turn(db, conversation.id, "send Sarah a reply saying Tuesday does not work");
+
+    const pending = listPendingEffects(db);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.capability.slot).toBe("email.send_message");
+    expect(pending[0]?.effect_kind).toBe("send");
+    expect(pending[0]?.payload).toEqual({
+      threadId: "18f0a",
+      to: ["sarah@acme.example"],
+      body: "Tuesday is out for me.",
+    });
+    // The card has to read differently from a draft's, because the act is different.
+    expect(pending[0]?.preview_text).toContain("no unsend");
+    expect(mocks.callCapability).not.toHaveBeenCalled();
+
+    await turn(db, conversation.id, confirmationSentence(pending[0]!.payload_hash));
+    const [, slot, payload] = mocks.callCapability.mock.calls[0] ?? [];
+    expect(slot).toBe("email.send_message");
+    expect(payload).toMatchObject({ to: ["sarah@acme.example"] });
+    expect(listExecutedEffects(db)).toHaveLength(1);
+  });
+
+  it("records the allowlist beside the payload, and will not dispatch outside it", async () => {
+    const db = openTestDb();
+    connectGmail(db, ["email.search_threads", "email.send_message"]);
+    const conversation = createConversation(db);
+    await turn(db, conversation.id, "send Sarah a reply saying Tuesday does not work");
+    const pending = listPendingEffects(db)[0]!;
+
+    expect(JSON.parse(pending.conflict_check_json!)).toMatchObject({
+      kind: "send_recipients",
+      source: "thread_sender",
+      allowed: ["sarah@acme.example"],
+    });
+
+    // Rewrite the recipient behind the confirmation's back. The payload hash catches it
+    // first; the point is that a store which somehow got past that is still stopped.
+    db.prepare("UPDATE proposed_effect SET conflict_check_json = ? WHERE id = ?").run(
+      JSON.stringify({ kind: "send_recipients", source: "thread_sender", allowed: [], checked_at: "x" }),
+      pending.id,
+    );
+    await turn(db, conversation.id, confirmationSentence(pending.payload_hash));
+
+    expect(mocks.callCapability).not.toHaveBeenCalled();
+    expect(listExecutedEffects(db)).toHaveLength(0);
+  });
+
+  it("never turns a request to draft into a send", async () => {
+    const db = openTestDb();
+    connectGmail(db, [
+      "email.search_threads",
+      "email.create_draft",
+      "email.send_message",
+    ]);
+
+    await turn(db, createConversation(db).id, "draft a reply to Sarah's email saying no");
+
+    expect(listPendingEffects(db)[0]?.capability.slot).toBe("email.create_draft");
+  });
+
+  it("refuses to send to a recipient it would have had to invent", async () => {
+    const db = openTestDb();
+    connectGmail(db, ["email.search_threads", "email.send_message"]);
+
+    const { result, sentToModel } = await turn(
+      db,
+      createConversation(db).id,
+      "send an email to Priya about the offsite",
+    );
+
+    expect(result.work).toBeNull();
+    expect(listPendingEffects(db)).toHaveLength(0);
+    expect(sentToModel).toContain("will not guess a recipient");
+  });
+
+  it("cannot be reached by a plan a model wrote", async () => {
+    // The guarantee that replaced the database's old refusal to store a send slot at all.
+    const db = openTestDb();
+    connectGmail(db, ["email.search_threads", "email.send_message"]);
+    expect(() =>
+      createWorkPlan(db, {
+        proposal: {
+          objective: "Send something on the user's behalf",
+          steps: [{
+            title: "Send it",
+            instruction: "Send the message.",
+            effect_kind: "send",
+            depends_on: [],
+          }],
+          allowed_effects: ["send"],
+          completion_criteria: ["It was sent."],
+          limits: { max_model_tool_calls: 4, max_retries_per_step: 2, max_duration_seconds: 300 },
+        },
+        sourceMessageId: appendMessage(db, createConversation(db).id, "user", "go").id,
+        origin: "surfaced_proposal",
+      }),
+    ).toThrow();
+  });
+});
+
 describe("moving a thread to Trash", () => {
   it("prepares one thread id and spends no model call doing it", async () => {
     const db = openTestDb();
@@ -359,6 +465,53 @@ describe("moving a thread to Trash", () => {
   });
 });
 
+describe("taking a thread back out of Trash", () => {
+  it("restores the thread Zeus recorded binning, after its own confirmation", async () => {
+    const db = openTestDb();
+    connectGmail(db, [
+      "email.search_threads",
+      "email.trash_thread",
+      "email.untrash_thread",
+    ]);
+    const conversation = createConversation(db);
+
+    // Trash it for real first: the ledger of what Zeus moved is where a restore finds its
+    // target, because a trashed thread has left the inbox Zeus syncs.
+    await turn(db, conversation.id, "delete the email from Sarah");
+    const trash = listPendingEffects(db)[0]!;
+    await turn(db, conversation.id, confirmationSentence(trash.payload_hash));
+    expect(listExecutedEffects(db)).toHaveLength(1);
+
+    const { result } = await turn(db, conversation.id, "actually put Sarah's email back");
+    expect(result.work?.pendingEffects).toHaveLength(1);
+    const restore = listPendingEffects(db)[0]!;
+    expect(restore.capability.slot).toBe("email.untrash_thread");
+    expect(restore.payload).toEqual({ threadId: "18f0a" });
+    expect(restore.preview_text).toContain("back out of your Gmail Trash");
+
+    await turn(db, conversation.id, confirmationSentence(restore.payload_hash));
+    const calls = mocks.callCapability.mock.calls.map(([, slot]) => slot);
+    expect(calls).toEqual(["email.trash_thread", "email.untrash_thread"]);
+  });
+
+  it("says plainly that it has nothing of its own to put back", async () => {
+    // A thread the user binned in Gmail itself is not in Zeus's ledger, and Zeus does not
+    // search the Trash to find one.
+    const db = openTestDb();
+    connectGmail(db, ["email.search_threads", "email.untrash_thread"]);
+
+    const { result, sentToModel } = await turn(
+      db,
+      createConversation(db).id,
+      "put the email from Sarah back",
+    );
+
+    expect(result.work).toBeNull();
+    expect(listPendingEffects(db)).toHaveLength(0);
+    expect(sentToModel).toContain("no record of moving an email to Trash");
+  });
+});
+
 describe("what a bin request is not allowed to mean", () => {
   it("will not bin the newest thread just because nothing narrowed the request", async () => {
     // The same shrug that picks a thread to read picks one to bin, and only one of those is
@@ -394,7 +547,7 @@ describe("what a bin request is not allowed to mean", () => {
 });
 
 describe("what a read-only inbox can be talked into", () => {
-  it("prepares nothing at all, and leaves the answer to the capabilities block", async () => {
+  it("prepares nothing for an inbox connected before Zeus could write", async () => {
     const db = openTestDb();
     connectGmail(db, ["email.search_threads", "email.get_thread"]);
     const conversation = createConversation(db);
@@ -408,7 +561,7 @@ describe("what a read-only inbox can be talked into", () => {
     expect(result.work).toBeNull();
     expect(listPendingEffects(db)).toHaveLength(0);
     expect(listWorkPlans(db)).toHaveLength(0);
-    expect(sentToModel).toContain("Drafting and deleting need a further permission");
+    expect(sentToModel).toContain("connected before Zeus could do any of that");
   });
 
   it("says what it can do once the write slots are bound", async () => {
@@ -417,7 +570,7 @@ describe("what a read-only inbox can be talked into", () => {
     const { sentToModel } = await turn(db, createConversation(db).id, "hello");
 
     expect(sentToModel).toContain("save a draft in the user's Gmail Drafts");
-    expect(sentToModel).toContain("cannot send email");
+    expect(sentToModel).toContain("cannot delete anything permanently");
   });
 });
 

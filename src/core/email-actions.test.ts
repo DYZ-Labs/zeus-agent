@@ -10,9 +10,13 @@ import {
   emailPreviewFor,
   emailWriteVerb,
   encodeEmailRequest,
+  replyRequest,
+  sendCheckFor,
+  sendRecipientsAllowed,
   parseEmailRequest,
   slotForEmailRequest,
   trashRequest,
+  untrashRequest,
 } from "./email-actions";
 import type { EmailRequest } from "./email-actions";
 import type { EmailThread } from "./email-sync";
@@ -49,6 +53,30 @@ describe("recognizing an email write", () => {
 
   it("reads a removal as a removal even when a draft verb is beside it", () => {
     expect(emailWriteVerb("delete the draft reply to Sarah")).toBe("trash");
+  });
+
+  it("only sends when the word is there, and drafts otherwise", () => {
+    // The confirmation would catch a wrong guess either way. What it would not catch is a
+    // user skimming a card they expected to say "draft".
+    expect(emailWriteVerb("send Sarah an email saying yes")).toBe("send");
+    expect(emailWriteVerb("draft a reply to Sarah and send it")).toBe("send");
+    expect(emailWriteVerb("email Bob about the offsite")).toBe("draft");
+    expect(emailWriteVerb("write Sarah a reply saying Tuesday is out")).toBe("draft");
+  });
+
+  it("does not read being asked to show an email as being asked to send one", () => {
+    // Read as a send, this becomes a reply addressed to Sarah — which the confirmation would
+    // catch, and which is an alarming card to be shown for having asked to read your mail.
+    expect(emailWriteVerb("send me the email from Sarah")).toBeNull();
+    expect(emailWriteVerb("forward me that message")).toBeNull();
+  });
+
+  it("reads undoing a removal as its own thing, not as another removal", () => {
+    // Every one of these contains a removal word. What is being asked for is the opposite.
+    expect(emailWriteVerb("undelete the email from Sarah")).toBe("untrash");
+    expect(emailWriteVerb("put that email back")).toBe("untrash");
+    expect(emailWriteVerb("restore the message I deleted")).toBe("untrash");
+    expect(emailWriteVerb("get Sarah's email out of the trash")).toBe("untrash");
   });
 });
 
@@ -91,7 +119,9 @@ describe("carrying the resolved action inside the plan", () => {
 
   it("routes each request to its own slot", () => {
     expect(slotForEmailRequest(trashRequest(THREAD))).toBe("email.trash_thread");
+    expect(slotForEmailRequest(untrashRequest(THREAD))).toBe("email.untrash_thread");
     expect(slotForEmailRequest(draftReplyRequest(THREAD, "yes")!)).toBe("email.create_draft");
+    expect(slotForEmailRequest(replyRequest(THREAD, "yes", "send")!)).toBe("email.send_message");
   });
 });
 
@@ -107,8 +137,51 @@ describe("the exact bytes", () => {
     });
   });
 
-  it("sends a thread id and nothing else to move a thread to Trash", () => {
+  it("sends a thread id and nothing else to move a thread either way", () => {
     expect(buildEmailPayload(trashRequest(THREAD), "", null)).toEqual({ threadId: "18f0a" });
+    expect(buildEmailPayload(untrashRequest(THREAD), "", null)).toEqual({ threadId: "18f0a" });
+  });
+});
+
+describe("the allowlist a send is checked against", () => {
+  it("records where the recipient came from, and passes only that exact set", () => {
+    const request = replyRequest(THREAD, "yes", "send")!;
+    const check = sendCheckFor(request, new Date("2026-08-20T10:00:00.000Z"));
+    expect(check).toMatchObject({
+      kind: "send_recipients",
+      source: "thread_sender",
+      allowed: ["sarah@acme.example"],
+    });
+    expect(sendRecipientsAllowed(check, buildEmailPayload(request, "hi", null))).toBe(true);
+  });
+
+  it("refuses a payload addressed anywhere the allowlist does not name", () => {
+    const request = replyRequest(THREAD, "yes", "send")!;
+    const check = sendCheckFor(request, new Date("2026-08-20T10:00:00.000Z"));
+
+    // Substituted, appended, emptied, and unrecorded — each of them a different way the
+    // bytes could stop matching the decision that approved them.
+    expect(sendRecipientsAllowed(check, { to: ["attacker@evil.example"], body: "hi" })).toBe(false);
+    expect(sendRecipientsAllowed(check, {
+      to: ["sarah@acme.example", "attacker@evil.example"],
+      body: "hi",
+    })).toBe(false);
+    expect(sendRecipientsAllowed(check, { to: [], body: "hi" })).toBe(false);
+    expect(sendRecipientsAllowed(check, { body: "hi" })).toBe(false);
+    expect(sendRecipientsAllowed(null, { to: ["sarah@acme.example"] })).toBe(false);
+    expect(sendRecipientsAllowed({ kind: "calendar_conflict", status: "clear" }, {
+      to: ["sarah@acme.example"],
+    })).toBe(false);
+  });
+
+  it("names the user's own message as the source when they typed the address", () => {
+    const request: EmailRequest = {
+      kind: "send_new",
+      to: "bob@acme.example",
+      subject: null,
+      instruction: "about the contract",
+    };
+    expect(sendCheckFor(request, new Date()).source).toBe("user_message");
   });
 });
 
@@ -118,6 +191,27 @@ describe("what the confirmation says", () => {
     expect(preview).toContain("sarah@acme.example");
     expect(preview).toContain("Q3 planning");
     expect(preview).toContain("Nothing is sent");
+  });
+
+  it("says a send cannot be taken back, in words a draft never uses", () => {
+    const draft = emailPreviewFor(draftReplyRequest(THREAD, "yes")!, THREAD, null);
+    const send = emailPreviewFor(replyRequest(THREAD, "yes", "send")!, THREAD, null);
+
+    expect(send).toContain("sarah@acme.example");
+    expect(send).toContain("no unsend");
+    expect(send).toContain("cannot take it back");
+    // The reassurance that makes a draft a draft must not appear on the one card where it
+    // would be false.
+    expect(send).not.toContain("Nothing is sent");
+    expect(send).not.toContain("waits in your Gmail Drafts");
+    expect(draft).toContain("Nothing is sent");
+  });
+
+  it("says restoring puts something back, and warns of nothing", () => {
+    const preview = emailPreviewFor(untrashRequest(THREAD), THREAD, 4);
+    expect(preview).toContain("Q3 planning");
+    expect(preview).toContain("back out of your Gmail Trash");
+    expect(preview).not.toContain("30 days");
   });
 
   it("says what trashing takes, and how long the way back lasts", () => {
@@ -134,6 +228,7 @@ describe("the code-owned plan", () => {
   it("never allows an effect kind beyond preparing locally and writing once", () => {
     for (const request of [
       trashRequest(THREAD),
+      untrashRequest(THREAD),
       draftReplyRequest(THREAD, "yes")!,
     ] satisfies EmailRequest[]) {
       const proposal = emailActionWorkPlanProposal(request, "objective");
@@ -143,6 +238,13 @@ describe("the code-owned plan", () => {
         "modify_external",
       ]);
     }
+
+    // A send plan asks for `send` and nothing wider, so authorizing one authorizes exactly
+    // that — never a trash it could have reached through a shared effect kind.
+    const sending = emailActionWorkPlanProposal(replyRequest(THREAD, "yes", "send")!, "objective");
+    expect(sending.allowed_effects).toEqual(["prepare_local", "send"]);
+    expect(sending.steps.map((step) => step.effect_kind)).toEqual(["prepare_local", "send"]);
+    expect(sending.allowed_effects).not.toContain("modify_external");
   });
 
   it("reads no mail while drafting, so no message body reaches a persisted artifact", () => {

@@ -562,7 +562,7 @@ describe("the first-party Google Calendar provider", () => {
     }
   });
 
-  it("binds the write slots only for a grant that actually carries the write scope", () => {
+  it("binds every slot a whole-mailbox grant carries, and only the reads without one", () => {
     process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = "g".repeat(40);
     try {
       bindAppOwner(db, { supabaseUserId: randomUUID(), email: "owner@example.com" });
@@ -577,6 +577,8 @@ describe("the first-party Google Calendar provider", () => {
         tool("get_thread", true),
         tool("create_draft", false),
         tool("trash_thread", false),
+        tool("untrash_thread", false),
+        tool("send_message", false),
       ];
       recordConnectorVerification(db, connector.id, { status: "ready", tools });
 
@@ -592,7 +594,9 @@ describe("the first-party Google Calendar provider", () => {
           "email.create_draft",
           "email.get_thread",
           "email.search_threads",
+          "email.send_message",
           "email.trash_thread",
+          "email.untrash_thread",
         ]);
 
       // Narrowing the grant narrows what Zeus can do, in the same store, without deleting
