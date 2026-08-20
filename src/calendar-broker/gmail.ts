@@ -1,11 +1,4 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { CalendarBrokerStore, GmailGrant } from "./store";
@@ -15,9 +8,25 @@ export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 const GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke";
-const ALLOWED_TOOLS = new Set(["search_threads", "get_thread"]);
+const GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const MAX_RESPONSE_BYTES = 1_000_000;
 const REQUEST_TIMEOUT_MS = 20_000;
+
+/** Gmail's own ceiling on `threads.list`. Asking for more is clamped, not refused. */
+const MAX_PAGE_SIZE = 50;
+const DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * How many thread metadata reads run at once.
+ *
+ * `threads.list` returns ids and snippets and nothing else, so a subject and a sender cost
+ * one request per thread. That is the price of this API, and eight at a time keeps a fifty
+ * thread page inside the request deadline without becoming a burst Gmail would rate-limit.
+ */
+const METADATA_CONCURRENCY = 8;
+
+/** Per-message body ceiling at this layer. Zeus bounds it again, harder, before rendering. */
+const MAX_BODY_CHARS = 8_000;
 
 const TokenResponse = z
   .object({
@@ -40,7 +49,14 @@ export type GoogleGmailTokenExchange = {
 };
 
 export class GoogleGmailError extends Error {
-  constructor(readonly code: string, message: string) {
+  /**
+   * What Google actually said, for the broker's own log and for nowhere else.
+   *
+   * Separate from `message`, which crosses to Zeus and from there can reach a user: the
+   * detail is Google's own prose, and the operator staring at a connection that will not
+   * read is the only reader it is worth anything to.
+   */
+  constructor(readonly code: string, message: string, readonly detail: string = message) {
     super(message);
     this.name = "GoogleGmailError";
   }
@@ -107,123 +123,297 @@ export async function revokeGmailGrant(
 }
 
 /**
- * Present a read-only MCP surface backed by Google's official Gmail MCP server.
+ * Present a read-only Gmail surface, served directly from the Gmail API.
  *
- * The upstream server currently advertises write tools even to a readonly token. Filtering
- * both discovery and dispatch here means the broker's public contract cannot grow when the
- * preview server does. The OAuth scope and this allowlist are independent defenses.
+ * This used to proxy Google's own Gmail MCP server at `gmailmcp.googleapis.com`. That server
+ * lists its tools to anybody holding a `gmail.readonly` token and then answers every actual
+ * tool call with `{isError: true, "The caller does not have permission"}` — HTTP 200, no
+ * code, no detail — for an account Gmail's REST API serves without complaint. It is a
+ * gated preview, and nothing on this side could open the gate. So the mailbox is read the
+ * way the calendar has always been read: a direct API client behind a locally registered
+ * tool, which is `google.ts` plus `mcp.ts` in shape and in reasoning.
+ *
+ * The two tool contracts are unchanged, deliberately. Zeus binds `search_threads` and
+ * `get_thread` by name, builds their arguments from the advertised schema, and parses
+ * exactly the payload the previous server returned — so the transport moved and nothing
+ * downstream of it had to.
+ *
+ * Read-only is now structural rather than filtered. The old allowlist existed because the
+ * upstream server advertised writes to a readonly token; there is nothing here to filter,
+ * because the only requests this file can make are two GETs.
  */
 export function createGoogleGmailMcpServer(input: {
   grant: GmailGrant;
   store: CalendarBrokerStore;
   oauth: GoogleGmailOAuthConfiguration;
-  remoteMcpUrl: string;
   fetcher?: typeof fetch;
-}): { server: Server; close: () => Promise<void> } {
+}): McpServer {
   const fetcher = input.fetcher ?? fetch;
-  const server = new Server(
-    { name: "zeus-google-gmail", version: "0.1.0" },
-    { capabilities: { tools: {} } },
-  );
-  let remotePromise: Promise<Client> | null = null;
+  const server = new McpServer({ name: "zeus-google-gmail", version: "0.1.0" });
+  let tokenPromise: Promise<string> | null = null;
 
-  const remoteClient = async (): Promise<Client> => {
-    if (remotePromise) return remotePromise;
-    remotePromise = (async () => {
+  // One token per request, minted lazily: a `tools/list` costs no refresh, and a search that
+  // fans out over fifty threads costs one rather than fifty.
+  const accessToken = (): Promise<string> => {
+    tokenPromise ??= (async () => {
       if (input.grant.status !== "active") {
         throw new GoogleGmailError("reconnect_required", "Gmail must be reconnected");
       }
-      const accessToken = await refreshGmailAccessToken(
-        input.grant.refreshToken,
-        input.oauth,
-        fetcher,
-      );
-      const client = new Client({ name: "zeus-google-gmail-broker", version: "0.1.0" });
-      try {
-        await client.connect(new StreamableHTTPClientTransport(
-          new URL(input.remoteMcpUrl),
-          {
-            fetch: fetcher,
-            requestInit: { headers: { Authorization: `Bearer ${accessToken}` } },
-          },
-        ));
-        return client;
-      } catch (error) {
-        await client.close().catch(() => undefined);
-        throw error;
-      }
+      return refreshGmailAccessToken(input.grant.refreshToken, input.oauth, fetcher);
     })();
-    return remotePromise;
+    return tokenPromise;
   };
 
-  const readTools = async (signal?: AbortSignal): Promise<Tool[]> => {
-    try {
-      const client = await remoteClient();
-      const listed = await client.listTools({}, { timeout: REQUEST_TIMEOUT_MS, signal });
-      const tools = listed.tools.filter((tool) => ALLOWED_TOOLS.has(tool.name));
-      for (const name of ALLOWED_TOOLS) {
-        if (!tools.some((tool) => tool.name === name)) {
-          throw new GoogleGmailError(
-            "tool_contract_changed",
-            `Google's Gmail server did not expose ${name}`,
-          );
-        }
-      }
-      return tools;
-    } catch (error) {
-      throw gmailFailure(input, error);
-    }
-  };
-
-  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => ({
-    tools: await readTools(extra.signal),
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (!ALLOWED_TOOLS.has(request.params.name)) {
-      return failure("tool_not_allowed: Zeus connected Gmail with read-only tools only");
-    }
-    try {
-      const tools = await readTools(extra.signal);
-      if (!tools.some((tool) => tool.name === request.params.name)) {
-        return failure("tool_contract_changed: That Gmail read tool is unavailable");
-      }
-      const client = await remoteClient();
-      const result = await client.callTool(
-        request.params,
-        undefined,
-        { timeout: REQUEST_TIMEOUT_MS, signal: extra.signal },
-      );
-      // Google's own refusal arrives as an ordinary tool result, not as a thrown transport
-      // error, so nothing in the catch below would ever have seen it. Passing it straight
-      // through hands Zeus untagged prose, which it can only report as "something went
-      // wrong" — the exact dead end this pass exists to end. Tag it, and lift the one
-      // bounded token its text may carry.
-      if (result.isError === true) {
-        const code = refusalCode("gmail_tool_refused", contentText(result.content));
-        reportGmailFailure(code, contentText(result.content));
-        return failure(`${code}: Google's Gmail tool refused the request`);
-      }
-      return result;
-    } catch (error) {
-      const failureError = gmailFailure(input, error);
-      reportGmailFailure(
-        failureError.code,
-        error instanceof Error ? error.message : String(error),
-      );
-      return failure(`${failureError.code}: ${failureError.message}`);
-    }
-  });
-
-  return {
-    server,
-    close: async () => {
-      if (!remotePromise) return;
-      const remote = await remotePromise.catch(() => null);
-      if (remote) await remote.close().catch(() => undefined);
+  server.registerTool(
+    "search_threads",
+    {
+      title: "Search Gmail threads",
+      description: "Search the connected user's mailbox and return thread subjects and senders.",
+      inputSchema: {
+        query: z.string().trim().min(1).max(1_000),
+        pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+        view: z.enum(THREAD_VIEWS).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     },
+    async ({ query, pageSize, view }) => {
+      try {
+        return success(await searchThreads(await accessToken(), fetcher, { query, pageSize, view }));
+      } catch (error) {
+        return gmailToolFailure(input, error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_thread",
+    {
+      title: "Read one Gmail thread",
+      description: "Return the messages of one thread in the connected user's mailbox.",
+      inputSchema: {
+        threadId: z.string().trim().min(1).max(1_024),
+        messageFormat: z.enum(MESSAGE_FORMATS).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ threadId, messageFormat }) => {
+      try {
+        return success(await readThread(await accessToken(), fetcher, threadId, messageFormat));
+      } catch (error) {
+        return gmailToolFailure(input, error);
+      }
+    },
+  );
+
+  return server;
+}
+
+const THREAD_VIEWS = [
+  "THREAD_VIEW_UNSPECIFIED",
+  "THREAD_VIEW_METADATA_ONLY",
+  "THREAD_VIEW_MINIMAL",
+] as const;
+
+const MESSAGE_FORMATS = ["FULL_CONTENT", "METADATA_ONLY"] as const;
+
+/**
+ * The window Zeus caches, in the shape it already parses.
+ *
+ * One `messages` entry per thread, holding the newest message. Zeus describes a thread by its
+ * newest message and keeps nothing else from the list, so sending the rest would be a larger
+ * payload saying the same thing — and it was payload size that truncated this response at the
+ * previous 200 KB cap.
+ */
+async function searchThreads(
+  token: string,
+  fetcher: typeof fetch,
+  options: { query: string; pageSize?: number; view?: string },
+): Promise<unknown> {
+  const pageSize = Math.min(options.pageSize ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+  const list = await gmailGet(token, fetcher, "/threads", {
+    q: options.query,
+    maxResults: String(pageSize),
+  });
+  const ids = asArray(list.threads)
+    .map((thread) => stringField(thread, "id"))
+    .filter((id): id is string => id !== null);
+  // `THREAD_VIEW_METADATA_ONLY` is the one view that omits the subject, and Zeus pins the
+  // value deliberately, so the choice is honored rather than ignored.
+  const withSubject = options.view !== "THREAD_VIEW_METADATA_ONLY";
+  const headers = withSubject ? ["Subject", "From", "Date"] : ["From", "Date"];
+  const threads = await mapConcurrently(ids, METADATA_CONCURRENCY, async (id) => {
+    const thread = await gmailGet(token, fetcher, `/threads/${encodeURIComponent(id)}`, {
+      format: "metadata",
+      metadataHeaders: headers,
+    });
+    return { id, messages: [summarize(newestMessage(thread), withSubject)] };
+  });
+  const nextPageToken = stringField(list, "nextPageToken");
+  return { threads, ...(nextPageToken === null ? {} : { nextPageToken }) };
+}
+
+/** One thread's messages, oldest first — the order Zeus keeps the last few of. */
+async function readThread(
+  token: string,
+  fetcher: typeof fetch,
+  threadId: string,
+  messageFormat: string | undefined,
+): Promise<unknown> {
+  const full = messageFormat !== "METADATA_ONLY";
+  const thread = await gmailGet(token, fetcher, `/threads/${encodeURIComponent(threadId)}`,
+    full
+      ? { format: "full" }
+      : { format: "metadata", metadataHeaders: ["Subject", "From", "Date"] });
+  return {
+    id: threadId,
+    messages: asArray(thread.messages).map((message) => ({
+      ...summarize(message, true),
+      plaintextBody: full ? plainTextBody(message) : null,
+    })),
   };
 }
+
+/** The fields Zeus reads off a message, from Gmail's headers and its own metadata. */
+function summarize(message: unknown, withSubject: boolean): Record<string, unknown> {
+  const record = asRecord(message);
+  const headers = headerMap(record);
+  return {
+    subject: withSubject ? headers.get("subject") ?? null : null,
+    sender: headers.get("from") ?? null,
+    // `internalDate` is epoch milliseconds as a string, which `Date.parse` cannot read; the
+    // `Date` header is the fallback because it can. A thread whose timestamp will not parse
+    // is one Zeus cannot place in its window.
+    date: epochToIso(record.internalDate) ?? headers.get("date") ?? null,
+    labelIds: asArray(record.labelIds).filter((id): id is string => typeof id === "string"),
+  };
+}
+
+function newestMessage(thread: Record<string, unknown>): unknown {
+  const messages = asArray(thread.messages);
+  return messages.length === 0 ? thread : messages[messages.length - 1];
+}
+
+function headerMap(message: Record<string, unknown>): Map<string, string> {
+  const payload = asRecord(message.payload);
+  const map = new Map<string, string>();
+  for (const entry of asArray(payload.headers)) {
+    const header = asRecord(entry);
+    const name = stringField(header, "name");
+    const value = stringField(header, "value");
+    if (name !== null && value !== null) map.set(name.toLowerCase(), value);
+  }
+  return map;
+}
+
+/**
+ * The plain-text body, if the message carries one.
+ *
+ * HTML is skipped rather than stripped, which is the rule Zeus's own renderer already keeps:
+ * un-marking-up somebody else's HTML is a parser deciding what a message said.
+ */
+function plainTextBody(message: unknown): string | null {
+  const found = findPlainText(asRecord(asRecord(message).payload), 0);
+  return found === null ? null : found.slice(0, MAX_BODY_CHARS);
+}
+
+function findPlainText(part: Record<string, unknown>, depth: number): string | null {
+  if (depth > 8) return null;
+  if (part.mimeType === "text/plain") {
+    const data = stringField(asRecord(part.body), "data");
+    if (data !== null) return decodeBase64Url(data);
+  }
+  for (const child of asArray(part.parts)) {
+    const found = findPlainText(asRecord(child), depth + 1);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+function decodeBase64Url(value: string): string {
+  return Buffer.from(value.replaceAll("-", "+").replaceAll("_", "/"), "base64").toString("utf8");
+}
+
+function epochToIso(value: unknown): string | null {
+  const milliseconds = Number(value);
+  return typeof value === "string" && Number.isFinite(milliseconds) && milliseconds > 0
+    ? new Date(milliseconds).toISOString()
+    : null;
+}
+
+/** One authenticated GET against the Gmail API, bounded and failing with a named code. */
+async function gmailGet(
+  token: string,
+  fetcher: typeof fetch,
+  path: string,
+  parameters: Record<string, string | string[]>,
+): Promise<Record<string, unknown>> {
+  const url = new URL(`${GMAIL_API_BASE}${path}`);
+  for (const [name, value] of Object.entries(parameters)) {
+    for (const entry of Array.isArray(value) ? value : [value]) {
+      url.searchParams.append(name, entry);
+    }
+  }
+  const response = await fetcher(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const body = await boundedJson(response);
+  if (!response.ok) {
+    throw new GoogleGmailError(
+      refusalCode(`gmail_http_${response.status}`, JSON.stringify(body ?? "")),
+      `Gmail answered ${response.status}`,
+      JSON.stringify(body ?? "").slice(0, 500),
+    );
+  }
+  return asRecord(body);
+}
+
+/** Bounded fan-out. Order is preserved so a window still reads newest first. */
+async function mapConcurrently<T, R>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await run(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function stringField(value: unknown, key: string): string | null {
+  const field = asRecord(value)[key];
+  return typeof field === "string" && field.length > 0 ? field : null;
+}
+
+function gmailToolFailure(
+  input: Pick<Parameters<typeof createGoogleGmailMcpServer>[0], "grant" | "store">,
+  error: unknown,
+) {
+  const failureError = gmailFailure(input, error);
+  reportGmailFailure(failureError.code, failureError.detail);
+  return failure(`${failureError.code}: ${failureError.message}`);
+}
+
+function success(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
 
 async function refreshGmailAccessToken(
   refreshToken: string,
@@ -335,22 +525,6 @@ function googleReasonToken(message: string): string | null {
 function refusalCode(base: string, message: string): string {
   const reason = googleReasonToken(message);
   return (reason === null ? base : `${base}_${reason}`).slice(0, 64);
-}
-
-/** The text a tool result carried, bounded, for pattern-matching and for the operator log. */
-function contentText(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter(
-      (entry): entry is { text: string } =>
-        entry !== null &&
-        typeof entry === "object" &&
-        (entry as { type?: unknown }).type === "text" &&
-        typeof (entry as { text?: unknown }).text === "string",
-    )
-    .map((entry) => entry.text)
-    .join("\n")
-    .slice(0, 2_000);
 }
 
 /**

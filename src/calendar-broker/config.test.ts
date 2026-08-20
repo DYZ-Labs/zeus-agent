@@ -51,7 +51,6 @@ describe("Calendar broker Gmail configuration", () => {
       clientId: "gmail-client",
       clientSecret: "gmail-secret",
       redirectUri: "https://calendar.zeusagent.dev/oauth/gmail/callback",
-      remoteMcpUrl: "https://gmailmcp.googleapis.com/mcp/v1",
     });
   });
 });
