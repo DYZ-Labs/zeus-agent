@@ -14,7 +14,7 @@ import {
   upsertGoogleGmailConnector,
 } from "@/core/connectors";
 import type { Db } from "@/core/db";
-import { syncEmail } from "@/core/email-sync";
+import { CONNECT_SYNC_TIMEOUT_MS, syncEmail } from "@/core/email-sync";
 import { verifyConnector } from "@/core/mcp-client";
 import { getAppOwner } from "@/core/owner";
 import { getAuthConfiguration } from "@/server/auth/config";
@@ -84,7 +84,7 @@ export async function applyGoogleGmailResult(
     scopes: result.scopes,
     sourceMessageId: source.id,
   });
-  await syncEmail(db, { signal: AbortSignal.timeout(10_000) });
+  await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
 }
 
 export async function disconnectGoogleGmailGrant(

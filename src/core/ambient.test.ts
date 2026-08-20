@@ -82,6 +82,11 @@ describe("the scheduled refresh", () => {
       "calendar.list_events",
       { signal: undefined },
     );
+    expect(ambientMocks.restoreConnectorReachability).toHaveBeenCalledWith(
+      db,
+      "email.search_threads",
+      { signal: undefined },
+    );
     expect(result.synced).toBe(false);
   });
 });

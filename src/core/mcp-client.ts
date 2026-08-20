@@ -55,7 +55,8 @@ import type { CapabilitySlot } from "./schema";
 
 const CONNECT_TIMEOUT_MS = 15_000;
 const CALL_TIMEOUT_MS = 30_000;
-const MAX_RESULT_BYTES = 200_000;
+/** Gmail `search_threads` returns every message in each thread; 200 KB truncated that JSON. */
+const MAX_RESULT_BYTES = 1_000_000;
 const GCLOUD_TIMEOUT_MS = 10_000;
 const MAX_GCLOUD_OUTPUT_BYTES = 8_192;
 
