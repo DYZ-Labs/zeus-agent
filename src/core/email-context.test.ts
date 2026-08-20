@@ -37,6 +37,7 @@ const CONNECTED: EmailCapabilityState = {
   connectorLabel: "Gmail",
   unusableStatus: null,
   unusableReason: null,
+  temporarilyUnreachable: false,
   lastReadAt: null,
 };
 

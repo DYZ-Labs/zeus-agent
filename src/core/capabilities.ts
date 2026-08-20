@@ -126,14 +126,26 @@ export type EmailCapabilityState = {
   connectorLabel: string | null;
   unusableStatus: ConnectorStatus | null;
   unusableReason: string | null;
+  /**
+   * The connection is intact and the service simply did not answer.
+   *
+   * Same distinction as the calendar field: a transient outage is not a grant the user has
+   * to repair, and collapsing the two is how a reply came to deny an inbox that was still
+   * authorized.
+   */
+  temporarilyUnreachable: boolean;
   lastReadAt: string | null;
 };
 
 export function emailCapabilityState(db: Db): EmailCapabilityState {
   const read = availableCapability(db, "email.search_threads");
+  // A connector that exists and cannot be called is a different answer from no connector at
+  // all. `provider === "google_gmail"` covers the hosted row before any slot is bound, which
+  // is the calendar's rule for `google_calendar` and the one this used to skip.
   const bound = read
     ? null
     : listConnectors(db).find((connector) =>
+        connector.provider === "google_gmail" ||
         connector.capabilities.some(
           (capability) =>
             capability.slot === "email.search_threads" ||
@@ -158,6 +170,13 @@ export function emailCapabilityState(db: Db): EmailCapabilityState {
     connectorLabel: connector?.label ?? null,
     unusableStatus: read ? null : (bound?.status ?? null),
     unusableReason,
+    temporarilyUnreachable:
+      !read &&
+      bound !== null &&
+      bound.status === "unreachable" &&
+      unusableReason !== null &&
+      !reachabilityFailureWithdrawsGrant(unusableReason) &&
+      bound.capabilities.some((entry) => entry.enabled === 1),
     lastReadAt: readEmailCoverage(db)?.fetchedAt ?? null,
   };
 }
@@ -167,16 +186,20 @@ export function emailCapabilityState(db: Db): EmailCapabilityState {
  *
  * Prose rather than JSON: every line is a sentence the model can repeat to the user without
  * translating a field name first, and the failure this fixes was a model inventing prose in
- * the absence of any.
+ * the absence of any. Calendar and inbox both belong here: the cached prompt names this
+ * block as the only authority on what is connected, so a service omitted from it is a
+ * service the model is free to deny.
  */
 export function renderCapabilityBlock(
-  state: CalendarCapabilityState,
+  calendar: CalendarCapabilityState,
+  email: EmailCapabilityState,
   context: EvaluationContext,
 ): string {
   const lines = [
     `Today is ${localDate(context)} (${context.local_weekday}), local time ` +
       `${context.local_time}, timezone ${context.timezone}.`,
-    ...calendarLines(state),
+    ...calendarLines(calendar),
+    ...emailLines(email),
   ];
   return `<capabilities>\n${escapeCapabilityData(lines.join("\n"))}\n</capabilities>`;
 }
@@ -275,6 +298,62 @@ function calendarLines(state: CalendarCapabilityState): string[] {
           "recorded separately in the calendar history block.",
   );
   return lines;
+}
+
+function emailLines(state: EmailCapabilityState): string[] {
+  const name = state.connectorLabel ?? "An inbox";
+  if (!state.connected) {
+    return [
+      "Inbox: not connected. Zeus cannot read any inbox, and knows nothing about what is " +
+        "waiting in one. The user connects Gmail in Settings, under Connections.",
+    ];
+  }
+  if (!state.canRead) {
+    if (state.temporarilyUnreachable) {
+      return [
+        `Inbox: ${name} is connected, and did not answer just now. The connection is ` +
+          "intact and needs nothing from the user; Zeus retries on its own and will pick " +
+          "it back up when the service answers. The inbox block, if present, is from " +
+          "the last successful read.",
+      ];
+    }
+    if (state.unusableReason === "missing_environment" && state.unusableStatus === "ready") {
+      return [
+        `Inbox: ${name} is connected but cannot be used right now (server configuration ` +
+          "missing). This deployment is missing a server-side setting; the operator of this " +
+          "Zeus has to restore it, and nothing in the user's Settings will change it.",
+      ];
+    }
+    const reconnect = state.unusableReason === "reconnect_required";
+    const disabled = state.unusableReason === "disabled";
+    const status = reconnect
+      ? "Reconnect required"
+      : disabled
+        ? "Disabled"
+        : state.unusableStatus
+          ? connectorStatusLabel(state.unusableStatus)
+          : "unavailable";
+    const action = reconnect
+      ? "reconnected"
+      : disabled
+        ? "enabled"
+        : state.unusableReason === "no_enabled_capability"
+          ? "given Gmail access"
+          : "reconnected or verified";
+    return [
+      `Inbox: ${name} is connected but cannot be used right now (${status}). Zeus cannot ` +
+        `read it until it is ${action} in Settings, under Connections.`,
+    ];
+  }
+  return [
+    `Inbox: ${name} is connected for reading. Zeus can see recent subjects and senders in ` +
+      "the inbox block in this message. Zeus does not hold message bodies until the user " +
+      "asks to open a thread, and cannot send, draft, or change mail.",
+    state.lastReadAt === null
+      ? "Zeus has never successfully read this inbox."
+      : "Zeus has read this inbox; the inbox block in this message is from that read and " +
+        "says whether it is current or stale.",
+  ];
 }
 
 /** "a", "a and b", "a, b, and c" — so the sentence reads the way a person would say it. */
