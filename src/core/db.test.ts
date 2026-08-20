@@ -38,6 +38,7 @@ import {
   purgeManagedMigrationBackups,
 } from "./db";
 import { MIGRATIONS, type Migration } from "./migrations";
+import { CAPABILITY_SLOT_EFFECTS, CapabilitySlot } from "./schema";
 import { ACCOUNTS_DIRECTORY } from "./stores";
 
 const FIRST: Migration = {
@@ -993,7 +994,7 @@ describe("email-slot migration rebuilds connector_capability in place", () => {
     db.close();
   });
 
-  it("admits the email read slots, and no email write slot exists to admit", () => {
+  it("admits the email draft and trash slots, and still has no send slot to admit", () => {
     const db = storeAtThirtyTwo();
     migrate(db, MIGRATIONS);
 
@@ -1008,9 +1009,24 @@ describe("email-slot migration rebuilds connector_capability in place", () => {
 
     expect(() => insert("email.search_threads", "external_read")).not.toThrow();
     expect(() => insert("email.get_thread", "external_read")).not.toThrow();
+    expect(() => insert("email.create_draft", "modify_external")).not.toThrow();
+    expect(() => insert("email.trash_thread", "modify_external")).not.toThrow();
     // The pairing CHECK still binds each slot to exactly one effect kind.
     expect(() => insert("email.get_thread", "send")).toThrow(/CHECK/u);
+    expect(() => insert("email.create_draft", "send")).toThrow(/CHECK/u);
+    expect(() => insert("email.create_draft", "external_read")).toThrow(/CHECK/u);
+    expect(() => insert("email.trash_thread", "external_read")).toThrow(/CHECK/u);
+    // The one that matters most, and the reason this test outlived the increment that wrote
+    // it: email can draft and can bin, and there is still no row shape that says it can send.
     expect(() => insert("email.send_message", "send")).toThrow(/CHECK/u);
     db.close();
+  });
+
+  it("names no capability slot that can send", () => {
+    // Stated against the type rather than the table, so a slot added without a migration
+    // still trips it. `send` remains in `EffectKind` because the enum is the vocabulary of
+    // authorization, not a list of things Zeus can do.
+    expect(CapabilitySlot.options.filter((slot) => /send/u.test(slot))).toEqual([]);
+    expect(Object.values(CAPABILITY_SLOT_EFFECTS)).not.toContain("send");
   });
 });

@@ -1,6 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import { calendarCapabilityForEffect, isConnectorEffect } from "./connectors";
+import {
+  availableCapability,
+  calendarCapabilityForEffect,
+  isConnectorEffect,
+  type BoundCapability,
+} from "./connectors";
+import { parseEmailRequest, slotForEmailRequest } from "./email-actions";
 import { parseWorkPlanApproval } from "./confirmation-text";
 import type { Db } from "./db";
 import { now } from "./db";
@@ -24,6 +30,7 @@ import type {
   WorkStep,
 } from "./schema";
 import {
+  CAPABILITY_SLOT_EFFECTS,
   EffectKind as EffectKindSchema,
   EvaluationContext as EvaluationContextSchema,
   WorkPlanProposal as WorkPlanProposalSchema,
@@ -255,7 +262,7 @@ const SELECT_RECEIPT = `
 export function createWorkPlan(db: Db, input: CreateWorkPlanInput): WorkPlanDetail {
   assertUserMessage(db, input.sourceMessageId);
   const proposal = normalizeProposal(input.proposal);
-  assertAuthorizableEffects(db, proposal.allowed_effects);
+  assertAuthorizableEffects(db, proposal.objective, proposal.allowed_effects);
   assertRunnableLimits(proposal);
   const generationProvenance = input.generationProvenance
     ? normalizeGenerationProvenance(db, input.generationProvenance)
@@ -640,7 +647,7 @@ export function authorizeWorkPlan(
   const expiresAt = normalizeFutureDate(input.expiresAt, "authorization expiry");
   const planEffects = parseEffects(detail.plan.allowed_effects_json);
   const allowedEffects = uniqueEffects(input.allowedEffects);
-  assertAuthorizableEffects(db, allowedEffects);
+  assertAuthorizableEffects(db, detail.plan.objective, allowedEffects);
   if (!sameStringSet(planEffects, allowedEffects)) {
     throw new Error("Authorization effects must exactly match the work plan effects");
   }
@@ -1173,7 +1180,7 @@ async function executeRun(
     // than failing it: reconnecting the service is a repair the user can make.
     let connectorCapabilityId: number | null = null;
     if (isConnectorEffect(step.effect_kind)) {
-      const available = calendarCapabilityForEffect(db, step.effect_kind);
+      const available = planCapabilityForEffect(db, detail.plan.objective, step.effect_kind);
       if (!available) {
         pauseStepAndRun(
           db,
@@ -2604,13 +2611,40 @@ function assertRunnableLimits(proposal: WorkPlanProposal): void {
  * enabled capability provides it, and that can change after a plan is written. `purchase`
  * is refused unconditionally — money is a different threat model and has no slot.
  */
-function assertAuthorizableEffects(db: Db, effects: readonly EffectKind[]): void {
+/**
+ * The bound capability that serves one step of this plan.
+ *
+ * `modify_external` stopped identifying a capability the moment email gained write slots: it
+ * now means either "change a calendar event" or "bin a mail thread", and asking by effect
+ * kind alone would have handed an email step the calendar's `update_event` grant — which
+ * fails nothing and does the wrong thing, the worst shape a bug can take here.
+ *
+ * The plan objective is what disambiguates, and it can, because both email and calendar
+ * writes are code-owned: each embeds its resolved request in the objective, covered by the
+ * plan hash. A generated plan carries neither and resolves to calendar exactly as before.
+ */
+export function planCapabilityForEffect(
+  db: Db,
+  objective: string,
+  effect: EffectKind,
+): BoundCapability | null {
+  const email = parseEmailRequest(objective);
+  if (!email) return calendarCapabilityForEffect(db, effect);
+  const slot = slotForEmailRequest(email);
+  return CAPABILITY_SLOT_EFFECTS[slot] === effect ? availableCapability(db, slot) : null;
+}
+
+function assertAuthorizableEffects(
+  db: Db,
+  objective: string,
+  effects: readonly EffectKind[],
+): void {
   for (const effect of effects) {
     if ((SAFE_EFFECT_KINDS as readonly EffectKind[]).includes(effect)) continue;
     if (effect === "purchase") {
       throw new Error("Zeus cannot be authorized to spend money");
     }
-    if (!isConnectorEffect(effect) || !calendarCapabilityForEffect(db, effect)) {
+    if (!isConnectorEffect(effect) || !planCapabilityForEffect(db, objective, effect)) {
       throw new Error(
         `Effect ${effect} is unavailable without a connected service that provides it`,
       );

@@ -55,6 +55,8 @@ export const CAPABILITY_SLOTS = [
   "calendar.update_event",
   "email.search_threads",
   "email.get_thread",
+  "email.create_draft",
+  "email.trash_thread",
 ] as const satisfies readonly CapabilitySlot[];
 
 /**
@@ -80,6 +82,12 @@ export const GOOGLE_CALENDAR_WRITE_SCOPE =
   "https://www.googleapis.com/auth/calendar.events";
 export const GOOGLE_GMAIL_BROKER_SERVICE_KEY = "GOOGLE_GMAIL_BROKER_SERVICE_KEY";
 export const GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+/**
+ * The one scope that can draft and can trash. It reads too, so a write grant asks for it
+ * alone. See `calendar-broker/gmail.ts` for why there is no narrower option and what that
+ * does and does not imply.
+ */
+export const GOOGLE_GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
 /** What one handshake found. Advisory: Zeus decides effects from the slot, not from this. */
 export type DiscoveredToolSummary = {
@@ -796,16 +804,30 @@ export function configureGoogleGmailCapabilities(
   db: Db,
   input: GoogleProviderCapabilitiesInput,
 ): ConnectorView {
-  if (!new Set(input.scopes).has(GOOGLE_GMAIL_READ_SCOPE)) {
-    throw new Error("Read-only Gmail access was not granted");
+  const scopeSet = new Set(input.scopes);
+  // `gmail.modify` reads as well as writes, so a write grant satisfies the read requirement
+  // on its own. A grant that carries neither is a connection that can do nothing.
+  const canRead =
+    scopeSet.has(GOOGLE_GMAIL_READ_SCOPE) || scopeSet.has(GOOGLE_GMAIL_WRITE_SCOPE);
+  const canWrite = scopeSet.has(GOOGLE_GMAIL_WRITE_SCOPE);
+  if (!canRead) throw new Error("Read-only Gmail access was not granted");
+  const desired: Array<[CapabilitySlot, string]> = [
+    ["email.search_threads", "search_threads"],
+    ["email.get_thread", "get_thread"],
+  ];
+  // An inbox connected before drafting existed holds a readonly refresh token, so it binds
+  // the two read slots and nothing else. It keeps working; it simply cannot draft until the
+  // user widens the grant, which is a question Settings asks and this code never assumes.
+  if (canWrite) {
+    desired.push(
+      ["email.create_draft", "create_draft"],
+      ["email.trash_thread", "trash_thread"],
+    );
   }
   return configureGoogleProviderCapabilities(db, input, {
     provider: "google_gmail",
     label: "Gmail",
-    desired: [
-      ["email.search_threads", "search_threads"],
-      ["email.get_thread", "get_thread"],
-    ],
+    desired,
   });
 }
 

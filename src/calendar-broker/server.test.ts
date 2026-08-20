@@ -23,7 +23,7 @@ import {
 } from "../core/email-sync";
 import { bindAppOwner } from "../core/owner";
 import type { CalendarBrokerConfiguration } from "./config";
-import { GMAIL_READ_SCOPE } from "./gmail";
+import { GMAIL_READ_SCOPE, GMAIL_WRITE_SCOPE } from "./gmail";
 import { CALENDAR_READ_SCOPE, CALENDAR_WRITE_SCOPE } from "./google";
 import {
   envelopeTimes,
@@ -43,11 +43,16 @@ let accountId: string;
 let fetcher: ReturnType<typeof vi.fn<typeof fetch>>;
 /** Set by a test to make Google refuse the tool call rather than answer it. */
 let gmailCallRefusal: { status: number; body: unknown } | null = null;
+/** What Google hands back at the token exchange, so a narrowed consent can be rehearsed. */
+let gmailGrantedScope: string = GMAIL_READ_SCOPE;
+/** The Google consent URL the last connect attempt sent the user to. */
+let gmailConsentUrl = "";
 
 beforeEach(async () => {
   store = new CalendarBrokerStore(":memory:", randomBytes(32));
   accountId = randomUUID();
   gmailCallRefusal = null;
+  gmailGrantedScope = GMAIL_READ_SCOPE;
   fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     if (url === "https://oauth2.googleapis.com/token") {
@@ -57,7 +62,7 @@ beforeEach(async () => {
           ? Response.json({
               access_token: "gmail-oauth-access",
               refresh_token: "gmail-refresh-secret",
-              scope: GMAIL_READ_SCOPE,
+              scope: gmailGrantedScope,
             })
           : Response.json({ access_token: "gmail-access" });
       }
@@ -221,6 +226,49 @@ describe("the multi-user Google Calendar broker", () => {
 
     expect(created.isError).toBe(false);
     expect(created.value).toMatchObject({ title: "Planning", status: "confirmed" });
+  });
+});
+
+describe("widening a Gmail grant", () => {
+  it("asks Google for the write scope and then exposes the write tools", async () => {
+    gmailGrantedScope = GMAIL_WRITE_SCOPE;
+    const result = await connectGmail("write");
+
+    // What the user was actually sent to consent to.
+    const consent = new URL(gmailConsentUrl);
+    expect(consent.searchParams.get("scope")).toBe(GMAIL_WRITE_SCOPE);
+    expect(store.getGmailGrant(result.connectionId, accountId)?.scopes).toEqual([
+      GMAIL_WRITE_SCOPE,
+    ]);
+
+    const client = new Client({ name: "test-zeus", version: "0.0.1" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`${origin}/gmail/mcp/${result.connectionId}`),
+      {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
+            "X-Zeus-Account-Id": accountId,
+            "X-Zeus-Request-Key": "durable-key",
+          },
+        },
+      },
+    ));
+    expect((await client.listTools()).tools.map((tool) => tool.name).sort()).toEqual([
+      "create_draft",
+      "get_thread",
+      "search_threads",
+      "trash_thread",
+    ]);
+    await client.close();
+  });
+
+  it("refuses a write consent that came back read-only", async () => {
+    // Asking for `gmail.modify` and being handed `gmail.readonly` is a grant that cannot do
+    // what the connection is about to claim it can. Recording it would bind write slots
+    // against a token that will refuse them at the first use.
+    gmailGrantedScope = GMAIL_READ_SCOPE;
+    await expect(connectGmail("write")).rejects.toThrow(/did not grant Gmail drafting/u);
   });
 });
 
@@ -408,11 +456,12 @@ function oauthRequest(): string {
   }, SERVICE_KEY);
 }
 
-async function connectGmail() {
+async function connectGmail(permission: "read" | "write" = "read") {
   const request = signBrokerEnvelope({
     kind: "google_gmail_oauth_request",
     accountId,
     returnUrl: "https://www.zeusagent.dev/api/integrations/google-gmail/callback",
+    permission,
     nonce: randomUUID(),
     ...envelopeTimes(),
   }, GMAIL_SERVICE_KEY);
@@ -422,7 +471,10 @@ async function connectGmail() {
   );
   expect(started.status).toBe(303);
   const google = new URL(started.headers.get("location")!);
-  expect(google.searchParams.get("scope")).toBe(GMAIL_READ_SCOPE);
+  gmailConsentUrl = google.toString();
+  expect(google.searchParams.get("scope")).toBe(
+    permission === "write" ? GMAIL_WRITE_SCOPE : GMAIL_READ_SCOPE,
+  );
   expect(google.searchParams.get("prompt")).toBe("consent");
   expect(google.searchParams.get("redirect_uri")).toBe(
     "https://calendar-dev.zeusagent.dev/oauth/gmail/callback",
@@ -436,10 +488,11 @@ async function connectGmail() {
   );
   expect(callback.status).toBe(303);
   const returnUrl = new URL(callback.headers.get("location")!);
-  return verifyGmailOAuthResult(
-    returnUrl.searchParams.get("result")!,
-    GMAIL_SERVICE_KEY,
-  );
+  const result = returnUrl.searchParams.get("result");
+  // A refused consent comes back as a message on the return URL rather than a result. Raising
+  // it here is what lets a test say which refusal it expected.
+  if (!result) throw new Error(returnUrl.searchParams.get("connector_error") ?? "no result");
+  return verifyGmailOAuthResult(result, GMAIL_SERVICE_KEY);
 }
 
 /**

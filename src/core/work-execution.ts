@@ -33,6 +33,13 @@ import type { CachedEvent } from "./calendar-time";
 import { calendarCapabilityForEffect, getConnector } from "./connectors";
 import type { BoundCapability } from "./connectors";
 import { buildContext, intentFieldProvenance } from "./context";
+import {
+  buildEmailPayload,
+  emailPreviewFor,
+  parseEmailRequest,
+} from "./email-actions";
+import type { EmailRequest } from "./email-actions";
+import { cachedThreads } from "./email-sync";
 import type { Db } from "./db";
 import {
   authorizeEffectByPolicy,
@@ -76,6 +83,7 @@ import {
   MAX_MODEL_TOOL_CALLS,
   listWorkArtifacts,
   minimumCallBudgetForSteps,
+  planCapabilityForEffect,
 } from "./work-plans";
 
 const SAFE_EFFECTS = new Set(["memory_read", "web_read", "prepare_local"]);
@@ -382,7 +390,7 @@ async function executeSafeStep(
   input: SafeStepExecutionInput,
 ): Promise<SafeStepExecutionResult> {
   const effect = input.step.effect_kind;
-  if (!SAFE_EFFECTS.has(effect) && !calendarCapabilityForEffect(db, effect)) {
+  if (!SAFE_EFFECTS.has(effect) && !planCapabilityForEffect(db, input.plan.objective, effect)) {
     return {
       pause: {
         code: "effect_not_available",
@@ -399,6 +407,14 @@ async function executeSafeStep(
       },
       toolCalls: 0,
     };
+  }
+
+  // Ahead of the calendar branches and ahead of `external_read`, both of which resolve
+  // through calendar slots. An email plan carries its resolved request in the objective, so
+  // this is a question about the plan rather than a guess about the step.
+  const emailRequest = parseEmailRequest(input.plan.objective);
+  if (emailRequest && effect === "prepare_local") {
+    return prepareEmailStep(db, input, emailRequest);
   }
 
   if (effect === "external_read") return executeExternalRead(db, input);
@@ -745,6 +761,204 @@ function calendarReadFailure(
   };
 }
 
+/** What the model may contribute to a draft: the words, and nothing that decides delivery. */
+const DraftedMessage = z
+  .object({
+    /** Used only for a brand-new draft; a reply's subject is the thread's, derived downstream. */
+    subject: z.string().max(300).nullable(),
+    body: z.string().min(1).max(10_000),
+  })
+  .strict();
+
+const DRAFT_PROMPT = [
+  "You write the body of one email for the user, in their voice.",
+  "Write only the message itself. No greeting line addressing anyone by a name you were not",
+  "given, no signature, no subject line, no quoted thread, and no commentary about drafting.",
+  "You are not told what the other person wrote, so do not pretend to answer it: write what",
+  "the user said they wanted to say. If their instruction is too thin to write from, say so",
+  "in one sentence as the body, so they can see it and correct you.",
+].join(" ");
+
+/**
+ * The `prepare_local` half of an email write.
+ *
+ * For a draft this is the one model call in the whole flow, and its output is constrained to
+ * a single `body` string. For a trash there is no model call at all — the step exists so the
+ * run stops at a step whose title says what it is doing, which is the same reason
+ * `checkCalendarStep` exists.
+ */
+async function prepareEmailStep(
+  db: Db,
+  input: SafeStepExecutionInput,
+  request: EmailRequest,
+): Promise<SafeStepExecutionResult> {
+  if (request.kind === "trash") {
+    const thread = cachedThreads(db, new Date()).find((entry) => entry.id === request.threadId);
+    if (!thread) {
+      // The inbox this was resolved against has expired or moved on. Refusing costs the user
+      // one more sentence; guessing costs them a conversation they cannot get back for thirty
+      // days, and only if they notice in time.
+      return {
+        output: { resolved: false, reason: "thread_no_longer_cached" },
+        toolCalls: 0,
+        pause: {
+          code: "email_target_unverifiable",
+          message: "That thread is no longer in the inbox Zeus has read",
+          requiresReauthorization: false,
+        },
+      };
+    }
+    return {
+      output: { resolved: true, thread_id: thread.id },
+      artifacts: [
+        {
+          kind: "research_notes",
+          title: input.step.title,
+          content: JSON.stringify(
+            { thread_id: thread.id, subject: thread.subject, from: thread.from },
+            null,
+            2,
+          ),
+          citations: [],
+          sourceMessageIds: input.plan.source_message_id === null
+            ? []
+            : [input.plan.source_message_id],
+          sourceMemoryItems: [],
+        },
+      ],
+      toolCalls: 0,
+    };
+  }
+
+  const response = await openai().responses.create({
+    model: MODEL,
+    max_output_tokens: 2_000,
+    reasoning: { effort: "medium" },
+    instructions: DRAFT_PROMPT,
+    input: [{ role: "user", content: `What the user asked for: ${request.instruction}` }],
+    text: { format: zodTextFormat(DraftedMessage, "zeus_drafted_message") },
+    store: false,
+  }, { idempotencyKey: input.providerRequestKey, signal: input.signal });
+  recordModelCall(db, responseUsage(response));
+  assertResponseComplete(response);
+
+  let drafted: { subject: string | null; body: string };
+  try {
+    drafted = DraftedMessage.parse(JSON.parse(response.output_text));
+  } catch {
+    return {
+      pause: { code: "draft_unreadable", message: "The drafted message could not be read" },
+      modelCalls: 1,
+      toolCalls: 1,
+    };
+  }
+  const unsafe = inspectUntrustedWorkData(`${drafted.subject ?? ""}\n${drafted.body}`);
+  if (unsafe) return sensitivePause(db, input, unsafe, 1, 1);
+  return {
+    output: { drafted: true },
+    artifacts: [
+      {
+        kind: "draft",
+        title: input.step.title,
+        content: JSON.stringify({ subject: drafted.subject, body: drafted.body }),
+        citations: [],
+        sourceMessageIds: input.plan.source_message_id === null
+          ? []
+          : [input.plan.source_message_id],
+        sourceMemoryItems: [],
+      },
+    ],
+    modelCalls: 1,
+    toolCalls: 1,
+  };
+}
+
+/**
+ * Build the exact draft or trash request and stop.
+ *
+ * No standing-policy branch and no direct execution, unlike the calendar write beneath it.
+ * The calendar's mode is defensible because a deterministic conflict gate re-reads the
+ * calendar and a daily ceiling bounds a misclassification; there is no equivalent question to
+ * ask about a message, so there is nothing here for a mode to stand on.
+ */
+async function executeEmailWrite(
+  db: Db,
+  input: SafeStepExecutionInput,
+  available: BoundCapability,
+  request: EmailRequest,
+): Promise<SafeStepExecutionResult> {
+  const threadId = request.kind === "draft_new" ? null : request.threadId;
+  const thread = threadId === null
+    ? null
+    : cachedThreads(db, new Date()).find((entry) => entry.id === threadId) ?? null;
+  if (threadId !== null && !thread) {
+    return {
+      output: { prepared: false, reason: "thread_no_longer_cached" },
+      toolCalls: 0,
+      pause: {
+        code: "email_target_unverifiable",
+        message: "That thread is no longer in the inbox Zeus has read",
+        requiresReauthorization: false,
+      },
+    };
+  }
+
+  const drafted = request.kind === "trash" ? null : draftedMessage(db, input);
+  if (request.kind !== "trash" && !drafted) {
+    return {
+      pause: { code: "draft_missing", message: "No drafted message was prepared for this step" },
+      toolCalls: 0,
+    };
+  }
+
+  const payload = buildEmailPayload(request, drafted?.body ?? "", drafted?.subject ?? null);
+  const mismatch = payloadSchemaMismatch(available.capability.input_schema_json, payload);
+  if (mismatch) {
+    return { pause: { code: "payload_invalid", message: mismatch }, toolCalls: 0 };
+  }
+
+  const effect = proposeEffect(db, {
+    workRunId: input.run.id,
+    workStepId: input.step.id,
+    slot: available.capability.slot,
+    payload,
+    previewText: emailPreviewFor(request, thread, null),
+    providerRequestKey: input.providerRequestKey,
+    requestMessageId: input.plan.source_message_id,
+    priorState: thread
+      ? { thread_id: thread.id, subject: thread.subject, from: thread.from }
+      : null,
+  });
+
+  return {
+    output: { proposed_effect_id: effect.id, payload_hash: effect.payload_hash },
+    toolCalls: 0,
+    pause: {
+      code: "effect_confirmation_required",
+      message: request.kind === "trash"
+        ? "Moving a thread to Trash needs your confirmation"
+        : "Saving this draft needs your confirmation",
+      requiresReauthorization: false,
+    },
+  };
+}
+
+/** The message written by this run's drafting step, read back from its artifact. */
+function draftedMessage(
+  db: Db,
+  input: SafeStepExecutionInput,
+): { subject: string | null; body: string } | null {
+  const artifacts = listWorkArtifacts(db, { runId: input.run.id });
+  const drafted = artifacts.filter((artifact) => artifact.kind === "draft").pop();
+  if (!drafted) return null;
+  try {
+    const parsed = DraftedMessage.parse(JSON.parse(drafted.content));
+    return parsed.body.trim() ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build the exact external request and stop.
  *
@@ -764,7 +978,7 @@ async function prepareExternalRequest(
   const settled = settledEffectForStep(db, input);
   if (settled) return settled;
 
-  const available = calendarCapabilityForEffect(db, input.step.effect_kind);
+  const available = planCapabilityForEffect(db, input.plan.objective, input.step.effect_kind);
   if (!available) {
     return {
       pause: {
@@ -774,6 +988,12 @@ async function prepareExternalRequest(
       toolCalls: 0,
     };
   }
+
+  // An email write builds its payload from the resolved request and the drafted prose, and
+  // never from a model reading the capability's schema. The recipient is the point: a payload
+  // a model composes is a payload a message in the mailbox can argue with.
+  const emailRequest = parseEmailRequest(input.plan.objective);
+  if (emailRequest) return executeEmailWrite(db, input, available, emailRequest);
 
   // A resolved calendar action needs no model to build its payload, and must not get one:
   // the conflict gate below is unconditional, and a gate a generated plan could route

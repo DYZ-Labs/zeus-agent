@@ -34,6 +34,8 @@ function context(timezone = "UTC"): EvaluationContext {
 const CONNECTED: EmailCapabilityState = {
   connected: true,
   canRead: true,
+  canDraft: false,
+  canTrash: false,
   connectorLabel: "Gmail",
   unusableStatus: null,
   unusableReason: null,

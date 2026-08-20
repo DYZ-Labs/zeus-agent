@@ -1,9 +1,26 @@
+import { createHash } from "node:crypto";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { CalendarBrokerStore, GmailGrant } from "./store";
 
 export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+
+/**
+ * The narrowest scope that can draft and can trash.
+ *
+ * There is no draft-only Gmail scope: `gmail.compose` and `gmail.modify` both confer the
+ * ability to send, and `threads.trash` needs `gmail.modify` regardless. So the honest
+ * statement is the two-part one, and it is worth writing down where the constant lives —
+ * **permanent deletion is prevented by scope, and sending is prevented by code.**
+ *
+ * By scope: `messages.delete` and `threads.delete` require `https://mail.google.com/`, which
+ * this broker never requests, so bypassing Trash is not something any bug here could reach.
+ * By code: Zeus has no `send` capability slot to name, `CapabilitySlot` cannot express one,
+ * and the only requests this file can make are the four registered below.
+ */
+export const GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
 const GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -27,6 +44,32 @@ const METADATA_CONCURRENCY = 8;
 
 /** Per-message body ceiling at this layer. Zeus bounds it again, harder, before rendering. */
 const MAX_BODY_CHARS = 8_000;
+
+/** What a draft may carry. Smaller than Zeus's 20 KB payload ceiling, so the review fits. */
+const MAX_DRAFT_BODY_CHARS = 10_000;
+const MAX_RECIPIENTS = 25;
+
+/**
+ * A bare address, and deliberately not a display-name form.
+ *
+ * `"Sarah Lee" <sarah@example.com>` is what a `From` header holds, and accepting it here would
+ * mean quoting rules and RFC 2047 encoding for the name — surface that buys nothing, since the
+ * address is the part that decides where mail goes and the part the user confirms. Excluding
+ * every space and angle bracket also makes header injection unrepresentable rather than
+ * filtered: no value matching this can carry a CRLF into the message Zeus assembles.
+ */
+const EmailAddress = z
+  .string()
+  .trim()
+  .min(3)
+  .max(320)
+  .regex(/^[^\s<>@",;:\\]+@[^\s<>@",;:\\]+\.[^\s<>@",;:\\]+$/u, "Expected a bare email address");
+
+/** A header value that cannot break out of its header. */
+const HeaderText = z
+  .string()
+  .max(998)
+  .regex(/^[^\r\n]*$/u, "A header value cannot span lines");
 
 const TokenResponse = z
   .object({
@@ -65,12 +108,17 @@ export class GoogleGmailError extends Error {
 export function gmailAuthorizationUrl(input: {
   configuration: GoogleGmailOAuthConfiguration;
   state: string;
+  permission: "read" | "write";
 }): URL {
   const url = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
   url.searchParams.set("client_id", input.configuration.clientId);
   url.searchParams.set("redirect_uri", input.configuration.redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", GMAIL_READ_SCOPE);
+  // `gmail.modify` covers reading too, so a write grant asks for one scope rather than two.
+  url.searchParams.set(
+    "scope",
+    input.permission === "write" ? GMAIL_WRITE_SCOPE : GMAIL_READ_SCOPE,
+  );
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("include_granted_scopes", "true");
   url.searchParams.set("prompt", "consent");
@@ -146,6 +194,7 @@ export function createGoogleGmailMcpServer(input: {
   grant: GmailGrant;
   store: CalendarBrokerStore;
   oauth: GoogleGmailOAuthConfiguration;
+  requestKey?: string | null;
   fetcher?: typeof fetch;
 }): McpServer {
   const fetcher = input.fetcher ?? fetch;
@@ -180,7 +229,7 @@ export function createGoogleGmailMcpServer(input: {
       try {
         return success(await searchThreads(await accessToken(), fetcher, { query, pageSize, view }));
       } catch (error) {
-        return gmailToolFailure(input, error);
+        return gmailToolFailure(input, error, "read");
       }
     },
   );
@@ -200,7 +249,70 @@ export function createGoogleGmailMcpServer(input: {
       try {
         return success(await readThread(await accessToken(), fetcher, threadId, messageFormat));
       } catch (error) {
-        return gmailToolFailure(input, error);
+        return gmailToolFailure(input, error, "read");
+      }
+    },
+  );
+
+  // A readonly grant lists two tools, a write grant lists four, and Zeus binds what it is
+  // shown. The scope decides here as well as at the callback and at capability binding —
+  // three checks rather than one because a tool that does not exist is the only kind that
+  // cannot be called by mistake.
+  if (!input.grant.scopes.includes(GMAIL_WRITE_SCOPE)) return server;
+
+  server.registerTool(
+    "create_draft",
+    {
+      title: "Create a Gmail draft",
+      description:
+        "Create one unsent draft in the connected user's mailbox. A draft is never sent: " +
+        "it waits in Drafts until the user sends it themselves.",
+      inputSchema: {
+        to: z.array(EmailAddress).min(1).max(MAX_RECIPIENTS),
+        // Optional because a reply's subject is the thread's, and the thread is read here
+        // rather than sent from Zeus — third-party text is not something to round-trip.
+        subject: HeaderText.optional(),
+        body: z.string().min(1).max(MAX_DRAFT_BODY_CHARS),
+        threadId: z.string().trim().min(1).max(1_024).optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ to, subject, body, threadId }) => {
+      // The same rule `create_event` keeps: without a durable key there is no way to tell a
+      // retry from a second request, and a draft created twice is a draft the user deletes
+      // twice.
+      if (!input.requestKey) return failure("A durable Zeus request key is required");
+      try {
+        return success(
+          await createDraft(await accessToken(), fetcher, {
+            to,
+            subject,
+            body,
+            threadId,
+            requestKey: input.requestKey,
+          }),
+        );
+      } catch (error) {
+        return gmailToolFailure(input, error, "draft");
+      }
+    },
+  );
+
+  server.registerTool(
+    "trash_thread",
+    {
+      title: "Move a Gmail thread to Trash",
+      description:
+        "Move one thread in the connected user's mailbox to Trash. Gmail empties Trash " +
+        "after 30 days; until then the thread can be restored.",
+      inputSchema: { threadId: z.string().trim().min(1).max(1_024) },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ threadId }) => {
+      try {
+        return success(await trashThread(await accessToken(), fetcher, threadId));
+      } catch (error) {
+        return gmailToolFailure(input, error, "trash");
       }
     },
   );
@@ -340,6 +452,209 @@ function epochToIso(value: unknown): string | null {
     : null;
 }
 
+/**
+ * Create one draft, or return the one this request already created.
+ *
+ * The `Message-ID` is derived from Zeus's durable request key, which is `create_event`'s
+ * derived event id in the shape this API allows: Gmail assigns draft ids itself, so the only
+ * caller-chosen identifier a draft can carry is a header. Looking it up before creating turns
+ * a retried request into a no-op.
+ */
+async function createDraft(
+  token: string,
+  fetcher: typeof fetch,
+  draft: {
+    to: string[];
+    subject?: string;
+    body: string;
+    threadId?: string;
+    requestKey: string;
+  },
+): Promise<Record<string, unknown>> {
+  const messageId = derivedMessageId(draft.requestKey, await accountDomain(token, fetcher));
+  const existing = await draftCarrying(token, fetcher, messageId);
+  if (existing) return { ...existing, message_id: messageId, created: false };
+
+  const reply = draft.threadId ? await replyHeaders(token, fetcher, draft.threadId) : null;
+  const raw = Buffer.from(
+    mimeMessage({
+      ...draft,
+      subject: draft.subject ?? reply?.subject ?? "",
+      messageId,
+      reply,
+    }),
+    "utf8",
+  ).toString("base64url");
+  const created = await gmailPost(token, fetcher, "/drafts", {
+    message: { raw, ...(draft.threadId ? { threadId: draft.threadId } : {}) },
+  });
+  return { ...draftSummary(created), message_id: messageId, created: true };
+}
+
+async function trashThread(
+  token: string,
+  fetcher: typeof fetch,
+  threadId: string,
+): Promise<Record<string, unknown>> {
+  const thread = await gmailPost(
+    token,
+    fetcher,
+    `/threads/${encodeURIComponent(threadId)}/trash`,
+    {},
+  );
+  const messages = asArray(thread.messages);
+  // Read the outcome back off the response rather than assuming a 200 meant it moved. Gmail
+  // labels every message in the thread, so "trashed" is all of them and not any of them.
+  const trashed =
+    messages.length > 0 &&
+    messages.every((message) =>
+      asArray(asRecord(message).labelIds).includes("TRASH"),
+    );
+  return { id: stringField(thread, "id") ?? threadId, trashed, message_count: messages.length };
+}
+
+/** The user's own domain, so a derived `Message-ID` is one their mail server would own. */
+async function accountDomain(token: string, fetcher: typeof fetch): Promise<string> {
+  const profile = await gmailGet(token, fetcher, "/profile", {});
+  const domain = stringField(profile, "emailAddress")?.split("@")[1];
+  if (!domain) {
+    throw new GoogleGmailError(
+      "gmail_profile_unreadable",
+      "Gmail did not say which account this is",
+    );
+  }
+  return domain;
+}
+
+async function draftCarrying(
+  token: string,
+  fetcher: typeof fetch,
+  messageId: string,
+): Promise<Record<string, unknown> | null> {
+  let found: Record<string, unknown>;
+  try {
+    found = await gmailGet(token, fetcher, "/drafts", {
+      q: `rfc822msgid:${messageId.replace(/^<|>$/gu, "")}`,
+      maxResults: "1",
+    });
+  } catch {
+    // A duplicate-check that fails must not stop the draft. Getting this wrong costs a second
+    // draft the user deletes; failing closed costs them the draft they asked for.
+    return null;
+  }
+  const first = asArray(found.drafts)[0];
+  return first === undefined ? null : draftSummary(asRecord(first));
+}
+
+/** The headers that make Gmail file a reply in its thread instead of starting a new one. */
+async function replyHeaders(
+  token: string,
+  fetcher: typeof fetch,
+  threadId: string,
+): Promise<{ inReplyTo: string; references: string; subject: string } | null> {
+  const thread = await gmailGet(token, fetcher, `/threads/${encodeURIComponent(threadId)}`, {
+    format: "metadata",
+    metadataHeaders: ["Message-ID", "References", "Subject"],
+  });
+  const headers = headerMap(asRecord(newestMessage(thread)));
+  const subject = replySubject(headers.get("subject") ?? "");
+  const parent = headers.get("message-id");
+  // A thread whose newest message carries no Message-ID still gets a draft — `threadId` alone
+  // files it in the right conversation in Gmail's own UI. Only the standards-compliant part
+  // of the threading is missing, and inventing a parent id would be worse than omitting it.
+  if (!parent) return { inReplyTo: "", references: "", subject };
+  const references = [headers.get("references"), parent].filter(Boolean).join(" ");
+  return { inReplyTo: parent, references, subject };
+}
+
+/** "Re: " once, never twice, and never on a subject that already carries it. */
+function replySubject(subject: string): string {
+  const base = subject.trim();
+  if (!base) return "Re:";
+  return /^re:/iu.test(base) ? base.slice(0, 900) : `Re: ${base}`.slice(0, 900);
+}
+
+function draftSummary(draft: Record<string, unknown>): Record<string, unknown> {
+  const message = asRecord(draft.message);
+  return {
+    id: stringField(draft, "id"),
+    thread_id: stringField(message, "threadId"),
+  };
+}
+
+function derivedMessageId(requestKey: string, domain: string): string {
+  return `<zeus-${createHash("sha256").update(requestKey).digest("hex").slice(0, 32)}@${domain}>`;
+}
+
+/**
+ * One RFC 5322 message.
+ *
+ * The body is base64 rather than inline UTF-8 because a transfer encoding that cannot
+ * misrepresent its content is worth more than a readable wire format: no line-length limit to
+ * violate, no 8-bit octets in a 7-bit field, and no way for the body to be read as headers.
+ */
+function mimeMessage(input: {
+  to: string[];
+  subject: string;
+  messageId: string;
+  body: string;
+  reply: { inReplyTo: string; references: string; subject: string } | null;
+}): string {
+  const headers = [
+    `To: ${input.to.join(", ")}`,
+    `Subject: ${encodedHeaderText(input.subject)}`,
+    `Message-ID: ${input.messageId}`,
+    // A thread whose newest message carries no Message-ID still threads in Gmail's own UI
+    // through `threadId`; only the standards-compliant half is missing, and inventing a
+    // parent id would be worse than omitting it.
+    ...(input.reply?.inReplyTo
+      ? [`In-Reply-To: ${input.reply.inReplyTo}`, `References: ${input.reply.references}`]
+      : []),
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+  ];
+  const body = Buffer.from(input.body, "utf8")
+    .toString("base64")
+    .replace(/(.{76})/gu, "$1\r\n");
+  return `${headers.join("\r\n")}\r\n\r\n${body}\r\n`;
+}
+
+/** RFC 2047 for anything a header field cannot carry as itself. */
+function encodedHeaderText(value: string): string {
+  // Byte length above character length is exactly "holds something outside ASCII", and
+  // says it without a regex over control characters.
+  if (Buffer.byteLength(value, "utf8") === value.length) return value;
+  return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+/** One authenticated POST against the Gmail API, bounded the same way a GET is. */
+async function gmailPost(
+  token: string,
+  fetcher: typeof fetch,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const response = await fetcher(`${GMAIL_API_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  const answer = await boundedJson(response);
+  if (!response.ok) {
+    throw new GoogleGmailError(
+      refusalCode(`gmail_http_${response.status}`, JSON.stringify(answer ?? "")),
+      `Gmail answered ${response.status}`,
+      JSON.stringify(answer ?? "").slice(0, 500),
+    );
+  }
+  return asRecord(answer);
+}
+
 /** One authenticated GET against the Gmail API, bounded and failing with a named code. */
 async function gmailGet(
   token: string,
@@ -404,9 +719,10 @@ function stringField(value: unknown, key: string): string | null {
 function gmailToolFailure(
   input: Pick<Parameters<typeof createGoogleGmailMcpServer>[0], "grant" | "store">,
   error: unknown,
+  operation: GmailOperation,
 ) {
   const failureError = gmailFailure(input, error);
-  reportGmailFailure(failureError.code, failureError.detail);
+  reportGmailFailure(operation, failureError.code, failureError.detail);
   return failure(`${failureError.code}: ${failureError.message}`);
 }
 
@@ -535,13 +851,26 @@ function refusalCode(base: string, message: string): string {
  * between "403" and "the Gmail API is not enabled on project 123", and an operator staring
  * at a connection that will not read has nothing else to go on.
  *
- * Safe to keep here and not upstream: this is a bounded search over the user's own inbox
- * (`in:inbox newer_than:7d`), so a refusal describes the request, not its contents. Only a
+ * Safe to keep here and not upstream: every request this file can make is a bounded one over
+ * the user's own mailbox, so a refusal describes the request, not its contents. Only a
  * failure is ever logged, and never a result.
+ *
+ * The operation is named because a failed draft reported as `gmail_read_failed` is an
+ * operator reading the wrong incident.
  */
-function reportGmailFailure(code: string, message: string): void {
+type GmailOperation = "read" | "draft" | "trash";
+
+function reportGmailFailure(
+  operation: GmailOperation,
+  code: string,
+  message: string,
+): void {
   process.stderr.write(
-    `${JSON.stringify({ event: "gmail_read_failed", code, detail: message.slice(0, 500) })}\n`,
+    `${JSON.stringify({
+      event: `gmail_${operation}_failed`,
+      code,
+      detail: message.slice(0, 500),
+    })}\n`,
   );
 }
 

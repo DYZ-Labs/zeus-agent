@@ -10,6 +10,7 @@ import {
   createGoogleGmailMcpServer,
   exchangeGmailCode,
   GMAIL_READ_SCOPE,
+  GMAIL_WRITE_SCOPE,
   gmailAuthorizationUrl,
   revokeGmailGrant,
 } from "./gmail";
@@ -95,10 +96,15 @@ export function createCalendarBrokerServer(
         const state = store.createGmailOAuthState({
           accountId: oauthRequest.accountId,
           returnUrl: oauthRequest.returnUrl,
+          permission: oauthRequest.permission,
         });
         return redirect(
           response,
-          gmailAuthorizationUrl({ configuration: gmailOAuthConfiguration, state }),
+          gmailAuthorizationUrl({
+            configuration: gmailOAuthConfiguration,
+            state,
+            permission: oauthRequest.permission,
+          }),
         );
       }
       if (request.method === "GET" && url.pathname === "/oauth/google/callback") {
@@ -155,11 +161,17 @@ export function createCalendarBrokerServer(
         if (!code) return redirectWithError(response, state.returnUrl, "Google returned no authorization code.");
         try {
           const token = await exchangeGmailCode(code, gmailOAuthConfiguration, fetcher);
-          if (!token.scopes.includes(GMAIL_READ_SCOPE)) {
+          // The scope the consent actually asked for. `gmail.modify` also reads, so a write
+          // grant satisfies both and a read grant satisfies only the read.
+          const requiredGmailScope =
+            state.permission === "write" ? GMAIL_WRITE_SCOPE : GMAIL_READ_SCOPE;
+          if (!token.scopes.includes(requiredGmailScope)) {
             return redirectWithError(
               response,
               state.returnUrl,
-              "Google did not grant read-only Gmail access.",
+              state.permission === "write"
+                ? "Google did not grant Gmail drafting access."
+                : "Google did not grant read-only Gmail access.",
             );
           }
           const grant = store.upsertGmailGrant({
@@ -225,6 +237,10 @@ export function createCalendarBrokerServer(
           grant,
           store,
           oauth: gmailOAuthConfiguration,
+          requestKey:
+            typeof request.headers["x-zeus-request-key"] === "string"
+              ? request.headers["x-zeus-request-key"]
+              : null,
           fetcher,
         });
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });

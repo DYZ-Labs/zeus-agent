@@ -9,6 +9,7 @@ import {
   type GoogleGmailOAuthResult,
 } from "@/calendar-broker/protocol";
 import {
+  GOOGLE_GMAIL_WRITE_SCOPE,
   configureGoogleGmailCapabilities,
   getGoogleGmailConnector,
   upsertGoogleGmailConnector,
@@ -21,7 +22,10 @@ import { getAuthConfiguration } from "@/server/auth/config";
 import { recordConnectionAction } from "@/server/google-calendar/integration";
 import { getGoogleGmailIntegrationConfiguration } from "./config";
 
-export function googleGmailAuthorizationUrl(accountId: string): URL {
+export function googleGmailAuthorizationUrl(
+  accountId: string,
+  permission: "read" | "write" = "read",
+): URL {
   const integration = requireConfiguration();
   const auth = getAuthConfiguration();
   if (auth.mode !== "configured") {
@@ -35,6 +39,7 @@ export function googleGmailAuthorizationUrl(accountId: string): URL {
     kind: "google_gmail_oauth_request",
     accountId,
     returnUrl,
+    permission,
     nonce: randomUUID(),
     ...envelopeTimes(),
   }, integration.serviceKey);
@@ -64,10 +69,11 @@ export async function applyGoogleGmailResult(
   if (!owner || owner.supabase_user_id !== result.accountId) {
     throw new Error("That Gmail grant does not belong to this memory store");
   }
-  const source = recordConnectionAction(
-    db,
-    "Connect Gmail with permission to read email. Zeus cannot send, draft, label, or delete email.",
-  );
+  // Written from the scopes Google actually returned, not from the ones Zeus asked for.
+  // This message is the `source_message_id` behind every capability row the next few lines
+  // bind, so a write slot recorded against a sentence saying Zeus cannot write would be an
+  // audit trail that disagrees with itself.
+  const source = recordConnectionAction(db, gmailConsentSentence(result.scopes));
   const existing = getGoogleGmailConnector(db);
   const connector =
     existing?.provider_connection_id === result.connectionId
@@ -85,6 +91,14 @@ export async function applyGoogleGmailResult(
     sourceMessageId: source.id,
   });
   await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
+}
+
+function gmailConsentSentence(scopes: readonly string[]): string {
+  return scopes.includes(GOOGLE_GMAIL_WRITE_SCOPE)
+    ? "Connect Gmail with permission to read email, save drafts, and move threads to Trash. " +
+      "Zeus cannot send email and cannot delete it permanently."
+    : "Connect Gmail with permission to read email. Zeus cannot send, draft, label, or " +
+      "delete email.";
 }
 
 export async function disconnectGoogleGmailGrant(

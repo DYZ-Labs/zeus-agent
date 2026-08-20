@@ -8,6 +8,13 @@ import {
   readEmailCoverage,
 } from "./email-sync";
 import type { EmailThread, ThreadMessage } from "./email-sync";
+import {
+  addressInMessage,
+  draftReplyRequest,
+  emailWriteVerb,
+  trashRequest,
+} from "./email-actions";
+import type { EmailRequest } from "./email-actions";
 import { contentWords } from "./calendar-time";
 import { InboxSnapshot } from "./schema";
 import type { EvaluationContext, InboxReadFailure } from "./schema";
@@ -338,6 +345,8 @@ export type ThreadRequest =
   | { status: "resolved"; thread: EmailThread }
   | { status: "ambiguous"; candidates: EmailThread[] }
   | { status: "no_match" }
+  /** An email write Zeus recognized and declined, with the code-owned reason it declined. */
+  | { status: "refused"; reason: string }
   | { status: "not_asked" };
 
 export function resolveThreadRequest(
@@ -350,18 +359,39 @@ export function resolveThreadRequest(
     ) ||
     /\b(?:e-?mail|message|thread)\b[^.?!]{0,40}\b(?:say|says|said|about)\b/iu.test(query);
   if (!asks) return { status: "not_asked" };
+  return matchThread(query, threads);
+}
+
+/**
+ * Which thread the words point at, with no opinion about what is being asked of it.
+ *
+ * Split out because deleting a thread and summarizing one ask the same question of the same
+ * cache: the trigger phrasing differs, the matching must not. Two copies of "which Sarah did
+ * they mean" would be two chances to disagree, and disagreeing here means acting on the
+ * wrong conversation.
+ */
+export function matchThread(
+  query: string,
+  threads: readonly EmailThread[],
+  options: { fallbackToNewest?: boolean } = {},
+): ThreadRequest {
   if (threads.length === 0) return { status: "no_match" };
 
   const words = contentWords(
     query.replace(
-      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|e-?mail|message|thread|note|say|says|said|about|from|the|my)\b/giu,
+      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|draft|compose|write|reply|replies|respond|answer|delete|trash|bin|junk|throw away|get rid of|e-?mails?|messages?|threads?|note|inbox|say|says|said|about|from|the|my|to)\b/giu,
       " ",
     ),
   );
   if (words.size === 0) {
     // "Summarize the email" with nothing to narrow it means the most recent one, which is
-    // what a person pointing at their screen would mean.
-    return { status: "resolved", thread: threads[0]! };
+    // what a person pointing at their screen would mean. "Delete my email" does not: the
+    // same shrug that picks a thread to read picks a thread to bin, and only one of those is
+    // recoverable by asking again. A destructive caller passes `fallbackToNewest: false` and
+    // gets an ambiguity it has to resolve out loud.
+    return options.fallbackToNewest === false
+      ? { status: "ambiguous", candidates: threads.slice(0, 5) }
+      : { status: "resolved", thread: threads[0]! };
   }
 
   const matches = threads.filter((thread) => {
@@ -394,6 +424,9 @@ export function renderThreadBlock(
       "Zeus read the inbox and no recent thread matches what was asked for. This is an inbox " +
         "that was read, not one that could not be read.",
     );
+  } else if (request.status === "refused") {
+    // Zeus's own sentence, never a message's, so it is written out rather than guarded.
+    lines.push(request.reason);
   } else if (request.status === "ambiguous") {
     lines.push("More than one recent thread matches. Ask which one:");
     for (const thread of request.candidates) {
@@ -435,4 +468,91 @@ export function renderThreadBlock(
 /** A message body is somebody else's text, so it cannot be allowed to close the block. */
 function escapeThreadData(value: string): string {
   return value.replaceAll("</thread>", "<\\/thread>");
+}
+
+
+/**
+ * A request for more than one thread at once.
+ *
+ * Refused rather than approximated. The calendar earned a batch path because a window is a
+ * set the code can verify it resolved completely; "all the newsletters" is a judgement, and a
+ * judgement that is wrong bins mail nobody asked about.
+ */
+const BULK = /\b(?:all|every|everything|each|any)\b|\bemails\b|\bmessages\b|\bthreads\b/iu;
+
+export type EmailWriteResolution =
+  | { status: "not_asked" }
+  | { status: "request"; request: EmailRequest; thread: EmailThread | null }
+  | { status: "ambiguous"; candidates: EmailThread[] }
+  | { status: "no_match" }
+  | { status: "refused"; reason: string };
+
+/**
+ * Which email write the user asked for, decided entirely from the cache and their own words.
+ *
+ * Nothing here asks a model anything, and that is the design rather than an economy: the
+ * fields a classifier would fill are which conversation and whose address, and both of those
+ * are fields it could invent. Ambiguity lists candidates and stops; a recipient Zeus cannot
+ * source honestly is refused with a sentence saying so.
+ */
+export function resolveEmailWriteRequest(
+  db: Db,
+  content: string,
+  at: Date = new Date(),
+): EmailWriteResolution {
+  const verb = emailWriteVerb(content);
+  if (!verb) return { status: "not_asked" };
+  const threads = cachedThreads(db, at);
+
+  if (verb === "trash") {
+    if (BULK.test(content)) {
+      return {
+        status: "refused",
+        reason:
+          "Zeus moves one thread to Trash at a time. Name the one you mean, and ask again " +
+          "for each of the others.",
+      };
+    }
+    const target = matchThread(content, threads, { fallbackToNewest: false });
+    if (target.status === "ambiguous") return { status: "ambiguous", candidates: target.candidates };
+    if (target.status !== "resolved") return { status: "no_match" };
+    return { status: "request", request: trashRequest(target.thread), thread: target.thread };
+  }
+
+  // An address the user typed is the only recipient Zeus can use that did not come out of
+  // somebody else's mailbox. There is no contacts integration to turn a name into one, and
+  // guessing from a cached sender that merely looks like "Sarah" is how mail reaches the
+  // wrong Sarah.
+  const typed = addressInMessage(content);
+  if (typed) {
+    return {
+      status: "request",
+      request: {
+        kind: "draft_new",
+        to: typed,
+        subject: null,
+        instruction: content.trim().slice(0, 800),
+      },
+      thread: null,
+    };
+  }
+
+  const target = matchThread(content, threads);
+  if (target.status === "ambiguous") return { status: "ambiguous", candidates: target.candidates };
+  if (target.status !== "resolved") {
+    return {
+      status: "refused",
+      reason:
+        "Zeus has no address to draft to. Name the address, or point at an email in the " +
+        "inbox to reply to.",
+    };
+  }
+  const request = draftReplyRequest(target.thread, content);
+  if (!request) {
+    return {
+      status: "refused",
+      reason: "Zeus could not read a reply address off that thread's sender.",
+    };
+  }
+  return { status: "request", request, thread: target.thread };
 }

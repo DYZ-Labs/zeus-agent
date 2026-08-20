@@ -112,17 +112,19 @@ export function calendarCapabilityState(db: Db): CalendarCapabilityState {
 }
 
 /**
- * What Zeus can do with the user's mail, which in this increment is exactly one thing.
+ * What Zeus can do with the user's mail.
  *
- * Far smaller than its calendar counterpart, and that asymmetry is the point rather than an
- * omission: email has no write slot, so there is no execution allowance to describe, no daily
- * ceiling to spend, and no confirmation ladder to explain. A shape that left room for those
- * would imply they exist.
+ * Still smaller than its calendar counterpart, and still for a reason rather than by
+ * omission: email's two writes are always one exact confirmation each, so there is no
+ * execution allowance to describe and no daily ceiling to spend. `canDraft` and `canTrash`
+ * are separate booleans because they are separate bindings, and a binding can drift.
  */
 export type EmailCapabilityState = {
   /** An inbox connector exists, whether or not it is currently usable. */
   connected: boolean;
   canRead: boolean;
+  canDraft: boolean;
+  canTrash: boolean;
   connectorLabel: string | null;
   unusableStatus: ConnectorStatus | null;
   unusableReason: string | null;
@@ -139,6 +141,8 @@ export type EmailCapabilityState = {
 
 export function emailCapabilityState(db: Db): EmailCapabilityState {
   const read = availableCapability(db, "email.search_threads");
+  const canDraft = availableCapability(db, "email.create_draft") !== null;
+  const canTrash = availableCapability(db, "email.trash_thread") !== null;
   // A connector that exists and cannot be called is a different answer from no connector at
   // all. `provider === "google_gmail"` covers the hosted row before any slot is bound, which
   // is the calendar's rule for `google_calendar` and the one this used to skip.
@@ -167,6 +171,8 @@ export function emailCapabilityState(db: Db): EmailCapabilityState {
   return {
     connected: read !== null || bound !== null,
     canRead: read !== null,
+    canDraft,
+    canTrash,
     connectorLabel: connector?.label ?? null,
     unusableStatus: read ? null : (bound?.status ?? null),
     unusableReason,
@@ -345,10 +351,21 @@ function emailLines(state: EmailCapabilityState): string[] {
         `read it until it is ${action} in Settings, under Connections.`,
     ];
   }
+  const writes = [
+    ...(state.canDraft ? ["save a draft in the user's Gmail Drafts"] : []),
+    ...(state.canTrash ? ["move a whole thread to the user's Gmail Trash"] : []),
+  ];
   return [
     `Inbox: ${name} is connected for reading. Zeus can see recent subjects and senders in ` +
       "the inbox block in this message. Zeus does not hold message bodies until the user " +
-      "asks to open a thread, and cannot send, draft, or change mail.",
+      "asks to open a thread.",
+    writes.length === 0
+      ? "Zeus cannot send, draft, or change mail. Drafting and deleting need a further " +
+        "permission the user grants in Settings, under Connections."
+      : `Zeus can ${series(writes)}, each after the user confirms that exact request. Zeus ` +
+        "cannot send email, and cannot delete anything permanently. A saved draft is unsent " +
+        "and waiting in Gmail; a trashed thread is in Gmail's Trash and can be put back. " +
+        "Never describe either as done unless the work result says it was completed.",
     state.lastReadAt === null
       ? "Zeus has never successfully read this inbox."
       : "Zeus has read this inbox; the inbox block in this message is from that read and " +

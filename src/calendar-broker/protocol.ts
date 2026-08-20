@@ -38,6 +38,13 @@ export const GoogleGmailOAuthRequest = z
     kind: z.literal("google_gmail_oauth_request"),
     accountId: z.string().uuid(),
     returnUrl: z.string().url(),
+    /**
+     * Defaulted rather than required, so the broker can ship before the app that asks for
+     * write access. The reverse order cannot be made safe — this envelope is `.strict()`, and
+     * a broker that has never heard of the field rejects one carrying it — so the default is
+     * what makes "broker first, then web" an ordering rather than an outage.
+     */
+    permission: z.enum(["read", "write"]).default("read"),
     nonce: z.string().uuid(),
     ...EnvelopeTimes,
   })
