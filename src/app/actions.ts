@@ -176,7 +176,7 @@ export async function editFactAction(formData: FormData): Promise<void> {
     ).catch(() => false);
   }
 
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function acceptCandidateAction(formData: FormData): Promise<void> {
@@ -189,8 +189,7 @@ export async function acceptCandidateAction(formData: FormData): Promise<void> {
   if (applied) {
     await embedAppliedMemory(db, applied, candidate.evidence);
   }
-  revalidatePath("/memory");
-  revalidatePath("/understanding");
+  revalidatePath("/about-you");
   revalidatePath("/today");
 }
 
@@ -198,7 +197,7 @@ export async function rejectCandidateAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
   rejectCandidateWithAudit(await requireOwnerDb(), id);
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function acceptFacetCandidateAction(formData: FormData): Promise<void> {
@@ -218,8 +217,8 @@ export async function acceptFacetCandidateAction(formData: FormData): Promise<vo
     facetEdit: { statement, machineEffect, structuredCondition },
   });
   if (applied) await embedAppliedMemory(db, applied, candidate.evidence);
-  revalidatePath("/understanding");
-  revalidatePath("/understanding/backfill");
+  revalidatePath("/about-you");
+  revalidatePath("/about-you/backfill");
   revalidatePath("/today");
 }
 
@@ -230,8 +229,8 @@ export async function rejectFacetCandidateAction(formData: FormData): Promise<vo
   const candidate = getCandidate(db, id);
   if (!candidate || candidate.kind !== "facet") return;
   rejectCandidateWithAudit(db, id);
-  revalidatePath("/understanding");
-  revalidatePath("/understanding/backfill");
+  revalidatePath("/about-you");
+  revalidatePath("/about-you/backfill");
 }
 
 export async function correctFacetAction(formData: FormData): Promise<void> {
@@ -283,7 +282,7 @@ export async function correctFacetAction(formData: FormData): Promise<void> {
       [passage],
     );
   }
-  revalidatePath("/understanding");
+  revalidatePath("/about-you");
   revalidatePath("/today");
 }
 
@@ -295,7 +294,7 @@ export async function closeFacetAction(formData: FormData): Promise<void> {
   if (!facet || facet.valid_to !== null) return;
   const source = curationMessage(db, `Marked understanding as no longer applicable: ${facet.statement}`);
   closeFacet(db, id, source.id);
-  revalidatePath("/understanding");
+  revalidatePath("/about-you");
   revalidatePath("/today");
 }
 
@@ -303,7 +302,7 @@ export async function forgetFacetAction(formData: FormData): Promise<void> {
   const id = Number(formData.get("id"));
   if (!Number.isInteger(id)) return;
   forgetFacet(await requireOwnerDb(), id);
-  revalidatePath("/understanding");
+  revalidatePath("/about-you");
   revalidatePath("/today");
 }
 
@@ -368,12 +367,12 @@ export async function answerReflectionAction(formData: FormData): Promise<void> 
   if (acceptedFacet) {
     await embedAppliedMemory(db, { facts: [], facets: [acceptedFacet] }, [passage]);
   }
-  revalidatePath("/understanding");
+  revalidatePath("/about-you");
 }
 
 export async function startBackfillAction(): Promise<void> {
   startUnderstandingBackfill(await requireOwnerDb());
-  revalidatePath("/understanding/backfill");
+  revalidatePath("/about-you/backfill");
 }
 
 export async function processBackfillAction(formData: FormData): Promise<void> {
@@ -382,8 +381,8 @@ export async function processBackfillAction(formData: FormData): Promise<void> {
   const db = await requireOwnerDb();
   if (!getUnderstandingBackfillJob(db, id)) return;
   await processUnderstandingBackfillBatch(db, id);
-  revalidatePath("/understanding/backfill");
-  revalidatePath("/understanding");
+  revalidatePath("/about-you/backfill");
+  revalidatePath("/about-you");
 }
 
 export async function acceptBackfillBatchAction(formData: FormData): Promise<void> {
@@ -396,8 +395,8 @@ export async function acceptBackfillBatchAction(formData: FormData): Promise<voi
     { facts: [], facets: accepted.facets },
     accepted.passages,
   );
-  revalidatePath("/understanding/backfill");
-  revalidatePath("/understanding");
+  revalidatePath("/about-you/backfill");
+  revalidatePath("/about-you");
   revalidatePath("/today");
 }
 
@@ -665,9 +664,8 @@ export async function deleteConversationAction(formData: FormData): Promise<void
   if (!conversation || conversation.title === "Memory curation") return;
   deleteConversationWithMemory(db, id);
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
   revalidatePath("/today");
-  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
   redirect("/settings#data");
@@ -698,9 +696,8 @@ export async function deleteConversationFromHistoryAction(
   if (!conversation || conversation.title === "Memory curation") return;
   deleteConversationWithMemory(db, id);
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
   revalidatePath("/today");
-  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }
@@ -728,9 +725,8 @@ export async function deleteAllConversationsAction(formData: FormData): Promise<
 
   deleteAllConversationsWithMemory(await requireOwnerDb());
   revalidatePath("/", "layout");
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
   revalidatePath("/today");
-  revalidatePath("/understanding");
   revalidatePath("/conversations");
   revalidatePath("/settings");
 }
@@ -748,7 +744,7 @@ export async function supersedeFactAction(formData: FormData): Promise<void> {
   );
   addFactEvidence(db, id, source.id, "correction", 1);
   supersedeFact(db, id);
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function reviveFactAction(formData: FormData): Promise<void> {
@@ -776,7 +772,7 @@ export async function reviveFactAction(formData: FormData): Promise<void> {
     reasserted.id,
     factSearchText(reasserted.subject_name, reasserted.predicate, reasserted.object),
   ).catch(() => false);
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function forgetFactAction(formData: FormData): Promise<void> {
@@ -790,7 +786,7 @@ export async function forgetFactAction(formData: FormData): Promise<void> {
   deleteEmbedding(db, "fact", id);
   forgetFact(db, id);
 
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
   if (fact.subject_slug) revalidatePath(`/entity/${fact.subject_slug}`);
 }
 
@@ -800,7 +796,7 @@ export async function setCardinalityAction(formData: FormData): Promise<void> {
   if (!name || (cardinality !== "single" && cardinality !== "multi")) return;
 
   setPredicateCardinality(await requireOwnerDb(), name, cardinality);
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function mergeEntitiesAction(formData: FormData): Promise<void> {
@@ -809,7 +805,7 @@ export async function mergeEntitiesAction(formData: FormData): Promise<void> {
   if (!Number.isInteger(source) || !Number.isInteger(target)) return;
 
   mergeEntities(await requireOwnerDb(), source, target);
-  revalidatePath("/memory");
+  revalidatePath("/about-you");
 }
 
 export async function setSummaryAction(formData: FormData): Promise<void> {

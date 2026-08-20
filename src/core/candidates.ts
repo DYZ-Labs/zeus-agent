@@ -214,6 +214,27 @@ export function recordCandidateResolution(
   );
 }
 
+export type PendingReview = {
+  /** The rows to render, newest first, capped at the requested limit. */
+  items: CandidateView[];
+  /** Every pending proposal, so a capped list can say what it left out. */
+  total: number;
+};
+
+/**
+ * The one review queue behind About you.
+ *
+ * Facts and facets are proposed into the same table and reviewed together, so the count and
+ * the rows are read in a single call and cannot describe different sets — the way a page
+ * filtering one but not the other did. Pass a limit of 0 for the count alone.
+ */
+export function listPendingReview(db: Db, limit: number): PendingReview {
+  return {
+    items: limit > 0 ? listCandidates(db, { status: "pending", limit }) : [],
+    total: countPendingCandidates(db),
+  };
+}
+
 export function countPendingCandidates(db: Db): number {
   return (
     db

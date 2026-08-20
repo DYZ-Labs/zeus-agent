@@ -313,6 +313,8 @@ function logAuthUnavailable(
  */
 const ROUTE_TEMPLATES = [
   "/",
+  "/about-you",
+  "/about-you/backfill",
   "/auth/callback",
   "/auth/confirm",
   "/auth/login",

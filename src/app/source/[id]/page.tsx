@@ -79,7 +79,7 @@ export default async function SourcePage({
 
       <div className="flex-1 overflow-y-auto px-6 py-7 lg:px-10">
         <Link
-          href="/memory"
+          href="/about-you"
           className="font-mono text-[0.68rem] underline underline-offset-2"
           style={{ color: "var(--shell-muted)" }}
         >
