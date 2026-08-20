@@ -4,8 +4,15 @@ import {
   listConnectors,
 } from "./connectors";
 import type { Db } from "./db";
-import { callCapability, restoreConnectorReachability } from "./mcp-client";
+import {
+  ConnectorError,
+  callCapability,
+  remoteFailureCode,
+  restoreConnectorReachability,
+} from "./mcp-client";
+import type { CapabilityCallResult } from "./mcp-client";
 import { errorSignature, logEvent } from "./observability";
+import type { EmailReadFailure, InboxReadFailure } from "./schema";
 
 /**
  * Refreshing the local view of the user's inbox.
@@ -93,48 +100,118 @@ export function emailWindow(at: Date = new Date(), days = WINDOW_DAYS): EmailWin
   };
 }
 
+export type EmailSyncResult =
+  | { ok: true; threads: EmailThread[]; window: EmailWindow }
+  | { ok: false; reason: EmailReadFailure; code: string | null };
+
 /**
  * Fetch and cache the current window.
  *
- * Returns null when no inbox is connected — the honest answer, and never an excuse to fall
- * back to some other source.
+ * Never throws, and never reports a failure it cannot name. The `null` this replaces meant
+ * eight different things — nothing connected, a schema Zeus will not build a query for, a
+ * deadline, a refusal from Google, an unreadable reply — and collapsing them is why a chat
+ * turn could only ever say the read "has not succeeded". A caller that knows which one it
+ * was can tell the user something they can act on, and an operator can grep for it.
  */
 export async function syncEmail(
   db: Db,
   options: { at?: Date; signal?: AbortSignal } = {},
-): Promise<{ threads: EmailThread[]; window: EmailWindow } | null> {
+): Promise<EmailSyncResult> {
   const available = availableCapability(db, "email.search_threads");
-  if (!available) return null;
+  if (!available) {
+    // No connector is not a fault and gets no error line; one that exists and cannot serve a
+    // call is, and the silence around it is what made this state indistinguishable from the
+    // read simply never having been attempted.
+    const reason = emailConnectorExists(db) ? "capability_unavailable" : "no_connector";
+    if (reason === "capability_unavailable") {
+      logEvent({ event: "email_synced", outcome: "error", reason });
+    }
+    return { ok: false, reason, code: null };
+  }
+  const connectorId = available.connector.id;
   const at = options.at ?? new Date();
+
+  let args: Record<string, unknown>;
   try {
-    const args = searchThreadArguments(available.capability.input_schema_json, WINDOW_DAYS);
-    const result = await callCapability(db, "email.search_threads", args, {
+    args = searchThreadArguments(available.capability.input_schema_json, WINDOW_DAYS);
+  } catch (error) {
+    return failedRead(connectorId, "unsupported_contract", null, error);
+  }
+
+  let result: CapabilityCallResult;
+  try {
+    result = await callCapability(db, "email.search_threads", args, {
       signal: options.signal,
       capabilityId: available.capability.id,
     });
-    if (result.isError) throw new Error("email_tool_reported_error");
-    const cached = cacheEmailThreads(
-      db,
-      available.connector.id,
-      emailToolPayload(result.value, result.text),
-      at,
-    );
+  } catch (error) {
+    return failedRead(connectorId, callFailureReason(error, options.signal), null, error);
+  }
+
+  if (result.isError) {
+    return failedRead(connectorId, "tool_error", remoteFailureCode(result.text), null);
+  }
+
+  // A cut reply is withheld rather than parsed. The one case it can still be read past is a
+  // `structuredContent` that names a thread list of its own — that field is not what the cap
+  // truncates. Without this, a truncated page whose structured half was protobuf-empty would
+  // be recorded as proof of an empty inbox.
+  const payload = emailToolPayload(result.value, result.truncated ? "" : result.text);
+  if (result.truncated && !hasThreadsArray(searchThreadsResponse(payload))) {
+    return failedRead(connectorId, "response_truncated", null, null);
+  }
+
+  try {
+    const cached = cacheEmailThreads(db, connectorId, payload, at);
     logEvent({
       event: "email_synced",
       outcome: "ok",
-      connector_id: available.connector.id,
+      connector_id: connectorId,
       count: cached.threads.length,
     });
-    return cached;
+    return { ok: true, ...cached };
   } catch (error) {
-    logEvent({
-      event: "email_synced",
-      outcome: "error",
-      connector_id: available.connector.id,
-      ...errorSignature(error),
-    });
-    return null;
+    return failedRead(connectorId, "response_unreadable", null, error);
   }
+}
+
+function failedRead(
+  connectorId: number,
+  reason: EmailReadFailure,
+  code: string | null,
+  error: unknown,
+): EmailSyncResult {
+  // `reason` is Zeus's word for it; the broker's own `code` was already logged beside it on
+  // this call's `connector_call` line. Two vocabularies, one per line, rather than one field
+  // that sometimes holds either.
+  logEvent({
+    event: "email_synced",
+    outcome: "error",
+    reason,
+    connector_id: connectorId,
+    ...(error === null ? {} : errorSignature(error)),
+  });
+  return { ok: false, reason, code };
+}
+
+/**
+ * Which failure a rejected call was.
+ *
+ * `callCapability` flattens anything that is not already a `ConnectorError` into
+ * `call_failed`, so the original abort does not survive it. The signal does: a deadline
+ * aborts with a `TimeoutError`, and only that counts as running out of time — a request the
+ * user themselves walked away from is not a slow inbox.
+ */
+function callFailureReason(
+  error: unknown,
+  signal: AbortSignal | undefined,
+): EmailReadFailure {
+  const reason: unknown = signal?.aborted === true ? signal.reason : null;
+  if (reason instanceof Error && reason.name === "TimeoutError") return "timed_out";
+  if (error instanceof ConnectorError && error.code === "capability_unavailable") {
+    return "capability_unavailable";
+  }
+  return "call_failed";
 }
 
 export type EmailCacheFreshness =
@@ -145,6 +222,15 @@ export type EmailCacheFreshness =
   | "unavailable"
   | "no_connector";
 
+export type EmailCacheStatus = {
+  freshness: EmailCacheFreshness;
+  /**
+   * Why this turn's refresh produced no read, or null when it produced one — or when none
+   * was due, which is the ordinary case and not a failure.
+   */
+  failure: InboxReadFailure | null;
+};
+
 /**
  * Make the inbox cache fresh enough for a chat turn to answer from, if it can.
  *
@@ -154,44 +240,74 @@ export type EmailCacheFreshness =
  * not replace the reply with an error. The turn awaits this alongside the calendar refresh
  * under one deadline, and `Promise.all` rejects on the first rejection — so "never throws"
  * is load-bearing for the calendar too, not just for this.
+ *
+ * What it now also returns is *why*, when the answer is no. The turn renders that: a reply
+ * that says the inbox could not be read and cannot say what stopped it is the failure this
+ * whole path kept producing.
  */
 export async function ensureFreshEmailCache(
   db: Db,
   options: { at?: Date; signal?: AbortSignal } = {},
-): Promise<EmailCacheFreshness> {
+): Promise<EmailCacheStatus> {
   const at = options.at ?? new Date();
   const coverage = readEmailCoverage(db);
   if (coverage && at.getTime() - Date.parse(coverage.fetchedAt) <= CHAT_COVERAGE_TTL_MS) {
-    return "fresh";
+    return { freshness: "fresh", failure: null };
   }
   let restored = false;
   if (!availableCapability(db, "email.search_threads")) {
     const awaiting = connectorAwaitingReachability(db, "email.search_threads");
-    if (!awaiting) return emailConnectorExists(db) ? "unavailable" : "no_connector";
+    if (!awaiting) {
+      return emailConnectorExists(db)
+        ? unavailableCache()
+        : { freshness: "no_connector", failure: { reason: "no_connector", code: null } };
+    }
     if (at.getTime() - Date.parse(awaiting.updated_at) <= CHAT_COVERAGE_TTL_MS) {
-      return "unavailable";
+      return unavailableCache();
     }
     restored = await restoreConnectorReachability(db, "email.search_threads", {
       signal: options.signal,
     });
-    if (!restored) return "unavailable";
+    if (!restored) return unavailableCache();
   }
   const deadline = AbortSignal.timeout(CHAT_SYNC_TIMEOUT_MS);
   const synced = await syncEmail(db, {
     at,
     signal: options.signal ? AbortSignal.any([options.signal, deadline]) : deadline,
   });
-  if (!synced) return "sync_failed";
-  return restored ? "restored_and_synced" : "synced";
+  if (!synced.ok) {
+    return {
+      freshness: "sync_failed",
+      failure: { reason: synced.reason, code: synced.code },
+    };
+  }
+  return { freshness: restored ? "restored_and_synced" : "synced", failure: null };
 }
 
-/** Whether any inbox connector exists at all, usable or not. Mirrors the capability block. */
+function unavailableCache(): EmailCacheStatus {
+  return {
+    freshness: "unavailable",
+    failure: { reason: "capability_unavailable", code: null },
+  };
+}
+
+/**
+ * Whether any inbox connector exists at all, usable or not. Mirrors the capability block.
+ *
+ * `provider === "google_gmail"` covers the hosted row before any slot is bound — a real
+ * state, reached whenever the OAuth callback verifies the connection and then fails to
+ * configure it. Without it this answered "nothing connected" for a row `emailCapabilityState`
+ * calls connected, and the turn would render a block denying the inbox its own header
+ * affirms.
+ */
 function emailConnectorExists(db: Db): boolean {
-  return listConnectors(db).some((connector) =>
-    connector.capabilities.some(
-      (capability) =>
-        capability.slot === "email.search_threads" || capability.slot === "email.get_thread",
-    ),
+  return listConnectors(db).some(
+    (connector) =>
+      connector.provider === "google_gmail" ||
+      connector.capabilities.some(
+        (capability) =>
+          capability.slot === "email.search_threads" || capability.slot === "email.get_thread",
+      ),
   );
 }
 

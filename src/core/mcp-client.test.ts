@@ -87,6 +87,12 @@ server.registerTool(
 await server.connect(new StdioServerTransport());
 `;
 
+// The same server, answering list_events with more text than Zeus will hold.
+const OVERSIZED_SERVER = CALENDAR_SERVER.replace(
+  'text: JSON.stringify({ from, to, events: [{ id: "evt-1" }] })',
+  'text: JSON.stringify({ from, to, events: [{ id: "evt-1", note: "x".repeat(1_100_000) }] })',
+);
+
 // The same server with one field added to list_events, i.e. a remote that changed its
 // contract after the user reviewed it.
 const DRIFTED_SERVER = CALENDAR_SERVER.replace(
@@ -291,6 +297,43 @@ describe("reaching a connected service", () => {
     );
     expect(getConnector(db, connectorId)?.status).toBe("unreachable");
   }, 30_000);
+});
+
+describe("a reply larger than Zeus will hold", () => {
+  it("reports the cut rather than handing back a fragment to parse", async () => {
+    const connectorId = calendarConnector(OVERSIZED_SERVER);
+    const capability = await grant(connectorId, "calendar.list_events", "list_events");
+
+    const result = await callCapability(
+      db,
+      "calendar.list_events",
+      { from: "2026-08-20T00:00:00.000Z", to: "2026-08-21T00:00:00.000Z" },
+      { capabilityId: capability.id },
+    );
+
+    // The failure this closes: the fragment used to come back as `value`, where it failed to
+    // parse exactly as a malformed reply would, so "that server sent nonsense" was reported
+    // for a server that sent too much. Raising the cap only moves that line.
+    expect(result.truncated).toBe(true);
+    expect(result.value).toBeNull();
+    expect(result.isError).toBe(false);
+    expect(() => JSON.parse(result.text)).toThrow();
+  });
+
+  it("leaves an ordinary reply untouched", async () => {
+    const connectorId = calendarConnector();
+    const capability = await grant(connectorId, "calendar.list_events", "list_events");
+
+    const result = await callCapability(
+      db,
+      "calendar.list_events",
+      { from: "2026-08-20T00:00:00.000Z", to: "2026-08-21T00:00:00.000Z" },
+      { capabilityId: capability.id },
+    );
+
+    expect(result.truncated).toBe(false);
+    expect(result.value).toMatchObject({ events: [{ id: "evt-1" }] });
+  });
 });
 
 describe("Google Application Default Credentials", () => {

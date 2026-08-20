@@ -297,4 +297,20 @@ describe("the standing inbox block", () => {
     expect(sentToModel.indexOf("<capabilities")).toBeLessThan(sentToModel.indexOf("<inbox "));
     expect(sentToModel.indexOf("<inbox ")).toBeLessThan(sentToModel.indexOf("<memory"));
   });
+
+  it("carries what stopped this turn's own read, not only that nothing was read", async () => {
+    // A connected Gmail that has never been read, whose search tool offers no field Zeus can
+    // put a bound on. The turn's refresh runs, fails for that reason, and the block says so —
+    // which is the whole difference between the reply the user got and a useful one.
+    const db = withInbox();
+    db.exec("DELETE FROM external_read_window; DELETE FROM external_signal;");
+
+    const sentToModel = await turn("what is waiting for me", db);
+
+    expect(sentToModel).toContain('<inbox state="unread"');
+    expect(sentToModel).toContain('read_failure="unsupported_contract"');
+    expect(sentToModel).toContain("operator of this Zeus");
+    // Still true, and still said — but no longer the only thing said.
+    expect(sentToModel).toContain("unknown, not empty");
+  });
 });

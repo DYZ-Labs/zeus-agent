@@ -10,7 +10,7 @@ import {
 import type { EmailThread, ThreadMessage } from "./email-sync";
 import { contentWords } from "./calendar-time";
 import { InboxSnapshot } from "./schema";
-import type { EvaluationContext } from "./schema";
+import type { EvaluationContext, InboxReadFailure } from "./schema";
 import { guardExternalText } from "./untrusted-data";
 
 /**
@@ -44,6 +44,7 @@ export function buildInboxContext(
   db: Db,
   context: EvaluationContext,
   state: EmailCapabilityState,
+  readFailure: InboxReadFailure | null = null,
 ): InboxSnapshot | null {
   if (!state.connected) return null;
   const at = new Date(context.evaluated_at);
@@ -57,6 +58,7 @@ export function buildInboxContext(
       threadsShown: 0,
       threadsTotal: 0,
       withheld: false,
+      readFailure,
     };
   }
   const fresh = at.getTime() - Date.parse(coverage.fetchedAt) <= CACHE_TTL_MS;
@@ -77,6 +79,7 @@ export function buildInboxContext(
     threadsShown: threads.length,
     threadsTotal: held.length,
     withheld: withheld.any,
+    readFailure,
   };
 }
 
@@ -88,8 +91,10 @@ export function renderInboxBlock(
   inbox: InboxSnapshot,
   context: EvaluationContext,
 ): string {
+  const failure = inbox.readFailure ?? null;
   const attrs = [
     `state="${inbox.state}"`,
+    ...(failure === null ? [] : [`read_failure="${failure.reason}"`]),
     ...(inbox.asOf === null ? [] : [`as_of="${inbox.asOf}"`]),
     ...(inbox.window === null
       ? []
@@ -105,11 +110,16 @@ export function renderInboxBlock(
       "No inbox read has succeeded yet, so what is waiting there is unknown — unknown, not " +
         "empty.",
     );
+    // The half that was missing. "It has not succeeded" is true of a read nobody attempted
+    // and of one that Google refused, and a person told only the first of those has nothing
+    // to do next. Say which, in Zeus's own words, and say whose problem it is.
+    lines.push(failureSentence(failure));
   } else if (inbox.state === "stale") {
     lines.push(
       "The user's inbox as Zeus last read it. A newer read has not succeeded; the " +
         "capabilities block says whether the connection needs anything.",
     );
+    if (failure !== null) lines.push(failureSentence(failure));
     if (inbox.threads.length === 0) lines.push("That read holds no recent threads.");
   } else if (inbox.threadsTotal === 0) {
     lines.push("Zeus read the inbox window and it holds no recent threads.");
@@ -132,6 +142,104 @@ export function renderInboxBlock(
   }
 
   return `<inbox ${attrs}>\n${escapeInboxData(lines.join("\n"))}\n</inbox>`;
+}
+
+/**
+ * What stopped the read, as a sentence Zeus can say out loud.
+ *
+ * Every branch is code-owned prose selected by a code-owned token; nothing a mail server
+ * wrote reaches this. The one remote-authored value in play is the broker's `code`, and it
+ * is matched to a bounded lowercase word before it ever arrives here — it steers the
+ * sentence, it never becomes one.
+ *
+ * The distinction each branch has to carry is whose problem it is. Telling someone to go and
+ * reconnect a grant that was never in question is the failure the capabilities block already
+ * fixed one layer up, and repeating it here would undo that.
+ */
+function failureSentence(failure: InboxReadFailure | null): string {
+  if (failure === null) {
+    return "Zeus has not tried to read it in this turn, and no earlier read succeeded.";
+  }
+  switch (failure.reason) {
+    case "capability_unavailable":
+      return "The inbox connection cannot currently serve a read; the capabilities block " +
+        "says what it needs.";
+    case "timed_out":
+      return "Zeus asked for it just now and Gmail did not answer in time. The connection " +
+        "is intact and needs nothing from the user; Zeus tries again on the next turn.";
+    case "call_failed":
+      return "Zeus asked for it just now and Gmail did not answer. The connection is " +
+        "intact and needs nothing from the user; Zeus tries again on the next turn.";
+    case "tool_error":
+      return brokerRefusal(failure.code);
+    case "unsupported_contract":
+      return "Gmail's search tool no longer offers a query Zeus can put a bound on, so Zeus " +
+        "did not send one rather than send an unbounded one. The operator of this Zeus has " +
+        "to fix that; nothing in the user's Settings will change it.";
+    case "response_truncated":
+      return "Gmail's reply was larger than Zeus will hold, so none of it was kept rather " +
+        "than half of it. The operator of this Zeus has to fix that; nothing in the user's " +
+        "Settings will change it.";
+    case "response_unreadable":
+      return "Gmail's reply was not in a form Zeus could read, so nothing was kept. The " +
+        "operator of this Zeus has to fix that; nothing in the user's Settings will change it.";
+    case "no_connector":
+      return "No inbox is connected.";
+  }
+}
+
+/**
+ * Whose problem a refusal from the Gmail broker is.
+ *
+ * One classification, read by two different voices — this block's prose and the Settings
+ * card's sentence — because the thing that must not drift between them is which of the three
+ * answers a refusal gets, not how each one is worded.
+ *
+ * The codes are matched, not parsed. `remoteFailureCode` has already bounded them to one
+ * lowercase token, and the broker composes them from an HTTP status and Google's own
+ * SCREAMING_SNAKE reason (`gmail_http_403_service_disabled`), so a substring test here is a
+ * test against a vocabulary, not against remote prose.
+ */
+export type BrokerRefusalKind = "reconnect" | "operator" | "transient";
+
+export function brokerRefusalKind(code: string | null): BrokerRefusalKind {
+  if (code === null) return "transient";
+  if (
+    code === "reconnect_required" ||
+    code === "refresh_revoked" ||
+    code.includes("scope_insufficient") ||
+    code.startsWith("gmail_http_401")
+  ) {
+    return "reconnect";
+  }
+  if (
+    code === "tool_contract_changed" ||
+    code === "tool_not_allowed" ||
+    code.includes("service_disabled") ||
+    code.includes("_disabled") ||
+    code.startsWith("gmail_http_403") ||
+    code.startsWith("gmail_http_400") ||
+    code.startsWith("gmail_http_404")
+  ) {
+    return "operator";
+  }
+  return "transient";
+}
+
+/** A refusal from the Gmail broker, split by whether the user can do anything about it. */
+function brokerRefusal(code: string | null): string {
+  switch (brokerRefusalKind(code)) {
+    case "reconnect":
+      return "Gmail refused the read because the authorization Zeus holds is no longer good " +
+        "enough for it. The user reconnects Gmail in Settings, under Connections.";
+    case "operator":
+      return "Gmail refused the read outright, in a way that will keep happening until " +
+        "somebody changes something. The operator of this Zeus has to fix it; nothing in " +
+        "the user's Settings will change it.";
+    case "transient":
+      return "Gmail refused the read just now. The connection is intact and needs nothing " +
+        "from the user; Zeus tries again on the next turn.";
+  }
 }
 
 function threadLine(thread: InboxSnapshot["threads"][number], timezone: string): string {

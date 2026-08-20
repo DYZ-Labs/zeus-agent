@@ -86,7 +86,36 @@ export type CapabilityCallResult = {
   value: unknown;
   text: string;
   isError: boolean;
+  /**
+   * The text content was larger than `MAX_RESULT_BYTES` and what came back is a fragment.
+   *
+   * Worth its own field because the alternative is indistinguishable from corruption: a
+   * sliced JSON document fails to parse exactly as a malformed one does, so a caller with
+   * only `value` to go on reports "that server sent nonsense" when it sent too much. Raising
+   * the cap cannot close that gap — it only moves it — so the condition is named instead.
+   *
+   * Only ever describes `text`. `structuredContent` arrives as its own field on the result
+   * and is never cut, so `value` still carries it when the server sent one.
+   */
+  truncated: boolean;
 };
+
+/**
+ * The code a broker put at the front of its own failure text.
+ *
+ * Zeus's brokers answer a refused call with `code: sentence` — see `failure()` in
+ * `calendar-broker/gmail.ts` — and that code is the most useful thing in the failure: it is
+ * the difference between "Google had a bad minute" and "this grant is gone". Remote-authored,
+ * so it is matched rather than read: one bounded lowercase token, or nothing at all.
+ *
+ * Digits are part of that token. Without them this silently dropped every code carrying a
+ * status — the calendar broker has answered `google_http_409:` since it was written — and a
+ * dropped code is a `reason` field that never reaches the log. The shape here is exactly the
+ * one `observability.ts` accepts for `reason`, so anything matched can be logged.
+ */
+export function remoteFailureCode(text: string): string | null {
+  return /^([a-z][a-z0-9_]{0,63}):/u.exec(text)?.[1] ?? null;
+}
 
 export class ConnectorError extends Error {
   readonly code: string;
@@ -404,39 +433,50 @@ export async function callCapability(
       },
     );
 
-    const text = boundedText(result.content);
+    const { text, truncated } = boundedText(result.content);
+    // A fragment is not a payload. `structuredContent` is a separate field and survives the
+    // text cap, so it is still preferred; only the concatenated text is withheld once it has
+    // been cut, because handing half a JSON document to a parser reports the wrong failure.
     const value =
-      result.structuredContent !== undefined ? result.structuredContent : parsedOrText(text);
+      result.structuredContent !== undefined
+        ? result.structuredContent
+        : truncated
+          ? null
+          : parsedOrText(text);
     // The broker names its own failures, and only two of them mean the authorization is
     // gone. `refresh_unavailable` is Google declining to mint a token this minute; recording
     // it as a reconnection would tell the user to redo consent over a transient outage.
-    if (
-      result.isError === true &&
-      (bound.connector.provider === "google_calendar" ||
-        bound.connector.provider === "google_gmail")
-    ) {
-      const remote = /^([a-z_]{1,64}):/u.exec(text)?.[1] ?? null;
-      if (remote === "reconnect_required" || remote === "refresh_revoked") {
-        recordConnectorVerification(db, bound.connector.id, {
-          status: "unreachable",
-          errorCode: "reconnect_required",
-        });
-      } else if (remote === "refresh_unavailable") {
-        recordConnectorVerification(db, bound.connector.id, {
-          status: "unreachable",
-          errorCode: "provider_unavailable",
-        });
-      }
+    //
+    // Read only for the two providers whose broker Zeus itself operates. A generic
+    // connector's error text is somebody else's prose, and a word before a colon in it is
+    // not a code — putting one in `reason` would fill an allowlisted field with remote text.
+    const brokered =
+      bound.connector.provider === "google_calendar" ||
+      bound.connector.provider === "google_gmail";
+    const remote = result.isError === true && brokered ? remoteFailureCode(text) : null;
+    if (remote === "reconnect_required" || remote === "refresh_revoked") {
+      recordConnectorVerification(db, bound.connector.id, {
+        status: "unreachable",
+        errorCode: "reconnect_required",
+      });
+    } else if (remote === "refresh_unavailable") {
+      recordConnectorVerification(db, bound.connector.id, {
+        status: "unreachable",
+        errorCode: "provider_unavailable",
+      });
     }
     logEvent({
       event: "connector_call",
       outcome: result.isError === true ? "error" : "ok",
+      // A refused call used to log `outcome: "error"` and nothing else, which left the whole
+      // trail saying only that something went wrong. The broker had already said which.
+      ...(result.isError === true ? { reason: remote ?? "tool_reported_error" } : {}),
       slot,
       effect: bound.capability.effect_kind,
       connector_id: bound.connector.id,
       duration_ms: Date.now() - startedAt,
     });
-    return { value, text, isError: result.isError === true };
+    return { value, text, isError: result.isError === true, truncated };
   } catch (error) {
     logEvent({
       event: "connector_call",
@@ -781,13 +821,15 @@ function bearerHeaders(connector: ConnectorView): Record<string, string> {
 
 type ToolContent = Array<{ type: string; text?: unknown }>;
 
-function boundedText(content: unknown): string {
-  if (!Array.isArray(content)) return "";
+function boundedText(content: unknown): { text: string; truncated: boolean } {
+  if (!Array.isArray(content)) return { text: "", truncated: false };
   const parts = (content as ToolContent)
     .filter((entry) => entry.type === "text" && typeof entry.text === "string")
     .map((entry) => entry.text as string);
   const text = parts.join("\n");
-  return text.length > MAX_RESULT_BYTES ? text.slice(0, MAX_RESULT_BYTES) : text;
+  return text.length > MAX_RESULT_BYTES
+    ? { text: text.slice(0, MAX_RESULT_BYTES), truncated: true }
+    : { text, truncated: false };
 }
 
 function parsedOrText(text: string): unknown {

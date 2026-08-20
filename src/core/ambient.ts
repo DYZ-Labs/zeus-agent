@@ -450,7 +450,7 @@ export async function refreshExternalSignals(
     syncCalendar(db, { at, signal: options.signal }),
     syncEmail(db, { at, signal: options.signal }),
   ]);
-  const synced = calendar !== null || email !== null;
+  const synced = calendar !== null || email.ok;
   const result = runDetectors(db, { at });
   logEvent({
     event: "detectors_run",

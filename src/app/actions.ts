@@ -37,6 +37,7 @@ import {
   setConnectorEnabled,
 } from "@/core/connectors";
 import { getConnectorPreset, presetCapability } from "@/core/connector-catalog";
+import { brokerRefusalKind } from "@/core/email-context";
 import { getSignal } from "@/core/detectors";
 import {
   confirmEffect,
@@ -110,6 +111,7 @@ import type { Db } from "@/core/db";
 import type {
   Cardinality,
   CommitmentStatus,
+  EmailReadFailure,
   FollowThroughEventType,
   FacetKind,
   FacetMachineEffect,
@@ -1003,9 +1005,54 @@ export async function verifyConnectorAction(formData: FormData): Promise<void> {
     connector?.provider === "google_gmail" ||
     connector?.capabilities.some((capability) => capability.slot === "email.search_threads")
   ) {
-    await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
+    const read = await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
+    // A connection that verifies and then cannot read is exactly the state the user has been
+    // looking at: a green dot beside an assistant saying it cannot see their mail. Say which
+    // of the two halves failed, on the page where they pressed the button.
+    if (!read.ok) {
+      redirect(
+        `/settings?connector_error=${encodeURIComponent(emailReadFailureMessage(read))}#connections`,
+      );
+    }
   }
   revalidatePath("/settings");
+}
+
+/**
+ * One short sentence for a failed inbox read, for the Settings card.
+ *
+ * Shorter and blunter than the chat block's version in `email-context.ts`, and deliberately
+ * a separate one: this is read next to a Connect button by someone deciding whether to press
+ * it again, so what matters is whether pressing it again would help.
+ */
+function emailReadFailureMessage(read: { reason: EmailReadFailure; code: string | null }): string {
+  if (read.reason === "tool_error") {
+    switch (brokerRefusalKind(read.code)) {
+      case "reconnect":
+        return "Gmail is connected, but the access Zeus holds is no longer good enough to read it. Disconnect and connect it again.";
+      case "operator":
+        // The code is the operator's actual lead, and Settings is where they will be looking.
+        return `Gmail is connected but refused the inbox read (${read.code ?? "no code"}). This is for the operator of this Zeus to fix; reconnecting will not change it.`;
+      case "transient":
+        return "Gmail is connected but refused the inbox read. Nothing to fix here — try again shortly.";
+    }
+  }
+  switch (read.reason) {
+    case "no_connector":
+      return "No inbox is connected.";
+    case "capability_unavailable":
+      return "Gmail is connected but cannot currently serve a read.";
+    case "timed_out":
+      return "Gmail is connected but did not answer in time. Nothing to fix here — try again shortly.";
+    case "call_failed":
+      return "Gmail is connected but did not answer. Nothing to fix here — try again shortly.";
+    case "unsupported_contract":
+      return "Gmail's search tool no longer offers a query Zeus can bound. This is for the operator of this Zeus to fix.";
+    case "response_truncated":
+      return "Gmail's reply was larger than Zeus will hold, so none of it was kept. This is for the operator of this Zeus to fix.";
+    case "response_unreadable":
+      return "Gmail's reply was not in a form Zeus could read. This is for the operator of this Zeus to fix.";
+  }
 }
 
 /**
