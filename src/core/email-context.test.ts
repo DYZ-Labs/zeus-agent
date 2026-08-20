@@ -36,6 +36,7 @@ const CONNECTED: EmailCapabilityState = {
   canRead: true,
   canDraft: false,
   canTrash: false,
+  canUntrash: false,
   connectorLabel: "Gmail",
   unusableStatus: null,
   unusableReason: null,

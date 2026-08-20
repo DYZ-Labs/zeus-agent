@@ -1011,11 +1011,13 @@ describe("email-slot migration rebuilds connector_capability in place", () => {
     expect(() => insert("email.get_thread", "external_read")).not.toThrow();
     expect(() => insert("email.create_draft", "modify_external")).not.toThrow();
     expect(() => insert("email.trash_thread", "modify_external")).not.toThrow();
+    expect(() => insert("email.untrash_thread", "modify_external")).not.toThrow();
     // The pairing CHECK still binds each slot to exactly one effect kind.
     expect(() => insert("email.get_thread", "send")).toThrow(/CHECK/u);
     expect(() => insert("email.create_draft", "send")).toThrow(/CHECK/u);
     expect(() => insert("email.create_draft", "external_read")).toThrow(/CHECK/u);
     expect(() => insert("email.trash_thread", "external_read")).toThrow(/CHECK/u);
+    expect(() => insert("email.untrash_thread", "send")).toThrow(/CHECK/u);
     // The one that matters most, and the reason this test outlived the increment that wrote
     // it: email can draft and can bin, and there is still no row shape that says it can send.
     expect(() => insert("email.send_message", "send")).toThrow(/CHECK/u);

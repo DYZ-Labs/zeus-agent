@@ -36,8 +36,10 @@ import { buildContext, intentFieldProvenance } from "./context";
 import {
   buildEmailPayload,
   emailPreviewFor,
+  isThreadMoveRequest,
   parseEmailRequest,
 } from "./email-actions";
+import { emailMoveTarget } from "./email-context";
 import type { EmailRequest } from "./email-actions";
 import { cachedThreads } from "./email-sync";
 import type { Db } from "./db";
@@ -792,11 +794,11 @@ async function prepareEmailStep(
   input: SafeStepExecutionInput,
   request: EmailRequest,
 ): Promise<SafeStepExecutionResult> {
-  if (request.kind === "trash") {
-    const thread = cachedThreads(db, new Date()).find((entry) => entry.id === request.threadId);
+  if (isThreadMoveRequest(request)) {
+    const thread = emailMoveTarget(db, request);
     if (!thread) {
-      // The inbox this was resolved against has expired or moved on. Refusing costs the user
-      // one more sentence; guessing costs them a conversation they cannot get back for thirty
+      // What this was resolved against has expired or moved on. Refusing costs the user one
+      // more sentence; guessing costs them a conversation they cannot get back for thirty
       // days, and only if they notice in time.
       return {
         output: { resolved: false, reason: "thread_no_longer_cached" },
@@ -888,9 +890,11 @@ async function executeEmailWrite(
   request: EmailRequest,
 ): Promise<SafeStepExecutionResult> {
   const threadId = request.kind === "draft_new" ? null : request.threadId;
-  const thread = threadId === null
+  const thread = request.kind === "draft_new"
     ? null
-    : cachedThreads(db, new Date()).find((entry) => entry.id === threadId) ?? null;
+    : isThreadMoveRequest(request)
+      ? emailMoveTarget(db, request)
+      : cachedThreads(db, new Date()).find((entry) => entry.id === request.threadId) ?? null;
   if (threadId !== null && !thread) {
     return {
       output: { prepared: false, reason: "thread_no_longer_cached" },
@@ -903,8 +907,8 @@ async function executeEmailWrite(
     };
   }
 
-  const drafted = request.kind === "trash" ? null : draftedMessage(db, input);
-  if (request.kind !== "trash" && !drafted) {
+  const drafted = isThreadMoveRequest(request) ? null : draftedMessage(db, input);
+  if (!isThreadMoveRequest(request) && !drafted) {
     return {
       pause: { code: "draft_missing", message: "No drafted message was prepared for this step" },
       toolCalls: 0,
@@ -937,7 +941,9 @@ async function executeEmailWrite(
       code: "effect_confirmation_required",
       message: request.kind === "trash"
         ? "Moving a thread to Trash needs your confirmation"
-        : "Saving this draft needs your confirmation",
+        : request.kind === "untrash"
+          ? "Restoring a thread from Trash needs your confirmation"
+          : "Saving this draft needs your confirmation",
       requiresReauthorization: false,
     },
   };

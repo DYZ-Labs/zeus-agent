@@ -959,15 +959,16 @@ export const CapabilitySlot = z.enum([
   "email.get_thread",
   "email.create_draft",
   "email.trash_thread",
+  "email.untrash_thread",
 ]);
 export type CapabilitySlot = z.infer<typeof CapabilitySlot>;
 
 /**
  * Email can now draft and can now bin, and still cannot send.
  *
- * The read slots came first on purpose, and the two write slots that join them are the two
+ * The read slots came first on purpose, and the three write slots that join them are the ones
  * whose worst case a user can undo: a draft waits unsent in their own Drafts, and a trashed
- * thread waits thirty days in their own Trash. There is no `email.send_message`, and that is
+ * thread waits thirty days in their own Trash — with a slot to bring it back out again. There is no `email.send_message`, and that is
  * the point of naming slots at all — a capability Zeus cannot name is one it cannot be talked
  * into, however adversarial the mail it is reading. Permanent deletion is out of reach for a
  * second, independent reason: it needs an OAuth scope the broker never asks for.
@@ -984,6 +985,7 @@ export const CAPABILITY_SLOT_EFFECTS = {
   "email.get_thread": "external_read",
   "email.create_draft": "modify_external",
   "email.trash_thread": "modify_external",
+  "email.untrash_thread": "modify_external",
 } as const satisfies Record<CapabilitySlot, EffectKind>;
 
 export const Sha256Hex = z

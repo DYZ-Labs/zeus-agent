@@ -18,7 +18,7 @@ export const GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
  * By scope: `messages.delete` and `threads.delete` require `https://mail.google.com/`, which
  * this broker never requests, so bypassing Trash is not something any bug here could reach.
  * By code: Zeus has no `send` capability slot to name, `CapabilitySlot` cannot express one,
- * and the only requests this file can make are the four registered below.
+ * and the only requests this file can make are the five registered below.
  */
 export const GMAIL_WRITE_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
 
@@ -108,17 +108,14 @@ export class GoogleGmailError extends Error {
 export function gmailAuthorizationUrl(input: {
   configuration: GoogleGmailOAuthConfiguration;
   state: string;
-  permission: "read" | "write";
 }): URL {
   const url = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
   url.searchParams.set("client_id", input.configuration.clientId);
   url.searchParams.set("redirect_uri", input.configuration.redirectUri);
   url.searchParams.set("response_type", "code");
-  // `gmail.modify` covers reading too, so a write grant asks for one scope rather than two.
-  url.searchParams.set(
-    "scope",
-    input.permission === "write" ? GMAIL_WRITE_SCOPE : GMAIL_READ_SCOPE,
-  );
+  // One scope, asked for once. `gmail.modify` covers reading, so connecting Gmail is a
+  // single consent and there is no second permission to go back for.
+  url.searchParams.set("scope", GMAIL_WRITE_SCOPE);
   url.searchParams.set("access_type", "offline");
   url.searchParams.set("include_granted_scopes", "true");
   url.searchParams.set("prompt", "consent");
@@ -310,9 +307,28 @@ export function createGoogleGmailMcpServer(input: {
     },
     async ({ threadId }) => {
       try {
-        return success(await trashThread(await accessToken(), fetcher, threadId));
+        return success(await moveThread(await accessToken(), fetcher, threadId, "trash"));
       } catch (error) {
         return gmailToolFailure(input, error, "trash");
+      }
+    },
+  );
+
+  server.registerTool(
+    "untrash_thread",
+    {
+      title: "Take a Gmail thread back out of Trash",
+      description:
+        "Restore one thread from the connected user's Trash to where it was before.",
+      inputSchema: { threadId: z.string().trim().min(1).max(1_024) },
+      // Not destructive: this is the direction that puts something back.
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ threadId }) => {
+      try {
+        return success(await moveThread(await accessToken(), fetcher, threadId, "untrash"));
+      } catch (error) {
+        return gmailToolFailure(input, error, "untrash");
       }
     },
   );
@@ -491,26 +507,39 @@ async function createDraft(
   return { ...draftSummary(created), message_id: messageId, created: true };
 }
 
-async function trashThread(
+/**
+ * Move one thread into Trash or back out of it.
+ *
+ * Both directions in one function because they are one request with one word changed, and
+ * because the answer is checked the same way: Gmail labels every message in a thread, so the
+ * outcome is read back off the response rather than inferred from a 200. Both are idempotent
+ * — trashing what is already trashed, or restoring what was never binned, changes nothing and
+ * still reports the state.
+ */
+async function moveThread(
   token: string,
   fetcher: typeof fetch,
   threadId: string,
+  direction: "trash" | "untrash",
 ): Promise<Record<string, unknown>> {
   const thread = await gmailPost(
     token,
     fetcher,
-    `/threads/${encodeURIComponent(threadId)}/trash`,
+    `/threads/${encodeURIComponent(threadId)}/${direction}`,
     {},
   );
   const messages = asArray(thread.messages);
-  // Read the outcome back off the response rather than assuming a 200 meant it moved. Gmail
-  // labels every message in the thread, so "trashed" is all of them and not any of them.
-  const trashed =
+  const inTrash = messages.some((message) =>
+    asArray(asRecord(message).labelIds).includes("TRASH"),
+  );
+  const allInTrash =
     messages.length > 0 &&
-    messages.every((message) =>
-      asArray(asRecord(message).labelIds).includes("TRASH"),
-    );
-  return { id: stringField(thread, "id") ?? threadId, trashed, message_count: messages.length };
+    messages.every((message) => asArray(asRecord(message).labelIds).includes("TRASH"));
+  return {
+    id: stringField(thread, "id") ?? threadId,
+    trashed: direction === "trash" ? allInTrash : inTrash,
+    message_count: messages.length,
+  };
 }
 
 /** The user's own domain, so a derived `Message-ID` is one their mail server would own. */
@@ -858,7 +887,7 @@ function refusalCode(base: string, message: string): string {
  * The operation is named because a failed draft reported as `gmail_read_failed` is an
  * operator reading the wrong incident.
  */
-type GmailOperation = "read" | "draft" | "trash";
+type GmailOperation = "read" | "draft" | "trash" | "untrash";
 
 function reportGmailFailure(
   operation: GmailOperation,

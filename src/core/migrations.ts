@@ -2429,6 +2429,55 @@ DROP TABLE connector_capability_email_write_legacy;
 CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
 `;
 
+/**
+ * The slot that takes a thread back out of Trash.
+ *
+ * Its own migration rather than a rewrite of 038, because a migration ledger is append-only:
+ * 038 has already run wherever this branch has, and editing it would make two stores that
+ * disagree both claim to be at 038.
+ */
+const EMAIL_UNTRASH_CAPABILITY_SLOT = `
+ALTER TABLE connector_capability RENAME TO connector_capability_untrash_legacy;
+CREATE TABLE connector_capability (
+  id                 INTEGER PRIMARY KEY,
+  connector_id       INTEGER NOT NULL REFERENCES connector(id) ON DELETE CASCADE,
+  slot               TEXT NOT NULL
+                     CHECK (slot IN ('calendar.list_events','calendar.create_event',
+                                     'calendar.update_event','email.search_threads',
+                                     'email.get_thread','email.create_draft',
+                                     'email.trash_thread','email.untrash_thread')),
+  remote_tool_name   TEXT NOT NULL,
+  effect_kind        TEXT NOT NULL
+                     CHECK (effect_kind IN ('external_read','schedule','modify_external')),
+  input_schema_json  TEXT NOT NULL CHECK (json_valid(input_schema_json)),
+  schema_hash        TEXT NOT NULL
+                     CHECK (length(schema_hash) = 64 AND schema_hash NOT GLOB '*[^0-9a-f]*'),
+  enabled            INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+  source_message_id  INTEGER NOT NULL REFERENCES message(id) ON DELETE RESTRICT,
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL,
+  UNIQUE (connector_id, slot),
+  CHECK (
+    (slot = 'calendar.list_events' AND effect_kind = 'external_read')
+    OR (slot = 'calendar.create_event' AND effect_kind = 'schedule')
+    OR (slot = 'calendar.update_event' AND effect_kind = 'modify_external')
+    OR (slot = 'email.search_threads' AND effect_kind = 'external_read')
+    OR (slot = 'email.get_thread' AND effect_kind = 'external_read')
+    OR (slot = 'email.create_draft' AND effect_kind = 'modify_external')
+    OR (slot = 'email.trash_thread' AND effect_kind = 'modify_external')
+    OR (slot = 'email.untrash_thread' AND effect_kind = 'modify_external')
+  )
+);
+INSERT INTO connector_capability
+  (id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+   enabled, source_message_id, created_at, updated_at)
+SELECT id, connector_id, slot, remote_tool_name, effect_kind, input_schema_json, schema_hash,
+       enabled, source_message_id, created_at, updated_at
+FROM connector_capability_untrash_legacy;
+DROP TABLE connector_capability_untrash_legacy;
+CREATE INDEX connector_capability_slot_idx ON connector_capability(slot, enabled);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   { id: "001_init", sql: INIT },
   { id: "002_seed", sql: SEED },
@@ -2475,4 +2524,5 @@ export const MIGRATIONS: readonly Migration[] = [
   { id: "036_email_detectors", sql: EMAIL_DETECTORS },
   { id: "037_google_gmail_provider", sql: GOOGLE_GMAIL_PROVIDER },
   { id: "038_email_write_capability_slots", sql: EMAIL_WRITE_CAPABILITY_SLOTS },
+  { id: "039_email_untrash_capability_slot", sql: EMAIL_UNTRASH_CAPABILITY_SLOT },
 ];

@@ -29,7 +29,8 @@ export type EmailRequest =
       subject: string | null;
       instruction: string;
     }
-  | { kind: "trash"; threadId: string };
+  | { kind: "trash"; threadId: string }
+  | { kind: "untrash"; threadId: string };
 
 export type EmailWriteKind = EmailRequest["kind"];
 
@@ -67,15 +68,26 @@ const DRAFT_VERB = /\b(?:draft|compose|write|reply|respond|answer)\b/iu;
  */
 const TRASH_VERB = /\b(?:delete|trash|bin|junk|throw away|get rid of)\b/iu;
 
+/**
+ * Verbs for the way back.
+ *
+ * Checked before the trash verbs, because most of these phrases contain one: "undelete",
+ * "put the deleted email back", "restore that from trash". The removal word is what is being
+ * undone, not what is being asked for.
+ */
+const UNTRASH_VERB =
+  /\b(?:untrash|undelete|restore|recover|undo)\b|\b(?:put|bring|take|pull)\b[^.?!]{0,40}?\bback\b|\bout of (?:the )?(?:trash|bin)\b/iu;
+
 export function mayBeEmailWriteRequest(input: string): boolean {
   if (!MAIL_NOUN.test(input)) return false;
   if (READ_VERB.test(input)) return false;
-  return DRAFT_VERB.test(input) || TRASH_VERB.test(input);
+  return DRAFT_VERB.test(input) || TRASH_VERB.test(input) || UNTRASH_VERB.test(input);
 }
 
-export function emailWriteVerb(input: string): "draft" | "trash" | null {
+export function emailWriteVerb(input: string): "draft" | "trash" | "untrash" | null {
   if (!mayBeEmailWriteRequest(input)) return null;
-  // Trash first: "delete the draft reply" is a removal, and a draft verb appearing beside a
+  if (UNTRASH_VERB.test(input)) return "untrash";
+  // Trash before draft: "delete the draft reply" is a removal, and a draft verb beside a
   // removal verb is describing what is being removed.
   if (TRASH_VERB.test(input)) return "trash";
   return DRAFT_VERB.test(input) ? "draft" : null;
@@ -115,6 +127,17 @@ export function trashRequest(thread: EmailThread): EmailRequest {
   return { kind: "trash", threadId: thread.id };
 }
 
+export function untrashRequest(thread: EmailThread): EmailRequest {
+  return { kind: "untrash", threadId: thread.id };
+}
+
+/** The two requests that move a thread rather than compose one. */
+export function isThreadMoveRequest(
+  request: EmailRequest,
+): request is Extract<EmailRequest, { kind: "trash" | "untrash" }> {
+  return request.kind === "trash" || request.kind === "untrash";
+}
+
 export function isEmailDraftRequest(
   request: EmailRequest,
 ): request is Extract<EmailRequest, { kind: "draft_reply" | "draft_new" }> {
@@ -122,7 +145,9 @@ export function isEmailDraftRequest(
 }
 
 export function slotForEmailRequest(request: EmailRequest): CapabilitySlot {
-  return request.kind === "trash" ? "email.trash_thread" : "email.create_draft";
+  if (request.kind === "trash") return "email.trash_thread";
+  if (request.kind === "untrash") return "email.untrash_thread";
+  return "email.create_draft";
 }
 
 /** Embed the resolved action so the plan hash covers it and the executor can recover it. */
@@ -139,7 +164,7 @@ export function parseEmailRequest(objective: string): EmailRequest | null {
     if (parsed === null || typeof parsed !== "object") return null;
     const record = parsed as Record<string, unknown>;
     return typeof record.kind === "string" &&
-      ["draft_reply", "draft_new", "trash"].includes(record.kind)
+      ["draft_reply", "draft_new", "trash", "untrash"].includes(record.kind)
       ? (parsed as EmailRequest)
       : null;
   } catch {
@@ -148,7 +173,11 @@ export function parseEmailRequest(objective: string): EmailRequest | null {
 }
 
 export function emailActionObjective(userText: string, request: EmailRequest): string {
-  const verb = request.kind === "trash" ? "Move an email thread to Trash" : "Save a Gmail draft";
+  const verb = request.kind === "trash"
+    ? "Move an email thread to Trash"
+    : request.kind === "untrash"
+      ? "Take an email thread back out of Trash"
+      : "Save a Gmail draft";
   return `${verb} for: ${userText.trim().slice(0, 400)} ${encodeEmailRequest(request)}`.slice(
     0,
     2000,
@@ -167,7 +196,7 @@ export function buildEmailPayload(
   body: string,
   subject: string | null,
 ): Record<string, unknown> {
-  if (request.kind === "trash") return { threadId: request.threadId };
+  if (isThreadMoveRequest(request)) return { threadId: request.threadId };
   // A reply carries no subject, because the only honest source for one is the thread — and
   // a thread's subject is somebody else's text. Sending it here would put third-party prose
   // in the plan objective, the plan hash, and the payload; the broker already reads the
@@ -183,6 +212,13 @@ export function emailPreviewFor(
   thread: EmailThread | null,
   messageCount: number | null,
 ): string {
+  if (request.kind === "untrash") {
+    const named = thread?.subject?.trim()
+      ? `the thread "${thread.subject.trim()}"`
+      : "that thread";
+    const from = thread?.from?.trim() ? ` from ${thread.from.trim()}` : "";
+    return `Take ${named}${from} back out of your Gmail Trash and return it to your mail.`;
+  }
   if (request.kind === "trash") {
     const named = thread?.subject?.trim()
       ? `the thread "${thread.subject.trim()}"`
@@ -211,7 +247,7 @@ export function emailPreviewFor(
 /**
  * The fixed, code-owned plan for one email write.
  *
- * Two steps, and deliberately no `external_read`. A read step would have to put what it read
+ * Two steps for every one of them, and deliberately no `external_read`. A read step would have to put what it read
  * into a `work_artifact`, and a `work_artifact` is a row: `email-sync.ts` holds message bodies
  * for exactly one turn and there is no table one may reach. So the draft is written from the
  * user's own instruction rather than from the message being replied to — which is a real
@@ -222,31 +258,40 @@ export function emailActionWorkPlanProposal(
   request: EmailRequest,
   objective: string,
 ): WorkPlanProposal {
-  if (request.kind === "trash") {
+  if (isThreadMoveRequest(request)) {
+    const toTrash = request.kind === "trash";
     return {
       objective,
       steps: [
         {
           title: "Name the thread",
-          instruction:
-            "Resolve the exact thread to be moved to Trash from the inbox Zeus has already " +
-            "read, so the user can see which conversation this is. Do not change anything.",
+          instruction: toTrash
+            ? "Resolve the exact thread to be moved to Trash from the inbox Zeus has already " +
+              "read, so the user can see which conversation this is. Do not change anything."
+            : "Resolve the exact thread to be taken back out of Trash from what Zeus " +
+              "recorded moving there, so the user can see which conversation this is. Do " +
+              "not change anything.",
           effect_kind: "prepare_local",
           depends_on: [],
         },
         {
-          title: "Move it to Trash",
-          instruction:
-            "Prepare the exact request to move that one thread to Trash and pause for one " +
-            "explicit confirmation. Nothing is deleted permanently and nothing is sent.",
+          title: toTrash ? "Move it to Trash" : "Take it back out of Trash",
+          instruction: toTrash
+            ? "Prepare the exact request to move that one thread to Trash and pause for one " +
+              "explicit confirmation. Nothing is deleted permanently and nothing is sent."
+            : "Prepare the exact request to restore that one thread from Trash and pause " +
+              "for one explicit confirmation.",
           effect_kind: "modify_external",
           depends_on: [1],
         },
       ],
       allowed_effects: ["prepare_local", "modify_external"],
       completion_criteria: [
-        "The thread was resolved from what Zeus had already read, and the move to Trash was " +
-          "left pending as one exact request until the user confirmed it.",
+        toTrash
+          ? "The thread was resolved from what Zeus had already read, and the move to Trash " +
+            "was left pending as one exact request until the user confirmed it."
+          : "The thread was resolved from what Zeus recorded moving to Trash, and the " +
+            "restore was left pending as one exact request until the user confirmed it.",
       ],
       limits: { max_model_tool_calls: 4, max_retries_per_step: 2, max_duration_seconds: 300 },
     };

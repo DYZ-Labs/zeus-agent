@@ -2,11 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
-import {
-  GMAIL_READ_SCOPE,
-  GMAIL_WRITE_SCOPE,
-  createGoogleGmailMcpServer,
-} from "./gmail";
+import { GMAIL_READ_SCOPE, GMAIL_WRITE_SCOPE, createGoogleGmailMcpServer } from "./gmail";
 import type { CalendarBrokerStore, GmailGrant } from "./store";
 
 const GRANT: GmailGrant = {
@@ -109,7 +105,7 @@ describe("what the broker offers", () => {
     await close();
   });
 
-  it("offers drafting and trashing to a write grant, and never sending", async () => {
+  it("offers drafting, trashing, and restoring to a write grant, and never sending", async () => {
     const { fetcher } = fakeGmail();
     const { client, close } = await connect(fetcher);
     const tools = (await client.listTools()).tools;
@@ -118,6 +114,7 @@ describe("what the broker offers", () => {
       "get_thread",
       "search_threads",
       "trash_thread",
+      "untrash_thread",
     ]);
     expect(tools.find((tool) => /send/u.test(tool.name))).toBeUndefined();
     expect(tools.find((tool) => tool.name === "trash_thread")?.annotations?.destructiveHint)
@@ -256,6 +253,37 @@ describe("moving a thread to Trash", () => {
       arguments: { threadId: "18f0a" },
     });
     expect(String((result.content as { text: string }[])[0]?.text)).toContain('"trashed":false');
+    await close();
+  });
+
+  it("takes a thread back out again, and says it is no longer trashed", async () => {
+    const { calls, fetcher } = fakeGmail({
+      "/untrash": { id: "18f0a", messages: [{ labelIds: ["INBOX"] }, { labelIds: ["INBOX"] }] },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "untrash_thread",
+      arguments: { threadId: "18f0a" },
+    });
+    expect(calls.some((call) => call.url.endsWith("/threads/18f0a/untrash"))).toBe(true);
+    expect(JSON.parse(String((result.content as { text: string }[])[0]?.text))).toEqual({
+      id: "18f0a",
+      trashed: false,
+      message_count: 2,
+    });
+    await close();
+  });
+
+  it("does not claim a restore worked while the thread is still in Trash", async () => {
+    const { fetcher } = fakeGmail({
+      "/untrash": { id: "18f0a", messages: [{ labelIds: ["TRASH"] }] },
+    });
+    const { client, close } = await connect(fetcher);
+    const result = await client.callTool({
+      name: "untrash_thread",
+      arguments: { threadId: "18f0a" },
+    });
+    expect(String((result.content as { text: string }[])[0]?.text)).toContain('"trashed":true');
     await close();
   });
 

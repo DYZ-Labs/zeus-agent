@@ -43,15 +43,10 @@ CREATE TABLE IF NOT EXISTS calendar_grant (
 );
 CREATE INDEX IF NOT EXISTS calendar_grant_status_idx ON calendar_grant(status, id);
 
--- Dropped rather than altered: every row here is a connection attempt with a fifteen minute
--- life, so recreating the table costs at most one in-flight consent, which retries. An
--- ALTER TABLE guarded by a column check would be more code protecting nothing.
-DROP TABLE IF EXISTS gmail_oauth_state;
 CREATE TABLE IF NOT EXISTS gmail_oauth_state (
   state_hash   TEXT PRIMARY KEY,
   account_id   TEXT NOT NULL,
   return_url   TEXT NOT NULL,
-  permission   TEXT NOT NULL CHECK (permission IN ('read','write')),
   expires_at   TEXT NOT NULL,
   created_at   TEXT NOT NULL
 );
@@ -88,7 +83,6 @@ export type CalendarGrant = {
 export type GmailOAuthState = {
   accountId: string;
   returnUrl: string;
-  permission: "read" | "write";
   expiresAt: string;
 };
 
@@ -130,9 +124,6 @@ export class CalendarBrokerStore {
     ).run(new Date().toISOString());
     this.db.prepare(
       "INSERT OR IGNORE INTO broker_migration (id, applied_at) VALUES ('002_gmail', ?)",
-    ).run(new Date().toISOString());
-    this.db.prepare(
-      "INSERT OR IGNORE INTO broker_migration (id, applied_at) VALUES ('003_gmail_write', ?)",
     ).run(new Date().toISOString());
     if (path !== ":memory:") {
       for (const suffix of ["", "-wal", "-shm"]) {
@@ -207,16 +198,9 @@ export class CalendarBrokerStore {
       this.db.prepare("DELETE FROM gmail_oauth_state WHERE expires_at <= ?").run(createdAt);
       this.db.prepare(
         `INSERT INTO gmail_oauth_state
-           (state_hash, account_id, return_url, permission, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        stateHash(state),
-        input.accountId,
-        input.returnUrl,
-        input.permission,
-        expiresAt,
-        createdAt,
-      );
+           (state_hash, account_id, return_url, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(stateHash(state), input.accountId, input.returnUrl, expiresAt, createdAt);
     })();
     return state;
   }
@@ -225,14 +209,9 @@ export class CalendarBrokerStore {
     return this.db.transaction((): GmailOAuthState | null => {
       const row = this.db.prepare<
         [string],
-        {
-          account_id: string;
-          return_url: string;
-          permission: "read" | "write";
-          expires_at: string;
-        }
+        { account_id: string; return_url: string; expires_at: string }
       >(
-        `SELECT account_id, return_url, permission, expires_at
+        `SELECT account_id, return_url, expires_at
          FROM gmail_oauth_state WHERE state_hash = ?`,
       ).get(stateHash(state));
       if (!row) return null;
@@ -241,7 +220,6 @@ export class CalendarBrokerStore {
       return {
         accountId: row.account_id,
         returnUrl: row.return_url,
-        permission: row.permission,
         expiresAt: row.expires_at,
       };
     }).immediate();

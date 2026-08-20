@@ -22,10 +22,7 @@ import { getAuthConfiguration } from "@/server/auth/config";
 import { recordConnectionAction } from "@/server/google-calendar/integration";
 import { getGoogleGmailIntegrationConfiguration } from "./config";
 
-export function googleGmailAuthorizationUrl(
-  accountId: string,
-  permission: "read" | "write" = "read",
-): URL {
+export function googleGmailAuthorizationUrl(accountId: string): URL {
   const integration = requireConfiguration();
   const auth = getAuthConfiguration();
   if (auth.mode !== "configured") {
@@ -39,7 +36,6 @@ export function googleGmailAuthorizationUrl(
     kind: "google_gmail_oauth_request",
     accountId,
     returnUrl,
-    permission,
     nonce: randomUUID(),
     ...envelopeTimes(),
   }, integration.serviceKey);
@@ -69,10 +65,6 @@ export async function applyGoogleGmailResult(
   if (!owner || owner.supabase_user_id !== result.accountId) {
     throw new Error("That Gmail grant does not belong to this memory store");
   }
-  // Written from the scopes Google actually returned, not from the ones Zeus asked for.
-  // This message is the `source_message_id` behind every capability row the next few lines
-  // bind, so a write slot recorded against a sentence saying Zeus cannot write would be an
-  // audit trail that disagrees with itself.
   const source = recordConnectionAction(db, gmailConsentSentence(result.scopes));
   const existing = getGoogleGmailConnector(db);
   const connector =
@@ -93,10 +85,18 @@ export async function applyGoogleGmailResult(
   await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
 }
 
+/**
+ * What the user agreed to, written from the scopes Google actually returned.
+ *
+ * This message is the `source_message_id` behind every capability row bound from it, so it
+ * has to describe the grant rather than the request. The read-only sentence is not a second
+ * tier of permission — connecting asks for everything at once — it is what an inbox connected
+ * before Zeus could write still honestly says about itself.
+ */
 function gmailConsentSentence(scopes: readonly string[]): string {
   return scopes.includes(GOOGLE_GMAIL_WRITE_SCOPE)
-    ? "Connect Gmail with permission to read email, save drafts, and move threads to Trash. " +
-      "Zeus cannot send email and cannot delete it permanently."
+    ? "Connect Gmail with permission to read email, save drafts, and move threads to Trash " +
+      "and back out of it. Zeus cannot send email and cannot delete it permanently."
     : "Connect Gmail with permission to read email. Zeus cannot send, draft, label, or " +
       "delete email.";
 }

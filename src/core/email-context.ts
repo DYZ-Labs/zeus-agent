@@ -13,7 +13,9 @@ import {
   draftReplyRequest,
   emailWriteVerb,
   trashRequest,
+  untrashRequest,
 } from "./email-actions";
+import { listExecutedEffects } from "./effects";
 import type { EmailRequest } from "./email-actions";
 import { contentWords } from "./calendar-time";
 import { InboxSnapshot } from "./schema";
@@ -379,7 +381,7 @@ export function matchThread(
 
   const words = contentWords(
     query.replace(
-      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|draft|compose|write|reply|replies|respond|answer|delete|trash|bin|junk|throw away|get rid of|e-?mails?|messages?|threads?|note|inbox|say|says|said|about|from|the|my|to)\b/giu,
+      /\b(?:summari[sz]e|what did|what does|read|open|show me|catch me up on|draft|compose|write|reply|replies|respond|answer|delete|trash|bin|junk|throw away|get rid of|untrash|undelete|restore|recover|undo|put|bring|take|pull|back|out of|e-?mails?|messages?|threads?|note|inbox|say|says|said|about|from|the|my|to)\b/giu,
       " ",
     ),
   );
@@ -480,6 +482,62 @@ function escapeThreadData(value: string): string {
  */
 const BULK = /\b(?:all|every|everything|each|any)\b|\bemails\b|\bmessages\b|\bthreads\b/iu;
 
+/**
+ * The thread a move request is aimed at.
+ *
+ * Trashing resolves against the inbox cache. Restoring cannot: a trashed thread has left the
+ * inbox, so it is not in the window Zeus syncs. What Zeus does hold is its own ledger of what
+ * it moved there, and the effect row carries the subject and sender it captured before the
+ * move — so "put that back" resolves against Zeus's own record of having binned it.
+ *
+ * The limit that follows is worth being plain about: a thread the user trashed themselves, in
+ * Gmail, is not something Zeus can find to restore. Searching the Trash would need a second
+ * read surface over the least-wanted mail in the account, and "undo the thing you just did"
+ * is the request this is actually for.
+ */
+export function emailMoveTarget(
+  db: Db,
+  request: { kind: "trash" | "untrash"; threadId: string },
+): EmailThread | null {
+  if (request.kind === "trash") {
+    return cachedThreads(db, new Date()).find((entry) => entry.id === request.threadId) ?? null;
+  }
+  return trashedByZeus(db).find((entry) => entry.id === request.threadId) ?? null;
+}
+
+/**
+ * Threads Zeus recorded moving to Trash, newest first, as the inbox rows they were.
+ *
+ * Read from executed effects rather than from a table of its own: the ledger is already the
+ * record of what happened, and a second copy is a second thing to keep true.
+ */
+export function trashedByZeus(db: Db, limit = 25): EmailThread[] {
+  const seen = new Set<string>();
+  const threads: EmailThread[] = [];
+  for (const effect of listExecutedEffects(db, limit)) {
+    if (effect.capability.slot !== "email.trash_thread") continue;
+    if (effect.prior_state_json === null) continue;
+    let prior: unknown;
+    try {
+      prior = JSON.parse(effect.prior_state_json);
+    } catch {
+      continue;
+    }
+    const record = prior as Record<string, unknown>;
+    const id = typeof record.thread_id === "string" ? record.thread_id : null;
+    if (id === null || seen.has(id)) continue;
+    seen.add(id);
+    threads.push({
+      id,
+      subject: typeof record.subject === "string" ? record.subject : null,
+      from: typeof record.from === "string" ? record.from : null,
+      last_activity_at: null,
+      unread: false,
+    });
+  }
+  return threads;
+}
+
 export type EmailWriteResolution =
   | { status: "not_asked" }
   | { status: "request"; request: EmailRequest; thread: EmailThread | null }
@@ -503,6 +561,24 @@ export function resolveEmailWriteRequest(
   const verb = emailWriteVerb(content);
   if (!verb) return { status: "not_asked" };
   const threads = cachedThreads(db, at);
+
+  if (verb === "untrash") {
+    const restorable = trashedByZeus(db);
+    if (restorable.length === 0) {
+      return {
+        status: "refused",
+        reason:
+          "Zeus has no record of moving an email to Trash, so there is nothing here it can " +
+          "put back. A thread deleted in Gmail itself is restored from Gmail's own Trash.",
+      };
+    }
+    // No newest-thread fallback either: restoring the wrong conversation is a smaller harm
+    // than binning one, but it is still an act on mail nobody named.
+    const target = matchThread(content, restorable, { fallbackToNewest: restorable.length === 1 });
+    if (target.status === "ambiguous") return { status: "ambiguous", candidates: target.candidates };
+    if (target.status !== "resolved") return { status: "no_match" };
+    return { status: "request", request: untrashRequest(target.thread), thread: target.thread };
+  }
 
   if (verb === "trash") {
     if (BULK.test(content)) {

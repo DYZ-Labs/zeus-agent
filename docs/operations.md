@@ -727,16 +727,14 @@ GOOGLE_GMAIL_BROKER_URL=https://calendar.zeusagent.dev
 GOOGLE_GMAIL_BROKER_SERVICE_KEY=<the same Gmail broker service key>
 ```
 
-The Gmail OAuth consent screen declares two scopes and no others:
+The Gmail OAuth consent screen declares exactly one scope:
+`https://www.googleapis.com/auth/gmail.modify`. Connecting Gmail is a single consent and
+grants everything Zeus can do with a mailbox — read, draft, trash, untrash. There is no
+second permission to come back for, and no read-only tier to choose.
 
-| Scope | Granted when | What it allows |
-|---|---|---|
-| `https://www.googleapis.com/auth/gmail.readonly` | Connecting Gmail | Reading threads |
-| `https://www.googleapis.com/auth/gmail.modify` | "Enable drafting" in Settings | Saving drafts, moving threads to Trash — and reading, which is why a write grant asks for this one alone |
-
-Both are Google *restricted* scopes, so adding the second crosses no new verification tier:
-test users can connect while the app is in testing, but a public external app needs Google's
-OAuth verification and recurring security assessment either way.
+It is a Google *restricted* scope, the same tier `gmail.readonly` was: test users can connect
+while the app is in testing, but a public external app needs Google's OAuth verification and
+recurring security assessment.
 
 `https://mail.google.com/` is never requested, and that is the operational guarantee behind
 "Zeus cannot delete your mail permanently": `messages.delete` and `threads.delete` accept no
@@ -745,15 +743,22 @@ other scope, so no bug in Zeus or the broker can reach them.
 **Sending is prevented by code, not by scope.** There is no draft-only Gmail scope —
 `gmail.modify` and `gmail.compose` both permit `messages.send` — so what stops a send is that
 Zeus has no `send` capability slot to name, the database CHECK rejects one, and the broker
-registers four tools of which none sends. The residual risk worth stating plainly: a
+registers five tools of which none sends. The residual risk worth stating plainly: a
 compromised broker holding a `gmail.modify` refresh token could send. That is the price of
 Google offering no narrower scope, and it is why the Gmail broker keeps its own project, its
 own OAuth client, and its own service key.
 
+Inboxes connected before Zeus could write still hold a `gmail.readonly` refresh token. They
+keep reading, bind only the two read slots, and say so in `<capabilities>`; reconnecting
+Gmail once grants the rest. That is a compatibility path, not a permission tier.
+
 The broker encrypts each account's refresh token and talks to `gmail.googleapis.com`
-directly; a read-only grant is shown only `search_threads` and `get_thread`, and the write
-tools are not registered at all for it. Disconnect revokes the Gmail grant before removing
-its provider row from the user's store.
+directly. Disconnect revokes the Gmail grant before removing its provider row from the user's
+store.
+
+Restoring from Trash resolves against Zeus's own effect ledger — the threads it recorded
+moving there — not against a search of the mailbox. A thread the user trashed in Gmail itself
+is restored from Gmail's own Trash; Zeus will say so rather than search for it.
 
 ## Commands
 

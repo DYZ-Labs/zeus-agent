@@ -13,6 +13,7 @@ import {
   parseEmailRequest,
   slotForEmailRequest,
   trashRequest,
+  untrashRequest,
 } from "./email-actions";
 import type { EmailRequest } from "./email-actions";
 import type { EmailThread } from "./email-sync";
@@ -49,6 +50,14 @@ describe("recognizing an email write", () => {
 
   it("reads a removal as a removal even when a draft verb is beside it", () => {
     expect(emailWriteVerb("delete the draft reply to Sarah")).toBe("trash");
+  });
+
+  it("reads undoing a removal as its own thing, not as another removal", () => {
+    // Every one of these contains a removal word. What is being asked for is the opposite.
+    expect(emailWriteVerb("undelete the email from Sarah")).toBe("untrash");
+    expect(emailWriteVerb("put that email back")).toBe("untrash");
+    expect(emailWriteVerb("restore the message I deleted")).toBe("untrash");
+    expect(emailWriteVerb("get Sarah's email out of the trash")).toBe("untrash");
   });
 });
 
@@ -91,6 +100,7 @@ describe("carrying the resolved action inside the plan", () => {
 
   it("routes each request to its own slot", () => {
     expect(slotForEmailRequest(trashRequest(THREAD))).toBe("email.trash_thread");
+    expect(slotForEmailRequest(untrashRequest(THREAD))).toBe("email.untrash_thread");
     expect(slotForEmailRequest(draftReplyRequest(THREAD, "yes")!)).toBe("email.create_draft");
   });
 });
@@ -107,8 +117,9 @@ describe("the exact bytes", () => {
     });
   });
 
-  it("sends a thread id and nothing else to move a thread to Trash", () => {
+  it("sends a thread id and nothing else to move a thread either way", () => {
     expect(buildEmailPayload(trashRequest(THREAD), "", null)).toEqual({ threadId: "18f0a" });
+    expect(buildEmailPayload(untrashRequest(THREAD), "", null)).toEqual({ threadId: "18f0a" });
   });
 });
 
@@ -118,6 +129,13 @@ describe("what the confirmation says", () => {
     expect(preview).toContain("sarah@acme.example");
     expect(preview).toContain("Q3 planning");
     expect(preview).toContain("Nothing is sent");
+  });
+
+  it("says restoring puts something back, and warns of nothing", () => {
+    const preview = emailPreviewFor(untrashRequest(THREAD), THREAD, 4);
+    expect(preview).toContain("Q3 planning");
+    expect(preview).toContain("back out of your Gmail Trash");
+    expect(preview).not.toContain("30 days");
   });
 
   it("says what trashing takes, and how long the way back lasts", () => {
@@ -134,6 +152,7 @@ describe("the code-owned plan", () => {
   it("never allows an effect kind beyond preparing locally and writing once", () => {
     for (const request of [
       trashRequest(THREAD),
+      untrashRequest(THREAD),
       draftReplyRequest(THREAD, "yes")!,
     ] satisfies EmailRequest[]) {
       const proposal = emailActionWorkPlanProposal(request, "objective");

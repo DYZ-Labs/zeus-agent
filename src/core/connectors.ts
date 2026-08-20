@@ -57,6 +57,7 @@ export const CAPABILITY_SLOTS = [
   "email.get_thread",
   "email.create_draft",
   "email.trash_thread",
+  "email.untrash_thread",
 ] as const satisfies readonly CapabilitySlot[];
 
 /**
@@ -815,13 +816,14 @@ export function configureGoogleGmailCapabilities(
     ["email.search_threads", "search_threads"],
     ["email.get_thread", "get_thread"],
   ];
-  // An inbox connected before drafting existed holds a readonly refresh token, so it binds
-  // the two read slots and nothing else. It keeps working; it simply cannot draft until the
-  // user widens the grant, which is a question Settings asks and this code never assumes.
+  // Connecting Gmail asks for everything at once, so a fresh connection always lands here
+  // with all five slots. The read-only branch is not a permission tier — it is what an inbox
+  // connected before Zeus could write still binds, so it keeps reading until it reconnects.
   if (canWrite) {
     desired.push(
       ["email.create_draft", "create_draft"],
       ["email.trash_thread", "trash_thread"],
+      ["email.untrash_thread", "untrash_thread"],
     );
   }
   return configureGoogleProviderCapabilities(db, input, {
