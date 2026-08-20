@@ -229,7 +229,8 @@ describe("the turn tells the model what Zeus can do", () => {
     const final = body.input.at(-1)?.content ?? "";
     expect(final.startsWith("<capabilities>")).toBe(true);
     // The condition the cached prefix could never resolve, resolved.
-    expect(final).toContain("not connected");
+    expect(final).toContain("Calendar: not connected");
+    expect(final).toContain("Inbox: not connected");
     expect(final).toContain("Australia/Sydney");
     expect(final.indexOf("<capabilities>")).toBeLessThan(final.indexOf("<memory"));
     // No calendar is connected, so there is no schedule block — the biconditional the
@@ -255,7 +256,9 @@ describe("the turn tells the model what Zeus can do", () => {
     expect(body.instructions).not.toContain("a panel directly below your reply already shows");
     // It is told where completed particulars live, and where earlier actions live.
     expect(body.instructions).toContain("what_it_did under external_requests_completed");
-    expect(body.instructions).toContain("<calendar_history> is the answer");
+    expect(body.instructions).toContain(
+      "If there is no <inbox> block, no inbox is connected, and <capabilities> is the only thing to relay about it",
+    );
   });
 
   it("asks for a voice, not only for a list of things not to claim", async () => {

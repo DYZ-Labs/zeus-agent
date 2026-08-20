@@ -275,6 +275,7 @@ describe("the standing inbox block", () => {
     expect(sentToModel).toContain("<inbox ");
     expect(sentToModel).toContain("Q3 planning");
     expect(sentToModel).toContain("sarah@example.com");
+    expect(sentToModel).toContain("Inbox: Gmail is connected for reading");
   });
 
   it("carries no message text, only what a subject line says", async () => {
