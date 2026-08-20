@@ -49,8 +49,24 @@ const MAX_PAGE_SIZE = 50;
 /** Mirrors `CHAT_COVERAGE_TTL_MS` in the calendar: how stale the proof may be on a turn. */
 export const CHAT_COVERAGE_TTL_MS = 15 * 60_000;
 
-/** Mirrors `CHAT_SYNC_TIMEOUT_MS`: how long a turn waits before answering from what it has. */
-export const CHAT_SYNC_TIMEOUT_MS = 6_000;
+/**
+ * How long a chat turn waits on an inbox refresh before answering from what it has.
+ *
+ * Longer than the calendar's six seconds: Gmail is a nested MCP hop (Zeus → broker →
+ * Google's Gmail server) and `search_threads` returns every message in each thread, so a
+ * cold read that the calendar would finish in time was aborting here. An aborted read
+ * leaves no coverage row, and the standing inbox then reports unknown forever.
+ */
+export const CHAT_SYNC_TIMEOUT_MS = 15_000;
+
+/**
+ * How long connect/verify will wait for the first inbox read.
+ *
+ * The OAuth callback is already a long wait; finishing the read here is what stops the
+ * first chat turn from greeting a connected inbox as unread. Matches the broker's own
+ * Gmail request deadline.
+ */
+export const CONNECT_SYNC_TIMEOUT_MS = 20_000;
 
 export type EmailThread = {
   id: string;
@@ -97,7 +113,12 @@ export async function syncEmail(
       capabilityId: available.capability.id,
     });
     if (result.isError) throw new Error("email_tool_reported_error");
-    const cached = cacheEmailThreads(db, available.connector.id, result.value, at);
+    const cached = cacheEmailThreads(
+      db,
+      available.connector.id,
+      emailToolPayload(result.value, result.text),
+      at,
+    );
     logEvent({
       event: "email_synced",
       outcome: "ok",
@@ -360,16 +381,10 @@ export function parseEmailThreads(value: unknown): {
   threads: EmailThread[];
   truncated: boolean;
 } {
-  const record =
-    value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
-  const list = Array.isArray(value)
-    ? value
-    : record && Array.isArray(record.threads)
-      ? (record.threads as unknown[])
-      : null;
+  const source = searchThreadsResponse(value);
+  const list = threadList(source);
   if (list === null) throw new Error("Email response did not contain a thread list");
+  const record = source !== null && !Array.isArray(source) ? source : null;
 
   const threads: EmailThread[] = [];
   for (const entry of list) {
@@ -392,8 +407,89 @@ export function parseEmailThreads(value: unknown): {
   }
   return {
     threads,
-    truncated: typeof record?.nextPageToken === "string" && record.nextPageToken.length > 0,
+    truncated: pageTokenOf(record).length > 0,
   };
+}
+
+/**
+ * Unwrap the SearchThreads RPC object Google's Gmail MCP actually returns.
+ *
+ * A bare array is accepted for tests and for servers that skip the envelope. A nested
+ * `searchThreadsResponse` is the other wrapping the same proto has shown up in. Anything
+ * else stays wrapped so `threadList` can still fail closed.
+ */
+function searchThreadsResponse(value: unknown): Record<string, unknown> | unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const nested = record.searchThreadsResponse;
+  if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+    return nested as Record<string, unknown>;
+  }
+  return record;
+}
+
+/**
+ * The thread array a SearchThreadsResponse holds — including the case where protobuf JSON
+ * omitted it because it was empty.
+ *
+ * Empty repeated fields are omitted, not sent as `[]`. Treating that omission as "no thread
+ * list" is how a successful empty read was recorded as no read at all, which is the
+ * unknown-vs-empty confusion this table exists to prevent. A payload that names some other
+ * list still fails closed.
+ */
+function threadList(source: Record<string, unknown> | unknown[] | null): unknown[] | null {
+  if (source === null) return null;
+  if (Array.isArray(source)) return source;
+  if (Object.hasOwn(source, "threads")) {
+    return Array.isArray(source.threads) ? source.threads : null;
+  }
+  const keys = Object.keys(source);
+  return keys.every((key) => SEARCH_RESPONSE_KEYS.has(key)) ? [] : null;
+}
+
+const SEARCH_RESPONSE_KEYS = new Set([
+  "threads",
+  "nextPageToken",
+  "next_page_token",
+  "resultCountEstimate",
+  "result_count_estimate",
+]);
+
+/**
+ * Prefer a payload that actually names a thread list.
+ *
+ * Google's MCP often sends the RPC JSON in `content` and a protobuf-empty object in
+ * `structuredContent` (omitted repeated fields). Zeus's client prefers structuredContent,
+ * which would make a full inbox look like no read at all. The text is still sitting on
+ * the result; use it when it holds the list.
+ */
+function emailToolPayload(value: unknown, text: string): unknown {
+  if (hasThreadsArray(searchThreadsResponse(value))) return value;
+  if (text.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (hasThreadsArray(searchThreadsResponse(parsed))) return parsed;
+    } catch {
+      // The text was not JSON; `parseEmailThreads` will fail closed on `value`.
+    }
+  }
+  return value;
+}
+
+function hasThreadsArray(source: Record<string, unknown> | unknown[] | null): boolean {
+  if (source === null) return false;
+  if (Array.isArray(source)) return true;
+  return Array.isArray(source.threads);
+}
+
+function pageTokenOf(record: Record<string, unknown> | null): string {
+  if (!record) return "";
+  for (const key of ["nextPageToken", "next_page_token"] as const) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return "";
 }
 
 /**

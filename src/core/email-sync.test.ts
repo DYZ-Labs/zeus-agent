@@ -108,6 +108,29 @@ describe("what Zeus will ask the inbox for", () => {
 
     expect(searchThreadArguments(minimal, 7)).toEqual({ query: "in:inbox newer_than:7d" });
   });
+
+  it("accepts the live Gmail MCP search_threads input schema", () => {
+    const live = JSON.stringify({
+      description: "Request message for SearchThreads RPC.",
+      properties: {
+        includeTrash: { type: "boolean" },
+        pageSize: { type: "integer" },
+        pageToken: { type: "string" },
+        query: { type: "string" },
+        view: {
+          enum: ["THREAD_VIEW_UNSPECIFIED", "THREAD_VIEW_METADATA_ONLY", "THREAD_VIEW_MINIMAL"],
+          type: "string",
+        },
+      },
+      type: "object",
+    });
+
+    expect(searchThreadArguments(live, 7)).toEqual({
+      query: "in:inbox newer_than:7d",
+      pageSize: 50,
+      view: "THREAD_VIEW_MINIMAL",
+    });
+  });
 });
 
 describe("what Zeus keeps from the answer", () => {
@@ -151,6 +174,50 @@ describe("what Zeus keeps from the answer", () => {
     expect(() => parseEmailThreads({ threads: ["nope"] })).toThrow(/invalid thread/u);
   });
 
+  it("reads Google's SearchThreadsResponse, including a date that is only a day", () => {
+    const { threads } = parseEmailThreads({
+      threads: [
+        {
+          id: "18abc",
+          messages: [
+            {
+              subject: "Q3 planning",
+              sender: "sarah@example.com",
+              date: "2026-08-20",
+              labelIds: ["INBOX", "UNREAD"],
+            },
+          ],
+        },
+      ],
+      resultCountEstimate: "1",
+    });
+
+    expect(threads[0]).toMatchObject({
+      id: "18abc",
+      subject: "Q3 planning",
+      from: "sarah@example.com",
+      last_activity_at: "2026-08-20",
+      unread: true,
+    });
+  });
+
+  it("treats a protobuf-empty SearchThreadsResponse as an empty inbox, not as no read", () => {
+    // Empty repeated fields are omitted. That is a successful empty read.
+    expect(parseEmailThreads({})).toEqual({ threads: [], truncated: false });
+    expect(parseEmailThreads({ resultCountEstimate: "0" })).toEqual({
+      threads: [],
+      truncated: false,
+    });
+  });
+
+  it("unwraps a nested SearchThreads envelope", () => {
+    const { threads } = parseEmailThreads({
+      searchThreadsResponse: { threads: [thread("t1", "2026-08-20T09:00:00.000Z")] },
+    });
+
+    expect(threads[0]?.id).toBe("t1");
+  });
+
   it("notices when the server said there was more", () => {
     const complete = parseEmailThreads({ threads: [thread("t1", "2026-08-20T09:00:00.000Z")] });
     const partial = parseEmailThreads({
@@ -160,6 +227,12 @@ describe("what Zeus keeps from the answer", () => {
 
     expect(complete.truncated).toBe(false);
     expect(partial.truncated).toBe(true);
+    expect(
+      parseEmailThreads({
+        threads: [thread("t1", "2026-08-20T09:00:00.000Z")],
+        next_page_token: "abc",
+      }).truncated,
+    ).toBe(true);
   });
 });
 

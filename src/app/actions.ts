@@ -18,7 +18,7 @@ import {
 import { updateAmbientSetting } from "@/core/ambient";
 import { updateCalendarActionSetting } from "@/core/calendar-policy";
 import { syncCalendar } from "@/core/calendar-sync";
-import { syncEmail } from "@/core/email-sync";
+import { CONNECT_SYNC_TIMEOUT_MS, syncEmail } from "@/core/email-sync";
 import {
   CAPABILITY_SLOTS,
   ConnectorPresetError,
@@ -1003,7 +1003,7 @@ export async function verifyConnectorAction(formData: FormData): Promise<void> {
     connector?.provider === "google_gmail" ||
     connector?.capabilities.some((capability) => capability.slot === "email.search_threads")
   ) {
-    await syncEmail(db, { signal: AbortSignal.timeout(10_000) });
+    await syncEmail(db, { signal: AbortSignal.timeout(CONNECT_SYNC_TIMEOUT_MS) });
   }
   revalidatePath("/settings");
 }

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { syncCalendar } from "./calendar-sync";
+import { syncEmail } from "./email-sync";
 import type { Db } from "./db";
 import { now } from "./db";
 import { getSignal, runDetectors } from "./detectors";
@@ -432,13 +433,24 @@ export async function refreshExternalSignals(
   options: { at?: Date; signal?: AbortSignal } = {},
 ): Promise<{ synced: boolean; detected: number; resolved: number }> {
   const at = options.at ?? new Date();
-  // `syncCalendar` refuses an unavailable capability, so without this a connector left
-  // `unreachable` by one bad minute kept every scheduled refresh a silent no-op until a chat
-  // turn happened to be recognized as a calendar request. A scheduled refresh needs the
-  // calendar as much as that turn does; the restore re-enables no capability row, so it can
+  // `syncCalendar` / `syncEmail` refuse an unavailable capability, so without this a
+  // connector left `unreachable` by one bad minute kept every scheduled refresh a silent
+  // no-op until a chat turn happened to need that service. A scheduled refresh needs the
+  // cache as much as that turn does; the restore re-enables no capability row, so it can
   // heal sooner but can never widen a grant.
-  await restoreConnectorReachability(db, "calendar.list_events", { signal: options.signal });
-  const synced = await syncCalendar(db, { at, signal: options.signal });
+  //
+  // Inbox used to be omitted here. Chat is the only other writer, and it aborts a slow
+  // Gmail hop rather than hang the turn — so a connected inbox that never quite finished
+  // in those few seconds stayed unread, and the standing block reported unknown forever.
+  await Promise.all([
+    restoreConnectorReachability(db, "calendar.list_events", { signal: options.signal }),
+    restoreConnectorReachability(db, "email.search_threads", { signal: options.signal }),
+  ]);
+  const [calendar, email] = await Promise.all([
+    syncCalendar(db, { at, signal: options.signal }),
+    syncEmail(db, { at, signal: options.signal }),
+  ]);
+  const synced = calendar !== null || email !== null;
   const result = runDetectors(db, { at });
   logEvent({
     event: "detectors_run",
@@ -446,7 +458,7 @@ export async function refreshExternalSignals(
     count: result.created.length,
   });
   return {
-    synced: synced !== null,
+    synced,
     detected: result.created.length,
     resolved: result.resolved,
   };
