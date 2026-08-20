@@ -1284,6 +1284,49 @@ export const ScheduleSnapshotEvent = z
   .strict();
 export type ScheduleSnapshotEvent = z.infer<typeof ScheduleSnapshotEvent>;
 
+/**
+ * Why an inbox read did not happen, in Zeus's own words.
+ *
+ * A fixed, code-owned vocabulary rather than a message, for the same reason the observability
+ * module keeps an allowlist: the honest account of a failed read has to be renderable into a
+ * prompt and into the UI, and an error string from a mail server is neither of those safely.
+ * Each value names one thing someone could act on.
+ */
+export const EmailReadFailure = z.enum([
+  /** No inbox connector exists at all. */
+  "no_connector",
+  /** One exists and cannot serve a call: disabled, unverified, or unreachable. */
+  "capability_unavailable",
+  /** The search tool's schema is not one Zeus can build a bounded query for. */
+  "unsupported_contract",
+  /** Zeus's own deadline fired before the read came back. */
+  "timed_out",
+  /** The broker or Google refused the call; `code` carries the broker's own word for it. */
+  "tool_error",
+  /** The reply was larger than Zeus will hold, so what arrived is a fragment. */
+  "response_truncated",
+  /** The reply arrived and is not a thread list Zeus can read. */
+  "response_unreadable",
+  /** The connected service did not answer, for a reason no more specific than that. */
+  "call_failed",
+]);
+export type EmailReadFailure = z.infer<typeof EmailReadFailure>;
+
+/**
+ * A failed read, as a turn carries it.
+ *
+ * `code` is the token a Zeus-operated broker put in front of its own failure text — bounded
+ * to one lowercase word by the match that extracts it, never a sentence, and null for every
+ * failure Zeus decided on its own.
+ */
+export const InboxReadFailure = z
+  .object({
+    reason: EmailReadFailure,
+    code: z.string().regex(/^[a-z_]{1,64}$/u).nullable(),
+  })
+  .strict();
+export type InboxReadFailure = z.infer<typeof InboxReadFailure>;
+
 export const InboxSnapshotThread = z
   .object({
     id: z.string(),
@@ -1314,6 +1357,15 @@ export const InboxSnapshot = z
     threadsShown: z.number().int().min(0),
     threadsTotal: z.number().int().min(0),
     withheld: z.boolean(),
+    /**
+     * Why this turn's own refresh failed, when it did.
+     *
+     * Optional so the rows written before this field existed still parse; null when the
+     * refresh succeeded or was not needed. Deliberately not folded into `state`: that column
+     * is CHECK-constrained in `inbox_context`, and "current" versus "stale" versus "unread"
+     * describes what Zeus holds, where this describes what just happened to it.
+     */
+    readFailure: InboxReadFailure.nullable().optional(),
   })
   .strict();
 export type InboxSnapshot = z.infer<typeof InboxSnapshot>;

@@ -252,14 +252,17 @@ export async function streamTurn(db: Db, options: StreamTurnOptions): Promise<Tu
   // `Promise.all` rejects on the first rejection, which would take down the turn including
   // the half that succeeded. Both refreshers return a status instead of throwing, and that
   // contract is what makes this safe.
-  await Promise.all([
+  const [, inboxRefresh] = await Promise.all([
     ensureFreshCalendarCache(db, { signal: options.signal }),
     ensureFreshEmailCache(db, { signal: options.signal }),
   ]);
   const capabilityState = calendarCapabilityState(db);
   const emailState = emailCapabilityState(db);
   const schedule = buildScheduleContext(db, evaluationContext, capabilityState);
-  const inbox = buildInboxContext(db, evaluationContext, emailState);
+  // What this turn's own refresh ran into, carried into the block rather than dropped. An
+  // inbox the turn just failed to read and one nobody has ever read render the same
+  // sentence otherwise, and only the first of them has a next step.
+  const inbox = buildInboxContext(db, evaluationContext, emailState, inboxRefresh.failure);
 
   const context = await buildContext(db, options.input, {
     excludeMessageIds: [userMessage.id],

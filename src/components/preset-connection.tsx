@@ -8,6 +8,7 @@ import {
   disconnectGoogleCalendarAction,
   disconnectGoogleGmailAction,
   removeConnectorAction,
+  verifyConnectorAction,
   type ConnectorSetupState,
 } from "@/app/actions";
 import { GMAIL_PRESET_ID, type ConnectorPreset } from "@/core/connector-catalog";
@@ -31,12 +32,18 @@ const INITIAL_STATE: ConnectorSetupState = {
  * `hostedStartHref` is null for a preset without an account-bound broker path. Local mode
  * still uses the user's own Application Default Credentials; hosted mode always starts the
  * provider-specific OAuth flow instead of spending process-wide credentials.
+ *
+ * `recheckLabel` opts a preset into a re-read control. Connecting and reading are two
+ * separate things that can fail separately, and this card only ever reported the first — so
+ * a service that handshakes and then cannot read showed a green dot while Zeus said it could
+ * see nothing, with no way to find out which half was broken.
  */
 export function PresetConnection({
   preset,
   icon,
   defaultSlots,
   hostedStartHref = null,
+  recheckLabel = null,
   connector,
   localMode,
   available,
@@ -45,6 +52,7 @@ export function PresetConnection({
   icon: ReactNode;
   defaultSlots: CapabilitySlot[];
   hostedStartHref?: string | null;
+  recheckLabel?: string | null;
   connector: ConnectorView | null;
   localMode: boolean;
   available: boolean;
@@ -101,22 +109,30 @@ export function PresetConnection({
         </div>
 
         {connected && connector ? (
-          localMode ? (
-            <form action={removeConnectorAction}>
-              <input type="hidden" name="id" value={connector.id} />
-              <SecondaryButton label="Disconnect" />
-            </form>
-          ) : (
-            <form
-              action={
-                preset.id === GMAIL_PRESET_ID
-                  ? disconnectGoogleGmailAction
-                  : disconnectGoogleCalendarAction
-              }
-            >
-              <SecondaryButton label="Disconnect" />
-            </form>
-          )
+          <div className="flex shrink-0 items-center gap-2">
+            {recheckLabel ? (
+              <form action={verifyConnectorAction}>
+                <input type="hidden" name="id" value={connector.id} />
+                <SecondaryButton label={recheckLabel} />
+              </form>
+            ) : null}
+            {localMode ? (
+              <form action={removeConnectorAction}>
+                <input type="hidden" name="id" value={connector.id} />
+                <SecondaryButton label="Disconnect" />
+              </form>
+            ) : (
+              <form
+                action={
+                  preset.id === GMAIL_PRESET_ID
+                    ? disconnectGoogleGmailAction
+                    : disconnectGoogleCalendarAction
+                }
+              >
+                <SecondaryButton label="Disconnect" />
+              </form>
+            )}
+          </div>
         ) : localMode ? (
           <form action={formAction}>
             <input type="hidden" name="presetId" value={preset.id} />

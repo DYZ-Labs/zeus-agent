@@ -189,13 +189,28 @@ export function createGoogleGmailMcpServer(input: {
         return failure("tool_contract_changed: That Gmail read tool is unavailable");
       }
       const client = await remoteClient();
-      return await client.callTool(
+      const result = await client.callTool(
         request.params,
         undefined,
         { timeout: REQUEST_TIMEOUT_MS, signal: extra.signal },
       );
+      // Google's own refusal arrives as an ordinary tool result, not as a thrown transport
+      // error, so nothing in the catch below would ever have seen it. Passing it straight
+      // through hands Zeus untagged prose, which it can only report as "something went
+      // wrong" — the exact dead end this pass exists to end. Tag it, and lift the one
+      // bounded token its text may carry.
+      if (result.isError === true) {
+        const code = refusalCode("gmail_tool_refused", contentText(result.content));
+        reportGmailFailure(code, contentText(result.content));
+        return failure(`${code}: Google's Gmail tool refused the request`);
+      }
+      return result;
     } catch (error) {
       const failureError = gmailFailure(input, error);
+      reportGmailFailure(
+        failureError.code,
+        error instanceof Error ? error.message : String(error),
+      );
       return failure(`${failureError.code}: ${failureError.message}`);
     }
   });
@@ -239,13 +254,121 @@ function gmailFailure(
   input: Pick<Parameters<typeof createGoogleGmailMcpServer>[0], "grant" | "store">,
   error: unknown,
 ): GoogleGmailError {
-  const normalized = error instanceof GoogleGmailError
-    ? error
-    : new GoogleGmailError("gmail_unavailable", "Google Gmail did not complete the request");
+  const normalized = error instanceof GoogleGmailError ? error : googleRefusal(error);
   if (normalized.code === "refresh_revoked") {
     input.store.markGmailReconnectRequired(input.grant.id, input.grant.accountId);
   }
   return normalized;
+}
+
+/**
+ * Name what Google actually did, rather than reporting that something did not work.
+ *
+ * A single `gmail_unavailable` used to cover everything below this line — an API nobody
+ * enabled, a token whose scopes are too narrow, a server having a minute, a socket that
+ * dropped — and Zeus faithfully relayed that one word to the user. Those are four different
+ * people's problems, and a connected Gmail that never reads is indistinguishable between
+ * them until this code says which.
+ *
+ * Both halves are matched, never read. The status is a number the transport recorded, and
+ * Google's reason is one SCREAMING_SNAKE token pulled out of its error body by pattern — so
+ * no sentence of Google's, and nothing a mailbox contains, can reach the code.
+ */
+function googleRefusal(error: unknown): GoogleGmailError {
+  const status = httpStatusOf(error);
+  const base = status === null ? "gmail_no_http_answer" : `gmail_http_${status}`;
+  return new GoogleGmailError(
+    refusalCode(base, error instanceof Error ? error.message : ""),
+    status === null
+      ? "Google's Gmail server did not return a usable answer"
+      : `Google's Gmail server answered ${status}`,
+  );
+}
+
+/**
+ * The HTTP status behind a transport failure.
+ *
+ * Bounded to a real status range on purpose: `StreamableHTTPError` uses `-1` for a reply it
+ * could not read at all, and an `McpError` puts a JSON-RPC code in the same property. Neither
+ * is an HTTP answer, and reporting one as `gmail_http_-32603` would be worse than saying
+ * nothing.
+ */
+function httpStatusOf(error: unknown, depth = 0): number | null {
+  if (!error || typeof error !== "object" || depth > 3) return null;
+  const record = error as { code?: unknown; status?: unknown; cause?: unknown };
+  for (const value of [record.code, record.status]) {
+    if (typeof value === "number" && value >= 100 && value <= 599) return value;
+  }
+  return httpStatusOf(record.cause, depth + 1);
+}
+
+/**
+ * Google's own machine reason for a refusal, when its error body carried one.
+ *
+ * The status alone cannot separate the two 403s that matter most: `SERVICE_DISABLED` is an
+ * API the operator never turned on, and `ACCESS_TOKEN_SCOPE_INSUFFICIENT` is a grant that is
+ * too narrow. One is fixed in a Cloud console and the other by asking the user for consent
+ * again, so telling them apart is the difference between a fix and another guess.
+ */
+function googleReasonToken(message: string): string | null {
+  // `reason` first, deliberately. Google's canonical error carries a broad `status`
+  // (`PERMISSION_DENIED`) beside a specific `details[].reason` (`SERVICE_DISABLED`), and the
+  // specific one is the one somebody can act on. Taking whichever appeared first in the body
+  // would mean the useful half lost to document order.
+  //
+  // The last pattern is for a message that is prose rather than an error document, which is
+  // how a tool-level refusal tends to arrive. It requires an underscore so that an ordinary
+  // capitalized word at the start of a sentence cannot be mistaken for a code.
+  const patterns = [
+    /"reason"\s*:\s*"([A-Z][A-Z0-9_]{2,47})"/u,
+    /"status"\s*:\s*"([A-Z][A-Z0-9_]{2,47})"/u,
+    /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,5})\b/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(message);
+    if (match) return match[1]!.toLowerCase();
+  }
+  return null;
+}
+
+/** A code plus the one bounded token the text carried, if any. Never the text itself. */
+function refusalCode(base: string, message: string): string {
+  const reason = googleReasonToken(message);
+  return (reason === null ? base : `${base}_${reason}`).slice(0, 64);
+}
+
+/** The text a tool result carried, bounded, for pattern-matching and for the operator log. */
+function contentText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (entry): entry is { text: string } =>
+        entry !== null &&
+        typeof entry === "object" &&
+        (entry as { type?: unknown }).type === "text" &&
+        typeof (entry as { text?: unknown }).text === "string",
+    )
+    .map((entry) => entry.text)
+    .join("\n")
+    .slice(0, 2_000);
+}
+
+/**
+ * One line in the broker's own log when a Gmail read fails.
+ *
+ * The one place Google's actual sentence is kept. It goes to the operator's log and nowhere
+ * else — never to Zeus, never to a prompt, never to the user — because it is the difference
+ * between "403" and "the Gmail API is not enabled on project 123", and an operator staring
+ * at a connection that will not read has nothing else to go on.
+ *
+ * Safe to keep here and not upstream: this is a bounded search over the user's own inbox
+ * (`in:inbox newer_than:7d`), so a refusal describes the request, not its contents. Only a
+ * failure is ever logged, and never a result.
+ */
+function reportGmailFailure(code: string, message: string): void {
+  process.stderr.write(
+    `${JSON.stringify({ event: "gmail_read_failed", code, detail: message.slice(0, 500) })}\n`,
+  );
 }
 
 function refreshTokenIsRevoked(status: number, body: unknown): boolean {

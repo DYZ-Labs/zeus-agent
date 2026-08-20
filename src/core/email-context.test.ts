@@ -152,6 +152,132 @@ describe("what the inbox block carries", () => {
   });
 });
 
+/**
+ * The half the block was missing.
+ *
+ * "No read has succeeded" is true of an inbox nobody asked for and of one Google refused,
+ * and someone told only the first of those has nothing to do next. That was the whole of
+ * what a connected-but-unreadable Gmail could produce.
+ */
+describe("saying why a read did not happen", () => {
+  it("separates a read nobody attempted from one that just failed", () => {
+    const never = renderInboxBlock(buildInboxContext(db, context(), CONNECTED)!, context());
+    expect(never).toContain("has not tried to read it in this turn");
+    expect(never).not.toContain("read_failure=");
+
+    const refused = renderInboxBlock(
+      buildInboxContext(db, context(), CONNECTED, {
+        reason: "tool_error",
+        code: "reconnect_required",
+      })!,
+      context(),
+    );
+    expect(refused).toContain('read_failure="tool_error"');
+    expect(refused).toContain("authorization Zeus holds is no longer good enough");
+    expect(refused).toContain("Settings");
+  });
+
+  it("splits a refusal by whose problem it is, from the code the broker composed", () => {
+    // `gmail_http_403_service_disabled` is an API nobody turned on and
+    // `gmail_http_403_access_token_scope_insufficient` is a grant that is too narrow. Same
+    // status, same one-word `gmail_unavailable` before this pass, two different people.
+    const operator = renderInboxBlock(
+      buildInboxContext(db, context(), CONNECTED, {
+        reason: "tool_error",
+        code: "gmail_http_403_service_disabled",
+      })!,
+      context(),
+    );
+    expect(operator).toContain("operator of this Zeus");
+    expect(operator).not.toContain("Settings, under Connections");
+
+    const consent = renderInboxBlock(
+      buildInboxContext(db, context(), CONNECTED, {
+        reason: "tool_error",
+        code: "gmail_http_403_access_token_scope_insufficient",
+      })!,
+      context(),
+    );
+    expect(consent).toContain("Settings, under Connections");
+
+    const transient = renderInboxBlock(
+      buildInboxContext(db, context(), CONNECTED, {
+        reason: "tool_error",
+        code: "gmail_http_503",
+      })!,
+      context(),
+    );
+    expect(transient).toContain("needs nothing from the user");
+  });
+
+  it("does not send the user to Settings over a service that merely did not answer", () => {
+    const block = renderInboxBlock(
+      buildInboxContext(db, context(), CONNECTED, { reason: "timed_out", code: null })!,
+      context(),
+    );
+
+    // The same rule the capabilities block already keeps one layer up: an intact connection
+    // described as one to go and repair reads as "Zeus has lost my mail".
+    expect(block).toContain("needs nothing from the user");
+    expect(block).not.toContain("Settings");
+  });
+
+  it("sends a deployment fault to the operator rather than to the user", () => {
+    for (const reason of ["response_truncated", "response_unreadable", "unsupported_contract"] as const) {
+      const block = renderInboxBlock(
+        buildInboxContext(db, context(), CONNECTED, { reason, code: null })!,
+        context(),
+      );
+      expect(block).toContain("operator of this Zeus");
+      expect(block).toContain("nothing in the user's Settings will change it");
+    }
+  });
+
+  it("says why a stale read has not been replaced, not only that it has not", () => {
+    cache([thread("t1", "Q3 planning", "sarah@example.com", "2026-08-20T09:00:00.000Z")]);
+    const muchLater = new Date(NOW.getTime() + 3 * 60 * 60 * 1000);
+
+    const inbox = buildInboxContext(
+      db,
+      createEvaluationContext({ trigger: "chat", referenceTime: muchLater, timezone: "UTC" }),
+      CONNECTED,
+      { reason: "call_failed", code: null },
+    )!;
+
+    expect(inbox.state).toBe("stale");
+    const block = renderInboxBlock(inbox, context());
+    expect(block).toContain("A newer read has not succeeded");
+    expect(block).toContain("did not answer");
+    // Still the threads it does hold. A failed refresh degrades the turn; it does not
+    // empty it.
+    expect(block).toContain("Q3 planning");
+  });
+
+  it("survives the round trip into the snapshot a turn keeps", () => {
+    const inbox = buildInboxContext(db, context(), CONNECTED, {
+      reason: "timed_out",
+      code: null,
+    })!;
+    const assistant = appendMessage(db, 1, "assistant", "I could not read it.").id;
+
+    recordInboxContext(db, assistant, inbox);
+
+    expect(inboxContextFor(db, assistant)?.readFailure).toEqual({
+      reason: "timed_out",
+      code: null,
+    });
+  });
+
+  it("still parses a snapshot written before the field existed", () => {
+    const assistant = appendMessage(db, 1, "assistant", "Here is your inbox.").id;
+    const legacy = buildInboxContext(db, context(), CONNECTED)!;
+    delete (legacy as { readFailure?: unknown }).readFailure;
+    recordInboxContext(db, assistant, legacy);
+
+    expect(inboxContextFor(db, assistant)?.state).toBe("unread");
+  });
+});
+
 describe("third-party text in the inbox block", () => {
   it("withholds an injection-shaped subject and reports that it did", () => {
     cache([

@@ -368,6 +368,73 @@ describe("guided connector actions", () => {
     expect(readCalendarCoverage(db)).not.toBeNull();
   });
 
+  it("says on the page why a verified inbox still could not be read", async () => {
+    // The state the user was actually in: Settings showing a green dot beside an assistant
+    // saying it cannot see their mail. Connecting and reading fail separately, and until now
+    // only the first of them had anywhere to report.
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const connectorId = connectGmailDirectly(db);
+    actionMocks.verifyConnector.mockResolvedValue({ tools: [] });
+    actionMocks.callCapability.mockResolvedValue({
+      value: null,
+      text: "reconnect_required: Gmail must be reconnected",
+      isError: true,
+      truncated: false,
+    });
+    const form = new FormData();
+    form.set("id", String(connectorId));
+
+    await verifyConnectorAction(form);
+
+    expect(actionMocks.redirect).toHaveBeenCalledWith(
+      expect.stringContaining("no%20longer%20good%20enough"),
+    );
+  });
+
+  it("puts the operator's lead on the page when only an operator can fix it", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const connectorId = connectGmailDirectly(db);
+    actionMocks.verifyConnector.mockResolvedValue({ tools: [] });
+    actionMocks.callCapability.mockResolvedValue({
+      value: null,
+      text: "gmail_http_403_service_disabled: Google's Gmail server answered 403",
+      isError: true,
+      truncated: false,
+    });
+    const form = new FormData();
+    form.set("id", String(connectorId));
+
+    await verifyConnectorAction(form);
+
+    expect(actionMocks.redirect).toHaveBeenCalledWith(
+      expect.stringContaining("gmail_http_403_service_disabled"),
+    );
+    expect(actionMocks.redirect).toHaveBeenCalledWith(
+      expect.stringContaining("reconnecting%20will%20not%20change%20it"),
+    );
+  });
+
+  it("says nothing on the page when the inbox read worked", async () => {
+    const db = openTestDb();
+    actionMocks.getDb.mockReturnValue(db);
+    const connectorId = connectGmailDirectly(db);
+    actionMocks.verifyConnector.mockResolvedValue({ tools: [] });
+    actionMocks.callCapability.mockResolvedValue({
+      value: { threads: [] },
+      text: '{"threads":[]}',
+      isError: false,
+      truncated: false,
+    });
+    const form = new FormData();
+    form.set("id", String(connectorId));
+
+    await verifyConnectorAction(form);
+
+    expect(actionMocks.redirect).not.toHaveBeenCalled();
+  });
+
   it("does not read a calendar through a connector that serves none", async () => {
     const db = openTestDb();
     actionMocks.getDb.mockReturnValue(db);
@@ -392,6 +459,36 @@ describe("guided connector actions", () => {
     expect(actionMocks.callCapability).not.toHaveBeenCalled();
   });
 });
+
+/** A connected, verified inbox connector, built from the core primitives. */
+function connectGmailDirectly(db: ReturnType<typeof openTestDb>): number {
+  const conversation = createConversation(db, { title: "Connections", source: "web" });
+  const sourceMessageId = appendMessage(db, conversation.id, "user", "connect Gmail", {
+    origin: "user_action",
+    recallState: "blocked",
+  }).id;
+  const connector = createConnector(db, {
+    label: "Gmail",
+    transport: "stdio",
+    command: "node",
+    args: ["./gmail-server.js"],
+    sourceMessageId,
+  });
+  recordConnectorVerification(db, connector.id, { status: "ready" });
+  setConnectorEnabled(db, connector.id, true, sourceMessageId);
+  const capability = bindCapability(db, {
+    connectorId: connector.id,
+    slot: "email.search_threads",
+    remoteToolName: "search_threads",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" }, pageSize: { type: "integer" } },
+    },
+    sourceMessageId,
+  });
+  setCapabilityEnabled(db, capability.id, true, sourceMessageId);
+  return connector.id;
+}
 
 /** A connected, verified calendar connector, built from the core primitives. */
 function connectCalendarDirectly(db: ReturnType<typeof openTestDb>): number {

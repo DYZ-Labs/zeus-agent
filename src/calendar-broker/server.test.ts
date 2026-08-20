@@ -35,10 +35,16 @@ let server: ReturnType<typeof createCalendarBrokerServer>;
 let origin: string;
 let accountId: string;
 let fetcher: ReturnType<typeof vi.fn<typeof fetch>>;
+/** Set by a test to make Google refuse the tool call rather than answer it. */
+let gmailCallRefusal: { status: number; body: unknown } | null = null;
+/** Set by a test to make Google answer the tool call with a refusal of its own. */
+let gmailToolResult: unknown = null;
 
 beforeEach(async () => {
   store = new CalendarBrokerStore(":memory:", randomBytes(32));
   accountId = randomUUID();
+  gmailCallRefusal = null;
+  gmailToolResult = null;
   fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     if (url === "https://oauth2.googleapis.com/token") {
@@ -265,6 +271,92 @@ describe("the multi-user Gmail broker", () => {
     expect(wrongAccount.status).toBe(404);
   });
 
+  it("names what Google refused, rather than that something did not work", async () => {
+    // The state a real deployment sat in: tools list, the read fails, and the only word
+    // anybody got back was `gmail_unavailable`. A disabled API and a grant that is too
+    // narrow both arrive as 403, and they are fixed in different places by different people.
+    const result = await connectGmail();
+    gmailCallRefusal = {
+      status: 403,
+      body: {
+        error: {
+          code: 403,
+          message: "Gmail API has not been used in project 123 before or it is disabled.",
+          status: "PERMISSION_DENIED",
+          details: [{ reason: "SERVICE_DISABLED" }],
+        },
+      },
+    };
+
+    const client = new Client({ name: "test-zeus", version: "0.0.1" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`${origin}/gmail/mcp/${result.connectionId}`),
+      {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
+            "X-Zeus-Account-Id": accountId,
+          },
+        },
+      },
+    ));
+    const searched = await client.callTool({
+      name: "search_threads",
+      arguments: { query: "in:inbox newer_than:7d", pageSize: 50 },
+    });
+    await client.close();
+
+    expect(searched.isError).toBe(true);
+    const text = JSON.stringify(searched.content);
+    expect(text).toContain("gmail_http_403");
+    // Google's own machine reason, matched to a bounded token — the half a status alone
+    // cannot supply.
+    expect(text).toContain("gmail_http_403_service_disabled");
+    // Still nothing of Google's prose, and the grant is untouched: a refusal Zeus cannot fix
+    // is not the user's consent going away.
+    expect(text).not.toContain("has not been used in project");
+    expect(store.getGmailGrant(result.connectionId, accountId)?.status).toBe("active");
+  });
+
+  it("tags a refusal Google returned as a result, not as a transport error", async () => {
+    // The other half, and the one that would otherwise still arrive unnamed: Google's MCP
+    // server answering with an ordinary `isError` tool result. Nothing throws, so none of the
+    // transport naming runs, and the text used to be forwarded untagged — leaving Zeus able
+    // to report only that something went wrong.
+    const result = await connectGmail();
+    gmailToolResult = {
+      isError: true,
+      content: [{
+        type: "text",
+        text: "Request had insufficient authentication scopes. ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+      }],
+    };
+
+    const client = new Client({ name: "test-zeus", version: "0.0.1" });
+    await client.connect(new StreamableHTTPClientTransport(
+      new URL(`${origin}/gmail/mcp/${result.connectionId}`),
+      {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer ${GMAIL_SERVICE_KEY}`,
+            "X-Zeus-Account-Id": accountId,
+          },
+        },
+      },
+    ));
+    const searched = await client.callTool({
+      name: "search_threads",
+      arguments: { query: "in:inbox newer_than:7d", pageSize: 50 },
+    });
+    await client.close();
+
+    expect(searched.isError).toBe(true);
+    const text = JSON.stringify(searched.content);
+    expect(text).toContain("gmail_tool_refused_access_token_scope_insufficient");
+    // Google's sentence stays in the broker's own log; only the token crosses to Zeus.
+    expect(text).not.toContain("insufficient authentication scopes");
+  });
+
   it("serves the locked Gmail provider transport in hosted Zeus", async () => {
     process.env[GOOGLE_GMAIL_BROKER_SERVICE_KEY] = GMAIL_SERVICE_KEY;
     const result = await connectGmail();
@@ -372,6 +464,12 @@ function gmailMcpResponse(init: RequestInit | undefined): Response {
   };
   if (request.method === "notifications/initialized") {
     return new Response(null, { status: 202 });
+  }
+  if (request.method === "tools/call" && gmailCallRefusal) {
+    return Response.json(gmailCallRefusal.body, { status: gmailCallRefusal.status });
+  }
+  if (request.method === "tools/call" && gmailToolResult) {
+    return Response.json({ jsonrpc: "2.0", id: request.id, result: gmailToolResult });
   }
   const result = request.method === "initialize"
     ? {
